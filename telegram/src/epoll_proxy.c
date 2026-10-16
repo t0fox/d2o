@@ -2032,11 +2032,9 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config) {
             for (size_t i = 0; i < route_worker_count(server); ++i)
                 (void)tg_route_dns_prefetch(server->route_dns,
                                             route_worker_domain(server, i));
-            for (size_t i = 0; i < route_cf_domain_count(server); ++i) {
-                char domain[TG_CF_DOMAIN_LEN];
-                if (route_cf_domain(server, i, domain) == 0)
-                    (void)tg_route_dns_prefetch(server->route_dns, domain);
-            }
+            if (config->cf_domain_pool)
+                tg_route_dns_prefetch_cf_pool(server->route_dns,
+                                               config->cf_domain_pool);
         }
     }
     if (set_nonblocking(server->listener_fd) != 0) goto fail;
