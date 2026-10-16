@@ -514,10 +514,16 @@ static int route_health_preferred_step(const tg_epoll_proxy *server,
     if (best->kind == TG_ROUTE_CF_PROXY) {
         for (size_t i = 0; i < route_cf_domain_count(server); ++i) {
             char domain[TG_CF_DOMAIN_LEN];
-            if (route_cf_domain(server, i, domain) == 0 &&
-                strcmp(best->hostname, domain) == 0) {
-                out->index = (uint8_t)i;
-                return 1;
+            if (route_cf_domain(server, i, domain) != 0) continue;
+            for (unsigned variant = 0; variant <=
+                    (unsigned)connection->route_is_media; ++variant) {
+                char hostname[TG_CF_DOMAIN_LEN];
+                if (tg_route_cf_proxy_hostname(connection->route_dc_id,
+                        (int)variant, domain, hostname, sizeof(hostname)) == 0 &&
+                    strcmp(best->hostname, hostname) == 0) {
+                    out->index = (uint8_t)(2u * i + variant);
+                    return 1;
+                }
             }
         }
     }
@@ -819,13 +825,18 @@ static int setup_route_attempt(proxy_connection *connection,
     }
     if (step->kind == TG_ROUTE_CF_WORKER || step->kind == TG_ROUTE_CF_PROXY) {
         char domain_copy[TG_CF_DOMAIN_LEN];
+        char hostname[TG_CF_DOMAIN_LEN];
         const char *domain;
         if (step->kind == TG_ROUTE_CF_WORKER) {
             domain = route_worker_domain(server, step->index);
         } else {
-            if (route_cf_domain(server, step->index, domain_copy) != 0)
+            if (route_cf_domain(server, step->index / 2u,
+                                domain_copy) != 0 ||
+                tg_route_cf_proxy_hostname(connection->route_dc_id,
+                    step->index % 2u, domain_copy, hostname,
+                    sizeof(hostname)) != 0)
                 return -1;
-            domain = domain_copy;
+            domain = hostname;
         }
         if (!domain || resolve_route_domain(server, domain, target) != 0)
             return -1;
@@ -1149,29 +1160,45 @@ static void advance_half_closes(proxy_connection *connection) {
 
 static int route_after_handshake(proxy_connection *connection) {
     tg_epoll_proxy *server = connection->server;
-    tg_listener_destination upstream;
-    memset(&upstream, 0, sizeof(upstream));
-    if (server->config.select_target(server->config.context,
-                                     &connection->original,
-                                     connection->handshake, &upstream) != 0 ||
-        target_sockaddr(&upstream, &(struct sockaddr_storage){0},
+    tg_epoll_route_selection selection = {0};
+    int validated = server->config.select_route != NULL;
+    if (validated) {
+        if (server->config.select_route(server->config.context,
+                                        &connection->original,
+                                        connection->handshake, &selection) != 0)
+            return -1;
+    } else {
+        /* Compatibility for the existing synthetic test fixture. */
+        if (server->config.select_target(server->config.context,
+                                         &connection->original,
+                                         connection->handshake,
+                                         &selection.upstream) != 0)
+            return -1;
+        tg_mtproto_init parsed;
+        if (tg_mtproto_parse_obfuscated2(connection->handshake,
+                                        &parsed) == 0) {
+            selection.dc_id = parsed.dc_id;
+            selection.is_media = parsed.is_media;
+            selection.proto = parsed.proto;
+        }
+    }
+    tg_listener_destination *upstream = &selection.upstream;
+    if (target_sockaddr(upstream, &(struct sockaddr_storage){0},
                         &(socklen_t){0}) != 0 ||
         (server->config.enforce_self_dial &&
-         tg_listener_is_self_dial_addr(&upstream, server->listen_ports,
+         tg_listener_is_self_dial_addr(upstream, server->listen_ports,
                                        server->config.listen_port_count)))
         return -1;
-    connection->upstream_target = upstream;
+    connection->upstream_target = *upstream;
     connection->direct_wss = 0;
-    tg_mtproto_init parsed;
     size_t worker_count = 0, cf_count = 0;
     tg_ws_routing_policy policy = TG_WS_ROUTING_ADAPTIVE;
     tg_route_step preferred = {0};
     int have_preferred = 0;
-    if (tg_mtproto_parse_obfuscated2(connection->handshake, &parsed) == 0 &&
-        parsed.dc_id != 0) {
-        connection->route_dc_id = parsed.dc_id;
-        connection->route_is_media = parsed.is_media;
-        connection->wss_proto = parsed.proto;
+    connection->route_dc_id = selection.dc_id;
+    connection->route_is_media = selection.is_media;
+    connection->wss_proto = selection.proto;
+    if (selection.dc_id != 0 && !selection.tcp_only) {
         worker_count = route_worker_count(server);
         cf_count = route_cf_domain_count(server);
         if (server->config.routing_config)
@@ -1941,7 +1968,8 @@ static void expire_connections(tg_epoll_proxy *server) {
 }
 
 tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config) {
-    if (!config || config->listener_fd < 0 || !config->select_target ||
+    if (!config || config->listener_fd < 0 ||
+        (!config->select_target && !config->select_route) ||
         config->queue_bytes < 1024 || config->queue_bytes > 1024u * 1024u ||
         !config->memory_budget_bytes || !config->configured_max_connections ||
         !config->handshake_timeout_ms || !config->idle_timeout_ms ||
