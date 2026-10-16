@@ -193,7 +193,7 @@ static void test_config_discovery_rejects_invalid_arguments(void) {
                                       &snapshot) != 0);
 }
 
-static void test_encrypted_response_accepts_new_session_before_rpc_result(void) {
+static void test_encrypted_response_ignores_control_messages_before_rpc_result(void) {
     const uint64_t request_message_id = UINT64_C(0x1234567800000000);
     uint8_t service[28] = {0};
     write_le32(service, UINT32_C(0x9ec20908));
@@ -207,7 +207,7 @@ static void test_encrypted_response_accepts_new_session_before_rpc_result(void) 
                                        &result_len) == 1);
     assert(tg_mtproto_parse_rpc_result(service, sizeof(service),
                                        request_message_id, 1, &result,
-                                       &result_len) == -1);
+                                       &result_len) == 1);
 
     uint8_t container[52] = {0};
     write_le32(container, UINT32_C(0x73f1f8dc));
@@ -222,6 +222,39 @@ static void test_encrypted_response_accepts_new_session_before_rpc_result(void) 
     assert(tg_mtproto_parse_rpc_result(container, sizeof(container),
                                        request_message_id, 3, &result,
                                        &result_len) == -1);
+
+    uint8_t control_container[88] = {0};
+    write_le32(control_container, UINT32_C(0x73f1f8dc));
+    write_le32(control_container + 4, 2);
+    write_le64(control_container + 8, 13);
+    write_le32(control_container + 16, 1);
+    write_le32(control_container + 20, sizeof(service));
+    memcpy(control_container + 24, service, sizeof(service));
+    write_le64(control_container + 52, 17);
+    write_le32(control_container + 60, 2);
+    write_le32(control_container + 64, 20);
+    write_le32(control_container + 68, UINT32_C(0x62d6b459));
+    write_le32(control_container + 72, UINT32_C(0x1cb5c415));
+    write_le32(control_container + 76, 1);
+    write_le64(control_container + 80, request_message_id);
+    assert(tg_mtproto_parse_rpc_result(control_container,
+                                       sizeof(control_container),
+                                       request_message_id, 2, &result,
+                                       &result_len) == 1);
+
+    uint8_t ack_container[44] = {0};
+    write_le32(ack_container, UINT32_C(0x73f1f8dc));
+    write_le32(ack_container + 4, 1);
+    write_le64(ack_container + 8, 21);
+    write_le32(ack_container + 16, 2);
+    write_le32(ack_container + 20, 20);
+    write_le32(ack_container + 24, UINT32_C(0x62d6b459));
+    write_le32(ack_container + 28, UINT32_C(0x1cb5c415));
+    write_le32(ack_container + 32, 1);
+    write_le64(ack_container + 36, request_message_id);
+    assert(tg_mtproto_parse_rpc_result(ack_container, sizeof(ack_container),
+                                       request_message_id, 2, &result,
+                                       &result_len) == 1);
 
     uint8_t empty_container[8] = {0};
     write_le32(empty_container, UINT32_C(0x73f1f8dc));
@@ -252,7 +285,7 @@ int main(void) {
     test_response_with_wrong_nonce_is_not_healthy();
     test_non_plain_response_is_not_healthy();
     test_config_discovery_rejects_invalid_arguments();
-    test_encrypted_response_accepts_new_session_before_rpc_result();
+    test_encrypted_response_ignores_control_messages_before_rpc_result();
     puts("Тесты MTProto probe и response parser: ок");
     return 0;
 }

@@ -534,7 +534,7 @@ int tg_mtproto_parse_rpc_result(const uint8_t *body, size_t body_len,
         return *result_len ? 0 : -1;
     }
     if (constructor == new_session_created)
-        return (outer_seqno & 1u) == 0 && body_len == 28 ? 1 : -1;
+        return body_len == 28 ? 1 : -1;
     if (constructor != msg_container || (outer_seqno & 1u) != 0 ||
         body_len < 8 || read_le32(body + 4) > 128)
         return -1;
@@ -542,7 +542,6 @@ int tg_mtproto_parse_rpc_result(const uint8_t *body, size_t body_len,
     uint32_t count = read_le32(body + 4);
     if (count == 0) return body_len == 8 ? 1 : -1;
     int found = 0;
-    int has_new_session = 0;
     for (uint32_t i = 0; i < count; ++i) {
         if (offset > body_len || body_len - offset < 16) return -1;
         uint64_t message_id = read_le64(body + offset);
@@ -563,13 +562,12 @@ int tg_mtproto_parse_rpc_result(const uint8_t *body, size_t body_len,
             if (!*result_len) return -1;
             found = 1;
         } else if (inner_constructor == new_session_created) {
-            if ((seqno & 1u) != 0 || message_len != 28) return -1;
-            has_new_session = 1;
+            if (message_len != 28) return -1;
         }
         offset += message_len;
     }
     if (offset != body_len) return -1;
-    return found ? 0 : (has_new_session ? 1 : -1);
+    return found ? 0 : 1;
 }
 
 int tg_mtproto_discover_config(const char *numeric_address, uint16_t port,

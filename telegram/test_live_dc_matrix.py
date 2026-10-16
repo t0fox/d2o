@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Проверяет живую TCP resPQ-матрицу DC1–DC5 у собранного d2ktg."""
+"""Проверяет живые TCP resPQ и help.getConfig для DC1–DC5 у собранного d2ktg."""
 
 import json
 import subprocess
@@ -15,50 +15,68 @@ EXPECTED = [
 ]
 
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        print("Использование: python3 test_live_dc_matrix.py /путь/к/d2ktg", file=sys.stderr)
-        return 2
-
+def check_matrix(executable: str, option: str, stage: str) -> bool:
     try:
         result = subprocess.run(
-            [sys.argv[1], "--check-telegram-dc-matrix"],
+            [executable, option],
             capture_output=True,
             check=False,
             text=True,
             timeout=50,
         )
     except subprocess.TimeoutExpired:
-        print("Проверка матрицы DC1–DC5 превысила 50 секунд", file=sys.stderr)
-        return 1
+        print(f"{option}: проверка DC1–DC5 превысила 50 секунд", file=sys.stderr)
+        return False
     except OSError as error:
         print(f"Не удалось запустить d2ktg: {error}", file=sys.stderr)
-        return 1
+        return False
 
     try:
         records = [json.loads(line) for line in result.stdout.splitlines() if line]
     except json.JSONDecodeError as error:
-        print(f"d2ktg вернул некорректный JSON: {error}", file=sys.stderr)
+        print(f"{option}: d2ktg вернул некорректный JSON: {error}", file=sys.stderr)
         if result.stderr:
             print(result.stderr, file=sys.stderr, end="")
-        return 1
+        return False
 
     actual = [(record.get("dc"), record.get("address")) for record in records]
     if actual != EXPECTED:
-        print(f"Неверная матрица DC: {actual!r}", file=sys.stderr)
+        print(f"{option}: неверная матрица DC: {actual!r}", file=sys.stderr)
         if result.stderr:
             print(result.stderr, file=sys.stderr, end="")
-        return 1
+        return False
     if result.returncode != 0 or any(
-        record.get("ok") is not True or record.get("stage") != "resPQ"
+        record.get("ok") is not True or record.get("stage") != stage
         for record in records
     ):
-        print("Не все пять DC прошли TCP и MTProto resPQ", file=sys.stderr)
+        print(f"{option}: не все пять DC прошли этап {stage}", file=sys.stderr)
         for record in records:
             print(json.dumps(record, ensure_ascii=False), file=sys.stderr)
-        return 1
+        return False
+    if stage == "help.getConfig" and any(
+        record.get("this_dc") != record.get("dc") or record.get("endpoint_count", 0) < 1
+        for record in records
+    ):
+        print(f"{option}: неверная конфигурация одного из DC", file=sys.stderr)
+        for record in records:
+            print(json.dumps(record, ensure_ascii=False), file=sys.stderr)
+        return False
+    return True
 
-    print("Живая TCP resPQ-проверка DC1–DC5: ок")
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("Использование: python3 test_live_dc_matrix.py /путь/к/d2ktg", file=sys.stderr)
+        return 2
+
+    for option, stage in (
+        ("--check-telegram-dc-matrix", "resPQ"),
+        ("--discover-telegram-dc-matrix", "help.getConfig"),
+    ):
+        if not check_matrix(sys.argv[1], option, stage):
+            return 1
+
+    print("Живые TCP resPQ и help.getConfig для DC1–DC5: ок")
     return 0
 
 

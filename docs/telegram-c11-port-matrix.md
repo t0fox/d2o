@@ -22,7 +22,7 @@
 | Ограниченная гонка WSS-кандидатов | `routing.rs` | Опциональный `TG_WS_ROUTING=hedged`, задержка и общий лимит параллельных гонок; кандидат становится основным после корректного MTProto transport packet | Локальный regression покрывает Abridged, Intermediate и Padded Intermediate, включая транспортное заполнение и quick ACK. Первый кандидат с HTTP 101 и запросом без MTProto-пакета не выигрывает; второй с корректным пакетом повышается. Реальная сеть не проверялась. |
 | CF domain pool, встроенные fallback domains, last-known-good | `cf_domain_pool.rs`, `default_domains.rs` | `cf_domains.c`: ручной пул, встроенные domains, проверенный кэш и атомарное обновление списка | Парсер, объединение и кэш покрыты тестами. Обновление из внешнего источника в этой среде не проверялось. |
 | DNS и DoH для CF-маршрутов | `cf_proxy_doh.rs` | `route_dns.c`: ограниченный кэш, системное разрешение, HTTPS DoH к Cloudflare и Google, проверка TLS hostname/SNI; DNS выполняет один вспомогательный worker | Формат ответа, кэш и адресные ограничения покрыты тестами. Живые DoH запросы не подтверждены. |
-| Диагностика по фазам и машинный вывод | `diagnostics.rs` | `--check-telegram-dc-matrix` последовательно проверяет по TCP исходные IPv4-адреса DC1–DC5 и выдаёт JSON-строку на каждый; `--check-telegram-dc` и `--discover-telegram-dc` остаются для одного IP | Живая проверка 2026-10-16: все пять адресов дошли до `resPQ` за 108–371 мс. Диагностика DNS/TLS/WS фаз и CF-ошибок, а также автоматический `help.getConfig` для всей матрицы отсутствуют. |
+| Диагностика по фазам и машинный вывод | `diagnostics.rs` | `--check-telegram-dc-matrix` и `--discover-telegram-dc-matrix` последовательно проверяют по TCP исходные IPv4-адреса DC1–DC5 и выдают JSON-строку на каждый; одиночные режимы остаются доступны | Живые проверки 2026-10-16: все пять адресов дошли до `resPQ`, все пять вернули `help.getConfig` с совпавшим `this_dc` и `endpoint_count=19`. Диагностика DNS/TLS/WS фаз и CF-ошибок отсутствует. |
 | Runtime counters и панель | `stats.rs` | Unix socket с правами `0600`, счётчики соединений, байтов, WSS попыток/ошибок и CF ответов; C-панель читает и валидирует ответ | Тесты socket/API проходят. RSS, полное состояние каждого маршрута и настоящая доступность Telegram в статусе не показываются. |
 | Пределы FD и RAM | `limits.rs` | `limits.c` рассчитывает лимит соединений по FD и памяти; daemon задаёт бюджет 32 MiB, предел 64 клиента и ограничивает WSS/hedge ресурсы | Unit-тесты и ASan/UBSan проходят. Реальный RSS и поведение на устройстве с 128 MiB не измерялись. |
 | Конфигурация и удаление relay client | `config.rs`, `server.rs`, `runtime.rs` | `d2ktg` принимает только `TG_MODE=local`; старые relay URL/secret/enroll ключи не разбираются. Установщик переводит старый `relay` в `local`, сохраняя старые поля с правами `0600` | Тесты конфигурации, панели, release и runtime install проходят. Отдельный `relay-enroll` сервер оставлен для совместимости прежних установок и существующего Meta DNS resolver; новый `d2ktg` к нему не обращается. |
@@ -36,12 +36,12 @@ Direct WSS, CF Worker, CF proxy, TCP fallback, discovery, DoH, пул домен
 адаптивный выбор и opt-in hedge представлены в коде и имеют локальные тесты.
 Успех WSS и hedge проверяется для трёх транспортных форматов.
 
-Полный критерий завершения пока не выполнен. Подтверждён живой TCP `resPQ`
-для DC1–DC5, но не WSS-доступ к Telegram, `help.getConfig` или реальные
-Worker/CF маршруты. Остаются незакрытыми диагностика DNS/TLS/WS фаз и
-CF-маршрутов, автоматический `help.getConfig` для DC1–DC5, проверка полной
-эквивалентности C/Rust runtime, release-сборки архитектур и ABI/QEMU, ресурсные
-замеры на 128 MiB устройстве и физические Keenetic/OpenWrt сценарии. WSS-health
+Полный критерий завершения пока не выполнен. Живые TCP `resPQ` и
+`help.getConfig` подтверждены для DC1–DC5, но не WSS-доступ к Telegram или
+реальные Worker/CF маршруты. Остаются незакрытыми диагностика DNS/TLS/WS фаз и
+CF-маршрутов, проверка полной эквивалентности C/Rust runtime, release-сборки
+архитектур и ABI/QEMU, ресурсные замеры на 128 MiB устройстве и физические
+Keenetic/OpenWrt сценарии. WSS-health
 проверяет структуру transport packet, а не конкретный RPC.
 
 Для сверенного Rust HEAD выполнен `cargo test --locked --quiet` из временной
@@ -52,8 +52,11 @@ CF-маршрутов, автоматический `help.getConfig` для DC1�
 только во временной копии, поэтому повторяемого межъязыкового теста в
 репозитории нет.
 
-Нативный набор `make -C telegram BUILD_DIR=build-gcc test d2ktg` прошёл. Живую
-матрицу проверяет `python3 telegram/test_live_dc_matrix.py /путь/к/d2ktg`.
+Для `help.getConfig` C-парсер пропускает корректный `msg_container` только с
+управляющими сообщениями `new_session_created` и `msgs_ack`, затем принимает
+следующий `rpc_result`.
+Нативный набор `make -C telegram BUILD_DIR=build-gcc test d2ktg` прошёл. Живые
+матрицы проверяет `python3 telegram/test_live_dc_matrix.py /путь/к/d2ktg`.
 
 Во время установки старые `relay-enroll` endpoint и сервер оставлены: они не
 используются новым локальным прокси и позволяют откатиться на прежний
