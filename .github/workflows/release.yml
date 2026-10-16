@@ -163,15 +163,19 @@ jobs:
       - name: Archives, latest.json and signature
         env:
           PRIVATE_KEY: ${{ secrets.D2O_ED25519_PRIVATE_KEY }}
-          PUBLIC_KEY_HEX: ${{ vars.D2O_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           if [ -z "$PRIVATE_KEY" ]; then
             echo "::error::D2O_ED25519_PRIVATE_KEY is empty: the d2o-signing environment secret did not reach this job (called from ci.yml without 'secrets: inherit'?)"
             exit 1
           fi
+          if ! PUBLIC_KEY_HEX=$(openssl pkey -pubin -in docs/d2o-release-public.pem -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d '[:space:]'); then
+            echo "::error::cannot read docs/d2o-release-public.pem"
+            exit 1
+          fi
+          export PUBLIC_KEY_HEX
           if ! [[ "$PUBLIC_KEY_HEX" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::D2O_SIGNING_PUBLIC_KEY is missing or malformed"
+            echo "::error::D2O public key in docs/d2o-release-public.pem is malformed"
             exit 1
           fi
           signing_pub=$(printf '%s\n' "$PRIVATE_KEY" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | od -An -tx1 | tr -d '[:space:]')
@@ -194,7 +198,7 @@ jobs:
           pub=$(python3 -c 'import base64,os; print(base64.b64encode(bytes.fromhex("302a300506032b6570032100"+os.environ["PUBLIC_KEY_HEX"])).decode())')
           for pinned in files/d2k-update.sh scripts/install.sh; do
             grep -qF "$pub" "$pinned" ||
-              { echo "::error::$pinned pins a signing key other than D2O_SIGNING_PUBLIC_KEY"; exit 1; }
+              { echo "::error::$pinned pins a signing key other than the checked-in D2O public key"; exit 1; }
           done
           printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$pub" > "$RUNNER_TEMP/public.pem"
           openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/public.pem" -rawin \
