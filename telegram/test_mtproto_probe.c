@@ -280,7 +280,20 @@ static void test_encrypted_response_ignores_control_messages_before_rpc_result(v
            result[0] == 0x78 && result[3] == 0x12);
 }
 
+static void test_wss_probe_rejects_invalid_configuration(void) {
+    tg_mtproto_probe_result result = {0};
+    assert(tg_mtproto_probe_res_pq_wss(NULL, "localhost", 1, 1000,
+                                       &result) == TG_MTPROTO_PROBE_INVALID);
+    assert(result.stage == TG_MTPROTO_PROBE_STAGE_INPUT);
+    assert(result.error == TG_MTPROTO_PROBE_ERROR_INVALID_INPUT);
+    assert(tg_mtproto_probe_res_pq_wss(NULL, NULL, 1, 1000,
+                                       &result) == TG_MTPROTO_PROBE_INVALID);
+    assert(tg_mtproto_probe_res_pq_wss(NULL, "localhost", 6, 1000,
+                                       &result) == TG_MTPROTO_PROBE_INVALID);
+}
+
 int main(void) {
+    test_wss_probe_rejects_invalid_configuration();
     test_valid_res_pq_is_a_real_mtproto_health_signal();
     test_response_with_wrong_nonce_is_not_healthy();
     test_non_plain_response_is_not_healthy();

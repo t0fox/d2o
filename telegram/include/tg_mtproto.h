@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <openssl/evp.h>
+#include <openssl/ssl.h>
 
 #define TG_MTPROTO_HANDSHAKE_LEN 64u
 #define TG_MTPROTO_PREKEY_IV_LEN 48u
@@ -72,12 +73,29 @@ typedef enum {
     TG_MTPROTO_PROBE_STAGE_INPUT = 0,
     TG_MTPROTO_PROBE_STAGE_TCP = 1,
     TG_MTPROTO_PROBE_STAGE_MTPROTO = 2,
-    TG_MTPROTO_PROBE_STAGE_RES_PQ = 3
+    TG_MTPROTO_PROBE_STAGE_RES_PQ = 3,
+    TG_MTPROTO_PROBE_STAGE_DNS = 4,
+    TG_MTPROTO_PROBE_STAGE_TLS = 5,
+    TG_MTPROTO_PROBE_STAGE_WS = 6
 } tg_mtproto_probe_stage;
+
+typedef enum {
+    TG_MTPROTO_PROBE_ERROR_NONE = 0,
+    TG_MTPROTO_PROBE_ERROR_INVALID_INPUT = 1,
+    TG_MTPROTO_PROBE_ERROR_DNS = 2,
+    TG_MTPROTO_PROBE_ERROR_CONNECT = 3,
+    TG_MTPROTO_PROBE_ERROR_TLS_HANDSHAKE = 4,
+    TG_MTPROTO_PROBE_ERROR_TLS_VERIFY = 5,
+    TG_MTPROTO_PROBE_ERROR_WS_UPGRADE = 6,
+    TG_MTPROTO_PROBE_ERROR_MTPROTO_RESPONSE = 7,
+    TG_MTPROTO_PROBE_ERROR_TIMEOUT = 8,
+    TG_MTPROTO_PROBE_ERROR_IO = 9
+} tg_mtproto_probe_error;
 
 typedef struct {
     tg_mtproto_probe_status status;
     tg_mtproto_probe_stage stage;
+    tg_mtproto_probe_error error;
     uint64_t latency_ms;
     uint8_t nonce[16];
     uint8_t server_nonce[16];
@@ -87,6 +105,9 @@ typedef struct {
 
 tg_mtproto_probe_status tg_mtproto_probe_res_pq(
     const char *numeric_address, uint16_t port, uint32_t dc_id, int is_media,
+    uint32_t timeout_ms, tg_mtproto_probe_result *out);
+tg_mtproto_probe_status tg_mtproto_probe_res_pq_wss(
+    SSL_CTX *tls_context, const char *hostname, uint32_t dc_id,
     uint32_t timeout_ms, tg_mtproto_probe_result *out);
 
 #endif

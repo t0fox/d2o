@@ -2,8 +2,11 @@
 #include "tg_mtproto.h"
 #include "tg_mtproto_auth.h"
 #include "tg_mtproto_discovery.h"
+#include "tg_tls.h"
+#include "tg_ws.h"
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -13,6 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <openssl/crypto.h>
+#include <openssl/err.h>
 #include <openssl/rand.h>
 
 #define TG_PROBE_MAX_PACKET (1024u * 1024u)
@@ -344,6 +348,357 @@ done:
     tg_mtproto_ctr_destroy(&from_server);
     OPENSSL_cleanse(handshake, sizeof(handshake));
     OPENSSL_cleanse(request, sizeof(request));
+    return status;
+}
+
+static int connect_hostname(const char *hostname, uint64_t deadline,
+                            int *dns_failed,
+                            tg_mtproto_probe_result *out) {
+    struct addrinfo hints = {0}, *addresses = NULL;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    *dns_failed = 0;
+    int rc = getaddrinfo(hostname, "443", &hints, &addresses);
+    if (rc != 0) {
+        *dns_failed = 1;
+        errno = EHOSTUNREACH;
+        return -1;
+    }
+    out->stage = TG_MTPROTO_PROBE_STAGE_TCP;
+    int connected = -1;
+    for (struct addrinfo *item = addresses; item; item = item->ai_next) {
+        if (monotonic_ms() >= deadline) {
+            errno = ETIMEDOUT;
+            break;
+        }
+        int fd = socket(item->ai_family, item->ai_socktype, item->ai_protocol);
+        if (fd < 0) continue;
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0 ||
+            fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+            close(fd);
+            continue;
+        }
+        int connect_rc = connect(fd, item->ai_addr, item->ai_addrlen);
+        if (connect_rc != 0 && errno != EINPROGRESS) {
+            close(fd);
+            continue;
+        }
+        if (connect_rc != 0) {
+            if (wait_fd(fd, POLLOUT, deadline) != 0) {
+                close(fd);
+                break;
+            }
+            int error = 0;
+            socklen_t error_len = sizeof(error);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_len) != 0 ||
+                error != 0) {
+                if (error) errno = error;
+                close(fd);
+                continue;
+            }
+        }
+        connected = fd;
+        break;
+    }
+    freeaddrinfo(addresses);
+    if (connected < 0 && monotonic_ms() >= deadline) errno = ETIMEDOUT;
+    return connected;
+}
+
+static int ssl_wait(SSL *ssl, int fd, int rc, uint64_t deadline) {
+    int error = SSL_get_error(ssl, rc);
+    short events;
+    if (error == SSL_ERROR_WANT_READ) events = POLLIN;
+    else if (error == SSL_ERROR_WANT_WRITE) events = POLLOUT;
+    else if (error == SSL_ERROR_SYSCALL && errno == EINTR) return 0;
+    else if (error == SSL_ERROR_SYSCALL &&
+             (errno == EAGAIN || errno == EWOULDBLOCK))
+        events = POLLIN | POLLOUT;
+    else {
+        if (!errno) errno = EPROTO;
+        return -1;
+    }
+    return wait_fd(fd, events, deadline);
+}
+
+static int ssl_handshake_until(SSL *ssl, int fd, uint64_t deadline) {
+    for (;;) {
+        ERR_clear_error();
+        errno = 0;
+        int rc = SSL_do_handshake(ssl);
+        if (rc == 1) return 0;
+        if (ssl_wait(ssl, fd, rc, deadline) != 0) return -1;
+    }
+}
+
+static int ssl_transfer_until(SSL *ssl, int fd, uint8_t *data, size_t len,
+                              int writing, uint64_t deadline) {
+    size_t offset = 0;
+    while (offset < len) {
+        size_t amount = 0;
+        ERR_clear_error();
+        errno = 0;
+        int rc = writing
+            ? SSL_write_ex(ssl, data + offset, len - offset, &amount)
+            : SSL_read_ex(ssl, data + offset, len - offset, &amount);
+        if (rc == 1) {
+            if (!amount) {
+                errno = ECONNRESET;
+                return -1;
+            }
+            offset += amount;
+            continue;
+        }
+        if (ssl_wait(ssl, fd, rc, deadline) != 0) return -1;
+    }
+    return 0;
+}
+
+static int wss_upgrade_until(SSL *ssl, int fd, const char *hostname,
+                             uint64_t deadline) {
+    tg_ws_upgrade_state state = {0};
+    if (tg_ws_upgrade_start_ex(&state, hostname, "/apiws", "binary",
+                               "https://web.telegram.org",
+                               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/131.0.0.0 Safari/537.36") != 0)
+        return -1;
+    size_t pending_len = 0;
+    const uint8_t *pending = tg_ws_upgrade_pending(&state, &pending_len);
+    if (!pending || ssl_transfer_until(ssl, fd, (uint8_t *)pending,
+                                      pending_len, 1, deadline) != 0 ||
+        tg_ws_upgrade_advance(&state, pending_len) != 0)
+        return -1;
+    while (!state.complete) {
+        uint8_t byte;
+        size_t consumed = 0;
+        if (ssl_transfer_until(ssl, fd, &byte, 1, 0, deadline) != 0)
+            return -1;
+        int rc = tg_ws_upgrade_feed(&state, &byte, 1, &consumed);
+        if (rc < 0 || consumed != 1) return -1;
+    }
+    return 0;
+}
+
+typedef struct {
+    tg_mtproto_ctr *server_decrypt;
+    tg_mtproto_probe_result *result;
+    uint8_t expected_nonce[16];
+    uint8_t *stream;
+    size_t stream_len;
+    size_t stream_cap;
+    int found;
+    int invalid;
+} wss_probe_response;
+
+static int collect_wss_probe_response(void *opaque, const uint8_t *payload,
+                                      size_t payload_len) {
+    wss_probe_response *response = opaque;
+    if (!response) return -1;
+    if (response->found) return 0;
+    if (!response->stream || response->stream_len > response->stream_cap ||
+        (payload_len && !payload) ||
+        payload_len > response->stream_cap - response->stream_len) {
+        response->invalid = 1;
+        return -1;
+    }
+    uint8_t *stream = response->stream + response->stream_len;
+    if (payload_len) memcpy(stream, payload, payload_len);
+    if (tg_mtproto_ctr_xor(response->server_decrypt, stream, payload_len) != 0) {
+        response->invalid = 1;
+        return -1;
+    }
+    response->stream_len += payload_len;
+    while (response->stream_len >= 4) {
+        uint32_t packet_len = read_le32(response->stream);
+        if (packet_len & UINT32_C(0x80000000)) {
+            memmove(response->stream, response->stream + 4,
+                    response->stream_len - 4);
+            response->stream_len -= 4;
+            continue;
+        }
+        if (packet_len < 20 || packet_len > TG_PROBE_MAX_PACKET) {
+            response->invalid = 1;
+            return -1;
+        }
+        if (response->stream_len < 4u + packet_len) return 0;
+        const uint8_t *body = NULL;
+        size_t body_len = 0;
+        if (parse_plain_response(response->stream + 4, packet_len,
+                                 &body, &body_len) != 0 ||
+            parse_res_pq(body, body_len, response->expected_nonce,
+                         response->result) != 0) {
+            response->invalid = 1;
+            return -1;
+        }
+        response->found = 1;
+        response->result->stage = TG_MTPROTO_PROBE_STAGE_RES_PQ;
+        return 0;
+    }
+    return 0;
+}
+
+static int wss_wait_for_res_pq(tg_ws_pump *pump, int fd,
+                               wss_probe_response *response,
+                               uint64_t deadline) {
+    while (!response->found) {
+        uint64_t now = monotonic_ms();
+        if (now >= deadline) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        short events = tg_ws_pump_events(pump);
+        short revents = 0;
+        if (SSL_pending(pump->ssl) > 0) {
+            revents = POLLIN;
+        } else {
+            uint64_t left = deadline - now;
+            int timeout = left > (uint64_t)INT_MAX ? INT_MAX : (int)left;
+            struct pollfd descriptor = {.fd = fd, .events = events};
+            int rc = poll(&descriptor, 1, timeout);
+            if (rc == 0) {
+                errno = ETIMEDOUT;
+                return -1;
+            }
+            if (rc < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            revents = descriptor.revents;
+        }
+        if (tg_ws_pump_process(pump, revents, collect_wss_probe_response,
+                               response) != 0)
+            return -1;
+        if (pump->closed && !response->found) {
+            errno = ECONNRESET;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+tg_mtproto_probe_status tg_mtproto_probe_res_pq_wss(
+    SSL_CTX *tls_context, const char *hostname, uint32_t dc_id,
+    uint32_t timeout_ms, tg_mtproto_probe_result *out) {
+    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN] = {0};
+    uint8_t request[40] = {0}, framed_request[44] = {0};
+    tg_mtproto_ctr to_server = {0}, from_server = {0};
+    wss_probe_response response = {0};
+    tg_ws_pump pump = {0};
+    SSL *ssl = NULL;
+    int pump_ready = 0, fd = -1, dns_failed = 0;
+    tg_mtproto_probe_status status = TG_MTPROTO_PROBE_INVALID;
+    tg_mtproto_probe_error error = TG_MTPROTO_PROBE_ERROR_INVALID_INPUT;
+    uint64_t started = monotonic_ms(), deadline = 0, last_message_id = 0;
+    if (!out) return TG_MTPROTO_PROBE_INVALID;
+    memset(out, 0, sizeof(*out));
+    out->stage = TG_MTPROTO_PROBE_STAGE_INPUT;
+    out->error = TG_MTPROTO_PROBE_ERROR_INVALID_INPUT;
+    if (!tls_context || !hostname || !*hostname || dc_id < 1 || dc_id > 5 ||
+        timeout_ms == 0 || timeout_ms > 60000 || !started ||
+        strlen(hostname) >= 256)
+        goto done;
+    deadline = started + timeout_ms;
+    out->stage = TG_MTPROTO_PROBE_STAGE_DNS;
+    fd = connect_hostname(hostname, deadline, &dns_failed, out);
+    if (fd < 0) {
+        error = dns_failed ? TG_MTPROTO_PROBE_ERROR_DNS
+                           : (errno == ETIMEDOUT
+                                ? TG_MTPROTO_PROBE_ERROR_TIMEOUT
+                                : TG_MTPROTO_PROBE_ERROR_CONNECT);
+        status = errno == ETIMEDOUT ? TG_MTPROTO_PROBE_TIMEOUT
+                                    : TG_MTPROTO_PROBE_CONNECT;
+        goto done;
+    }
+    out->stage = TG_MTPROTO_PROBE_STAGE_TLS;
+    ssl = tg_tls_prepare_client_fd(tls_context, fd, hostname, hostname);
+    if (!ssl || ssl_handshake_until(ssl, fd, deadline) != 0) {
+        error = errno == ETIMEDOUT ? TG_MTPROTO_PROBE_ERROR_TIMEOUT
+               : (ssl && SSL_get_verify_result(ssl) != X509_V_OK
+                    ? TG_MTPROTO_PROBE_ERROR_TLS_VERIFY
+                    : TG_MTPROTO_PROBE_ERROR_TLS_HANDSHAKE);
+        status = errno == ETIMEDOUT ? TG_MTPROTO_PROBE_TIMEOUT
+                                    : TG_MTPROTO_PROBE_IO;
+        goto done;
+    }
+    if (SSL_get_verify_result(ssl) != X509_V_OK) {
+        error = TG_MTPROTO_PROBE_ERROR_TLS_VERIFY;
+        status = TG_MTPROTO_PROBE_IO;
+        goto done;
+    }
+    out->stage = TG_MTPROTO_PROBE_STAGE_WS;
+    if (wss_upgrade_until(ssl, fd, hostname, deadline) != 0) {
+        error = errno == ETIMEDOUT ? TG_MTPROTO_PROBE_ERROR_TIMEOUT
+                                   : TG_MTPROTO_PROBE_ERROR_WS_UPGRADE;
+        status = errno == ETIMEDOUT ? TG_MTPROTO_PROBE_TIMEOUT
+                                    : TG_MTPROTO_PROBE_INVALID;
+        goto done;
+    }
+    out->stage = TG_MTPROTO_PROBE_STAGE_MTPROTO;
+    response.stream_cap = TG_PROBE_MAX_PACKET + 4u;
+    response.stream = OPENSSL_malloc(response.stream_cap);
+    if (!response.stream || RAND_bytes(out->nonce, sizeof(out->nonce)) != 1 ||
+        tg_mtproto_make_obfuscated2_init(TG_MTPROTO_INTERMEDIATE, dc_id, 0,
+                                         handshake, &to_server,
+                                         &from_server) != 0 ||
+        make_message_id(request + 8, 0, &last_message_id) != 0) {
+        error = TG_MTPROTO_PROBE_ERROR_IO;
+        status = TG_MTPROTO_PROBE_IO;
+        goto done;
+    }
+    request[16] = 20;
+    memcpy(request + 20, "\xf1\x8e\x7e\xbe", 4);
+    memcpy(request + 24, out->nonce, sizeof(out->nonce));
+    write_le32(framed_request, sizeof(request));
+    memcpy(framed_request + 4, request, sizeof(request));
+    if (tg_mtproto_ctr_xor(&to_server, framed_request,
+                           sizeof(framed_request)) != 0 ||
+        tg_ws_pump_init(&pump, ssl) != 0) {
+        error = TG_MTPROTO_PROBE_ERROR_IO;
+        status = TG_MTPROTO_PROBE_IO;
+        goto done;
+    }
+    pump_ready = 1;
+    response.server_decrypt = &from_server;
+    response.result = out;
+    memcpy(response.expected_nonce, out->nonce, sizeof(out->nonce));
+    if (tg_ws_pump_queue_binary(&pump, handshake, sizeof(handshake)) != 0 ||
+        tg_ws_pump_queue_binary(&pump, framed_request,
+                                sizeof(framed_request)) != 0 ||
+        wss_wait_for_res_pq(&pump, fd, &response, deadline) != 0) {
+        if (errno == ETIMEDOUT) {
+            error = TG_MTPROTO_PROBE_ERROR_TIMEOUT;
+            status = TG_MTPROTO_PROBE_TIMEOUT;
+        } else if (response.invalid) {
+            error = TG_MTPROTO_PROBE_ERROR_MTPROTO_RESPONSE;
+            status = TG_MTPROTO_PROBE_INVALID;
+        } else {
+            error = TG_MTPROTO_PROBE_ERROR_IO;
+            status = TG_MTPROTO_PROBE_IO;
+        }
+        goto done;
+    }
+    error = TG_MTPROTO_PROBE_ERROR_NONE;
+    status = TG_MTPROTO_PROBE_OK;
+done:
+    if (pump_ready) tg_ws_pump_destroy(&pump);
+    SSL_free(ssl);
+    if (fd >= 0) close(fd);
+    if (response.stream) {
+        OPENSSL_cleanse(response.stream, response.stream_cap);
+        OPENSSL_free(response.stream);
+    }
+    tg_mtproto_ctr_destroy(&to_server);
+    tg_mtproto_ctr_destroy(&from_server);
+    OPENSSL_cleanse(handshake, sizeof(handshake));
+    OPENSSL_cleanse(request, sizeof(request));
+    OPENSSL_cleanse(framed_request, sizeof(framed_request));
+    out->status = status;
+    out->error = error;
+    if (started && monotonic_ms() >= started)
+        out->latency_ms = monotonic_ms() - started;
     return status;
 }
 
