@@ -59,7 +59,7 @@ async function main(){
  else if(x.method==='Page.javascriptDialogOpening'){dialogs.push(x.params.message);call('Page.handleJavaScriptDialog',{accept:true})}
  else if(x.method==='Runtime.exceptionThrown')exceptions.push(x.params.exceptionDetails)};
  const call=(method,params={})=>new Promise((resolve,reject)=>{pending.set(++id,{resolve,reject});ws.send(JSON.stringify({id,method,params}))});
- const evaluate=async(expression)=>{const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw Error(JSON.stringify(r.exceptionDetails));return r.result.value};
+ const evaluate=async(expression)=>{try{const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw Error(JSON.stringify(r.exceptionDetails));return r.result.value}catch(e){throw Error('Runtime.evaluate failed for '+expression+': '+(e?.message||JSON.stringify(e)))}};
  const wait=ms=>new Promise(r=>setTimeout(r,ms));
  const until=async(expr,msg)=>{for(let i=0;i<160;i++){if(await evaluate(expr))return;await wait(50)}throw Error(msg)};
  await call('Page.enable');await call('Runtime.enable');
@@ -135,7 +135,7 @@ async function main(){
    const b=await evaluate('(()=>{const r=document.querySelector("#telegram-body").getBoundingClientRect();return {x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}})()');
    const s=await call('Page.captureScreenshot',{format:'png',clip:{...b,scale:2}});fs.writeFileSync(path.join(shots,name+'.png'),Buffer.from(s.data,'base64'))};
   const tunnelState=async st=>{panel.telegram(st);await until('document.querySelector("#telegram-body").dataset.state==="'+st+'"','tunnel must reach '+st)};
-  await evaluate('window.tgFlowCanvas=document.querySelector("#telegram-body .tg-flow-canvas")');
+  await evaluate('(()=>{window.tgFlowCanvas=document.querySelector("#telegram-body .tg-flow-canvas");return true})()');
   assert.equal(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state'),'mixed','C11 sessions show active and connecting route states');
   assert.match(await evaluate('document.querySelector("#tg-flow-caption").textContent'),/DC2 · media 1/);
   assert.equal(await evaluate('document.querySelector("[data-tg-session-count]").textContent'),'3');
@@ -195,7 +195,7 @@ async function main(){
 
   // Опрос не сбрасывает раскрытые подробности, фокус и фильтр.
   await evaluate('document.querySelector(".plan").open=true');
-  await evaluate('document.querySelector("[data-control=restart]").focus();window.restartBefore=document.querySelector("[data-control=restart]")');
+  await evaluate('(()=>{const button=document.querySelector("[data-control=restart]");button.focus();window.restartBefore=button;return true})()');
   const polls='performance.getEntriesByType("resource").filter(e=>new URL(e.name).pathname==="/api/status").length';
   const before=await evaluate(polls);
   /* В простое опрос раз в 6 с (PR #18): два опроса — до 12 с, ждём 15. */
