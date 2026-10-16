@@ -105,9 +105,9 @@ typedef struct {
 
 tg_mtproto_probe_status tg_mtproto_probe_res_pq(
     const char *numeric_address, uint16_t port, uint32_t dc_id, int is_media,
-    uint32_t timeout_ms, tg_mtproto_probe_result *out);
+    uint32_t socket_mark, uint32_t timeout_ms, tg_mtproto_probe_result *out);
 tg_mtproto_probe_status tg_mtproto_probe_res_pq_wss(
     SSL_CTX *tls_context, const char *hostname, uint32_t dc_id,
-    uint32_t timeout_ms, tg_mtproto_probe_result *out);
+    uint32_t socket_mark, uint32_t timeout_ms, tg_mtproto_probe_result *out);
 
 #endif

@@ -4,6 +4,7 @@
 #include "tg_mtproto_discovery.h"
 #include "tg_tls.h"
 #include "tg_ws.h"
+#include "tg_config.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -204,6 +205,17 @@ static int parse_plain_response(const uint8_t *packet, size_t len,
     return 0;
 }
 
+static int set_probe_socket_mark(int fd, uint32_t mark) {
+    if (!mark) return 0;
+#ifdef SO_MARK
+    return setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+#else
+    (void)fd;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
 static int make_address(const char *text, uint16_t port,
                         struct sockaddr_storage *storage,
                         socklen_t *length) {
@@ -227,7 +239,7 @@ static int make_address(const char *text, uint16_t port,
 
 tg_mtproto_probe_status tg_mtproto_probe_res_pq(
     const char *numeric_address, uint16_t port, uint32_t dc_id, int is_media,
-    uint32_t timeout_ms, tg_mtproto_probe_result *out) {
+    uint32_t socket_mark, uint32_t timeout_ms, tg_mtproto_probe_result *out) {
     struct sockaddr_storage address;
     socklen_t address_len = 0;
     uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN];
@@ -266,6 +278,10 @@ tg_mtproto_probe_status tg_mtproto_probe_res_pq(
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0 ||
         fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        status = TG_MTPROTO_PROBE_IO;
+        goto done;
+    }
+    if (set_probe_socket_mark(fd, socket_mark) != 0) {
         status = TG_MTPROTO_PROBE_IO;
         goto done;
     }
@@ -351,8 +367,8 @@ done:
     return status;
 }
 
-static int connect_hostname(const char *hostname, uint64_t deadline,
-                            int *dns_failed,
+static int connect_hostname(const char *hostname, uint32_t socket_mark,
+                            uint64_t deadline, int *dns_failed,
                             tg_mtproto_probe_result *out) {
     struct addrinfo hints = {0}, *addresses = NULL;
     hints.ai_family = AF_UNSPEC;
@@ -377,6 +393,10 @@ static int connect_hostname(const char *hostname, uint64_t deadline,
         int flags = fcntl(fd, F_GETFL, 0);
         if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0 ||
             fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+            close(fd);
+            continue;
+        }
+        if (set_probe_socket_mark(fd, socket_mark) != 0) {
             close(fd);
             continue;
         }
@@ -581,7 +601,7 @@ static int wss_wait_for_res_pq(tg_ws_pump *pump, int fd,
 
 tg_mtproto_probe_status tg_mtproto_probe_res_pq_wss(
     SSL_CTX *tls_context, const char *hostname, uint32_t dc_id,
-    uint32_t timeout_ms, tg_mtproto_probe_result *out) {
+    uint32_t socket_mark, uint32_t timeout_ms, tg_mtproto_probe_result *out) {
     uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN] = {0};
     uint8_t request[40] = {0}, framed_request[44] = {0};
     tg_mtproto_ctr to_server = {0}, from_server = {0};
@@ -602,7 +622,7 @@ tg_mtproto_probe_status tg_mtproto_probe_res_pq_wss(
         goto done;
     deadline = started + timeout_ms;
     out->stage = TG_MTPROTO_PROBE_STAGE_DNS;
-    fd = connect_hostname(hostname, deadline, &dns_failed, out);
+    fd = connect_hostname(hostname, socket_mark, deadline, &dns_failed, out);
     if (fd < 0) {
         error = dns_failed ? TG_MTPROTO_PROBE_ERROR_DNS
                            : (errno == ETIMEDOUT

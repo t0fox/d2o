@@ -140,7 +140,7 @@ static void test_valid_res_pq_is_a_real_mtproto_health_signal(void) {
     pthread_t thread;
     assert(pthread_create(&thread, NULL, serve_res_pq, &fake) == 0);
     tg_mtproto_probe_result result = {0};
-    assert(tg_mtproto_probe_res_pq("127.0.0.1", port, 4, 0, 2000,
+    assert(tg_mtproto_probe_res_pq("127.0.0.1", port, 4, 0, 0, 2000,
                                    &result) == TG_MTPROTO_PROBE_OK);
     assert(result.status == TG_MTPROTO_PROBE_OK && result.pq_len == 2);
     assert(result.stage == TG_MTPROTO_PROBE_STAGE_RES_PQ);
@@ -155,7 +155,7 @@ static void test_response_with_wrong_nonce_is_not_healthy(void) {
     pthread_t thread;
     assert(pthread_create(&thread, NULL, serve_res_pq, &fake) == 0);
     tg_mtproto_probe_result result = {0};
-    assert(tg_mtproto_probe_res_pq("127.0.0.1", port, 4, 0, 2000,
+    assert(tg_mtproto_probe_res_pq("127.0.0.1", port, 4, 0, 0, 2000,
                                    &result) == TG_MTPROTO_PROBE_INVALID);
     assert(result.stage == TG_MTPROTO_PROBE_STAGE_MTPROTO);
     assert(pthread_join(thread, NULL) == 0);
@@ -170,7 +170,7 @@ static void test_non_plain_response_is_not_healthy(void) {
         pthread_t thread;
         assert(pthread_create(&thread, NULL, serve_res_pq, &fake) == 0);
         tg_mtproto_probe_result result = {0};
-        assert(tg_mtproto_probe_res_pq("127.0.0.1", port, 4, 0, 2000,
+        assert(tg_mtproto_probe_res_pq("127.0.0.1", port, 4, 0, 0, 2000,
                                        &result) == TG_MTPROTO_PROBE_INVALID);
         assert(result.stage == TG_MTPROTO_PROBE_STAGE_MTPROTO);
         assert(pthread_join(thread, NULL) == 0);
@@ -282,13 +282,13 @@ static void test_encrypted_response_ignores_control_messages_before_rpc_result(v
 
 static void test_wss_probe_rejects_invalid_configuration(void) {
     tg_mtproto_probe_result result = {0};
-    assert(tg_mtproto_probe_res_pq_wss(NULL, "localhost", 1, 1000,
+    assert(tg_mtproto_probe_res_pq_wss(NULL, "localhost", 1, 0, 1000,
                                        &result) == TG_MTPROTO_PROBE_INVALID);
     assert(result.stage == TG_MTPROTO_PROBE_STAGE_INPUT);
     assert(result.error == TG_MTPROTO_PROBE_ERROR_INVALID_INPUT);
-    assert(tg_mtproto_probe_res_pq_wss(NULL, NULL, 1, 1000,
+    assert(tg_mtproto_probe_res_pq_wss(NULL, NULL, 1, 0, 1000,
                                        &result) == TG_MTPROTO_PROBE_INVALID);
-    assert(tg_mtproto_probe_res_pq_wss(NULL, "localhost", 6, 1000,
+    assert(tg_mtproto_probe_res_pq_wss(NULL, "localhost", 6, 0, 1000,
                                        &result) == TG_MTPROTO_PROBE_INVALID);
 }
 

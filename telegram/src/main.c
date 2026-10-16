@@ -183,7 +183,7 @@ static int run_local_daemon(const char *config_path) {
         .configured_max_connections = 64,
         .handshake_timeout_ms = 5000,
         .idle_timeout_ms = 300000,
-        .socket_mark = 0x31,
+        .socket_mark = TG_OUTBOUND_SOCKET_MARK,
         .require_socket_mark = 1,
         .enforce_self_dial = 1,
         .enable_direct_wss = 1,
@@ -341,7 +341,8 @@ static int check_telegram_dc(const char *address, const char *dc_text,
     }
     tg_mtproto_probe_result result = {0};
     tg_mtproto_probe_status status = tg_mtproto_probe_res_pq(
-        address, (uint16_t)port, (uint32_t)dc, 0, 8000, &result);
+        address, (uint16_t)port, (uint32_t)dc, 0,
+        TG_OUTBOUND_SOCKET_MARK, 8000, &result);
     const char *stage = "input", *error = "invalid";
     switch (result.stage) {
     case TG_MTPROTO_PROBE_STAGE_TCP: stage = "tcp"; break;
@@ -409,7 +410,8 @@ static int check_telegram_wss_matrix(const char *ca_bundle) {
         }
         tg_mtproto_probe_result result = {0};
         tg_mtproto_probe_status status = tg_mtproto_probe_res_pq_wss(
-            tls_context, hostname, dc, 8000, &result);
+            tls_context, hostname, dc, TG_OUTBOUND_SOCKET_MARK,
+            8000, &result);
         printf("{\"ok\":%s,\"route\":\"direct_wss\",\"stage\":\"%s\",\"dc\":%u,\"host\":\"%s\",\"latency_ms\":%llu,\"error\":\"%s\"}\n",
                status == TG_MTPROTO_PROBE_OK ? "true" : "false",
                telegram_probe_stage_name(result.stage), dc, hostname,
@@ -434,7 +436,8 @@ static int discover_telegram_dc(const char *address, const char *dc_text,
     }
     tg_dc_snapshot snapshot = {0};
     int rc = tg_mtproto_discover_config(address, (uint16_t)port,
-                                        (uint32_t)dc, 8000, 0,
+                                        (uint32_t)dc, 8000,
+                                        TG_OUTBOUND_SOCKET_MARK,
                                         (int64_t)time(NULL), &snapshot);
     if (rc == 0) {
         printf("{\"ok\":true,\"stage\":\"help.getConfig\",\"dc\":%lu,\"address\":\"%s\",\"port\":%lu,\"this_dc\":%u,\"endpoint_count\":%zu,\"config_date\":%lld,\"config_expires\":%lld}\n",
