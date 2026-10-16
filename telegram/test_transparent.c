@@ -64,6 +64,13 @@ static void test_known_dc_is_validated_and_target_is_preserved(void) {
                                         &upstream) == 0);
     assert(upstream.family == original.family && upstream.port == original.port);
     assert(memcmp(upstream.address, original.address, 4) == 0);
+    /* The target map knows DC4 even when the Obfuscated2 DC hint is absent. */
+    make_no_dc_handshake(handshake);
+    tg_epoll_route_selection selected = {0};
+    assert(tg_transparent_select_route(&policy, &original, handshake,
+                                       &selected) == 0);
+    assert(selected.dc_id == 4 && !selected.is_media && !selected.tcp_only);
+    assert(selected.proto == TG_MTPROTO_INTERMEDIATE);
 }
 
 static void test_policy_rejects_wrong_port_cidr_and_unlisted_dc(void) {
@@ -119,6 +126,10 @@ static void test_unmapped_direct_route_preserves_exact_original_target(void) {
                                         &upstream) == 0);
     assert(memcmp(upstream.address, original.address, 4) == 0);
     assert(upstream.port == original.port);
+    tg_epoll_route_selection selected = {0};
+    assert(tg_transparent_select_route(&policy, &original, handshake,
+                                       &selected) == 0);
+    assert(selected.dc_id == 0 && selected.tcp_only);
 }
 
 static void test_exact_tcpo_secret_is_used_for_original_destination_only(void) {
@@ -170,6 +181,10 @@ static void test_exact_tcpo_secret_is_used_for_original_destination_only(void) {
     destination(&original, "149.154.167.91", 443);
     assert(tg_transparent_select_target(&policy, &original, handshake,
                                         &upstream) == 0);
+    tg_epoll_route_selection selected = {0};
+    assert(tg_transparent_select_route(&policy, &original, handshake,
+                                       &selected) == 0);
+    assert(selected.dc_id == 4 && selected.tcp_only);
     destination(&original, "149.154.167.92", 443);
     assert(tg_transparent_select_target(&policy, &original, handshake,
                                         &upstream) != 0);
