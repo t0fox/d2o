@@ -17,6 +17,7 @@ static int parse(const char *text) {
 }
 int main(void) {
     assert(known_key("TG_MODE") && known_key("TG_DC_MAP_PATH"));
+    assert(known_key("TG_CF_WORKER_DOMAIN"));
     assert(parse("SCHEMA='1'\nMODE='apply'\nSTATE_DIR='/opt/d2k/state'\nQUEUE_NUM=\"2000\"\nPANEL_LISTEN='0.0.0.0:8080'\n") == 0);
     assert(parse("SCHEMA=1\nMODE=apply\nSTATE_DIR=/opt/d2k/state\nQUEUE_NUM=2000\n") == 0);
     assert(parse("QUEUE_NUM=\n") == -1);

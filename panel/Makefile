@@ -62,6 +62,7 @@ clean-header-deadline:
 
 test-js:
 	node test_ui.cjs
+	node test_telegram_flow.cjs
 	node test_poll.cjs
 	node test_status_cache.cjs
 	node test_updates.cjs

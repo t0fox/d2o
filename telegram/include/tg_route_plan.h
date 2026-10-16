@@ -5,7 +5,7 @@
 #include "tg_cf_domains.h"
 
 #define TG_ROUTE_PLAN_MAX (2u + TG_CONFIG_MAX_CF_WORKER_DOMAINS + \
-                           TG_CF_POOL_MAX + 1u)
+                           2u * TG_CF_POOL_MAX + 1u)
 
 typedef enum {
     TG_ROUTE_DIRECT_WSS = 1,
@@ -25,6 +25,10 @@ typedef struct {
 } tg_route_plan;
 
 uint32_t tg_route_websocket_dc(uint32_t dc_id);
+/* Cloudflare proxy hosts are kwsN.<base-domain>, never the bare domain. */
+int tg_route_cf_proxy_hostname(uint32_t dc_id, int media_variant,
+                               const char *domain, char *hostname,
+                               size_t hostname_size);
 int tg_route_plan_build(uint32_t dc_id, int is_media,
                         tg_ws_routing_policy policy, int prefer_cf,
                         size_t worker_count, size_t cf_domain_count,

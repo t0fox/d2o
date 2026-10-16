@@ -4,6 +4,7 @@
 #include "server.h"
 
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -22,6 +23,7 @@
 
 #define REQUEST_MAX (32u * 1024u)
 #define BODY_MAX (1024u * 1024u)
+#define TELEGRAM_STATS_MAX 131072u
 #ifndef D2K_PANEL_HEADER_TIMEOUT_MS
 #define D2K_PANEL_HEADER_TIMEOUT_MS 5000
 #endif
@@ -440,8 +442,8 @@ static int telegram_stats_optional_number(const char *json, const char *key,
 }
 
 static void telegram_stats_value(const d2k_panel_config *cfg,
-                                 char out[1024]) {
-    snprintf(out, 1024, "null");
+                                 char out[TELEGRAM_STATS_MAX]) {
+    snprintf(out, TELEGRAM_STATS_MAX, "null");
     if (!cfg || !cfg->telegram_stats_path) return;
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
@@ -477,7 +479,7 @@ static void telegram_stats_value(const d2k_panel_config *cfg,
         }
     }
 
-    char raw[1024];
+    char raw[TELEGRAM_STATS_MAX];
     size_t used = 0;
     int complete = 0;
     while (monotonic_ms() < deadline) {
@@ -500,7 +502,8 @@ static void telegram_stats_value(const d2k_panel_config *cfg,
     if (!complete || !used) return;
     raw[used] = '\0';
     if (!json_valid_object(raw, raw + used)) return;
-    char active[21], maximum[21], started[21], from_client[21], from_upstream[21];
+    char active[21], maximum[21], started[21], accepted[21];
+    char from_client[21], from_upstream[21];
     char wss_attempts[21], wss_failures[21], wss_responses[21], cf_responses[21];
     char success_dc[21], success_route[21], success_latency[21], success_age[21];
     char failure_dc[21], failure_route[21], failure_stage[21], failure_age[21];
@@ -522,20 +525,370 @@ static void telegram_stats_value(const d2k_panel_config *cfg,
         telegram_stats_optional_number(raw, "last_failure_stage", failure_stage) != 0 ||
         telegram_stats_optional_number(raw, "last_failure_age_ms", failure_age) != 0)
         return;
-    (void)snprintf(out, 1024,
-                   "{\"active_connections\":%s,\"max_connections\":%s,"
-                   "\"connections_started\":%s,\"bytes_from_clients\":%s,"
-                   "\"bytes_from_upstreams\":%s,\"wss_attempts\":%s,"
-                   "\"wss_failures\":%s,\"wss_responses\":%s,"
-                   "\"cf_wss_responses\":%s,\"last_success_dc\":%s,"
-                   "\"last_success_route\":%s,\"last_success_latency_ms\":%s,"
-                   "\"last_success_age_ms\":%s,\"last_failure_dc\":%s,"
-                   "\"last_failure_route\":%s,\"last_failure_stage\":%s,"
-                   "\"last_failure_age_ms\":%s}",
-                   active, maximum, started, from_client, from_upstream,
-                   wss_attempts, wss_failures, wss_responses, cf_responses,
-                   success_dc, success_route, success_latency, success_age,
-                   failure_dc, failure_route, failure_stage, failure_age);
+    const char *sessions = NULL, *truncated = NULL;
+    size_t sessions_len = 0, truncated_len = 0;
+    if (!json_top_value(raw, "active_sessions", &sessions, &sessions_len) ||
+        sessions_len < 2 || sessions[0] != '[' ||
+        !json_top_value(raw, "route_sessions_truncated", &truncated,
+                        &truncated_len) ||
+        !((truncated_len == 4 && memcmp(truncated, "true", 4) == 0) ||
+          (truncated_len == 5 && memcmp(truncated, "false", 5) == 0)) ||
+        telegram_stats_number(raw, "process_started_at", started) != 0 ||
+        telegram_stats_number(raw, "accepted_connections", accepted) != 0)
+        return;
+    if (used >= TELEGRAM_STATS_MAX) return;
+    memcpy(out, raw, used + 1);
+}
+
+enum { TG_WORKER_MAX = 8, TG_WORKER_DOMAIN_MAX = 253, TG_WORKER_BODY_MAX = 4096 };
+typedef char tg_worker_domain[TG_WORKER_DOMAIN_MAX + 1];
+
+static int worker_domain_normalize(const char *input, size_t length,
+                                   int allow_url, tg_worker_domain output) {
+    while (length && isspace((unsigned char)*input)) { input++; length--; }
+    while (length && isspace((unsigned char)input[length - 1])) length--;
+    if (allow_url && length >= 7 && strncasecmp(input, "http://", 7) == 0) {
+        input += 7; length -= 7;
+    } else if (allow_url && length >= 8 &&
+               strncasecmp(input, "https://", 8) == 0) {
+        input += 8; length -= 8;
+    }
+    size_t host_length = 0;
+    while (host_length < length && input[host_length] != '/' &&
+           input[host_length] != '?' && input[host_length] != '#')
+        host_length++;
+    if (!allow_url && host_length != length) return -1;
+    length = host_length;
+    if (!length || length > TG_WORKER_DOMAIN_MAX) return -1;
+    for (size_t i = 0; i < length; ++i) {
+        unsigned char c = (unsigned char)input[i];
+        if (!(isalnum(c) || c == '-' || c == '.')) return -1;
+        output[i] = (char)tolower(c);
+    }
+    output[length] = '\0';
+    size_t label_start = 0, labels = 0;
+    int tld_has_alpha = 0;
+    for (size_t i = 0; i <= length; ++i) {
+        if (i < length && output[i] != '.') continue;
+        size_t label_length = i - label_start;
+        if (!label_length || label_length > 63 || output[label_start] == '-' ||
+            output[i - 1] == '-') return -1;
+        labels++;
+        if (i == length) {
+            if (label_length < 2) return -1;
+            for (size_t j = label_start; j < i; ++j)
+                if (isalpha((unsigned char)output[j])) tld_has_alpha = 1;
+        }
+        label_start = i + 1;
+    }
+    return labels >= 2 && tld_has_alpha ? 0 : -1;
+}
+
+static int worker_domain_add(tg_worker_domain domains[TG_WORKER_MAX],
+                             size_t *count, const char *value, size_t length,
+                             int allow_url) {
+    tg_worker_domain normalized;
+    if (worker_domain_normalize(value, length, allow_url, normalized) != 0)
+        return -1;
+    for (size_t i = 0; i < *count; ++i)
+        if (strcmp(domains[i], normalized) == 0) return 0;
+    if (*count >= TG_WORKER_MAX) return -1;
+    memcpy(domains[(*count)++], normalized, strlen(normalized) + 1);
+    return 0;
+}
+
+static int worker_line(const char *line, size_t length) {
+    size_t start = 0, end = length;
+    while (start < end && (line[start] == ' ' || line[start] == '\t')) start++;
+    if (start == end || line[start] == '#') return 0;
+    const char *equal = memchr(line + start, '=', end - start);
+    if (!equal) return 0;
+    end = (size_t)(equal - line);
+    while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t')) end--;
+    static const char key[] = "TG_CF_WORKER_DOMAIN";
+    return end - start == sizeof key - 1 &&
+           memcmp(line + start, key, sizeof key - 1) == 0;
+}
+
+static int worker_domains_from_config(const char *path,
+                                      tg_worker_domain domains[TG_WORKER_MAX],
+                                      size_t *count) {
+    *count = 0;
+    if (!path) return -1;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uint64_t)st.st_size > BODY_MAX) { close(fd); return -1; }
+    size_t length = (size_t)st.st_size;
+    char *contents = malloc(length + 1);
+    if (!contents) { close(fd); return -1; }
+    size_t used = 0;
+    while (used < length) {
+        ssize_t n = read(fd, contents + used, length - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { free(contents); close(fd); return -1; }
+        used += (size_t)n;
+    }
+    close(fd);
+    contents[used] = '\0';
+    if (memchr(contents, '\0', used)) { free(contents); return -1; }
+    size_t offset = 0;
+    while (offset < used) {
+        size_t end = offset;
+        while (end < used && contents[end] != '\n') end++;
+        size_t line_end = end;
+        if (line_end > offset && contents[line_end - 1] == '\r') line_end--;
+        if (worker_line(contents + offset, line_end - offset)) {
+            const char *equal = memchr(contents + offset, '=', line_end - offset);
+            const char *value = equal + 1;
+            size_t value_len = (size_t)((contents + line_end) - value);
+            while (value_len && (*value == ' ' || *value == '\t')) { value++; value_len--; }
+            while (value_len && (value[value_len - 1] == ' ' || value[value_len - 1] == '\t')) value_len--;
+            if (value_len >= 2 && ((*value == '\'' && value[value_len - 1] == '\'') ||
+                                   (*value == '"' && value[value_len - 1] == '"'))) {
+                value++; value_len -= 2;
+            }
+            *count = 0;
+            size_t item = 0;
+            for (size_t i = 0; i <= value_len; ++i) {
+                if (i != value_len && value[i] != ',') continue;
+                if (i > item && worker_domain_add(domains, count, value + item,
+                                                  i - item, 1) != 0) {
+                    free(contents); return -1;
+                }
+                item = i + 1;
+            }
+        }
+        offset = end < used ? end + 1 : used;
+    }
+    free(contents);
+    return 0;
+}
+
+static int worker_domains_from_json(const char *json, size_t length,
+                                    tg_worker_domain domains[TG_WORKER_MAX],
+                                    size_t *count) {
+    if (!json_valid_object(json, json + length)) return -1;
+    char *copy = malloc(length + 1);
+    if (!copy) return -1;
+    memcpy(copy, json, length); copy[length] = '\0';
+    const char *value = NULL;
+    size_t value_len = 0;
+    if (!json_top_value(copy, "domains", &value, &value_len)) {
+        free(copy); return -1;
+    }
+    const char *p = value, *end = value + value_len;
+    json_reader reader = { .p = p, .end = end, .depth = 0 };
+    json_ws(&reader);
+    if (reader.p >= reader.end || *reader.p++ != '[') { free(copy); return -1; }
+    *count = 0;
+    json_ws(&reader);
+    if (reader.p < reader.end && *reader.p == ']') reader.p++;
+    else for (;;) {
+        json_ws(&reader);
+        if (reader.p >= reader.end || *reader.p++ != '"') { free(copy); return -1; }
+        const char *start = reader.p;
+        while (reader.p < reader.end && *reader.p != '"') {
+            unsigned char c = (unsigned char)*reader.p++;
+            if (c == '\\' || c >= 0x80) { free(copy); return -1; }
+        }
+        if (reader.p >= reader.end || worker_domain_add(domains, count, start,
+                (size_t)(reader.p - start), 0) != 0) { free(copy); return -1; }
+        reader.p++;
+        json_ws(&reader);
+        if (reader.p >= reader.end) { free(copy); return -1; }
+        if (*reader.p == ']') { reader.p++; break; }
+        if (*reader.p++ != ',') { free(copy); return -1; }
+    }
+    json_ws(&reader);
+    int ok = reader.p == reader.end;
+    free(copy);
+    return ok ? 0 : -1;
+}
+
+static int worker_config_write(const char *path,
+                               tg_worker_domain domains[TG_WORKER_MAX],
+                               size_t count) {
+    int input = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (input < 0) return -1;
+    struct stat st;
+    if (fstat(input, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uint64_t)st.st_size > BODY_MAX) { close(input); return -1; }
+    size_t length = (size_t)st.st_size;
+    char *source = malloc(length + 1);
+    size_t extra = TG_WORKER_MAX * (TG_WORKER_DOMAIN_MAX + 1) + 64;
+    if (!source) { close(input); return -1; }
+    size_t used = 0;
+    while (used < length) {
+        ssize_t n = read(input, source + used, length - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { free(source); close(input); return -1; }
+        used += (size_t)n;
+    }
+    close(input);
+    source[used] = '\0';
+    if (memchr(source, '\0', used)) { free(source); return -1; }
+    char *output = malloc(length + extra);
+    if (!output) { free(source); return -1; }
+    size_t written = 0, offset = 0;
+    while (offset < used) {
+        size_t end = offset;
+        while (end < used && source[end] != '\n') end++;
+        size_t line_length = end - offset;
+        if (line_length && source[offset + line_length - 1] == '\r') line_length--;
+        if (!worker_line(source + offset, line_length)) {
+            size_t full = (end < used ? end + 1 : end) - offset;
+            memcpy(output + written, source + offset, full);
+            written += full;
+        }
+        offset = end < used ? end + 1 : used;
+    }
+    if (count) {
+        if (written && output[written - 1] != '\n') output[written++] = '\n';
+        written += (size_t)snprintf(output + written, length + extra - written,
+                                    "TG_CF_WORKER_DOMAIN=");
+        for (size_t i = 0; i < count; ++i) {
+            if (i) output[written++] = ',';
+            size_t n = strlen(domains[i]);
+            memcpy(output + written, domains[i], n); written += n;
+        }
+        output[written++] = '\n';
+    }
+    size_t path_len = strlen(path);
+    char *temporary = malloc(path_len + sizeof ".workers.XXXXXX");
+    if (!temporary) { free(output); free(source); return -1; }
+    (void)snprintf(temporary, path_len + sizeof ".workers.XXXXXX",
+                   "%s.workers.XXXXXX", path);
+    int out = mkstemp(temporary);
+    int rc = -1;
+    if (out >= 0) {
+        int failed = fchmod(out, st.st_mode & 0777) != 0;
+        size_t sent = 0;
+        while (!failed && sent < written) {
+            ssize_t n = write(out, output + sent, written - sent);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { failed = 1; break; }
+            sent += (size_t)n;
+        }
+        if (!failed && fsync(out) != 0) failed = 1;
+        if (close(out) != 0) failed = 1;
+        if (!failed && rename(temporary, path) == 0) rc = 0;
+        else unlink(temporary);
+    }
+    free(temporary); free(output); free(source);
+    return rc;
+}
+
+static int worker_request_body(int fd, const char *req, size_t used,
+                               char body[TG_WORKER_BODY_MAX + 1],
+                               size_t *body_len) {
+    const char *transfer = NULL, *length = NULL;
+    size_t transfer_len = 0, length_len = 0;
+    if (header_value(req, "Transfer-Encoding", &transfer, &transfer_len) ||
+        !header_value(req, "Content-Length", &length, &length_len) ||
+        !length_len || length_len > 4) return -1;
+    size_t expected = 0;
+    for (size_t i = 0; i < length_len; ++i) {
+        if (length[i] < '0' || length[i] > '9') return -1;
+        expected = expected * 10 + (size_t)(length[i] - '0');
+    }
+    if (!expected || expected > TG_WORKER_BODY_MAX) return -1;
+    const char *headers_end = strstr(req, "\r\n\r\n");
+    if (!headers_end) return -1;
+    size_t offset = (size_t)(headers_end + 4 - req);
+    size_t received = used > offset ? used - offset : 0;
+    if (received > expected) return -1;
+    if (received) memcpy(body, req + offset, received);
+    long long deadline = monotonic_ms() + D2K_PANEL_HEADER_TIMEOUT_MS;
+    while (received < expected) {
+        long long remaining = deadline - monotonic_ms();
+        if (remaining <= 0) return -1;
+        struct pollfd ready = { .fd = fd, .events = POLLIN };
+        int rc = poll(&ready, 1, (int)remaining);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc <= 0 || (ready.revents & (POLLERR | POLLNVAL))) return -1;
+        ssize_t n = read(fd, body + received, expected - received);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        received += (size_t)n;
+    }
+    body[received] = '\0';
+    *body_len = received;
+    return 0;
+}
+
+static int api_telegram_workers(int fd, const d2k_panel_config *cfg,
+                                const char *req, size_t used,
+                                const char *method) {
+    static const char json_type[] = "application/json; charset=utf-8";
+    if (!cfg || !cfg->config_path) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Файл конфигурации недоступен\"}";
+        return response(fd, 503, "Service Unavailable", json_type, body, sizeof body - 1);
+    }
+    tg_worker_domain domains[TG_WORKER_MAX] = {{0}};
+    size_t count = 0;
+    if (strcmp(method, "GET") == 0) {
+        if (worker_domains_from_config(cfg->config_path, domains, &count) != 0) {
+            static const char body[] = "{\"ok\":false,\"message\":\"Не удалось прочитать настройки Workers\"}";
+            return response(fd, 500, "Config Error", json_type, body, sizeof body - 1);
+        }
+        char body[2304];
+        size_t body_len = 0;
+        int n = snprintf(body, sizeof body, "{\"domains\":[");
+        if (n < 0 || (size_t)n >= sizeof body) return -1;
+        body_len = (size_t)n;
+        for (size_t i = 0; i < count; ++i) {
+            n = snprintf(body + body_len, sizeof body - body_len,
+                         "%s\"%s\"", i ? "," : "", domains[i]);
+            if (n < 0 || (size_t)n >= sizeof body - body_len) return -1;
+            body_len += (size_t)n;
+        }
+        n = snprintf(body + body_len, sizeof body - body_len, "]}");
+        if (n < 0 || (size_t)n >= sizeof body - body_len) return -1;
+        body_len += (size_t)n;
+        return response(fd, 200, "OK", json_type, body, body_len);
+    }
+    if (strcmp(method, "POST") != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Метод не поддерживается\"}";
+        return response(fd, 405, "Method Not Allowed", json_type, body, sizeof body - 1);
+    }
+    if (!cfg->control_enabled || !d2k_panel_same_origin(req)) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Изменять настройки можно только с этой панели\"}";
+        return response(fd, 403, "Forbidden", json_type, body, sizeof body - 1);
+    }
+    const char *content_type = NULL;
+    size_t content_type_len = 0;
+    if (!header_value(req, "Content-Type", &content_type, &content_type_len) ||
+        content_type_len < 16 || strncasecmp(content_type, "application/json", 16) != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Ожидается JSON со списком доменов\"}";
+        return response(fd, 415, "Unsupported Media Type", json_type, body, sizeof body - 1);
+    }
+    char request_body[TG_WORKER_BODY_MAX + 1];
+    size_t request_len = 0;
+    if (worker_request_body(fd, req, used, request_body, &request_len) != 0 ||
+        worker_domains_from_json(request_body, request_len, domains, &count) != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Проверьте домены: до 8 имён без URL и пути\"}";
+        return response(fd, 400, "Bad Request", json_type, body, sizeof body - 1);
+    }
+    d2k_panel_control_tick();
+    if (action_pid) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Дождитесь завершения текущей команды\"}";
+        return response(fd, 409, "Conflict", json_type, body, sizeof body - 1);
+    }
+    if (worker_config_write(cfg->config_path, domains, count) != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Не удалось сохранить настройки Workers\"}";
+        return response(fd, 500, "Config Error", json_type, body, sizeof body - 1);
+    }
+    int started = run_service_action(cfg, "telegram-restart", fd);
+    if (started != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Настройки сохранены, но C11 не удалось перезапустить\"}";
+        return response(fd, started > 0 ? 409 : 500,
+                        started > 0 ? "Conflict" : "Service Error",
+                        json_type, body, sizeof body - 1);
+    }
+    static const char body[] = "{\"ok\":true,\"message\":\"Настройки сохранены, C11 перезапускается\"}";
+    return response(fd, 202, "Accepted", json_type, body, sizeof body - 1);
 }
 
 static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
@@ -829,7 +1182,7 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     const char *panel_listen = cfg && cfg->panel_listen ? cfg->panel_listen : "127.0.0.1:8090";
     int queue = cfg ? cfg->queue_num : 2000;
     int telegram_enabled=0,telegram_configured=0,telegram_running=0;char telegram_status[24];
-    char telegram_stats[1024];
+    char telegram_stats[TELEGRAM_STATS_MAX];
     telegram_config_flags(cfg,&telegram_enabled,&telegram_configured);
     telegram_status_value(cfg,telegram_enabled,telegram_configured,&telegram_running,telegram_status);
     telegram_stats_value(cfg,telegram_stats);
@@ -896,7 +1249,7 @@ static int api_status(int fd, const d2k_panel_config *cfg, const char *query) {
     char *live = NULL;
     size_t live_len = 0;
     if (cfg && cfg->live_path && json_object_file(cfg->live_path, &live, &live_len) == 0) {
-        size_t cap = live_len + 16384;
+        size_t cap = live_len + TELEGRAM_STATS_MAX + 16384;
         char *body = malloc(cap);
         if (!body) { free(live); return -1; }
         panel_buf b = { .p = body, .len = 0, .cap = cap, .failed = 0 };
@@ -939,7 +1292,7 @@ static int api_status(int fd, const d2k_panel_config *cfg, const char *query) {
         "{\"linked\":false,\"link_note\":\"движок не отдаёт состояние\","
         "\"catalog_at\":\"\",\"boxes\":[],\"searches\":[],\"targets\":0,"
         "\"confirms\":0,\"probes_used\":0,\"client_unfit\":0}";
-    size_t cap = 16384;
+    size_t cap = TELEGRAM_STATS_MAX + 16384;
     char *body = malloc(cap);
     if (!body) { return -1; }
     panel_buf b = { .p = body, .len = 0, .cap = cap, .failed = 0 };
@@ -1029,6 +1382,13 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     }
     char *query = strchr(path, '?');
     if (query) { *query++ = '\0'; }
+    if (strcmp(path, "/api/telegram/workers") == 0) {
+        if (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0) {
+            return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8",
+                            "method not allowed\n", 19);
+        }
+        return api_telegram_workers(fd, cfg, req, used, method);
+    }
     if (strcmp(path, "/api/update") == 0) {
         if (strcmp(method, "GET") != 0) {
             return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8",
@@ -1058,6 +1418,9 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     }
     if (strcmp(path, "/assets/panel.js") == 0) {
         return static_file(fd, cfg, req, "panel.js", "application/javascript; charset=utf-8");
+    }
+    if (strcmp(path, "/assets/telegram-flow.js") == 0) {
+        return static_file(fd, cfg, req, "telegram-flow.js", "application/javascript; charset=utf-8");
     }
     if (strcmp(path, "/assets/gsap.js") == 0) {
         return static_file(fd, cfg, req, "gsap.js", "application/javascript; charset=utf-8");

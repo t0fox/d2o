@@ -97,7 +97,7 @@ test-route-dns: $(BUILD_DIR)/test-route-dns
 
 $(BUILD_DIR)/test-route-dns: test_route_dns.c src/route_dns.c src/cf_domains.c src/tls.c include/tg_route_dns.h include/tg_cf_domains.h include/tg_listener.h
 	mkdir -p $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -pthread -o $@ test_route_dns.c src/route_dns.c src/cf_domains.c src/tls.c $(OPENSSL_LIBS)
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -DTG_ROUTE_DNS_TESTING -pthread -o $@ test_route_dns.c src/route_dns.c src/cf_domains.c src/tls.c $(OPENSSL_LIBS)
 
 $(BUILD_DIR)/test-route-plan: test_route_plan.c src/route_plan.c include/tg_route_plan.h include/tg_config.h include/tg_cf_domains.h
 	mkdir -p $(BUILD_DIR)

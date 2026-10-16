@@ -21,6 +21,8 @@ typedef struct {
     const d2k_panel_config *cfg;
 } server_call;
 
+static void wait_action_done(const d2k_panel_config *cfg);
+
 static void *serve_thread(void *arg) {
     server_call *call = arg;
     (void)d2k_panel_handle_fd(call->fd, call->cfg);
@@ -230,7 +232,14 @@ static void *serve_telegram_stats(void *opaque) {
               "\"last_success_route\":1,\"last_success_latency_ms\":126,"
               "\"last_success_age_ms\":500,\"last_failure_dc\":3,"
               "\"last_failure_route\":2,\"last_failure_stage\":4,"
-              "\"last_failure_age_ms\":9000}\n");
+              "\"last_failure_age_ms\":9000,\"process_started_at\":100,"
+              "\"accepted_connections\":9,\"active_sessions\":[{"
+              "\"id\":9,\"dc\":2,\"is_media\":false,"
+              "\"stage\":\"upstream_ready\",\"direct_state\":\"selected\","
+              "\"direct_transport\":\"direct_wss\",\"fallback_state\":\"idle\","
+              "\"fallback_transport\":null,\"selected_transport\":\"direct_wss\","
+              "\"telegram_response_seen\":false,\"events\":[]}],"
+              "\"route_sessions_truncated\":false}\n");
     close(client);
     close(fixture->listener);
     return NULL;
@@ -276,18 +285,89 @@ static void test_telegram_stats_socket_is_normalized_for_status_api(void) {
     assert(pthread_join(server, NULL) == 0);
     assert(strstr(response,
                   "\"telegram_stats\":{\"active_connections\":2,"
-                  "\"max_connections\":64,\"connections_started\":9,"
+                  "\"max_connections\":64,\"connections_started\":9,") != NULL);
+    assert(strstr(response,
+                  "\"process_started_at\":100,\"accepted_connections\":9,"
+                  "\"active_sessions\":[{\"id\":9,\"dc\":2,\"is_media\":false,") != NULL);
+    assert(strstr(response, "\"route_sessions_truncated\":false}") != NULL);
+    assert(strstr(response,
                   "\"bytes_from_clients\":1234,\"bytes_from_upstreams\":5678,"
                   "\"wss_attempts\":8,\"wss_failures\":2,"
                   "\"wss_responses\":5,\"cf_wss_responses\":3,"
                   "\"last_success_dc\":2,\"last_success_route\":1,"
                   "\"last_success_latency_ms\":126,\"last_success_age_ms\":500,"
                   "\"last_failure_dc\":3,\"last_failure_route\":2,"
-                  "\"last_failure_stage\":4,\"last_failure_age_ms\":9000}") != NULL);
+                  "\"last_failure_stage\":4,\"last_failure_age_ms\":9000,") != NULL);
     unlink(socket_path);
     unlink(live);
     unlink(status);
     unlink(pid);
+}
+
+static void test_telegram_worker_domains_are_validated_and_restart_only_c11(void) {
+    char config[] = "/tmp/d2k-panel-workers-config.XXXXXX";
+    char service[] = "/tmp/d2k-panel-workers-service.XXXXXX";
+    char marker[] = "/tmp/d2k-panel-workers-marker.XXXXXX";
+    write_temp_file(config, "MODE=apply\nTG_ENABLED=1\nTG_MODE=local\n"
+                           "TG_CF_WORKER_DOMAIN=HTTPS://Old.Example/path\n");
+    write_temp_file(marker, "");
+    char service_script[512];
+    int script_len = snprintf(service_script, sizeof service_script,
+        "#!/bin/sh\nprintf '%%s\\n' \"$1\" > '%s'\n", marker);
+    assert(script_len > 0 && (size_t)script_len < sizeof service_script);
+    rewrite_file(service, service_script);
+    assert(chmod(service, 0700) == 0);
+    d2k_panel_config cfg = { .config_path = config, .service_path = service,
+        .control_enabled = 1 };
+    char response[8192];
+    (void)request(&cfg,
+        "GET /api/telegram/workers HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "\"domains\":[\"old.example\"]") != NULL);
+
+    const char *json = "{\"domains\":[\"My-Worker.Example\",\"backup.example\"]}";
+    char req[1024];
+    int req_len = snprintf(req, sizeof req,
+        "POST /api/telegram/workers HTTP/1.1\r\nHost: localhost\r\n"
+        "Origin: http://localhost\r\nContent-Type: application/json\r\n"
+        "Content-Length: %zu\r\n\r\n%s", strlen(json), json);
+    assert(req_len > 0 && (size_t)req_len < sizeof req);
+    (void)request(&cfg, req, response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 202 Accepted") != NULL);
+    wait_action_done(&cfg);
+    FILE *f = fopen(config, "r");
+    assert(f != NULL);
+    char contents[2048] = {0};
+    assert(fread(contents, 1, sizeof contents - 1, f) > 0);
+    fclose(f);
+    assert(strstr(contents, "TG_CF_WORKER_DOMAIN=my-worker.example,backup.example") != NULL);
+    f = fopen(marker, "r");
+    assert(f != NULL);
+    char action[64] = {0};
+    assert(fgets(action, sizeof action, f) != NULL);
+    fclose(f);
+    assert(strcmp(action, "telegram-restart\n") == 0);
+
+    const char *invalid = "{\"domains\":[\"worker.example/path\"]}";
+    req_len = snprintf(req, sizeof req,
+        "POST /api/telegram/workers HTTP/1.1\r\nHost: localhost\r\n"
+        "Origin: http://localhost\r\nContent-Type: application/json\r\n"
+        "Content-Length: %zu\r\n\r\n%s", strlen(invalid), invalid);
+    assert(req_len > 0 && (size_t)req_len < sizeof req);
+    (void)request(&cfg, req, response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 400 Bad Request") != NULL);
+
+    req_len = snprintf(req, sizeof req,
+        "POST /api/telegram/workers HTTP/1.1\r\nHost: localhost\r\n"
+        "Origin: http://attacker.example\r\nContent-Type: application/json\r\n"
+        "Content-Length: %zu\r\n\r\n%s", strlen(json), json);
+    assert(req_len > 0 && (size_t)req_len < sizeof req);
+    (void)request(&cfg, req, response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 403 Forbidden") != NULL);
+    unlink(config);
+    unlink(service);
+    unlink(marker);
 }
 
 /* Состояние автообновления пишет d2k-update.sh; панель отдаёт файл как есть.
@@ -667,6 +747,7 @@ int main(void) {
     test_invalid_live_json_is_not_reported_as_empty_knowledge();
     test_telegram_status_is_dynamic_and_never_exposes_secret();
     test_telegram_stats_socket_is_normalized_for_status_api();
+    test_telegram_worker_domains_are_validated_and_restart_only_c11();
     test_update_state_is_served_from_file();
     test_unsupported_method_is_rejected();
     test_slow_control_does_not_block_status();

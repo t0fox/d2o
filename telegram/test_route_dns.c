@@ -7,6 +7,15 @@
 #include <string.h>
 #include <time.h>
 
+extern size_t tg_route_dns_test_doh_endpoint_count(void);
+extern int tg_route_dns_test_doh_endpoint(size_t index, const char **host,
+                                          uint8_t address[4], int *http2);
+extern int tg_route_dns_test_h2_encode_headers(
+    const char *hostname, size_t body_len, uint8_t *headers,
+    size_t headers_cap, size_t *headers_len);
+extern int tg_route_dns_test_h2_response_is_ok(const uint8_t *block,
+                                               size_t block_len);
+
 typedef struct {
     pthread_mutex_t mutex;
     size_t calls;
@@ -121,6 +130,43 @@ static void test_http_body_parser_accepts_content_length_response(void) {
                                             body, sizeof(body), &body_len) != 0);
 }
 
+static void test_doh_endpoint_order_and_fallbacks(void) {
+    static const char *const hosts[] = {
+        "d.webshiftvpn.ru", "cloudflare-dns.com", "dns.google", "dns.sb"
+    };
+    static const uint8_t addresses[][4] = {
+        {31, 31, 207, 68}, {1, 1, 1, 1}, {8, 8, 8, 8},
+        {185, 222, 222, 222}
+    };
+    assert(tg_route_dns_test_doh_endpoint_count() ==
+           sizeof(hosts) / sizeof(hosts[0]));
+    for (size_t i = 0; i < sizeof(hosts) / sizeof(hosts[0]); ++i) {
+        const char *host = NULL;
+        uint8_t address[4] = {0};
+        int http2 = 0;
+        assert(tg_route_dns_test_doh_endpoint(i, &host, address, &http2) == 0);
+        assert(strcmp(host, hosts[i]) == 0);
+        assert(memcmp(address, addresses[i], sizeof(address)) == 0);
+        assert(http2 == (i == 0 || i == 3));
+    }
+}
+
+static void test_http2_doh_headers_and_status(void) {
+    uint8_t headers[512] = {0};
+    size_t headers_len = 0;
+    assert(tg_route_dns_test_h2_encode_headers(
+               "d.webshiftvpn.ru", 29, headers, sizeof(headers),
+               &headers_len) == 0);
+    assert(headers_len > 24 && headers[0] == 0x83 && headers[1] == 0x87 &&
+           headers[2] == 0x04 && headers[3] == 10 &&
+           memcmp(headers + 4, "/dns-query", 10) == 0);
+    assert(memcmp(headers + headers_len - 5,
+                  (uint8_t[]){0x0f, 0x0d, 0x02, '2', '9'}, 5) == 0);
+    assert(tg_route_dns_test_h2_response_is_ok((uint8_t[]){0x88}, 1));
+    assert(!tg_route_dns_test_h2_response_is_ok((uint8_t[]){0x8c}, 1));
+    assert(!tg_route_dns_test_h2_response_is_ok((uint8_t[]){0x80}, 1));
+}
+
 static void test_cache_returns_bounded_public_addresses(void) {
     resolver_fixture fixture = {0};
     assert(pthread_mutex_init(&fixture.mutex, NULL) == 0);
@@ -162,6 +208,8 @@ int main(void) {
     test_doh_dns_message_validation();
     test_http_body_parser_accepts_bounded_chunked_response();
     test_http_body_parser_accepts_content_length_response();
+    test_doh_endpoint_order_and_fallbacks();
+    test_http2_doh_headers_and_status();
     test_cache_returns_bounded_public_addresses();
     test_private_and_invalid_results_are_rejected();
     puts("Тесты DNS-кэша Telegram-маршрутов: ок");

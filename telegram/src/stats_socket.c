@@ -4,12 +4,105 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
+
+static const char *route_stage_name(uint8_t stage) {
+    switch (stage) {
+    case TG_ROUTE_SESSION_STAGE_ROUTING: return "routing";
+    case TG_ROUTE_SESSION_STAGE_UPSTREAM_READY: return "upstream_ready";
+    case TG_ROUTE_SESSION_STAGE_FIRST_WSS_BINARY_RESPONSE:
+        return "first_wss_binary_response";
+    default: return "accepted";
+    }
+}
+
+static const char *route_state_name(uint8_t state) {
+    static const char *const names[] = {
+        "idle", "connecting", "connected", "selected", "cooldown",
+        "failed", "cancelled", "skipped", "first_binary_response"
+    };
+    return state < sizeof(names) / sizeof(names[0]) ? names[state] : "idle";
+}
+
+static const char *route_transport_name(uint8_t transport) {
+    switch (transport) {
+    case TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS: return "direct_wss";
+    case TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_WORKER: return "cloudflare_worker";
+    case TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_PROXY: return "cloudflare_proxy";
+    case TG_ROUTE_SESSION_TRANSPORT_TCP_FALLBACK: return "tcp_fallback";
+    case TG_ROUTE_SESSION_TRANSPORT_TCP_PASSTHROUGH: return "tcp_passthrough";
+    default: return NULL;
+    }
+}
+
+static int stats_append(char *buffer, size_t capacity, size_t *used,
+                        const char *format, ...) {
+    if (*used >= capacity) return -1;
+    va_list args;
+    va_start(args, format);
+    int count = vsnprintf(buffer + *used, capacity - *used, format, args);
+    va_end(args);
+    if (count < 0 || (size_t)count >= capacity - *used) return -1;
+    *used += (size_t)count;
+    return 0;
+}
+
+static int append_active_sessions(char *buffer, size_t capacity, size_t *used,
+                                  const tg_epoll_proxy_stats *stats) {
+    if (stats_append(buffer, capacity, used,
+        "\"process_started_at\":%" PRIu64 ",\"accepted_connections\":%" PRIu64
+        ",\"active_sessions\":[", stats->process_started_at,
+        stats->accepted_connections) != 0)
+        return -1;
+    for (size_t i = 0; i < stats->active_sessions_count; ++i) {
+        const tg_active_route_session *session = &stats->active_sessions[i];
+        const char *direct = route_transport_name(session->direct_transport);
+        const char *fallback = route_transport_name(session->fallback_transport);
+        const char *selected = route_transport_name(session->selected_transport);
+        int rc = session->has_dc
+            ? stats_append(buffer, capacity, used,
+                "%s{\"id\":%" PRIu64 ",\"dc\":%u", i ? "," : "",
+                session->id, session->dc)
+            : stats_append(buffer, capacity, used,
+                "%s{\"id\":%" PRIu64 ",\"dc\":null", i ? "," : "",
+                session->id);
+        if (rc != 0 || stats_append(buffer, capacity, used,
+            ",\"is_media\":%s,\"stage\":\"%s\",\"direct_state\":\"%s\","
+            "\"direct_transport\":%s%s%s,\"fallback_state\":\"%s\","
+            "\"fallback_transport\":%s%s%s,\"selected_transport\":%s%s%s,"
+            "\"telegram_response_seen\":%s,\"events\":[",
+            session->has_media ? (session->is_media ? "true" : "false") : "null",
+            route_stage_name(session->stage), route_state_name(session->direct_state),
+            direct ? "\"" : "null", direct ? direct : "", direct ? "\"" : "",
+            route_state_name(session->fallback_state),
+            fallback ? "\"" : "null", fallback ? fallback : "", fallback ? "\"" : "",
+            selected ? "\"" : "null", selected ? selected : "", selected ? "\"" : "",
+            session->telegram_response_seen ? "true" : "false") != 0)
+            return -1;
+        for (size_t j = 0; j < session->event_count; ++j) {
+            const tg_route_session_event *event = &session->events[j];
+            const char *transport = route_transport_name(event->transport);
+            if (!transport || stats_append(buffer, capacity, used,
+                "%s{\"sequence\":%" PRIu64 ",\"branch\":\"%s\","
+                "\"transport\":\"%s\",\"state\":\"%s\"}",
+                j ? "," : "", event->sequence,
+                event->branch ? "fallback" : "direct", transport,
+                route_state_name(event->state)) != 0)
+                return -1;
+        }
+        if (stats_append(buffer, capacity, used, "]}") != 0) return -1;
+    }
+    return stats_append(buffer, capacity, used,
+        "],\"route_sessions_truncated\":%s,",
+        stats->route_sessions_truncated ? "true" : "false");
+}
 
 static int set_socket_flags(int fd) {
     int status_flags = fcntl(fd, F_GETFL, 0);
@@ -132,23 +225,43 @@ int tg_stats_socket_serve(tg_stats_socket *server,
             continue;
         }
         tg_epoll_proxy_stats stats;
-        char response[768];
+        char response[131072];
         int n = tg_epoll_proxy_get_stats(proxy, &stats);
-        int length = n == 0
-            ? snprintf(response, sizeof(response),
-                       "{\"active_connections\":%zu,\"max_connections\":%zu,\"connections_started\":%" PRIu64 ",\"bytes_from_clients\":%" PRIu64 ",\"bytes_from_upstreams\":%" PRIu64 ",\"wss_attempts\":%" PRIu64 ",\"wss_failures\":%" PRIu64 ",\"wss_responses\":%" PRIu64 ",\"cf_wss_responses\":%" PRIu64 ",\"last_success_dc\":%u,\"last_success_route\":%u,\"last_success_latency_ms\":%" PRIu64 ",\"last_success_age_ms\":%" PRIu64 ",\"last_failure_dc\":%u,\"last_failure_route\":%u,\"last_failure_stage\":%u,\"last_failure_age_ms\":%" PRIu64 "}\n",
-                       stats.active_connections, stats.max_connections,
-                       stats.connections_started, stats.bytes_from_clients,
-                       stats.bytes_from_upstreams, stats.wss_attempts,
-                       stats.wss_failures, stats.wss_responses,
-                       stats.cf_wss_responses, stats.last_success_dc,
-                       stats.last_success_route,
-                       stats.last_success_latency_ms,
-                       stats.last_success_age_ms, stats.last_failure_dc,
-                       stats.last_failure_route, stats.last_failure_stage,
-                       stats.last_failure_age_ms)
-            : -1;
+        size_t used = 0;
+        int length = n == 0 ? snprintf(response, sizeof(response),
+            "{\"active_connections\":%zu,", stats.active_connections) : -1;
         if (length > 0 && (size_t)length < sizeof(response)) {
+            used = (size_t)length;
+            if (append_active_sessions(response, sizeof(response), &used,
+                                       &stats) == 0 &&
+                stats_append(response, sizeof(response), &used,
+                    "\"max_connections\":%zu,\"connections_started\":%" PRIu64
+                    ",\"bytes_from_clients\":%" PRIu64
+                    ",\"bytes_from_upstreams\":%" PRIu64
+                    ",\"wss_attempts\":%" PRIu64 ",\"wss_failures\":%" PRIu64
+                    ",\"wss_responses\":%" PRIu64
+                    ",\"cf_wss_responses\":%" PRIu64
+                    ",\"last_success_dc\":%u,\"last_success_route\":%u"
+                    ",\"last_success_latency_ms\":%" PRIu64
+                    ",\"last_success_age_ms\":%" PRIu64
+                    ",\"last_failure_dc\":%u,\"last_failure_route\":%u"
+                    ",\"last_failure_stage\":%u,\"last_failure_age_ms\":%" PRIu64
+                    "}\n",
+                    stats.max_connections, stats.connections_started,
+                    stats.bytes_from_clients, stats.bytes_from_upstreams,
+                    stats.wss_attempts, stats.wss_failures, stats.wss_responses,
+                    stats.cf_wss_responses, stats.last_success_dc,
+                    stats.last_success_route, stats.last_success_latency_ms,
+                    stats.last_success_age_ms, stats.last_failure_dc,
+                    stats.last_failure_route, stats.last_failure_stage,
+                    stats.last_failure_age_ms) == 0)
+                length = (int)used;
+            else
+                length = -1;
+        } else {
+            length = -1;
+        }
+        if (length > 0 && (size_t)length == used) {
             size_t sent = 0;
             while (sent < (size_t)length) {
                 ssize_t written = send(client, response + sent,

@@ -76,6 +76,7 @@ static int known_key(const char *key) {
         "CONNBYTES", "VOICE_PORTS", "VOICE_CONNBYTES", "TG_ENABLED",
         "TG_MODE", "TG_DC_MAP_PATH", "TG_RELAY_URL", "TG_RELAY_SECRET", "TG_IDENTITY", "TG_CA_BUNDLE",
         "TG_STATUS", "TG_STATS_SOCKET", "TG_PORT", "TG_ENROLL_PORT",
+        "TG_CF_WORKER_DOMAIN",
         /* Читает files/S99d2k (разгрузка PPE на Keenetic); панели значение
            не нужно, но ключ законный и пишется установщиком. */
         "D2K_PPE_DEOFFLOAD"

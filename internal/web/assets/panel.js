@@ -79,7 +79,7 @@
   function telegramRouteName(route) {
     return route === 1 ? "прямой WSS" :
       route === 2 ? "Worker Cloudflare" :
-      route === 3 ? "CF proxy" : "неизвестный маршрут";
+      route === 3 ? "CF proxy" : route === 4 ? "прямой TCP" : "неизвестный маршрут";
   }
   function telegramFailureStage(stage) {
     return stage === 1 ? "DNS" :
@@ -324,6 +324,8 @@
     this.filter = "";
     this.openTags = {};
     this.flash = null;
+    this.workerDialog = null;
+    this.workerDomains = [];
     this.$ = function (id) { return doc.getElementById(id); };
   }
 
@@ -766,6 +768,153 @@
     if (no && no.focus) no.focus();   /* фокус на отказе, не на необратимом */
   };
 
+  function normalizeWorkerInput(value) {
+    var domain = str(value).trim().toLowerCase();
+    if (!domain || domain.length > 253) return null;
+    var labels = domain.split("."), tld = labels[labels.length - 1];
+    if (labels.length < 2 || tld.length < 2 || !/[a-z]/.test(tld)) return null;
+    for (var i = 0; i < labels.length; i++) {
+      if (labels[i].length < 1 || labels[i].length > 63 ||
+          !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(labels[i])) return null;
+    }
+    return domain;
+  }
+
+  App.prototype.renderWorkerDialog = function () {
+    var dialog = this.workerDialog;
+    if (!dialog) return;
+    var listNode = dialog.querySelector("[data-worker-list]");
+    var input = dialog.querySelector("[data-worker-input]");
+    var addButton = dialog.querySelector("[data-worker-add]");
+    var saveButton = dialog.querySelector("[data-worker-save]");
+    var note = dialog.querySelector("[data-worker-note]");
+    var editable = !!(this.m && this.m.snap.controls_enabled) && !this.pending;
+    input.disabled = !editable || this.workerDomains.length >= 8;
+    addButton.disabled = !editable || this.workerDomains.length >= 8;
+    saveButton.disabled = !editable;
+    listNode.replaceChildren();
+    if (!this.workerDomains.length) {
+      listNode.appendChild(el(this.doc, "li", "tg-worker-empty", "Пока нет добавленных доменов"));
+    }
+    var self = this;
+    this.workerDomains.forEach(function (domain, index) {
+      var row = el(self.doc, "li", "tg-worker-row");
+      var name = el(self.doc, "span", "", domain);
+      var remove = el(self.doc, "button", "tg-worker-remove", "Удалить");
+      remove.type = "button";
+      remove.disabled = !editable;
+      remove.setAttribute("aria-label", "Удалить " + domain);
+      remove.addEventListener("click", function () {
+        self.workerDomains.splice(index, 1);
+        self.renderWorkerDialog();
+      });
+      row.append(name, remove);
+      listNode.appendChild(row);
+    });
+    if (note) {
+      note.textContent = this.m && !this.m.snap.controls_enabled
+        ? "Управление отключено в конфигурации. Список доступен только для просмотра."
+        : this.workerDomains.length >= 8 ? "Добавлено 8 из 8 доменов." : "Добавьте hostname Worker без схемы и пути.";
+    }
+  };
+
+  App.prototype.openTelegramWorkers = function () {
+    var self = this, doc = this.doc;
+    if (this.pending) return;
+    if (!this.workerDialog) {
+      var dialog = this.workerDialog = el(doc, "dialog", "tg-worker-dialog");
+      dialog.setAttribute("aria-labelledby", "tg-worker-title");
+      var heading = el(doc, "h2", "", "Мои Workers");
+      heading.id = "tg-worker-title";
+      var intro = el(doc, "p", "tg-worker-intro", "Добавьте до 8 доменов Cloudflare Worker. Настройки сохранятся и перезапустят только C11.");
+      var listNode = el(doc, "ul", "tg-worker-list");
+      listNode.setAttribute("data-worker-list", "");
+      var field = el(doc, "label", "tg-worker-field", "Домен Worker");
+      var input = el(doc, "input", "");
+      input.type = "text";
+      input.autocomplete = "url";
+      input.spellcheck = false;
+      input.placeholder = "my-worker.example.com";
+      input.setAttribute("data-worker-input", "");
+      field.appendChild(input);
+      var addButton = el(doc, "button", "btn", "Добавить домен");
+      addButton.type = "button";
+      addButton.setAttribute("data-worker-add", "");
+      var note = el(doc, "p", "tg-worker-note", "");
+      note.setAttribute("data-worker-note", "");
+      var message = el(doc, "p", "tg-worker-message", "");
+      message.setAttribute("aria-live", "polite");
+      var cancel = el(doc, "button", "btn", "Отмена");
+      cancel.type = "button";
+      var save = el(doc, "button", "btn", "Сохранить");
+      save.type = "button";
+      save.setAttribute("data-variant", "primary");
+      save.setAttribute("data-worker-save", "");
+      var footer = el(doc, "div", "tg-worker-footer");
+      footer.append(cancel, save);
+      dialog.append(heading, intro, listNode, field, addButton, note, message, footer);
+      doc.body.appendChild(dialog);
+      function addDomain() {
+        var domain = normalizeWorkerInput(input.value);
+        if (!domain) { message.textContent = "Введите корректный домен, например my-worker.example.com."; return; }
+        if (self.workerDomains.indexOf(domain) >= 0) { message.textContent = "Этот домен уже добавлен."; return; }
+        if (self.workerDomains.length >= 8) { message.textContent = "Можно добавить не больше 8 доменов."; return; }
+        self.workerDomains.push(domain);
+        input.value = "";
+        message.textContent = "";
+        self.renderWorkerDialog();
+        input.focus();
+      }
+      addButton.addEventListener("click", addDomain);
+      input.addEventListener("keydown", function (event) {
+        if (event.key === "Enter") { event.preventDefault(); addDomain(); }
+      });
+      cancel.addEventListener("click", function () { dialog.close(); });
+      save.addEventListener("click", function () { self.saveTelegramWorkers(message); });
+    }
+    var dialog = this.workerDialog;
+    var message = dialog.querySelector(".tg-worker-message");
+    message.textContent = "Загружаем список…";
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    this.win.fetch("/api/telegram/workers", { cache: "no-store" })
+      .then(function (reply) {
+        return reply.json().then(function (body) {
+          if (!reply.ok || !Array.isArray(body.domains)) throw new Error(body.message || "Не удалось загрузить домены");
+          self.workerDomains = body.domains.slice(0, 8);
+          message.textContent = "";
+          self.renderWorkerDialog();
+        });
+      })
+      .catch(function (error) { message.textContent = str(error && error.message) || "Не удалось загрузить список Workers."; });
+  };
+
+  App.prototype.saveTelegramWorkers = function (message) {
+    var self = this;
+    if (this.pending || !(this.m && this.m.snap.controls_enabled)) return;
+    this.pending = "telegram-workers";
+    this.renderTelegram(this.m, true);
+    this.renderWorkerDialog();
+    this.win.fetch("/api/telegram/workers", {
+      method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domains: this.workerDomains })
+    }).then(function (reply) {
+      return reply.json().catch(function () { return {}; }).then(function (body) {
+        if (!reply.ok) throw new Error(str(body.message) || "Не удалось сохранить Workers.");
+        self.workerDialog.close();
+        self.flash = { tone: "info", text: str(body.message) || "Настройки Workers сохранены.", at: Date.now() };
+      });
+    }).catch(function (error) {
+      message.textContent = str(error && error.message) || "Не удалось сохранить список Workers.";
+    }).then(function () {
+      self.pending = null;
+      self.renderTelegram(self.m, true);
+      self.renderWorkerDialog();
+      self.renderNotice();
+      self.poll();
+      self.win.setTimeout(function () { self.poll(); }, 800);
+    });
+  };
+
   /* Неудавшаяся команда — короткое покачивание её кнопки рядом с текстом ошибки. */
   App.prototype.shake = function (action) {
     if (!Motion.on()) return;
@@ -775,6 +924,7 @@
 
   App.prototype.act = function (action, confirmed) {
     var self = this;
+    if (action === "telegram-workers") { this.openTelegramWorkers(); return; }
     if (action === "cancel") { this.armed = null; this.renderActions(); return; }
     if (CONFIRM[action] && !confirmed) {
       if (this.pending) return;
@@ -1729,467 +1879,197 @@
   /* ─── Telegram ─── */
 
   var TG = {
-    connected: { word: "Подключён", lamp: "ok", note: "Туннель установлен и держит соединение с ретранслятором." },
-    connecting: { word: "Подключается", lamp: "warn", note: "Служба запущена и устанавливает соединение с ретранслятором." },
-    local: { word: "Локальный прокси", lamp: "warn", note: "Локальный прокси запущен. Доступность Telegram DC и реального MTProto-ответа ещё не подтверждена." },
+    connected: { word: "Подключён", lamp: "ok", note: "Получен подтверждённый ответ Telegram." },
+    connecting: { word: "Подключается", lamp: "warn", note: "Служба запущена и проверяет доступные маршруты." },
+    local: { word: "Локальный прокси", lamp: "warn", note: "Прокси запущен. Ответ Telegram появится после подтверждённого обмена." },
     stopped: { word: "Остановлен", lamp: "idle", note: "Служба не запущена." },
-    not_configured: { word: "Не настроен", lamp: "idle", note: "В конфигурации не заданы TG_RELAY_URL и TG_RELAY_SECRET (или порт записи). Без них туннель не включить." }
+    not_configured: { word: "Не настроен", lamp: "idle", note: "Для C11 укажите TG_MODE=local в конфигурации." }
   };
-
-  /* Туннель: роутер слева, ретранслятор справа. Сцена строится один раз и живёт
-     между состояниями, чтобы переходы шли из того, что уже на экране. */
-  var TUN = { ribs: [150, 200, 250, 300, 350, 400, 450, 500], inX: 92, outX: 548, routerX: 112, poolOut: 7, poolBack: 9 };
 
   function tunnelScene(doc) {
-    var fig = el(doc, "figure", "tunnel-scene");
-    fig.setAttribute("aria-hidden", "true");
-    var s = svgEl(doc, "svg", { viewBox: "0 0 640 150", preserveAspectRatio: "xMidYMid meet" }, "tun");
-    var g = function (cls, parent) { var x = svgEl(doc, "g", {}, cls); (parent || s).appendChild(x); return x; };
-    var ground = g("tun-ground");
-    ground.appendChild(svgEl(doc, "path", { d: "M0 134H640" }));
-    for (var h = 8; h < 640; h += 22) ground.appendChild(svgEl(doc, "path", { d: "M" + h + " 134l-10 12" }));
-    /* Тело туннеля: свод из колец; поверх каждого — его же подсветка от проходящих пакетов. */
-    var tube = g("tun-tube");
-    tube.appendChild(svgEl(doc, "path", { d: "M92 30H548" }, "tun-wall"));
-    tube.appendChild(svgEl(doc, "path", { d: "M92 120H548" }, "tun-wall"));
-    var lit = g("tun-lit");
-    TUN.ribs.forEach(function (x) {
-      var d = "M" + x + " 30a14 45 0 0 1 0 90";
-      tube.appendChild(svgEl(doc, "path", { d: d }, "tun-rib"));
-      lit.appendChild(svgEl(doc, "path", { d: d }, "tun-rib-lit"));
-    });
-    /* Порталы: зев, его подсветка и кольцо рукопожатия. */
-    var inP = g("tun-portal tun-in");
-    inP.appendChild(svgEl(doc, "ellipse", { cx: TUN.inX, cy: 75, rx: 20, ry: 45 }, "tun-mouth"));
-    inP.appendChild(svgEl(doc, "ellipse", { cx: TUN.inX, cy: 75, rx: 20, ry: 45 }, "tun-mouth-lit"));
-    inP.appendChild(svgEl(doc, "ellipse", { cx: TUN.inX, cy: 75, rx: 20, ry: 45 }, "tun-ring tun-ring-in"));
-    var outP = g("tun-portal tun-out");
-    outP.appendChild(svgEl(doc, "ellipse", { cx: TUN.outX, cy: 75, rx: 20, ry: 45 }, "tun-mouth"));
-    outP.appendChild(svgEl(doc, "ellipse", { cx: TUN.outX, cy: 75, rx: 20, ry: 45 }, "tun-mouth-lit"));
-    /* Роутер: антенны с волнами вызова, корпус, огни питания, передачи и приёма. */
-    var router = g("tun-node tun-router");
-    router.appendChild(svgEl(doc, "path", { d: "M20 70V40M54 70V40" }, "tun-detail"));
-    [20, 54].forEach(function (x) {
-      router.appendChild(svgEl(doc, "path", { d: "M" + (x - 5) + " 35a7 7 0 0 1 10 0" }, "tun-wave"));
-      router.appendChild(svgEl(doc, "path", { d: "M" + (x - 9) + " 31a13 13 0 0 1 18 0" }, "tun-wave"));
-    });
-    router.appendChild(svgEl(doc, "rect", { x: 8, y: 70, width: 58, height: 20, rx: 4 }));
-    ["pwr", "tx", "rx"].forEach(function (k, i) { router.appendChild(svgEl(doc, "circle", { cx: 20 + i * 9, cy: 80, r: 2.4 }, "tun-led led-" + k)); });
-    var relay = g("tun-node tun-relay");
-    relay.appendChild(svgEl(doc, "circle", { cx: 604, cy: 75, r: 22 }));
-    relay.appendChild(svgEl(doc, "path", { d: "M593 76l22-9-6 20-5-7-5 3z" }, "tun-detail"));
-    s.appendChild(svgEl(doc, "circle", { cx: 604, cy: 75, r: 29 }, "tun-ring tun-ring-relay"));
-    /* Полосы: туда — верхняя, обратно — нижняя. */
-    var routes = g("tun-routes");
-    routes.appendChild(svgEl(doc, "path", { d: "M58 80C72 80 76 62 96 62H540C566 62 572 75 582 75", id: "tun-route-out" }, "tun-route"));
-    routes.appendChild(svgEl(doc, "path", { d: "M582 80C572 80 566 88 540 88H96C76 88 72 84 58 84", id: "tun-route-back" }, "tun-route"));
-    /* Пакеты — пул, центрированный в начале координат: размер меняется на каждом запуске. */
-    var traffic = g("tun-traffic");
-    var i;
-    for (i = 0; i < TUN.poolOut; i++) traffic.appendChild(svgEl(doc, "rect", { x: -6, y: -4.5, width: 12, height: 9, rx: 4.5 }, "pkt pkt-out"));
-    for (i = 0; i < TUN.poolBack; i++) traffic.appendChild(svgEl(doc, "rect", { x: -9, y: -4.5, width: 18, height: 9, rx: 4.5 }, "pkt pkt-back"));
-    traffic.appendChild(svgEl(doc, "circle", { cx: 0, cy: 0, r: 4.5 }, "tun-probe"));
-    traffic.appendChild(svgEl(doc, "circle", { cx: 0, cy: 0, r: 4.5 }, "tun-reply"));
-    /* Неподвижный кадр для «уменьшить движение»: поток или вызов у входа. */
-    var still = g("tun-still");
-    var flow = g("tun-still-flow", still);
-    [[170, 14], [292, 22], [326, 11], [452, 17]].forEach(function (p) { flow.appendChild(svgEl(doc, "rect", { x: p[0] - p[1] / 2, y: 57.5, width: p[1], height: 9, rx: 4.5 }, "pkt-still")); });
-    [[214, 24], [246, 16], [396, 20]].forEach(function (p) { flow.appendChild(svgEl(doc, "rect", { x: p[0] - p[1] / 2, y: 83.5, width: p[1], height: 9, rx: 4.5 }, "pkt-still pkt-still-back")); });
-    g("tun-still-probe", still).appendChild(svgEl(doc, "circle", { cx: 214, cy: 62, r: 4.5 }));
-    /* Шлагбаум на входе, когда служба стоит. */
-    var gate = g("tun-gate");
-    gate.appendChild(svgEl(doc, "path", { d: "M72 36v78M112 36v78" }, "gate-post"));
-    gate.appendChild(svgEl(doc, "path", { d: "M72 56h40" }, "gate-bar"));
-    gate.appendChild(svgEl(doc, "path", { d: "M72 94h40" }, "gate-bar"));
-    fig.appendChild(s);
-    var labels = el(doc, "figcaption", "tun-labels");
-    add(labels, el(doc, "span", "", "Этот роутер"), el(doc, "span", "", "Ретранслятор"));
-    fig.appendChild(labels);
-    return fig;
-  }
+    var root = el(doc, "div", "tg-flow");
+    var canvas = el(doc, "canvas", "tg-flow-canvas");
+    canvas.setAttribute("role", "img");
+    canvas.setAttribute("aria-label", "Схема активных маршрутов Telegram");
+    var caption = el(doc, "p", "tg-flow-caption", "Активные маршруты появятся после подключения.");
+    caption.id = "tg-flow-caption";
+    var panels = el(doc, "div", "tg-flow-panels");
+    var active = el(doc, "section", "tg-flow-block");
+    active.setAttribute("data-tg-active-sessions", "");
+    var activeTitle = el(doc, "div", "tg-flow-block-head");
+    add(activeTitle, el(doc, "h3", "", "Активные сессии"),
+      el(doc, "span", "tg-flow-count", "0"));
+    activeTitle.lastChild.setAttribute("data-tg-session-count", "");
+    var sessionList = el(doc, "div", "tg-flow-session-list");
+    sessionList.setAttribute("data-tg-session-list", "");
+    sessionList.setAttribute("role", "list");
+    active.append(activeTitle, sessionList);
 
-  /* Расписание живого трафика на кольце длиной period секунд: запрос уходит,
-     пачка ответов разного размера возвращается, паузы неровные. Каждый пакет
-     получает элемент пула, не занятый на кольце, поэтому петля бесшовна. */
-  function tunnelTraffic(seed, period) {
-    var a = seed >>> 0;
-    var r = function () {
-      a = (a + 0x6D2B79F5) >>> 0;
-      var t = Math.imul(a ^ (a >>> 15), 1 | a);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-    var out = [], back = [], t = 0.1;
-    while (t < period) {
-      var d = 2.3 + r() * 0.45;
-      out.push({ t: t, w: 12 + r() * 6, d: d });
-      var n = 1 + Math.floor(Math.pow(r(), 1.7) * 4), at = t + d + 0.08 + r() * 0.12;
-      for (var i = 0; i < n; i++) {
-        var bw = 16 + r() * 16;
-        back.push({ t: at, w: bw, d: 2.5 + (bw - 16) / 16 * 0.5 + r() * 0.25 });
-        at += 0.13 + r() * 0.22;
-      }
-      if (r() < 0.3) out.push({ t: t + 0.35 + r() * 0.3, w: 9, d: 2.2 + r() * 0.3 });
-      t += 0.5 + r() * 1.2 + (r() < 0.15 ? 1.1 : 0);
+    var summary = el(doc, "section", "tg-flow-block");
+    summary.setAttribute("data-tg-connection-summary", "");
+    summary.appendChild(el(doc, "h3", "", "Краткая сводка подключений"));
+    var metrics = el(doc, "div", "tg-flow-metrics");
+    [
+      ["Сессии сейчас", "tg-flow-metric-active", "data-tg-active-count"],
+      ["Всего подключений", "tg-flow-metric-total", "data-tg-accepted-count"],
+      ["Ответы Telegram", "tg-flow-metric-confirmed", "data-tg-confirmed-count"]
+    ].forEach(function (item) {
+      var metric = el(doc, "div", "tg-flow-metric " + item[1]);
+      metric.append(el(doc, "span", "", item[0]), el(doc, "b", "", "—"));
+      metric.lastChild.setAttribute(item[2], "");
+      metrics.appendChild(metric);
+    });
+    var lastSuccess = el(doc, "p", "tg-flow-last-success", "Подтверждённых ответов пока нет");
+    lastSuccess.setAttribute("data-tg-last-success", "");
+    summary.append(metrics, lastSuccess);
+    panels.append(active, summary);
+    root.append(canvas, caption, panels);
+    if (global.D2kTelegramFlow && global.D2kTelegramFlow.mountTelegramFlow) {
+      root.__flow = global.D2kTelegramFlow.mountTelegramFlow(canvas);
     }
-    var place = function (list, pool) {
-      var slots = [], placed = [];
-      list.forEach(function (p) { p.t = p.t % period; });
-      list.sort(function (x, y) { return x.t - y.t; });
-      var clash = function (x, y) {
-        var gap = 0.06;
-        return ((x.t - y.t + period) % period) < y.d + gap || ((y.t - x.t + period) % period) < x.d + gap;
-      };
-      list.forEach(function (p) {
-        for (var s = 0; s < pool; s++) {
-          var busy = slots[s] || (slots[s] = []);
-          if (busy.some(function (q) { return clash(p, q); })) continue;
-          busy.push(p); p.slot = s; placed.push(p); return;
-        }
-      });
-      return placed;
-    };
-    var po = place(out, TUN.poolOut), pb = place(back, TUN.poolBack);
-    return { period: period, out: po, back: pb, dropped: out.length + back.length - po.length - pb.length };
+    root.__sessionRows = new Map();
+    return root;
   }
 
-  /* Что CSS показывает в каждом состоянии и от чего отталкиваются переходы. */
-  var TUN_LOOK = {
-    connected: { tube: 1, ribs: 1, relay: 1, pwr: 1, tx: 0.3, rx: 0.3 },
-    connecting: { tube: 1, ribs: 0.5, relay: 0.7, pwr: 1, tx: 0.2, rx: 0.5 },
-    local: { tube: 0.8, ribs: 0.7, relay: 0.25, pwr: 1, tx: 1, rx: 1 },
-    stopped: { tube: 0.45, ribs: 1, relay: 0.6, pwr: 0.8, tx: 1, rx: 1 },
-    not_configured: { tube: 1, ribs: 1, relay: 0.4, pwr: 1, tx: 1, rx: 1 }
-  };
-
-  /* Оснастка сцены: элементы и «свет», который каждый кадр читает положение
-     пакетов и подсвечивает рёбра, зевы и огни роутера рядом с ними. */
-  function tunnelRig(svg) {
-    var g = Motion.g;
-    var q = function (sel) { return [].slice.call(svg.querySelectorAll(sel)); };
-    var R = {
-      svg: svg, ribs: q(".tun-rib"), lit: q(".tun-rib-lit"), walls: q(".tun-wall"), tube: svg.querySelector(".tun-tube"),
-      mouths: q(".tun-mouth"), mouthLit: q(".tun-mouth-lit"), out: svg.querySelector(".tun-out"),
-      ringIn: svg.querySelector(".tun-ring-in"), ringRelay: svg.querySelector(".tun-ring-relay"),
-      relay: svg.querySelector(".tun-relay"), waves: q(".tun-wave"),
-      led: { pwr: svg.querySelector(".led-pwr"), tx: svg.querySelector(".led-tx"), rx: svg.querySelector(".led-rx") },
-      pktOut: q(".pkt-out"), pktBack: q(".pkt-back"), probe: svg.querySelector(".tun-probe"), reply: svg.querySelector(".tun-reply"),
-      posts: q(".gate-post"), bars: q(".gate-bar"),
-      boost: TUN.ribs.map(function () { return { v: 0 }; }),
-      G: { pwr: 1, tx: 0.3, rx: 0.3, link: 0, mIn: 0, mOut: 0 }
-    };
-    R.movers = R.pktOut.map(function (e) { return { el: e, lane: 1 }; })
-      .concat(R.pktBack.map(function (e) { return { el: e, lane: -1 }; }))
-      .concat([{ el: R.probe, lane: 1 }, { el: R.reply, lane: -1 }]);
-    var lights = R.lit.concat(R.mouthLit, [R.led.pwr, R.led.tx, R.led.rx]);
-    var set = lights.map(function (e) { return g.quickSetter(e, "opacity"); });
-    var last = lights.map(function () { return -1; });
-    var inf = new Array(lights.length);
-    var nr = TUN.ribs.length;
-    R.glow = function () {
-      var i, G = R.G;
-      for (i = 0; i < inf.length; i++) inf[i] = 0;
-      var tx = 0, rx = 0;
-      for (var m = 0; m < R.movers.length; m++) {
-        var e = R.movers[m].el;
-        var o = +g.getProperty(e, "opacity");
-        if (!(o > 0.02)) continue;
-        var x = +g.getProperty(e, "x");
-        var w = e.width ? e.width.baseVal.value : 12;
-        var wv = o * Math.min(1.15, 0.55 + w / 40);
-        for (i = 0; i < nr; i++) {
-          var d = Math.abs(x - TUN.ribs[i]);
-          if (d < 36) inf[i] = Math.max(inf[i], (1 - d / 36) * wv);
-        }
-        var di = Math.abs(x - TUN.inX), dout = Math.abs(x - TUN.outX);
-        if (di < 44) inf[nr] = Math.max(inf[nr], (1 - di / 44) * wv);
-        if (dout < 44) inf[nr + 1] = Math.max(inf[nr + 1], (1 - dout / 44) * wv);
-        if (x < TUN.routerX) { if (R.movers[m].lane > 0) tx = Math.max(tx, o); else rx = Math.max(rx, o); }
-      }
-      for (i = 0; i < nr; i++) inf[i] = Math.max(R.boost[i].v, inf[i] * 0.85);
-      inf[nr] = Math.max(G.mIn, inf[nr] * 0.9);
-      inf[nr + 1] = Math.max(G.mOut, inf[nr + 1] * 0.9);
-      inf[nr + 2] = G.pwr;
-      inf[nr + 3] = Math.max(G.tx, G.link, tx);
-      inf[nr + 4] = Math.max(G.rx, rx);
-      for (i = 0; i < lights.length; i++) {
-        var v = Math.round(Math.min(1, inf[i]) * 100) / 100;
-        if (v !== last[i]) { last[i] = v; set[i](v); }
-      }
-    };
-    R.reset = function () {
-      last = lights.map(function () { return -1; });
-    };
-    return R;
+  function telegramSessionRoute(session) {
+    if (session.selected_transport) return session.selected_transport;
+    if (session.fallback_transport && ["connecting", "connected", "first_binary_response"].indexOf(session.fallback_state) >= 0)
+      return session.fallback_transport;
+    return session.direct_transport || session.fallback_transport || null;
   }
 
-  var TUN_PATH = {
-    out: { path: "#tun-route-out", align: "#tun-route-out", alignOrigin: [0.5, 0.5], autoRotate: true },
-    back: { path: "#tun-route-back", align: "#tun-route-back", alignOrigin: [0.5, 0.5], autoRotate: true }
-  };
-  function tunPath(lane, start, end) {
-    var p = Object.assign({}, TUN_PATH[lane]);
-    if (start !== undefined) p.start = start;
-    if (end !== undefined) p.end = end;
-    return p;
+  function telegramTransportLabel(transport) {
+    return transport === "direct_wss" ? "Прямой WSS" :
+      transport === "cloudflare_worker" ? "Cloudflare Worker" :
+      transport === "cloudflare_proxy" ? "Прокси Cloudflare" :
+      transport === "tcp_fallback" ? "Резервный TCP" :
+      transport === "tcp_passthrough" ? "Прямой TCP" : "Маршрут определяется";
   }
 
-  /* Уход из прошлого состояния: трафик стекает, шлагбаум поднимается,
-     свет и огни возвращаются к виду нового состояния. Возвращает время конца. */
-  function tunnelLeave(tl, R, from, st) {
-    var g = Motion.g, end = 0;
-    var live = R.movers.filter(function (m) { return +g.getProperty(m.el, "opacity") > 0.02; });
-    if (live.length) {
-      tl.to(live.map(function (m) { return m.el; }), {
-        x: function (i) { return "+=" + live[i].lane * (40 + i * 6); }, autoAlpha: 0,
-        duration: 0.55, ease: "power2.in", stagger: 0.025
-      }, 0);
-      end = 0.45;
-    }
-    tl.to(R.boost, { v: 0, duration: 0.4, ease: "power2.out" }, 0);
-    tl.to(R.waves, { autoAlpha: 0, duration: 0.25 }, 0)
-      .set([R.ringIn, R.ringRelay], { clearProps: "transform,opacity,visibility" }, 0);
-    var to = TUN_LOOK[st], was = TUN_LOOK[from];
-    tl.to(R.G, { pwr: to.pwr, tx: to.tx, rx: to.rx, link: 0, mIn: 0, mOut: 0, duration: 0.5, ease: "power2.out" }, 0.1);
-    if (from === "stopped") {
-      tl.to(R.posts, { y: -64, autoAlpha: 0, duration: 0.45, ease: "back.in(1.6)" }, 0)
-        .to(R.bars, { drawSVG: "50% 50%", duration: 0.25, ease: "power2.in" }, 0)
-        .set(R.posts.concat(R.bars), { clearProps: "transform,opacity,visibility,strokeDasharray,strokeDashoffset" }, 0.5);
-      end = Math.max(end, 0.4);
-    }
-    if (was && st !== "not_configured") {
-      /* CSS уже показывает новое состояние; держим старый вид и уводим к новому. */
-      tl.fromTo([R.tube, R.out], { opacity: was.tube }, { opacity: to.tube, duration: 0.7, ease: "power2.inOut", clearProps: "opacity" }, 0.15);
-      tl.fromTo(R.relay, { opacity: was.relay }, { opacity: to.relay, duration: 0.7, ease: "power2.inOut", clearProps: "opacity" }, 0.15);
-      if (st !== "connected") tl.fromTo(R.ribs, { opacity: was.ribs }, { opacity: to.ribs, duration: 0.5, stagger: 0.04, clearProps: "opacity" }, 0.1);
-    }
-    return end;
-  }
-
-  /* Свод прорисовывается от входа к выходу: первый показ и выход из наброска. */
-  function tunnelDrawIn(tl, R, at) {
-    /* clearProps внутри твина DrawSVG не срабатывает (плагин пишет после очистки):
-       штрих снимается отдельной установкой в конце. */
-    tl.fromTo(R.walls, { drawSVG: "0% 0%" }, { drawSVG: "0% 100%", duration: 0.9, ease: "power2.inOut" }, at)
-      .fromTo(R.ribs, { drawSVG: "50% 50%" }, { drawSVG: "0% 100%", duration: 0.45, stagger: 0.07, ease: "power2.out" }, at + 0.15)
-      .set(R.walls.concat(R.ribs), { clearProps: "strokeDasharray,strokeDashoffset" }, at + 1.15)
-      .fromTo(R.mouths, { scaleY: 0.2, autoAlpha: 0, transformOrigin: "50% 50%" }, { scaleY: 1, autoAlpha: 1, duration: 0.6, stagger: 0.35, ease: "back.out(1.8)", clearProps: "transform,opacity,visibility" }, at);
-    return at + 0.9;
-  }
-
-  /* Рукопожатие: вызов доходит до ретранслятора, тот отвечает, ответ
-     возвращается — и туннель «открывается»: рёбра загораются по очереди. */
-  function tunnelHandshake(tl, R, at) {
-    var g = Motion.g;
-    tl.fromTo(R.waves, { autoAlpha: 0.9, scale: 0.6, transformOrigin: "50% 100%" },
-      { autoAlpha: 0, scale: 1.3, duration: 0.7, stagger: 0.08, ease: "power2.out", immediateRender: false }, at)
-      .set(R.probe, { autoAlpha: 1 }, at + 0.1)
-      .to(R.probe, { motionPath: tunPath("out", 0, 1), duration: 0.95, ease: "power2.inOut" }, at + 0.1)
-      .to(R.probe, { autoAlpha: 0, scale: 2.2, transformOrigin: "50% 50%", duration: 0.25, ease: "power2.out" }, at + 1.02)
-      .fromTo(R.ringRelay, { scale: 1, autoAlpha: 0.9, transformOrigin: "50% 50%" }, { scale: 1.55, autoAlpha: 0, duration: 0.8, ease: "power2.out", immediateRender: false }, at + 1.02)
-      .fromTo(R.relay, { scale: 1, transformOrigin: "50% 50%" }, { scale: 1.08, duration: 0.14, yoyo: true, repeat: 1, ease: "power2.out", immediateRender: false }, at + 1.02)
-      .to(R.G, { mOut: 1, duration: 0.15 }, at + 1.0)
-      .to(R.G, { mOut: 0, duration: 0.7, ease: "power2.out" }, at + 1.2)
-      .set(R.reply, { autoAlpha: 1, scale: 1 }, at + 1.1)
-      .to(R.reply, { motionPath: tunPath("back", 0, 1), duration: 0.8, ease: "power2.inOut" }, at + 1.1)
-      .to(R.reply, { autoAlpha: 0, duration: 0.2 }, at + 1.82)
-      .set([R.probe, R.reply], { clearProps: "transform", autoAlpha: 0 }, at + 2.1)
-      .fromTo(R.ringIn, { scale: 1, autoAlpha: 0.9, transformOrigin: "50% 50%" }, { scale: 1.4, autoAlpha: 0, duration: 0.7, ease: "power2.out", immediateRender: false }, at + 1.85)
-      .to(R.G, { mIn: 1, duration: 0.12 }, at + 1.85)
-      .to(R.G, { mIn: 0, duration: 0.8, ease: "power2.out" }, at + 2.0)
-      .fromTo(R.G, { tx: 1, rx: 1 }, { tx: TUN_LOOK.connected.tx, rx: TUN_LOOK.connected.rx, duration: 0.6, immediateRender: false }, at + 1.9);
-    var open = at + 1.9;
-    R.boost.forEach(function (b, i) {
-      tl.to(b, { v: 1, duration: 0.12, ease: "power2.out" }, open + i * 0.06)
-        .to(b, { v: 0, duration: 0.6, ease: "power2.in" }, open + i * 0.06 + 0.14);
+  function updateTelegramSessions(ui, stats) {
+    var listNode = ui.scene.querySelector("[data-tg-session-list]");
+    var countNode = ui.scene.querySelector("[data-tg-session-count]");
+    if (!listNode || !countNode) return;
+    var sessions = stats && Array.isArray(stats.active_sessions) ? stats.active_sessions : [];
+    var activeCount = stats && Number.isFinite(Number(stats.active_connections))
+      ? Math.max(0, Number(stats.active_connections)) : null;
+    var countText = activeCount === null ? "—" : String(activeCount);
+    if (stats && stats.route_sessions_truncated) countText += "+";
+    if (countNode.textContent !== countText) countNode.textContent = countText;
+    var live = new Set(sessions.map(function (session) { return String(session.id); }));
+    ui.scene.__sessionRows.forEach(function (row, id) {
+      if (!live.has(id)) { row.remove(); ui.scene.__sessionRows.delete(id); }
     });
-    tl.fromTo(R.ribs, { drawSVG: "50% 50%", opacity: 0.5 }, { drawSVG: "0% 100%", opacity: 1, duration: 0.4, stagger: 0.06, ease: "power2.out", immediateRender: false }, open)
-      .set(R.ribs, { clearProps: "strokeDasharray,strokeDashoffset,opacity" }, open + 0.9);
-    void g;
-    return open + 0.35;
-  }
-
-  /* Подключён: живой трафик. Обход на 30 кадрах по бесшовному кольцу:
-     первый круг начинается с пустого туннеля, дальше крутится окно второго круга. */
-  function tunnelTrafficLoop(tl, R, at) {
-    var g = Motion.g;
-    var plan = tunnelTraffic(0xD2C7, 12), L = plan.period;
-    var loop = g.timeline({ paused: true });
-    var launch = function (p, el, lane, off) {
-      var t = p.t + off, h = p.w > 20 ? 10 : 9, op = lane === "out" ? 1 : 0.78;
-      loop.set(el, { attr: { width: p.w, height: h, x: -p.w / 2, y: -h / 2, rx: h / 2 } }, t)
-        .to(el, { motionPath: tunPath(lane, 0, 1), duration: p.d, ease: "power1.inOut" }, t)
-        .fromTo(el, { autoAlpha: 0 }, { autoAlpha: op, duration: 0.22, ease: "none", immediateRender: false }, t)
-        .to(el, { autoAlpha: 0, duration: 0.28, ease: "none" }, t + p.d - 0.28);
-    };
-    [0, L].forEach(function (off) {
-      plan.out.forEach(function (p) { launch(p, R.pktOut[p.slot], "out", off); });
-      plan.back.forEach(function (p) { launch(p, R.pktBack[p.slot], "back", off); });
-    });
-    tl.add(loop.tweenFromTo(0, L, { ease: "none" }), at)
-      .add(loop.tweenFromTo(L, 2 * L, { ease: "none", repeat: -1 }), at + L);
-  }
-
-  /* Подключается: роутер зовёт, вызов уходит в туннель и гаснет без ответа;
-     попытки повторяются с растущей паузой и каждый раз заходят дальше. */
-  function tunnelSearchLoop(tl, R, at) {
-    var g = Motion.g;
-    var loop = g.timeline({ repeat: -1 });
-    [[0, 0.42], [1.7, 0.58], [3.9, 0.74]].forEach(function (a) {
-      var t = a[0], reach = a[1], d = 0.7 + reach * 1.1;
-      loop.to(R.G, { link: 1, duration: 0.1, ease: "power2.out" }, t)
-        .to(R.G, { link: 0, duration: 0.7, ease: "power2.in" }, t + 0.12)
-        .fromTo(R.waves, { autoAlpha: 0.85, scale: 0.6, transformOrigin: "50% 100%" },
-          { autoAlpha: 0, scale: 1.35, duration: 0.8, stagger: { each: 0.1, from: "start" }, ease: "power2.out", immediateRender: false }, t)
-        .to(R.probe, { motionPath: tunPath("out", 0, reach), duration: d, ease: "power2.out" }, t + 0.15)
-        .fromTo(R.probe, { autoAlpha: 0, scale: 1 }, { autoAlpha: 1, duration: 0.15, immediateRender: false }, t + 0.15)
-        .to(R.probe, { autoAlpha: 0, scale: 0.4, transformOrigin: "50% 50%", duration: 0.45, ease: "power2.in" }, t + 0.15 + d - 0.35);
-    });
-    loop.to({}, { duration: 1.4 });
-    tl.add(loop, at)
-      /* Ретранслятор ещё не ответил: его пунктирное кольцо медленно «ищет». */
-      .fromTo(R.ringRelay, { rotation: 0, transformOrigin: "50% 50%" }, { rotation: 360, duration: 14, ease: "none", repeat: -1, immediateRender: false }, at);
-  }
-
-  /* Петля туннеля живёт, только пока он на экране и вкладка видна:
-     SVG анимируется в основном потоке, и бесконечная петля за кадром — чистый расход. */
-  function tunnelMotion(body, st, prev) {
-    var g = Motion.g;
-    if (body.__tl) { body.__tl.kill(); body.__tl = null; }
-    if (g && body.__tick) { g.ticker.remove(body.__tick); body.__tick = null; }
-    var svg = body.querySelector(".tun");
-    if (!Motion.on() || !svg) {
-      if (g && svg) g.set(svg.querySelectorAll("*"), { clearProps: "all" });
-      body.__rig = null;
-      body.setAttribute("data-motion", "still");
-      tunnelWatch(body);
+    if (!stats) {
+      ui.sessionEmpty = ui.sessionEmpty || el(ui.scene.ownerDocument, "p", "tg-flow-empty", "Статистика маршрутов пока недоступна");
+      if (ui.sessionEmpty.parentNode !== listNode) listNode.replaceChildren(ui.sessionEmpty);
       return;
     }
-    body.setAttribute("data-motion", "live");
-    var R = body.__rig && body.__rig.svg === svg ? body.__rig : (body.__rig = tunnelRig(svg));
-    R.reset();
-    var tl = g.timeline({ paused: true, onUpdate: R.glow });
-    var at = prev ? tunnelLeave(tl, R, prev, st) : 0;
-    if (!prev) {
-      var look = TUN_LOOK[st];
-      g.set(R.G, { pwr: look.pwr, tx: look.tx, rx: look.rx, link: 0, mIn: 0, mOut: 0 });
+    if (!sessions.length) {
+      ui.sessionEmpty = ui.sessionEmpty || el(ui.scene.ownerDocument, "p", "tg-flow-empty", activeCount
+        ? "Сессии есть, маршрут ещё определяется" : "Нет активных сессий");
+      ui.sessionEmpty.textContent = activeCount ? "Сессии есть, маршрут ещё определяется" : "Нет активных сессий";
+      if (ui.sessionEmpty.parentNode !== listNode) listNode.replaceChildren(ui.sessionEmpty);
+      return;
     }
-    if (st === "connected") {
-      if (!prev || prev === "not_configured") at = tunnelDrawIn(tl, R, at);
-      if (prev) at = tunnelHandshake(tl, R, at);
-      tunnelTrafficLoop(tl, R, at);
-    } else if (st === "connecting") {
-      if (!prev || prev === "not_configured") at = tunnelDrawIn(tl, R, at);
-      tunnelSearchLoop(tl, R, at + 0.2);
-    } else if (st === "local") {
-      if (!prev || prev === "not_configured") at = tunnelDrawIn(tl, R, at);
-      tl.set(R.G, { tx: 1, rx: 1, link: 0, mIn: 0, mOut: 0 }, at);
-    } else if (st === "stopped") {
-      if (!prev || prev === "not_configured") at = tunnelDrawIn(tl, R, at) - 0.3;
-      /* Шлагбаум падает с отскоком, перекладины прочерчиваются, когда стойки встали. */
-      tl.fromTo(R.posts, { y: -70, autoAlpha: 0 }, { y: 0, autoAlpha: 1, duration: 0.9, ease: "bounce.out", immediateRender: true }, at)
-        .fromTo(R.bars, { drawSVG: "50% 50%", autoAlpha: 0 }, { drawSVG: "0% 100%", autoAlpha: 1, duration: 0.35, stagger: 0.1, ease: "power2.out", immediateRender: true }, at + 0.55)
-        .set(R.posts.concat(R.bars), { clearProps: "transform,opacity,visibility,strokeDasharray,strokeDashoffset" }, at + 1.1)
-        /* Роутер жив, туннель нет: питание дышит медленно. */
-        .to(R.G, { pwr: 0.35, duration: 1.8, ease: "sine.inOut", yoyo: true, repeat: -1 }, at + 1.2);
-    } else {
-      /* Не настроен: набросок проступает карандашом; на месте ретранслятора — призрак. */
-      var sketch = [R.tube, R.out, svg.querySelector(".tun-in"), R.relay];
-      if (prev) { tl.to(sketch, { autoAlpha: 0, duration: 0.35, ease: "power2.in" }, 0); at = Math.max(at, 0.4); }
-      tl.fromTo(sketch, { autoAlpha: 0, y: 4 }, { autoAlpha: function (i) { return i === 3 ? 0.4 : 1; }, y: 0, duration: 0.6, stagger: 0.12, ease: "power2.out", immediateRender: !prev }, at)
-        .set(sketch, { clearProps: "transform,opacity,visibility" }, at + 1.1)
-        .fromTo(R.relay, { opacity: 0.4 }, { opacity: 0.22, duration: 2.2, ease: "sine.inOut", yoyo: true, repeat: -1, immediateRender: false }, at + 1.15);
-    }
-    body.__tl = tl;
-    tunnelWatch(body);
+    if (ui.sessionEmpty && ui.sessionEmpty.parentNode === listNode) ui.sessionEmpty.remove();
+    sessions.forEach(function (session) {
+      var id = String(session.id);
+      var row = ui.scene.__sessionRows.get(id);
+      if (!row) {
+        row = el(ui.scene.ownerDocument, "div", "tg-flow-session");
+        row.setAttribute("role", "listitem");
+        row.__fields = [el(ui.scene.ownerDocument, "b"), el(ui.scene.ownerDocument, "span"), el(ui.scene.ownerDocument, "span")];
+        row.__fields.forEach(function (field) { row.appendChild(field); });
+        ui.scene.__sessionRows.set(id, row);
+      }
+      var dc = session.dc == null ? "DC неизвестен" : "DC" + session.dc;
+      var kind = session.is_media === true ? "media" : session.is_media === false ? "основная" : "тип не определён";
+      var confirmed = session.telegram_response_seen === true;
+      var route = telegramTransportLabel(telegramSessionRoute(session));
+      var status = confirmed ? "Ответ Telegram подтверждён" :
+        session.selected_transport ? "Маршрут выбран · ждём ответ Telegram" : "Соединение устанавливается";
+      var values = [dc + " · " + kind, "Маршрут: " + route, status];
+      row.__fields.forEach(function (field, index) {
+        if (field.textContent !== values[index]) field.textContent = values[index];
+      });
+      if (row.parentNode !== listNode) listNode.appendChild(row);
+    });
   }
 
-  function tunnelWatch(body) {
-    var win = global;
-    var sync = function () {
-      var visible = body.__onscreen !== false && !(win.document && win.document.hidden);
-      body.setAttribute("data-onscreen", String(visible));
-      if (body.__tl) {
-        /* Петля идёт на 30 кадрах: для фоновой иллюстрации этого достаточно,
-           а работы основного потока вдвое меньше. */
-        var tl = body.__tl, g = Motion.g;
-        tl.pause();
-        if (body.__tick) { g.ticker.remove(body.__tick); body.__tick = null; }
-        if (visible) {
-          var last = g.ticker.time, odd = false;
-          body.__tick = function (time) {
-            odd = !odd;
-            if (odd) return;
-            /* После долгой паузы кадра (фон, отладчик) не перепрыгиваем полсцены. */
-            tl.time(tl.time() + Math.min(time - last, 0.1));
-            last = time;
-          };
-          g.ticker.add(body.__tick);
-        }
-      }
-    };
-    if (!body.__io && typeof win.IntersectionObserver === "function") {
-      body.__io = new win.IntersectionObserver(function (entries) {
-        body.__onscreen = entries[entries.length - 1].isIntersecting;
-        sync();
-      });
-      body.__io.observe(body);
-      win.document.addEventListener("visibilitychange", sync);
-    }
-    sync();
+  function updateTelegramSummary(ui, stats) {
+    var scene = ui.scene;
+    var active = stats ? String(Math.max(0, Number(stats.active_connections) || 0)) : "—";
+    var total = stats ? String(Math.max(0, Number(stats.accepted_connections) || 0)) : "—";
+    var confirmed = stats ? String(Math.max(0, Number(stats.wss_responses) || 0)) : "—";
+    var activeNode = scene.querySelector("[data-tg-active-count]");
+    var totalNode = scene.querySelector("[data-tg-accepted-count]");
+    var confirmedNode = scene.querySelector("[data-tg-confirmed-count]");
+    if (activeNode && activeNode.textContent !== active) activeNode.textContent = active;
+    if (totalNode && totalNode.textContent !== total) totalNode.textContent = total;
+    if (confirmedNode && confirmedNode.textContent !== confirmed) confirmedNode.textContent = confirmed;
+    var last = scene.querySelector("[data-tg-last-success]");
+    if (!last) return;
+    var successCount = Number(stats && stats.wss_responses) || 0;
+    var text = successCount && Number.isFinite(Number(stats.last_success_age_ms))
+      ? "Последний ответ: " + (stats.last_success_dc ? "DC" + stats.last_success_dc + " · " : "") +
+        telegramRouteName(Number(stats.last_success_route)) + " · " + telegramAge(Number(stats.last_success_age_ms))
+      : successCount ? "Подтверждён ответ Telegram" : "Подтверждённых ответов пока нет";
+    if (last.textContent !== text) last.textContent = text;
   }
 
   App.prototype.renderTelegram = function (m, force) {
-    var doc = this.doc, self = this;
     if (!m) return;
-    var snap = m.snap;
+    var doc = this.doc, snap = m.snap;
     var st = TG[snap.telegram_status] ? snap.telegram_status : (snap.telegram_configured ? "stopped" : "not_configured");
     var info = TG[st];
     var busy = snap.control_state === "running" || !!this.pending;
     var body = this.$("telegram-body");
-    var key = JSON.stringify([st, snap.telegram_enabled, snap.telegram_configured, snap.telegram_stats, snap.controls_enabled, busy, this.pending]);
+    var stale = doc.body.getAttribute("data-stale") === "true";
+    var stats = snap.telegram_stats;
+    var key = JSON.stringify([st, snap.telegram_enabled, snap.telegram_configured, stats,
+      snap.controls_enabled, busy, this.pending, stale]);
     if (!force && body.__d2kKey === key) return;
-    var focused = doc.activeElement && body.contains(doc.activeElement) ? doc.activeElement.getAttribute("data-control") : null;
+    var focused = doc.activeElement && body.contains(doc.activeElement)
+      ? doc.activeElement.getAttribute("data-control") : null;
     body.__d2kKey = key;
-    var state = el(doc, "div", "tunnel-state");
-    var lamp = el(doc, "span", "lamp");
-    lamp.setAttribute("data-tone", info.lamp);
-    add(state, lamp, el(doc, "span", "tunnel-word", info.word));
-    var actions = el(doc, "div", "tunnel-actions");
+    var ui = body.__tgUi;
+    if (!ui) {
+      ui = body.__tgUi = {
+        state: el(doc, "div", "tunnel-state"),
+        lamp: el(doc, "span", "lamp"),
+        word: el(doc, "span", "tunnel-word"),
+        actions: el(doc, "div", "tunnel-actions"),
+        scene: tunnelScene(doc),
+        note: el(doc, "p", "tunnel-note"),
+      };
+      ui.state.append(ui.lamp, ui.word);
+      body.replaceChildren(ui.state, ui.actions, ui.scene, ui.note);
+      if (ui.scene.__flow) ui.scene.__flow.attach();
+    }
+    ui.lamp.setAttribute("data-tone", info.lamp);
+    if (ui.word.textContent !== info.word) ui.word.textContent = info.word;
+    var buttons = [];
     if (snap.controls_enabled) {
       if (snap.telegram_enabled) {
-        actions.appendChild(this.button("telegram-disable", "Выключить туннель", "stop", null, busy));
+        buttons.push(this.button("telegram-disable", "Выключить туннель", "stop", null, busy));
       } else {
-        actions.appendChild(this.button("telegram-enable", "Включить туннель", "send", "primary", busy || !snap.telegram_configured));
+        buttons.push(this.button("telegram-enable", "Включить туннель", "send", "primary", busy || !snap.telegram_configured));
       }
     }
+    buttons.push(this.button("telegram-workers", "Мои Workers", null, null, busy));
+    ui.actions.replaceChildren.apply(ui.actions, buttons);
     var note = info.note;
     if (snap.telegram_enabled && st === "stopped") note = "Туннель включён в конфигурации, но служба не запущена.";
-    var scene = body.__scene || (body.__scene = tunnelScene(doc));
-    var children = [state, actions, scene, el(doc, "p", "tunnel-note", note)];
-    var stats = snap.telegram_stats;
-    if (stats && typeof stats.wss_attempts === "number") {
-      children.push(el(doc, "p", "tunnel-note", "Маршруты WSS: попыток " + stats.wss_attempts + ", сбоев " + stats.wss_failures + ", ответов " + stats.wss_responses + " (CF: " + stats.cf_wss_responses + ")."));
-      if (stats.last_success_dc > 0 && stats.last_success_route > 0) {
-        children.push(el(doc, "p", "tunnel-note", "Последний подтверждённый ответ MTProto: DC " + stats.last_success_dc + ", " + telegramRouteName(stats.last_success_route) + ", " + stats.last_success_latency_ms + " мс, " + telegramAge(stats.last_success_age_ms) + " назад."));
-      }
-      if (stats.last_failure_dc > 0 && stats.last_failure_route > 0) {
-        children.push(el(doc, "p", "tunnel-note", "Последняя ошибка WSS: DC " + stats.last_failure_dc + ", " + telegramRouteName(stats.last_failure_route) + ", этап " + telegramFailureStage(stats.last_failure_stage) + ", " + telegramAge(stats.last_failure_age_ms) + " назад."));
-      }
-    }
+    if (ui.note.textContent !== note) ui.note.textContent = note;
     body.setAttribute("data-state", st);
-    /* Сцена одна на все состояния: смена состояния — переход на том же рисунке. */
-    var prevState = body.__sceneState || "";
-    body.replaceChildren.apply(body, children);
-    if (prevState !== st) {
-      body.__sceneState = st;
-      tunnelMotion(body, st, prevState);
-    }
+    if (ui.scene.__flow) ui.scene.__flow.update(stats);
+    updateTelegramSessions(ui, stats);
+    updateTelegramSummary(ui, stats);
     if (focused) {
       var again = body.querySelector("button");
       if (again) again.focus();
     }
-    void self;
   };
 
   /* ─── Диагностика ─── */
@@ -2385,7 +2265,7 @@
     planGist: planGist, plural: plural, duration: duration,
     telegramRouteName: telegramRouteName,
     telegramFailureStage: telegramFailureStage,
-    tunnelTraffic: tunnelTraffic, App: App
+    App: App
   };
   if (typeof module === "object" && module.exports) module.exports = api;
   if (global && global.document && global.document.getElementById) {

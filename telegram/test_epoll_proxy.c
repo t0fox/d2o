@@ -168,7 +168,8 @@ static int resolve_test_route_domain(void *opaque, const char *domain,
     proxy_fixture *fixture = opaque;
     ++fixture->resolve_calls;
     if (strcmp(domain, "worker.test") != 0 &&
-        strcmp(domain, "cfproxy.test") != 0) return -1;
+        strcmp(domain, "kws4.cfproxy.test") != 0 &&
+        strcmp(domain, "kws4-1.cfproxy.test") != 0) return -1;
     *out = fixture->upstream;
     return 0;
 }
@@ -244,7 +245,7 @@ static X509 *make_wss_test_cert(EVP_PKEY *key) {
     X509_EXTENSION_free(extension);
     extension = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name,
         "DNS:kws4.web.telegram.org,DNS:kws4-1.web.telegram.org,"
-        "DNS:worker.test,DNS:cfproxy.test,IP:127.0.0.1");
+        "DNS:worker.test,DNS:kws4.cfproxy.test,DNS:kws4-1.cfproxy.test,IP:127.0.0.1");
     assert(extension && X509_add_ext(cert, extension, -1) == 1);
     X509_EXTENSION_free(extension);
     assert(X509_sign(cert, key, EVP_sha256()) > 0);
@@ -846,12 +847,16 @@ static void test_read_only_stats_socket(void) {
     assert(client >= 0);
     assert(connect(client, (struct sockaddr *)&address, sizeof(address)) == 0);
     assert(tg_stats_socket_serve(&stats_socket, proxy) == 0);
-    char response[768];
+    char response[64u * 1024u];
     ssize_t length = recv(client, response, sizeof(response) - 1, 0);
     assert(length > 0);
     response[length] = '\0';
     assert(strstr(response, "\"active_connections\":0") != NULL);
     assert(strstr(response, "\"connections_started\":0") != NULL);
+    assert(strstr(response, "\"process_started_at\":") != NULL);
+    assert(strstr(response, "\"accepted_connections\":0") != NULL);
+    assert(strstr(response, "\"active_sessions\":[]") != NULL);
+    assert(strstr(response, "\"route_sessions_truncated\":false") != NULL);
     assert(strstr(response, "\"last_success_dc\":0") != NULL);
     assert(strstr(response, "\"last_failure_stage\":0") != NULL);
     close(client);
@@ -1256,7 +1261,6 @@ static void test_epoll_hedged_wss_uses_second_live_candidate(
            (ssize_t)sizeof(handshake));
     assert(send(client, wss.expected_packet, wss.expected_packet_len, 0) ==
            (ssize_t)wss.expected_packet_len);
-    assert(shutdown(client, SHUT_WR) == 0);
     uint8_t echoed[sizeof(wss.response_packet)];
     size_t received = 0;
     while (received < wss.response_packet_len) {
@@ -1268,12 +1272,29 @@ static void test_epoll_hedged_wss_uses_second_live_candidate(
         received += (size_t)n;
     }
     assert(memcmp(echoed, wss.response_packet, wss.response_packet_len) == 0);
+    tg_epoll_proxy_stats route_stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
+    assert(route_stats.active_connections == 1 &&
+           route_stats.active_sessions_count == 1);
+    const tg_active_route_session *session = &route_stats.active_sessions[0];
+    assert(session->id > 0 && session->has_dc && session->dc == 4);
+    assert(session->has_media && session->is_media);
+    assert(session->stage == TG_ROUTE_SESSION_STAGE_FIRST_WSS_BINARY_RESPONSE);
+    assert(session->direct_state == TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
+    assert(session->direct_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
+    assert(session->selected_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
+    assert(session->telegram_response_seen);
+    assert(session->event_count >= 4);
+    assert(session->events[session->event_count - 1u].state ==
+           TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
+    assert(session->events[session->event_count - 1u].sequence >
+           session->events[session->event_count - 2u].sequence);
+    assert(shutdown(client, SHUT_WR) == 0);
     assert(pthread_join(wss_thread, NULL) == 0);
     assert(wss.accepted_count == 2 && atomic_load(&wss.complete) == 1);
     close(client);
     atomic_store(&runner.stop, 1);
     assert(pthread_join(proxy_thread, NULL) == 0);
-    tg_epoll_proxy_stats route_stats;
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
     assert(route_stats.wss_attempts == 2 && route_stats.wss_responses == 1);
     tg_epoll_proxy_destroy(proxy);
@@ -1640,7 +1661,7 @@ static void test_epoll_cf_proxy_uses_mtproto_packet_framing(void) {
         .listener = create_listener(&ws_port),
         .cert_path = cert_path,
         .key_path = key_path,
-        .expected_sni = "cfproxy.test",
+        .expected_sni = "kws4-1.cfproxy.test",
         .expected_path = "/apiws",
         .expect_binary_subprotocol = 1
     };

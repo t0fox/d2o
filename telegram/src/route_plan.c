@@ -1,9 +1,22 @@
 #include "tg_route_plan.h"
 
+#include <stdio.h>
 #include <string.h>
 
 uint32_t tg_route_websocket_dc(uint32_t dc_id) {
     return dc_id == 203 ? 2 : dc_id;
+}
+
+int tg_route_cf_proxy_hostname(uint32_t dc_id, int media_variant,
+                               const char *domain, char *hostname,
+                               size_t hostname_size) {
+    uint32_t dc = tg_route_websocket_dc(dc_id);
+    if (dc < 1 || dc > 5 || (media_variant != 0 && media_variant != 1) ||
+        !domain || !*domain || !hostname || !hostname_size)
+        return -1;
+    int n = snprintf(hostname, hostname_size, "kws%u%s.%s", dc,
+                     media_variant ? "-1" : "", domain);
+    return n > 0 && (size_t)n < hostname_size ? 0 : -1;
 }
 
 static int append_step(tg_route_plan *plan, tg_route_kind kind, size_t index) {
@@ -24,11 +37,17 @@ static int append_direct(tg_route_plan *plan, uint32_t dc_id, int is_media) {
 }
 
 static int append_cloudflare(tg_route_plan *plan, size_t worker_count,
-                             size_t cf_domain_count) {
+                             size_t cf_domain_count, int is_media) {
     for (size_t i = 0; i < worker_count; ++i)
         if (append_step(plan, TG_ROUTE_CF_WORKER, i) != 0) return -1;
-    for (size_t i = 0; i < cf_domain_count; ++i)
-        if (append_step(plan, TG_ROUTE_CF_PROXY, i) != 0) return -1;
+    for (size_t i = 0; i < cf_domain_count; ++i) {
+        /* Index encodes the base domain and its media (-1) variant. */
+        if (is_media &&
+            append_step(plan, TG_ROUTE_CF_PROXY, 2u * i + 1u) != 0)
+            return -1;
+        if (append_step(plan, TG_ROUTE_CF_PROXY, 2u * i) != 0)
+            return -1;
+    }
     return 0;
 }
 
@@ -49,12 +68,12 @@ int tg_route_plan_build(uint32_t dc_id, int is_media,
     int cf_first = policy == TG_WS_ROUTING_CF_FIRST ||
                    (policy == TG_WS_ROUTING_ADAPTIVE && prefer_cf);
     if (cf_first) {
-        if (append_cloudflare(out, worker_count, cf_domain_count) != 0 ||
+        if (append_cloudflare(out, worker_count, cf_domain_count, is_media) != 0 ||
             append_direct(out, dc_id, is_media) != 0)
             return -1;
     } else {
         if (append_direct(out, dc_id, is_media) != 0 ||
-            append_cloudflare(out, worker_count, cf_domain_count) != 0)
+            append_cloudflare(out, worker_count, cf_domain_count, is_media) != 0)
             return -1;
     }
     return append_step(out, TG_ROUTE_DIRECT_TCP, 0);

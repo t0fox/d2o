@@ -26,6 +26,9 @@ tg_route_dns *tg_route_dns_create(SSL_CTX *tls_context, uint32_t socket_mark,
                                   void *context);
 void tg_route_dns_destroy(tg_route_dns *cache);
 int tg_route_dns_prefetch(tg_route_dns *cache, const char *domain);
+/* Prefetch real kwsN / kwsN-1 Cloudflare hosts, not bare base domains. */
+void tg_route_dns_prefetch_cf_pool(tg_route_dns *cache,
+                                   tg_cf_domain_pool *pool);
 int tg_route_dns_resolve(tg_route_dns *cache, const char *domain,
                          tg_listener_destination *out);
 int tg_route_dns_parse_response(const uint8_t *response, size_t length,

@@ -193,6 +193,7 @@ static int run_local_daemon(const char *config_path) {
         .listen_ports = listen_ports,
         .listen_port_count = sizeof(listen_ports) / sizeof(listen_ports[0]),
         .select_target = tg_transparent_select_target,
+        .select_route = tg_transparent_select_route,
         .context = &policy
     };
     proxy = tg_epoll_proxy_create(&proxy_config);

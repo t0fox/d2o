@@ -1,0 +1,104 @@
+"use strict";
+const assert = require("node:assert/strict");
+const flow = require("../internal/web/assets/telegram-flow.js");
+
+const session = (values = {}) => ({
+  id: 1,
+  dc: null,
+  is_media: null,
+  stage: "accepted",
+  direct_state: "idle",
+  direct_transport: null,
+  fallback_state: "idle",
+  fallback_transport: null,
+  selected_transport: null,
+  telegram_response_seen: false,
+  events: [],
+  ...values,
+});
+
+const snapshot = (values = {}) => ({
+  active_connections: 0,
+  accepted_connections: 0,
+  active_sessions: [],
+  route_sessions_truncated: false,
+  ...values,
+});
+
+{
+  const view = flow.summarizeTelegramFlow(snapshot());
+  assert.equal(view.state, "idle");
+  assert.equal(view.activeConnections, 0);
+  assert.equal(view.acceptedConnections, 0);
+}
+
+{
+  const view = flow.summarizeTelegramFlow(snapshot({
+    active_connections: 4,
+    accepted_connections: 27,
+    route_sessions_truncated: true,
+    active_sessions: [
+      session({ id: 4, dc: 2, is_media: false, stage: "upstream_ready",
+        direct_state: "selected", direct_transport: "direct_wss",
+        selected_transport: "direct_wss" }),
+      session({ id: 5, dc: 2, is_media: true, stage: "first_wss_binary_response",
+        direct_state: "selected", direct_transport: "direct_wss",
+        selected_transport: "direct_wss", telegram_response_seen: true,
+        events: [{ sequence: 4, branch: "direct", transport: "direct_wss",
+          state: "first_binary_response" }] }),
+      session({ id: 6, dc: 4, is_media: true, stage: "routing",
+        fallback_state: "connecting", fallback_transport: "cloudflare_worker",
+        events: [{ sequence: 1, branch: "fallback", transport: "cloudflare_worker",
+          state: "connecting" }] }),
+      session({ id: 7, dc: null, is_media: null, stage: "upstream_ready",
+        direct_state: "selected", direct_transport: "tcp_passthrough",
+        selected_transport: "tcp_passthrough" }),
+    ],
+  }));
+  assert.equal(view.state, "mixed");
+  assert.equal(view.activeConnections, 4);
+  assert.equal(view.acceptedConnections, 27);
+  assert.equal(view.truncated, true);
+  assert.equal(view.mediaSessions, 2);
+  assert.match(view.dcLabel, /Несколько DC · media 2/);
+  assert.equal(view.lanes[0].counts.selected, 2);
+  assert.equal(view.lanes[1].label, "Прямой TCP passthrough");
+  assert.equal(view.lanes[1].counts.selected, 1);
+  assert.equal(view.lanes[2].counts.connecting, 1);
+}
+
+{
+  const view = flow.summarizeTelegramFlow(snapshot({
+    active_connections: 2,
+    active_sessions: [
+      session({ id: 31, dc: 2, is_media: false, stage: "upstream_ready",
+        direct_state: "selected", direct_transport: "direct_wss",
+        selected_transport: "direct_wss" }),
+      session({ id: 32, dc: null, is_media: null, stage: "upstream_ready",
+        direct_state: "selected", direct_transport: "tcp_passthrough",
+        selected_transport: "tcp_passthrough" }),
+    ],
+  }));
+  assert.equal(view.dcLabel, "DC2");
+  assert.notEqual(view.dcLabel, "Несколько DC");
+}
+
+{
+  const view = flow.summarizeTelegramFlow(snapshot({
+    active_connections: 70,
+    accepted_connections: 70,
+    active_sessions: Array.from({ length: 64 }, (_, index) => session({ id: index + 1 })),
+    route_sessions_truncated: true,
+  }));
+  assert.equal(view.sessions.length, 64);
+  assert.equal(view.activeConnections, 70);
+  assert.equal(view.truncated, true);
+}
+
+{
+  const view = flow.summarizeTelegramFlow(snapshot({ active_connections: 1 }));
+  assert.equal(view.state, "unavailable");
+  assert.match(view.caption, /маршрут пока не определён/);
+}
+
+console.log("telegram flow: active sessions and route states match C11 snapshots");

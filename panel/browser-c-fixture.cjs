@@ -6,27 +6,32 @@ module.exports=async function(visualFixture){
  const temp=fs.mkdtempSync(path.join(os.tmpdir(),'d2k-c-browser-'));
  const config=path.join(temp,'config'),live=path.join(temp,'live.json'),log=path.join(temp,'actions');
  const engine=path.join(temp,'engine.pid'),controller=path.join(temp,'controller.pid'),telegram=path.join(temp,'telegram.pid');
- const tgStatus=path.join(temp,'tg-status'),service=path.join(temp,'service');
+ const tgStatus=path.join(temp,'tg-status'),tgStats=path.join(temp,'telegram-stats.sock'),service=path.join(temp,'service');
+ const connectedTelegramStats=visualFixture.telegramStats||null;
+ let telegramStats=connectedTelegramStats;
  const pid=String(process.pid)+'\n';
  const writeLive=()=>fs.writeFileSync(live,JSON.stringify({...visualFixture.knowledge,linked:true,catalog_at:'local-browser-fixture'}));
  fs.writeFileSync(config,'MODE=apply\nTG_ENABLED=1\nTG_MODE=local\nTG_RELAY_URL=https://relay.example.invalid\nTG_RELAY_SECRET=public-test-fixture\n');
  for(const file of [engine,controller,telegram])fs.writeFileSync(file,pid);
  fs.writeFileSync(tgStatus,'connected\n');writeLive();
+ const statsServer=net.createServer(socket=>socket.end(telegramStats?JSON.stringify(telegramStats)+'\n':''));
+ await new Promise((resolve,reject)=>{statsServer.once('error',reject);statsServer.listen(tgStats,resolve)});
  fs.writeFileSync(service,'#!/usr/bin/env node\n'+
   'const fs=require("node:fs");const action=process.argv[2];\n'+
   'const paths='+JSON.stringify({config,log,engine})+';\n'+
   'if(action==="engine-stop")fs.rmSync(paths.engine,{force:true});\n'+
   'if(action==="engine-start"||action==="engine-restart")fs.writeFileSync(paths.engine,'+JSON.stringify(pid)+');\n'+
-  'if(action.startsWith("telegram-"))fs.writeFileSync(paths.config,fs.readFileSync(paths.config,"utf8").replace(/TG_ENABLED=[01]/,"TG_ENABLED="+(action==="telegram-enable"?1:0)));\n'+
+  'if(action==="telegram-enable"||action==="telegram-disable")fs.writeFileSync(paths.config,fs.readFileSync(paths.config,"utf8").replace(/TG_ENABLED=[01]/,"TG_ENABLED="+(action==="telegram-enable"?1:0)));\n'+
   'fs.appendFileSync(paths.log,action+"\\n");\n',{mode:0o700});
  const socket=net.createServer();await new Promise(r=>socket.listen(0,'127.0.0.1',r));
  const port=socket.address().port;await new Promise(r=>socket.close(r));
  const child=spawn(path.join(__dirname,'d2kpanel'),['serve','--config',config,'--listen','127.0.0.1:'+port,
   '--live',live,'--assets',path.resolve(__dirname,'../internal/web/assets'),'--service',service,
-  '--engine-pid',engine,'--controller-pid',controller,'--telegram-pid',telegram,'--telegram-status',tgStatus],{stdio:'ignore'});
+  '--engine-pid',engine,'--controller-pid',controller,'--telegram-pid',telegram,'--telegram-status',tgStatus,
+  '--telegram-stats',tgStats],{stdio:'ignore'});
  const timer=setInterval(writeLive,2000),url='http://127.0.0.1:'+port+'/';
  const close=async()=>{
-  clearInterval(timer);child.kill('SIGTERM');
+  clearInterval(timer);child.kill('SIGTERM');statsServer.close();
   if(child.exitCode===null)await new Promise(r=>child.once('exit',r));
   fs.rmSync(temp,{recursive:true,force:true});
  };
@@ -41,7 +46,10 @@ module.exports=async function(visualFixture){
   /* seen — проверка «команды НЕ было». waitFor для этого не годится: он
      ждёт появления и падает по тайм-ауту, то есть отрицание им стоит три
      секунды и читается как поломка. */
-  return {url,close,telegram:status=>fs.writeFileSync(tgStatus,status+'\n'),
+  return {url,close,telegram:status=>{
+    fs.writeFileSync(tgStatus,status+'\n');
+    telegramStats=status==='connected'?connectedTelegramStats:null;
+   },telegramStats:stats=>{telegramStats=stats},
    seen:(command)=>fs.existsSync(log)&&fs.readFileSync(log,'utf8').split('\n').includes(command),
    waitFor:async(command)=>{
    for(let i=0;i<60;i++){

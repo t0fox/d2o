@@ -56,12 +56,31 @@ struct tg_route_dns {
 typedef struct {
     const char *host;
     uint8_t address[4];
+    int http2;
 } doh_endpoint;
 
 static const doh_endpoint doh_endpoints[] = {
+    {.host = "d.webshiftvpn.ru", .address = {31, 31, 207, 68}, .http2 = 1},
     {.host = "cloudflare-dns.com", .address = {1, 1, 1, 1}},
-    {.host = "dns.google", .address = {8, 8, 8, 8}}
+    {.host = "dns.google", .address = {8, 8, 8, 8}},
+    {.host = "dns.sb", .address = {185, 222, 222, 222}, .http2 = 1}
 };
+
+#ifdef TG_ROUTE_DNS_TESTING
+size_t tg_route_dns_test_doh_endpoint_count(void) {
+    return sizeof(doh_endpoints) / sizeof(doh_endpoints[0]);
+}
+
+int tg_route_dns_test_doh_endpoint(size_t index, const char **host,
+                                   uint8_t address[4], int *http2) {
+    if (index >= sizeof(doh_endpoints) / sizeof(doh_endpoints[0]) || !host ||
+        !address || !http2) return -1;
+    *host = doh_endpoints[index].host;
+    memcpy(address, doh_endpoints[index].address, 4);
+    *http2 = doh_endpoints[index].http2;
+    return 0;
+}
+#endif
 
 static int valid_domain(const char *domain);
 
@@ -259,7 +278,7 @@ static int set_route_socket_mark(int fd, uint32_t mark) {
 
 static int https_connect(tg_route_dns *cache, const char *hostname,
                          const tg_listener_destination *target,
-                         int *fd_out, SSL **ssl_out) {
+                         int http2, int *fd_out, SSL **ssl_out) {
     struct sockaddr_storage address;
     socklen_t address_len;
     memset(&address, 0, sizeof(address));
@@ -309,7 +328,10 @@ static int https_connect(tg_route_dns *cache, const char *hostname,
     }
     SSL *ssl = tg_tls_prepare_client_fd(cache->tls_context, fd,
                                         hostname, hostname);
-    if (!ssl) {
+    if (!ssl ||
+        (http2 && SSL_set_alpn_protos(ssl,
+            (const unsigned char[]){2, 'h', '2'}, 3) != 0)) {
+        SSL_free(ssl);
         close(fd);
         return -1;
     }
@@ -329,6 +351,16 @@ static int https_connect(tg_route_dns *cache, const char *hostname,
         SSL_free(ssl);
         close(fd);
         return -1;
+    }
+    if (http2) {
+        const unsigned char *selected = NULL;
+        unsigned int selected_len = 0;
+        SSL_get0_alpn_selected(ssl, &selected, &selected_len);
+        if (selected_len != 2 || memcmp(selected, "h2", 2) != 0) {
+            SSL_free(ssl);
+            close(fd);
+            return -1;
+        }
     }
     *fd_out = fd;
     *ssl_out = ssl;
@@ -390,6 +422,353 @@ static int ssl_write_all(SSL *ssl, int fd, const uint8_t *data, size_t length,
         if (!events || wait_socket(fd, events, deadline) != 0) return -1;
     }
     return 0;
+}
+
+static int ssl_read_exact(SSL *ssl, int fd, uint8_t *data, size_t length,
+                          uint64_t deadline) {
+    size_t offset = 0;
+    while (offset < length) {
+        size_t received = 0;
+        int rc = SSL_read_ex(ssl, data + offset, length - offset, &received);
+        if (rc == 1) {
+            if (!received) return -1;
+            offset += received;
+            continue;
+        }
+        int error = SSL_get_error(ssl, rc);
+        short events = error == SSL_ERROR_WANT_READ ? POLLIN :
+                       error == SSL_ERROR_WANT_WRITE ? POLLOUT : 0;
+        if (!events || wait_socket(fd, events, deadline) != 0) return -1;
+    }
+    return 0;
+}
+
+#define TG_H2_FRAME_MAX 65536u
+#define TG_H2_HEADER_BLOCK_MAX 8192u
+
+static int h2_write_frame(SSL *ssl, int fd, uint8_t type, uint8_t flags,
+                          uint32_t stream_id, const uint8_t *payload,
+                          size_t payload_len, uint64_t deadline) {
+    if (payload_len > 0xffffffu || (payload_len && !payload)) return -1;
+    uint8_t header[9] = {
+        (uint8_t)(payload_len >> 16), (uint8_t)(payload_len >> 8),
+        (uint8_t)payload_len, type, flags,
+        (uint8_t)(stream_id >> 24), (uint8_t)(stream_id >> 16),
+        (uint8_t)(stream_id >> 8), (uint8_t)stream_id
+    };
+    header[5] &= 0x7fu;
+    if (ssl_write_all(ssl, fd, header, sizeof(header), deadline) != 0)
+        return -1;
+    return payload_len ? ssl_write_all(ssl, fd, payload, payload_len,
+                                       deadline) : 0;
+}
+
+static int h2_read_frame(SSL *ssl, int fd, uint8_t *type, uint8_t *flags,
+                         uint32_t *stream_id, uint8_t *payload,
+                         size_t payload_cap, size_t *payload_len,
+                         uint64_t deadline) {
+    uint8_t header[9];
+    if (ssl_read_exact(ssl, fd, header, sizeof(header), deadline) != 0)
+        return -1;
+    size_t length = ((size_t)header[0] << 16) |
+                    ((size_t)header[1] << 8) | header[2];
+    if (length > payload_cap || length > TG_H2_FRAME_MAX) return -1;
+    *type = header[3];
+    *flags = header[4];
+    *stream_id = ((uint32_t)(header[5] & 0x7fu) << 24) |
+                 ((uint32_t)header[6] << 16) |
+                 ((uint32_t)header[7] << 8) | header[8];
+    *payload_len = length;
+    return length ? ssl_read_exact(ssl, fd, payload, length, deadline) : 0;
+}
+
+static int hpack_encode_integer(uint8_t *out, size_t cap, size_t *length,
+                                unsigned prefix_bits, uint8_t marker,
+                                size_t value) {
+    if (!out || !length || prefix_bits == 0 || prefix_bits > 7) return -1;
+    size_t prefix_max = ((size_t)1u << prefix_bits) - 1u;
+    if (*length >= cap) return -1;
+    if (value < prefix_max) {
+        out[(*length)++] = (uint8_t)(marker | value);
+        return 0;
+    }
+    out[(*length)++] = (uint8_t)(marker | prefix_max);
+    value -= prefix_max;
+    while (value >= 128u) {
+        if (*length >= cap) return -1;
+        out[(*length)++] = (uint8_t)((value & 0x7fu) | 0x80u);
+        value >>= 7;
+    }
+    if (*length >= cap) return -1;
+    out[(*length)++] = (uint8_t)value;
+    return 0;
+}
+
+static int hpack_encode_string(uint8_t *out, size_t cap, size_t *length,
+                               const char *value) {
+    size_t value_len = strlen(value);
+    if (hpack_encode_integer(out, cap, length, 7, 0, value_len) != 0 ||
+        value_len > cap - *length) return -1;
+    memcpy(out + *length, value, value_len);
+    *length += value_len;
+    return 0;
+}
+
+static int hpack_encode_header(uint8_t *out, size_t cap, size_t *length,
+                               size_t static_name_index, const char *value) {
+    if (hpack_encode_integer(out, cap, length, 4, 0,
+                             static_name_index) != 0)
+        return -1;
+    return hpack_encode_string(out, cap, length, value);
+}
+
+static int h2_encode_doh_headers(const char *hostname, size_t body_len,
+                                 uint8_t *headers, size_t headers_cap,
+                                 size_t *headers_len) {
+    if (!hostname || !headers || !headers_len || body_len > 65535u)
+        return -1;
+    *headers_len = 0;
+    if (headers_cap < 2u) return -1;
+    headers[(*headers_len)++] = 0x83u;
+    headers[(*headers_len)++] = 0x87u;
+    headers[(*headers_len)++] = 0x04u;
+    if (hpack_encode_string(headers, headers_cap, headers_len,
+                            "/dns-query") != 0 ||
+        hpack_encode_header(headers, headers_cap, headers_len, 1, hostname) != 0 ||
+        hpack_encode_header(headers, headers_cap, headers_len, 19,
+                            "application/dns-message") != 0 ||
+        hpack_encode_header(headers, headers_cap, headers_len, 31,
+                            "application/dns-message") != 0)
+        return -1;
+    char content_length[8];
+    int printed = snprintf(content_length, sizeof(content_length), "%zu",
+                           body_len);
+    if (printed < 0 || (size_t)printed >= sizeof(content_length)) return -1;
+    return hpack_encode_header(headers, headers_cap, headers_len, 28,
+                               content_length);
+}
+
+#ifdef TG_ROUTE_DNS_TESTING
+int tg_route_dns_test_h2_encode_headers(const char *hostname, size_t body_len,
+                                        uint8_t *headers, size_t headers_cap,
+                                        size_t *headers_len) {
+    return h2_encode_doh_headers(hostname, body_len, headers, headers_cap,
+                                 headers_len);
+}
+#endif
+
+static int hpack_read_integer(const uint8_t *block, size_t block_len,
+                              size_t *offset, unsigned prefix_bits,
+                              size_t *value) {
+    if (!block || !offset || !value || *offset >= block_len ||
+        prefix_bits == 0 || prefix_bits > 7) return -1;
+    size_t prefix_max = ((size_t)1u << prefix_bits) - 1u;
+    size_t result = block[*offset] & prefix_max;
+    ++*offset;
+    if (result < prefix_max) {
+        *value = result;
+        return 0;
+    }
+    unsigned shift = 0;
+    for (;;) {
+        if (*offset >= block_len || shift >= sizeof(size_t) * 8u) return -1;
+        uint8_t byte = block[(*offset)++];
+        size_t part = byte & 0x7fu;
+        if (part > (SIZE_MAX - result) >> shift) return -1;
+        result += part << shift;
+        if (!(byte & 0x80u)) break;
+        shift += 7u;
+    }
+    *value = result;
+    return 0;
+}
+
+static int hpack_skip_string(const uint8_t *block, size_t block_len,
+                             size_t *offset, const uint8_t **value,
+                             size_t *value_len, int *huffman) {
+    if (!block || !offset || *offset >= block_len) return -1;
+    *huffman = (block[*offset] & 0x80u) != 0;
+    size_t length;
+    if (hpack_read_integer(block, block_len, offset, 7, &length) != 0 ||
+        length > block_len - *offset) return -1;
+    *value = block + *offset;
+    *value_len = length;
+    *offset += length;
+    return 0;
+}
+
+static int h2_response_is_ok(const uint8_t *block, size_t block_len) {
+    size_t offset = 0;
+    int status_seen = 0;
+    while (offset < block_len) {
+        uint8_t first = block[offset];
+        size_t index;
+        if (first & 0x80u) {
+            if (hpack_read_integer(block, block_len, &offset, 7, &index) != 0 ||
+                index == 0) return 0;
+            if (index == 8u) status_seen = 1;
+            else if (index >= 9u && index <= 14u) return 0;
+            continue;
+        }
+        if ((first & 0xe0u) == 0x20u) {
+            if (hpack_read_integer(block, block_len, &offset, 5, &index) != 0)
+                return 0;
+            continue;
+        }
+        int literal = (first & 0x40u) != 0;
+        unsigned prefix = literal ? 6u : 4u;
+        if (hpack_read_integer(block, block_len, &offset, prefix, &index) != 0)
+            return 0;
+        int status_name = index == 8u;
+        if (index == 0) {
+            const uint8_t *name;
+            size_t name_len;
+            int name_huffman;
+            if (hpack_skip_string(block, block_len, &offset, &name,
+                                  &name_len, &name_huffman) != 0) return 0;
+            status_name = !name_huffman && name_len == 7u &&
+                          memcmp(name, ":status", 7) == 0;
+        }
+        const uint8_t *value;
+        size_t value_len;
+        int value_huffman;
+        if (hpack_skip_string(block, block_len, &offset, &value,
+                              &value_len, &value_huffman) != 0) return 0;
+        if (status_name) {
+            if (value_huffman || value_len != 3u ||
+                memcmp(value, "200", 3) != 0) return 0;
+            status_seen = 1;
+        }
+    }
+    return status_seen;
+}
+
+#ifdef TG_ROUTE_DNS_TESTING
+int tg_route_dns_test_h2_response_is_ok(const uint8_t *block,
+                                        size_t block_len) {
+    return h2_response_is_ok(block, block_len);
+}
+#endif
+
+static int h2_response_body(SSL *ssl, int fd, uint8_t *body, size_t body_cap,
+                            size_t *body_len, uint64_t deadline) {
+    uint8_t payload[TG_H2_FRAME_MAX];
+    uint8_t headers[TG_H2_HEADER_BLOCK_MAX];
+    size_t headers_len = 0;
+    *body_len = 0;
+    int status_ok = 0;
+    int headers_seen = 0;
+    int stream_done = 0;
+    while (!stream_done) {
+        uint8_t type, flags;
+        uint32_t stream_id;
+        size_t payload_len;
+        if (h2_read_frame(ssl, fd, &type, &flags, &stream_id, payload,
+                          sizeof(payload), &payload_len, deadline) != 0)
+            return -1;
+        if (type == 4u && stream_id == 0u) {
+            if (!(flags & 1u) && h2_write_frame(ssl, fd, 4u, 1u, 0u,
+                                                 NULL, 0, deadline) != 0)
+                return -1;
+            continue;
+        }
+        if (type == 6u && stream_id == 0u) {
+            if (payload_len != 8u) return -1;
+            if (!(flags & 1u) && h2_write_frame(ssl, fd, 6u, 1u, 0u,
+                                                 payload, payload_len,
+                                                 deadline) != 0)
+                return -1;
+            continue;
+        }
+        if (type == 7u || (type == 3u && stream_id == 1u)) return -1;
+        if (stream_id != 1u) continue;
+        if (type == 1u && !headers_seen) {
+            int headers_end_stream = (flags & 1u) != 0;
+            size_t offset = 0;
+            size_t end = payload_len;
+            if (flags & 0x08u) {
+                if (!payload_len) return -1;
+                size_t padding = payload[offset++];
+                if (padding > end - offset) return -1;
+                end -= padding;
+            }
+            if (flags & 0x20u) {
+                if (end - offset < 5u) return -1;
+                offset += 5u;
+            }
+            size_t fragment_len = end - offset;
+            if (fragment_len > sizeof(headers) - headers_len) return -1;
+            memcpy(headers + headers_len, payload + offset, fragment_len);
+            headers_len += fragment_len;
+            while (!(flags & 0x04u)) {
+                if (h2_read_frame(ssl, fd, &type, &flags, &stream_id, payload,
+                                  sizeof(payload), &payload_len,
+                                  deadline) != 0 || type != 9u ||
+                    stream_id != 1u ||
+                    payload_len > sizeof(headers) - headers_len) return -1;
+                memcpy(headers + headers_len, payload, payload_len);
+                headers_len += payload_len;
+            }
+            headers_seen = 1;
+            status_ok = h2_response_is_ok(headers, headers_len);
+            if (!status_ok) return -1;
+            if (headers_end_stream) stream_done = 1;
+        } else if (type == 0u) {
+            if (!headers_seen || !status_ok) return -1;
+            size_t offset = 0;
+            size_t end = payload_len;
+            if (flags & 0x08u) {
+                if (!payload_len) return -1;
+                size_t padding = payload[offset++];
+                if (padding > end - offset) return -1;
+                end -= padding;
+            }
+            size_t data_len = end - offset;
+            if (data_len > body_cap - *body_len) return -1;
+            memcpy(body + *body_len, payload + offset, data_len);
+            *body_len += data_len;
+            if (flags & 1u) stream_done = 1;
+        }
+    }
+    return 0;
+}
+
+static int tg_route_dns_https2_request(
+    tg_route_dns *cache, const char *hostname,
+    const tg_listener_destination *target, const char *path,
+    const uint8_t *request_body, size_t request_body_len,
+    uint8_t *response_body, size_t response_body_cap,
+    size_t *response_body_len) {
+    if (!cache || !cache->tls_context || !valid_domain(hostname) || !path ||
+        strcmp(path, "/dns-query") != 0 || !request_body ||
+        request_body_len > 65535u || !response_body || !response_body_len ||
+        response_body_cap > TG_ROUTE_HTTPS_BODY_MAX) return -1;
+    int fd = -1;
+    SSL *ssl = NULL;
+    if (https_connect(cache, hostname, target, 1, &fd, &ssl) != 0) return -1;
+    uint64_t deadline = monotonic_ms() + TG_ROUTE_DOH_TIMEOUT_MS;
+    static const uint8_t preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    uint8_t headers[512];
+    size_t headers_len = 0;
+    int rc = ssl_write_all(ssl, fd, preface, sizeof(preface) - 1u,
+                           deadline);
+    if (rc == 0)
+        rc = h2_write_frame(ssl, fd, 4u, 0u, 0u, NULL, 0, deadline);
+    if (rc == 0)
+        rc = h2_encode_doh_headers(hostname, request_body_len, headers,
+                                   sizeof(headers), &headers_len);
+    if (rc == 0)
+        rc = h2_write_frame(ssl, fd, 1u, 0x04u, 1u, headers, headers_len,
+                            deadline);
+    if (rc == 0)
+        rc = h2_write_frame(ssl, fd, 0u, 0x01u, 1u, request_body,
+                            request_body_len, deadline);
+    if (rc == 0)
+        rc = h2_response_body(ssl, fd, response_body, response_body_cap,
+                              response_body_len, deadline);
+    SSL_free(ssl);
+    close(fd);
+    return rc;
 }
 
 static int http_response_has_explicit_framing(const uint8_t *response,
@@ -576,7 +955,7 @@ int tg_route_dns_https_request(
         (content_type && contains_http_control(content_type))) return -1;
     int fd = -1;
     SSL *ssl = NULL;
-    if (https_connect(cache, hostname, target, &fd, &ssl) != 0) return -1;
+    if (https_connect(cache, hostname, target, 0, &fd, &ssl) != 0) return -1;
     uint64_t deadline = monotonic_ms() + TG_ROUTE_DOH_TIMEOUT_MS;
     char request[2048];
     int request_len = snprintf(request, sizeof(request),
@@ -620,10 +999,15 @@ static int doh_query_endpoint(tg_route_dns *cache,
     memcpy(target.address, endpoint->address, sizeof(endpoint->address));
     uint8_t body[TG_ROUTE_HTTPS_BODY_MAX];
     size_t body_len = 0;
-    if (tg_route_dns_https_request(
-            cache, endpoint->host, &target, "POST", "/dns-query",
-            "application/dns-message", "application/dns-message", query,
-            query_len, body, sizeof(body), &body_len) != 0)
+    int request_rc = endpoint->http2
+        ? tg_route_dns_https2_request(cache, endpoint->host, &target,
+                                      "/dns-query", query, query_len, body,
+                                      sizeof(body), &body_len)
+        : tg_route_dns_https_request(
+              cache, endpoint->host, &target, "POST", "/dns-query",
+              "application/dns-message", "application/dns-message", query,
+              query_len, body, sizeof(body), &body_len);
+    if (request_rc != 0)
         return -1;
     return tg_route_dns_parse_response(body, body_len, query_id, addresses,
                                        count);
@@ -729,13 +1113,8 @@ static void *resolver_worker(void *opaque) {
             if (cache->domain_pool && tg_cf_domain_pool_refresh_due(
                     cache->domain_pool, (uint64_t)time(NULL))) {
                 if (tg_cf_domain_pool_refresh(cache->domain_pool, cache) == 0) {
-                    size_t count = tg_cf_domain_pool_count(cache->domain_pool);
-                    for (size_t i = 0; i < count; ++i) {
-                        char domain[TG_CF_DOMAIN_LEN];
-                        if (tg_cf_domain_pool_copy_at(cache->domain_pool, i,
-                                                      domain) == 0)
-                            (void)tg_route_dns_prefetch(cache, domain);
-                    }
+                    tg_route_dns_prefetch_cf_pool(cache,
+                                                  cache->domain_pool);
                 }
                 pthread_mutex_lock(&cache->mutex);
                 continue;
@@ -861,6 +1240,28 @@ int tg_route_dns_prefetch(tg_route_dns *cache, const char *domain) {
         ? -1 : enqueue(cache, index, monotonic_ms());
     pthread_mutex_unlock(&cache->mutex);
     return rc;
+}
+
+void tg_route_dns_prefetch_cf_pool(tg_route_dns *cache,
+                                   tg_cf_domain_pool *pool) {
+    if (!cache || !pool) return;
+    /* Bound initial requests on small routers. Remaining hostnames are
+     * enqueued lazily by route selection when needed. */
+    size_t count = tg_cf_domain_pool_count(pool);
+    if (count > 3u) count = 3u;
+    for (size_t i = 0; i < count; ++i) {
+        char base[TG_CF_DOMAIN_LEN];
+        if (tg_cf_domain_pool_copy_at(pool, i, base) != 0) continue;
+        for (unsigned dc = 1; dc <= 5; ++dc) {
+            for (unsigned variant = 0; variant <= 1; ++variant) {
+                char host[TG_CF_DOMAIN_LEN];
+                int n = snprintf(host, sizeof(host), "kws%u%s.%s", dc,
+                                 variant ? "-1" : "", base);
+                if (n > 0 && (size_t)n < sizeof(host))
+                    (void)tg_route_dns_prefetch(cache, host);
+            }
+        }
+    }
 }
 
 int tg_route_dns_resolve(tg_route_dns *cache, const char *domain,
