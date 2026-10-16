@@ -61,7 +61,7 @@ short=$(g rev-parse --short=7 HEAD)
 expect "a fix since the last release makes one" "$(key release)" true
 expect "the id carries the time and the commit" "$(key id)" "d2o-20261013-0102-$short"
 expect "the version carries the date and the commit" "$(key version)" "13.10.2026 ($short)"
-if grep -qF -- '--title "D2O $VERSION"' "$ROOT/.github/workflows/release.yml"; then
+if grep -qE -- '--title "D2O [$]VERSION"' "$ROOT/.github/workflows/release.yml"; then
     echo "ok: the release title uses the D2O date and commit"
 else
     echo "FAIL: the release title does not use the D2O date and commit" >&2
