@@ -729,13 +729,8 @@ static void *resolver_worker(void *opaque) {
             if (cache->domain_pool && tg_cf_domain_pool_refresh_due(
                     cache->domain_pool, (uint64_t)time(NULL))) {
                 if (tg_cf_domain_pool_refresh(cache->domain_pool, cache) == 0) {
-                    size_t count = tg_cf_domain_pool_count(cache->domain_pool);
-                    for (size_t i = 0; i < count; ++i) {
-                        char domain[TG_CF_DOMAIN_LEN];
-                        if (tg_cf_domain_pool_copy_at(cache->domain_pool, i,
-                                                      domain) == 0)
-                            (void)tg_route_dns_prefetch(cache, domain);
-                    }
+                    tg_route_dns_prefetch_cf_pool(cache,
+                                                  cache->domain_pool);
                 }
                 pthread_mutex_lock(&cache->mutex);
                 continue;
@@ -861,6 +856,28 @@ int tg_route_dns_prefetch(tg_route_dns *cache, const char *domain) {
         ? -1 : enqueue(cache, index, monotonic_ms());
     pthread_mutex_unlock(&cache->mutex);
     return rc;
+}
+
+void tg_route_dns_prefetch_cf_pool(tg_route_dns *cache,
+                                   tg_cf_domain_pool *pool) {
+    if (!cache || !pool) return;
+    /* Bound initial requests on small routers. Remaining hostnames are
+     * enqueued lazily by route selection when needed. */
+    size_t count = tg_cf_domain_pool_count(pool);
+    if (count > 3u) count = 3u;
+    for (size_t i = 0; i < count; ++i) {
+        char base[TG_CF_DOMAIN_LEN];
+        if (tg_cf_domain_pool_copy_at(pool, i, base) != 0) continue;
+        for (unsigned dc = 1; dc <= 5; ++dc) {
+            for (unsigned variant = 0; variant <= 1; ++variant) {
+                char host[TG_CF_DOMAIN_LEN];
+                int n = snprintf(host, sizeof(host), "kws%u%s.%s", dc,
+                                 variant ? "-1" : "", base);
+                if (n > 0 && (size_t)n < sizeof(host))
+                    (void)tg_route_dns_prefetch(cache, host);
+            }
+        }
+    }
 }
 
 int tg_route_dns_resolve(tg_route_dns *cache, const char *domain,
