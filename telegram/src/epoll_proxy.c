@@ -52,7 +52,9 @@ typedef struct {
     tg_listener_destination original;
     uint64_t cooldown_until_ms;
     uint64_t last_success_ms;
+    uint64_t last_failure_ms;
     uint64_t latency_ms;
+    uint32_t last_failure_stage;
     uint64_t attempts;
     uint64_t failures;
     uint64_t responses;
@@ -148,6 +150,14 @@ struct tg_epoll_proxy {
     uint64_t connections_started;
     uint64_t bytes_from_clients;
     uint64_t bytes_from_upstreams;
+    uint64_t last_success_ms;
+    uint64_t last_success_latency_ms;
+    uint64_t last_failure_ms;
+    uint32_t last_success_dc;
+    uint32_t last_success_route;
+    uint32_t last_failure_dc;
+    uint32_t last_failure_route;
+    uint32_t last_failure_stage;
     route_health route_health[TG_ROUTE_HEALTH_MAX];
     proxy_connection *connections;
     proxy_connection *retired;
@@ -424,7 +434,28 @@ static void route_health_failed(proxy_connection *connection) {
         (size_t)connection->route_health_index];
     if (!health->used) return;
     if (health->failures != UINT64_MAX) ++health->failures;
-    health->cooldown_until_ms = monotonic_ms() + TG_ROUTE_HEALTH_COOLDOWN_MS;
+    uint64_t now = monotonic_ms();
+    health->cooldown_until_ms = now + TG_ROUTE_HEALTH_COOLDOWN_MS;
+    health->last_failure_ms = now;
+    if (connection->connecting || connection->wss_phase == WSS_NONE) {
+        health->last_failure_stage = TG_EPOLL_FAILURE_TCP;
+    } else if (connection->wss_phase == WSS_TLS) {
+        health->last_failure_stage = TG_EPOLL_FAILURE_TLS;
+    } else if (connection->wss_phase == WSS_UPGRADE_WRITE ||
+               connection->wss_phase == WSS_UPGRADE_READ) {
+        health->last_failure_stage = TG_EPOLL_FAILURE_WEBSOCKET;
+    } else if (connection->wss_phase == WSS_READY) {
+        health->last_failure_stage = TG_EPOLL_FAILURE_MTPROTO;
+    } else {
+        health->last_failure_stage = TG_EPOLL_FAILURE_SETUP;
+    }
+    tg_epoll_proxy *server = connection->server;
+    if (now >= server->last_failure_ms) {
+        server->last_failure_ms = now;
+        server->last_failure_dc = health->dc_id;
+        server->last_failure_route = (uint32_t)health->kind;
+        server->last_failure_stage = health->last_failure_stage;
+    }
 }
 
 static size_t route_worker_count(const tg_epoll_proxy *server);
@@ -1492,6 +1523,14 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
             health->last_success_ms = now;
             health->latency_ms = now >= connection->route_started_ms
                 ? now - connection->route_started_ms : 0;
+            if (now >= connection->server->last_success_ms) {
+                connection->server->last_success_ms = now;
+                connection->server->last_success_dc = health->dc_id;
+                connection->server->last_success_route =
+                    (uint32_t)health->kind;
+                connection->server->last_success_latency_ms =
+                    health->latency_ms;
+            }
             if (health->responses != UINT64_MAX) ++health->responses;
             if ((health->kind == TG_ROUTE_CF_WORKER ||
                  health->kind == TG_ROUTE_CF_PROXY) &&
@@ -2044,6 +2083,17 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
     out->bytes_from_upstreams = server->bytes_from_upstreams;
     out->wss_attempts = out->wss_failures = out->wss_responses =
         out->cf_wss_responses = 0;
+    out->last_success_dc = server->last_success_dc;
+    out->last_success_route = server->last_success_route;
+    out->last_success_latency_ms = server->last_success_latency_ms;
+    uint64_t now = monotonic_ms();
+    out->last_success_age_ms = server->last_success_ms &&
+        now >= server->last_success_ms ? now - server->last_success_ms : 0;
+    out->last_failure_dc = server->last_failure_dc;
+    out->last_failure_route = server->last_failure_route;
+    out->last_failure_stage = server->last_failure_stage;
+    out->last_failure_age_ms = server->last_failure_ms &&
+        now >= server->last_failure_ms ? now - server->last_failure_ms : 0;
     for (size_t i = 0; i < TG_ROUTE_HEALTH_MAX; ++i) {
         const route_health *health = &server->route_health[i];
         if (!health->used) continue;

@@ -12,6 +12,16 @@
 
 typedef struct tg_epoll_proxy tg_epoll_proxy;
 
+typedef enum {
+    TG_EPOLL_FAILURE_NONE = 0,
+    TG_EPOLL_FAILURE_DNS = 1,
+    TG_EPOLL_FAILURE_TCP = 2,
+    TG_EPOLL_FAILURE_TLS = 3,
+    TG_EPOLL_FAILURE_WEBSOCKET = 4,
+    TG_EPOLL_FAILURE_MTPROTO = 5,
+    TG_EPOLL_FAILURE_SETUP = 6
+} tg_epoll_failure_stage;
+
 typedef struct {
     size_t active_connections;
     size_t max_connections;
@@ -22,6 +32,14 @@ typedef struct {
     uint64_t wss_failures;
     uint64_t wss_responses;
     uint64_t cf_wss_responses;
+    uint32_t last_success_dc;
+    uint32_t last_success_route;
+    uint64_t last_success_latency_ms;
+    uint64_t last_success_age_ms;
+    uint32_t last_failure_dc;
+    uint32_t last_failure_route;
+    uint32_t last_failure_stage;
+    uint64_t last_failure_age_ms;
 } tg_epoll_proxy_stats;
 
 typedef int (*tg_epoll_original_destination_fn)(

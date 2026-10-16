@@ -76,6 +76,20 @@
     if (h < 48) return h + " ч " + (m % 60) + " мин";
     return Math.floor(h / 24) + " дн " + (h % 24) + " ч";
   }
+  function telegramRouteName(route) {
+    return route === 1 ? "прямой WSS" :
+      route === 2 ? "Worker Cloudflare" :
+      route === 3 ? "CF proxy" : "неизвестный маршрут";
+  }
+  function telegramFailureStage(stage) {
+    return stage === 1 ? "DNS" :
+      stage === 2 ? "TCP" :
+      stage === 3 ? "TLS" :
+      stage === 4 ? "WebSocket" :
+      stage === 5 ? "MTProto" :
+      stage === 6 ? "настройка маршрута" : "неизвестный этап";
+  }
+  function telegramAge(ms) { return ms < 1000 ? "только что" : duration(ms); }
   function clock(ms) {
     var s = Math.max(0, Math.floor(ms / 1000));
     var m = Math.floor(s / 60), h = Math.floor(m / 60);
@@ -2156,6 +2170,12 @@
     var stats = snap.telegram_stats;
     if (stats && typeof stats.wss_attempts === "number") {
       children.push(el(doc, "p", "tunnel-note", "Маршруты WSS: попыток " + stats.wss_attempts + ", сбоев " + stats.wss_failures + ", ответов " + stats.wss_responses + " (CF: " + stats.cf_wss_responses + ")."));
+      if (stats.last_success_dc > 0 && stats.last_success_route > 0) {
+        children.push(el(doc, "p", "tunnel-note", "Последний подтверждённый ответ MTProto: DC " + stats.last_success_dc + ", " + telegramRouteName(stats.last_success_route) + ", " + stats.last_success_latency_ms + " мс, " + telegramAge(stats.last_success_age_ms) + " назад."));
+      }
+      if (stats.last_failure_dc > 0 && stats.last_failure_route > 0) {
+        children.push(el(doc, "p", "tunnel-note", "Последняя ошибка WSS: DC " + stats.last_failure_dc + ", " + telegramRouteName(stats.last_failure_route) + ", этап " + telegramFailureStage(stats.last_failure_stage) + ", " + telegramAge(stats.last_failure_age_ms) + " назад."));
+      }
     }
     body.setAttribute("data-state", st);
     /* Сцена одна на все состояния: смена состояния — переход на том же рисунке. */
@@ -2362,7 +2382,10 @@
 
   var api = {
     model: model, coveredBy: coveredBy, slotsView: slotsView, trackFor: trackFor, shapeLabel: shapeLabel,
-    planGist: planGist, plural: plural, duration: duration, tunnelTraffic: tunnelTraffic, App: App
+    planGist: planGist, plural: plural, duration: duration,
+    telegramRouteName: telegramRouteName,
+    telegramFailureStage: telegramFailureStage,
+    tunnelTraffic: tunnelTraffic, App: App
   };
   if (typeof module === "object" && module.exports) module.exports = api;
   if (global && global.document && global.document.getElementById) {

@@ -4,6 +4,7 @@
 #include "tg_stats_socket.h"
 #include "tg_tls.h"
 #include "tg_ws.h"
+#include "tg_route_plan.h"
 
 #include <assert.h>
 #include <arpa/inet.h>
@@ -845,12 +846,14 @@ static void test_read_only_stats_socket(void) {
     assert(client >= 0);
     assert(connect(client, (struct sockaddr *)&address, sizeof(address)) == 0);
     assert(tg_stats_socket_serve(&stats_socket, proxy) == 0);
-    char response[256];
+    char response[768];
     ssize_t length = recv(client, response, sizeof(response) - 1, 0);
     assert(length > 0);
     response[length] = '\0';
     assert(strstr(response, "\"active_connections\":0") != NULL);
     assert(strstr(response, "\"connections_started\":0") != NULL);
+    assert(strstr(response, "\"last_success_dc\":0") != NULL);
+    assert(strstr(response, "\"last_failure_stage\":0") != NULL);
     close(client);
 
     tg_stats_socket_close(&stats_socket);
@@ -1392,6 +1395,11 @@ static void test_epoll_wss_failure_cooldown_and_recovery(void) {
     assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
     assert(stats.wss_attempts == 3 && stats.wss_failures == 2 &&
            stats.wss_responses == 1);
+    assert(stats.last_success_dc > 0 &&
+           stats.last_success_route == TG_ROUTE_DIRECT_WSS);
+    assert(stats.last_failure_dc > 0 &&
+           stats.last_failure_route == TG_ROUTE_DIRECT_WSS &&
+           stats.last_failure_stage == TG_EPOLL_FAILURE_MTPROTO);
     tg_epoll_proxy_destroy(proxy);
     close(listener);
     close(wss.listener);

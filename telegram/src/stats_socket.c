@@ -132,16 +132,21 @@ int tg_stats_socket_serve(tg_stats_socket *server,
             continue;
         }
         tg_epoll_proxy_stats stats;
-        char response[512];
+        char response[768];
         int n = tg_epoll_proxy_get_stats(proxy, &stats);
         int length = n == 0
             ? snprintf(response, sizeof(response),
-                       "{\"active_connections\":%zu,\"max_connections\":%zu,\"connections_started\":%" PRIu64 ",\"bytes_from_clients\":%" PRIu64 ",\"bytes_from_upstreams\":%" PRIu64 ",\"wss_attempts\":%" PRIu64 ",\"wss_failures\":%" PRIu64 ",\"wss_responses\":%" PRIu64 ",\"cf_wss_responses\":%" PRIu64 "}\n",
+                       "{\"active_connections\":%zu,\"max_connections\":%zu,\"connections_started\":%" PRIu64 ",\"bytes_from_clients\":%" PRIu64 ",\"bytes_from_upstreams\":%" PRIu64 ",\"wss_attempts\":%" PRIu64 ",\"wss_failures\":%" PRIu64 ",\"wss_responses\":%" PRIu64 ",\"cf_wss_responses\":%" PRIu64 ",\"last_success_dc\":%u,\"last_success_route\":%u,\"last_success_latency_ms\":%" PRIu64 ",\"last_success_age_ms\":%" PRIu64 ",\"last_failure_dc\":%u,\"last_failure_route\":%u,\"last_failure_stage\":%u,\"last_failure_age_ms\":%" PRIu64 "}\n",
                        stats.active_connections, stats.max_connections,
                        stats.connections_started, stats.bytes_from_clients,
                        stats.bytes_from_upstreams, stats.wss_attempts,
                        stats.wss_failures, stats.wss_responses,
-                       stats.cf_wss_responses)
+                       stats.cf_wss_responses, stats.last_success_dc,
+                       stats.last_success_route,
+                       stats.last_success_latency_ms,
+                       stats.last_success_age_ms, stats.last_failure_dc,
+                       stats.last_failure_route, stats.last_failure_stage,
+                       stats.last_failure_age_ms)
             : -1;
         if (length > 0 && (size_t)length < sizeof(response)) {
             size_t sent = 0;

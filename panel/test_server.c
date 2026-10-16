@@ -226,7 +226,11 @@ static void *serve_telegram_stats(void *opaque) {
               "\"connections_started\":9,\"bytes_from_clients\":1234,"
               "\"bytes_from_upstreams\":5678,\"wss_attempts\":8,"
               "\"wss_failures\":2,\"wss_responses\":5,"
-              "\"cf_wss_responses\":3}\n");
+              "\"cf_wss_responses\":3,\"last_success_dc\":2,"
+              "\"last_success_route\":1,\"last_success_latency_ms\":126,"
+              "\"last_success_age_ms\":500,\"last_failure_dc\":3,"
+              "\"last_failure_route\":2,\"last_failure_stage\":4,"
+              "\"last_failure_age_ms\":9000}\n");
     close(client);
     close(fixture->listener);
     return NULL;
@@ -275,7 +279,11 @@ static void test_telegram_stats_socket_is_normalized_for_status_api(void) {
                   "\"max_connections\":64,\"connections_started\":9,"
                   "\"bytes_from_clients\":1234,\"bytes_from_upstreams\":5678,"
                   "\"wss_attempts\":8,\"wss_failures\":2,"
-                  "\"wss_responses\":5,\"cf_wss_responses\":3}") != NULL);
+                  "\"wss_responses\":5,\"cf_wss_responses\":3,"
+                  "\"last_success_dc\":2,\"last_success_route\":1,"
+                  "\"last_success_latency_ms\":126,\"last_success_age_ms\":500,"
+                  "\"last_failure_dc\":3,\"last_failure_route\":2,"
+                  "\"last_failure_stage\":4,\"last_failure_age_ms\":9000}") != NULL);
     unlink(socket_path);
     unlink(live);
     unlink(status);

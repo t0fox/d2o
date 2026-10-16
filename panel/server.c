@@ -428,9 +428,20 @@ static int telegram_stats_number(const char *json, const char *key,
     return 0;
 }
 
+static int telegram_stats_optional_number(const char *json, const char *key,
+                                         char out[21]) {
+    const char *value = NULL;
+    size_t length = 0;
+    if (!json_top_value(json, key, &value, &length)) {
+        memcpy(out, "0", 2);
+        return 0;
+    }
+    return telegram_stats_number(json, key, out);
+}
+
 static void telegram_stats_value(const d2k_panel_config *cfg,
-                                 char out[512]) {
-    snprintf(out, 512, "null");
+                                 char out[1024]) {
+    snprintf(out, 1024, "null");
     if (!cfg || !cfg->telegram_stats_path) return;
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
@@ -491,6 +502,8 @@ static void telegram_stats_value(const d2k_panel_config *cfg,
     if (!json_valid_object(raw, raw + used)) return;
     char active[21], maximum[21], started[21], from_client[21], from_upstream[21];
     char wss_attempts[21], wss_failures[21], wss_responses[21], cf_responses[21];
+    char success_dc[21], success_route[21], success_latency[21], success_age[21];
+    char failure_dc[21], failure_route[21], failure_stage[21], failure_age[21];
     if (telegram_stats_number(raw, "active_connections", active) != 0 ||
         telegram_stats_number(raw, "max_connections", maximum) != 0 ||
         telegram_stats_number(raw, "connections_started", started) != 0 ||
@@ -499,16 +512,30 @@ static void telegram_stats_value(const d2k_panel_config *cfg,
         telegram_stats_number(raw, "wss_attempts", wss_attempts) != 0 ||
         telegram_stats_number(raw, "wss_failures", wss_failures) != 0 ||
         telegram_stats_number(raw, "wss_responses", wss_responses) != 0 ||
-        telegram_stats_number(raw, "cf_wss_responses", cf_responses) != 0)
+        telegram_stats_number(raw, "cf_wss_responses", cf_responses) != 0 ||
+        telegram_stats_optional_number(raw, "last_success_dc", success_dc) != 0 ||
+        telegram_stats_optional_number(raw, "last_success_route", success_route) != 0 ||
+        telegram_stats_optional_number(raw, "last_success_latency_ms", success_latency) != 0 ||
+        telegram_stats_optional_number(raw, "last_success_age_ms", success_age) != 0 ||
+        telegram_stats_optional_number(raw, "last_failure_dc", failure_dc) != 0 ||
+        telegram_stats_optional_number(raw, "last_failure_route", failure_route) != 0 ||
+        telegram_stats_optional_number(raw, "last_failure_stage", failure_stage) != 0 ||
+        telegram_stats_optional_number(raw, "last_failure_age_ms", failure_age) != 0)
         return;
-    (void)snprintf(out, 512,
+    (void)snprintf(out, 1024,
                    "{\"active_connections\":%s,\"max_connections\":%s,"
                    "\"connections_started\":%s,\"bytes_from_clients\":%s,"
                    "\"bytes_from_upstreams\":%s,\"wss_attempts\":%s,"
                    "\"wss_failures\":%s,\"wss_responses\":%s,"
-                   "\"cf_wss_responses\":%s}",
+                   "\"cf_wss_responses\":%s,\"last_success_dc\":%s,"
+                   "\"last_success_route\":%s,\"last_success_latency_ms\":%s,"
+                   "\"last_success_age_ms\":%s,\"last_failure_dc\":%s,"
+                   "\"last_failure_route\":%s,\"last_failure_stage\":%s,"
+                   "\"last_failure_age_ms\":%s}",
                    active, maximum, started, from_client, from_upstream,
-                   wss_attempts, wss_failures, wss_responses, cf_responses);
+                   wss_attempts, wss_failures, wss_responses, cf_responses,
+                   success_dc, success_route, success_latency, success_age,
+                   failure_dc, failure_route, failure_stage, failure_age);
 }
 
 static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
@@ -802,7 +829,7 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     const char *panel_listen = cfg && cfg->panel_listen ? cfg->panel_listen : "127.0.0.1:8090";
     int queue = cfg ? cfg->queue_num : 2000;
     int telegram_enabled=0,telegram_configured=0,telegram_running=0;char telegram_status[24];
-    char telegram_stats[512];
+    char telegram_stats[1024];
     telegram_config_flags(cfg,&telegram_enabled,&telegram_configured);
     telegram_status_value(cfg,telegram_enabled,telegram_configured,&telegram_running,telegram_status);
     telegram_stats_value(cfg,telegram_stats);
