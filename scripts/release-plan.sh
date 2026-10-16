@@ -25,11 +25,11 @@ OUTPUT=${GITHUB_OUTPUT:-/dev/stdout}
 
 sha=$(git rev-parse HEAD)
 short=$(git rev-parse --short=7 HEAD)
-id="d2o-$NOW-$short"
+id="d2k-$NOW-$short"
 day=${NOW%%-*}
 version="$(echo "$day" | cut -c7-8).$(echo "$day" | cut -c5-6).$(echo "$day" | cut -c1-4) ($short)"
 
-last=$(git describe --tags --abbrev=0 --match 'd2o-*' HEAD 2>/dev/null || true)
+last=$(git describe --tags --abbrev=0 --match 'd2k-*' HEAD 2>/dev/null || true)
 range=HEAD
 [ -z "$last" ] || range="$last..HEAD"
 
@@ -58,7 +58,7 @@ elif [ -n "$worthy" ]; then
     # The panel shows the notes; thirty lines is the most a person reads there.
     notes=$(printf 'Что изменилось:\n'; printf '%s\n' "$worthy" | head -n 30 | sed 's/^/- /')
 else
-    notes="Выпуск d2o $version"
+    notes="Выпуск D2K $version"
 fi
 
 {
@@ -66,8 +66,8 @@ fi
     echo "sha=$sha"
     echo "id=$id"
     echo "version=$version"
-    echo "notes<<D2O_NOTES_EOF"
+    echo "notes<<D2K_NOTES_EOF"
     printf '%s\n' "$notes"
-    echo "D2O_NOTES_EOF"
+    echo "D2K_NOTES_EOF"
 } >> "$OUTPUT"
 echo "release-plan: release=$release ($why)" >&2

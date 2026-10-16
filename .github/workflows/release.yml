@@ -1,4 +1,4 @@
-name: d2o release
+name: D2K release
 # Continuous delivery from main. Nobody starts a release by hand:
 #
 #   push to main → CI (ci.yml) → ci-ok green → this workflow
@@ -11,7 +11,7 @@ name: d2o release
 # Routers take releases/latest/download/latest.json, check the signature with
 # the pinned key and install the archive for their CPU (files/d2k-update.sh).
 #
-# The manual run (Actions → d2o release → Run workflow) stays for one case:
+# The manual run (Actions → D2K release → Run workflow) stays for one case:
 # release main now even without a fix or a feature.
 on:
   workflow_call:
@@ -222,7 +222,7 @@ jobs:
           # A run cancelled between "draft" and "public" leaves its draft.
           # Only drafts of this workflow go: d2k-* and never published.
           gh release list --limit 100 --json tagName,isDraft \
-            --jq '.[] | select(.isDraft and (.tagName | startswith("d2o-"))) | .tagName' |
+            --jq '.[] | select(.isDraft and (.tagName | startswith("d2k-"))) | .tagName' |
             while read -r t; do gh release delete "$t" --yes; done
           out="$RUNNER_TEMP/release"
           printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.txt"
