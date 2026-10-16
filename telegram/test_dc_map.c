@@ -50,6 +50,31 @@ static void test_builtin_map_accepts_only_exact_known_dc_addresses(void) {
     assert(tg_dc_resolve(NULL, &dst, 0, 0, 0, &route, &source) == TG_DC_LOOKUP_NOT_LISTED);
 }
 
+static void test_builtin_map_accepts_known_ipv6_dc_addresses(void) {
+    static const struct {
+        uint32_t dc;
+        const char *address;
+    } routes[] = {
+        {1, "2001:b28:f23d:f001::a"},
+        {2, "2001:67c:4e8:f002::a"},
+        {3, "2001:b28:f23d:f003::a"},
+        {4, "2001:67c:4e8:f004::a"},
+        {5, "2001:b28:f23f:f005::a"}
+    };
+    tg_dc_endpoint route;
+    tg_dc_map_source source;
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); ++i) {
+        tg_listener_destination dst = destination(routes[i].address, 443);
+        assert(tg_dc_resolve(NULL, &dst, 0, routes[i].dc, 0,
+                             &route, &source) == TG_DC_LOOKUP_OK);
+        assert(route.id == routes[i].dc && route.family == AF_INET6 &&
+               source == TG_DC_MAP_BUILTIN);
+    }
+    tg_listener_destination unknown = destination("2001:db8::9", 443);
+    assert(tg_dc_resolve(NULL, &unknown, 0, 0, 0, &route, &source) ==
+           TG_DC_LOOKUP_NOT_LISTED);
+}
+
 static void test_official_map_enforces_media_dc_and_cdn_flags(void) {
     tg_dc_endpoint endpoints[8];
     tg_dc_snapshot snapshot = complete_snapshot(endpoints);
@@ -94,6 +119,7 @@ static void test_snapshot_validation_requires_complete_safe_primary_map(void) {
 
 int main(void) {
     test_builtin_map_accepts_only_exact_known_dc_addresses();
+    test_builtin_map_accepts_known_ipv6_dc_addresses();
     test_official_map_enforces_media_dc_and_cdn_flags();
     test_snapshot_validation_requires_complete_safe_primary_map();
     puts("Тесты карты Telegram DC: ок");

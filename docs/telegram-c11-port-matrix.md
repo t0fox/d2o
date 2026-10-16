@@ -14,7 +14,7 @@
 | Abridged, intermediate и padded intermediate; разбиение пакетов | `splitter.rs` | `mtproto_splitter.c`; для direct WSS и CF proxy сохраняются MTProto-границы, Worker использует потоковый режим | `telegram/differential/run.py` на Rust HEAD `4ef79fb` сравнивает несколько пакетов, произвольные границы чтений, CTR, raw mode, EOF flush и oversize на 144 воспроизводимых сценариях; расхождений нет. Это не сверяет полный runtime и выбор маршрутов. |
 | Исходное назначение, IPv4/IPv6, разрешение Telegram DC | `transparent.rs`, `transparent_proxy.rs` | `listener.c` читает IPv4/IPv6 `SO_ORIGINAL_DST`; `transparent.c` проверяет DC-карту, порт, CIDR и защиту от собственного dial | Парсер и политика покрыты тестами. Kernel REDIRECT для IPv6 и фактический трафик на роутере не проверялись. |
 | TCP bridge, backpressure, закрытие и тайм-ауты | `transparent_proxy.rs`, `bridge.rs` | Linux `epoll` runtime, ограниченные очереди, неблокирующий TLS, WSS ping/pong/close, idle и handshake deadlines | Локальные тесты epoll, WSS и лимитов проходят. Стресс-тест на целевом роутере отсутствует. |
-| DC discovery, проверка `req_pq_multi/resPQ`, auth и `help.getConfig` | `dc_discovery.rs` | `mtproto_probe.c`, `mtproto_auth.c`, `mtproto_config.c`; демон обновляет карту через IPv4/IPv6 seed DC1, сохраняет LKG и повторяет неудачу позже | Парсеры и криптография покрыты векторами. Одиночный CLI проверяет указанный IP; `--check-telegram-dc-matrix` и `--discover-telegram-dc-matrix` проверяют DC1–DC5. 2026-10-16 все пять TCP probes дошли до `resPQ`, а `help.getConfig` вернул совпавший `this_dc` и 19 endpoints. |
+| DC discovery, проверка `req_pq_multi/resPQ`, auth и `help.getConfig` | `dc_discovery.rs` | `mtproto_probe.c`, `mtproto_auth.c`, `mtproto_config.c`; демон обновляет карту через IPv4/IPv6 seed DC1, сохраняет LKG и повторяет неудачу позже | Парсеры и криптография покрыты векторами. Differential runner сверяет C/Rust выбор DC и причины отказа на 116 сценариях: все 33 встроенных IPv4 адреса, media/DC подсказки и синтетические официальные `dcOption` для TCP-only порта, CDN, IPv6, неоднозначности и неизвестных адресов. C дополнительно содержит пять встроенных IPv6 fallback адресов, отсутствующих в Rust `DEFAULT_DC_ROUTES`; официальный IPv6 путь сравнивается. Одиночный CLI проверяет указанный IP; `--check-telegram-dc-matrix` и `--discover-telegram-dc-matrix` проверяют DC1–DC5. 2026-10-16 все пять TCP probes дошли до `resPQ`, а `help.getConfig` вернул совпавший `this_dc` и 19 endpoints. |
 | Прямой Telegram WSS `kwsN.web.telegram.org/apiws` | `ws_client.rs`, `routing.rs` | Direct WSS для DC1–DC5, TLS hostname/SNI и проверка сертификата; при сбое до WebSocket Upgrade маршрут меняется дальше по плану | Локальные тесты проходят. `--check-telegram-wss-matrix [CA_BUNDLE]` различает DNS/TCP/TLS/WS/MTProto и проверяет `resPQ` с nonce. 2026-10-16 все `kws1`–`kws5` вернули `resPQ`. В `files/tg-roots.pem` добавлен [официальный Go Daddy Root G2](https://certs.godaddy.com/repository/?lang=ENU) (SHA-256 `45140B3247EB9CC8C5B4F0D7B53091F73292089E6E5A63E2749DD3ACA9198EDA`), потому что текущая цепочка Telegram WSS заканчивается на нём. |
 | Cloudflare Worker на пользовательском домене | `routing.rs`, `bridge.rs` | `TG_CF_WORKER_DOMAIN`; проверенный TLS, настраиваемый Worker path, потоковый framing | План и transport mocks покрыты. Живой Worker/domain не проверен. |
 | Резервный CF WebSocket proxy | `routing.rs`, `cf_proxy_doh.rs` | `TG_CF_DOMAIN`; WSS с MTProto packet framing и ограниченным пулом доменов | Локальные тесты плана, DNS и пула проходят. Живые CF proxy домены не проверялись. |
@@ -56,9 +56,10 @@ OpenSSL и MTProto (размеры приведены в таблице). Реа
 не менялось. Повторяемый `telegram/differential/run.py` закрепляет донорский
 Rust SHA и собирает временный runner рядом с неизменённой копией донора. Он
 сравнивает `splitter.rs`/`crypto.rs` с `mtproto_splitter.c`/`mtproto_crypto.c`
-на 144 framing-сценариях и 90 проверках Obfuscated2; текущая проверка прошла без
-расхождений. Сверка остальных перечисленных выше runtime-функций и маршрутов
-ещё не реализована.
+на 144 framing-сценариях и 90 проверках Obfuscated2, а `dc_map.rs`/C
+`tg_dc_resolve` — на 116 сценариях карты DC; текущая проверка прошла без
+расхождений. Сверка остальных перечисленных выше runtime-функций и выбора либо
+переключения сетевых маршрутов ещё не реализована.
 
 Для `help.getConfig` C-парсер пропускает корректный `msg_container` только с
 управляющими сообщениями `new_session_created` и `msgs_ack`, затем принимает

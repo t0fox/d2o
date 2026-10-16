@@ -110,6 +110,82 @@ def handshake_requests() -> str:
     return "\n".join(requests) + "\n"
 
 
+BUILTIN_DC_ROUTES = (
+    (1, "149.154.175.50", 0), (1, "149.154.175.51", 0),
+    (1, "149.154.175.52", 1), (1, "149.154.175.53", 0),
+    (1, "149.154.175.54", 0), (2, "149.154.167.41", 0),
+    (2, "149.154.167.50", 0), (2, "149.154.167.51", 0),
+    (2, "149.154.167.220", 0), (2, "95.161.76.100", 0),
+    (2, "149.154.167.151", 1), (2, "149.154.167.222", 1),
+    (2, "149.154.167.223", 1), (2, "149.154.162.123", 1),
+    (3, "149.154.175.100", 0), (3, "149.154.175.101", 0),
+    (3, "149.154.175.102", 1), (4, "149.154.167.91", 0),
+    (4, "149.154.167.92", 0), (4, "149.154.164.250", 1),
+    (4, "149.154.166.120", 1), (4, "149.154.166.121", 1),
+    (4, "149.154.167.118", 1), (4, "149.154.165.111", 1),
+    (5, "91.108.56.100", 0), (5, "91.108.56.101", 0),
+    (5, "91.108.56.116", 0), (5, "91.108.56.126", 0),
+    (5, "149.154.171.5", 0), (5, "91.108.56.102", 1),
+    (5, "91.108.56.128", 1), (5, "91.108.56.151", 1),
+    (203, "91.105.192.100", 0),
+)
+
+
+def dc_map_corpus() -> str:
+    cases: list[str] = []
+
+    def add(case_id, source, address, port, media, dc, endpoints=()):
+        encoded = "/".join(
+            ",".join(str(value) for value in endpoint) for endpoint in endpoints
+        )
+        cases.append(
+            f"{case_id}\t{source}\t{address}\t{port}\t{media}\t{dc}\t{encoded}"
+        )
+
+    for index, (dc, address, _media_only) in enumerate(BUILTIN_DC_ROUTES):
+        for media in (0, 1):
+            add(f"builtin-{index}-media-{media}", "builtin", address, 443, media, 0)
+        add(f"builtin-{index}-wrong-dc", "builtin", address, 443, 1,
+            2 if dc == 203 else dc + 1)
+
+    add("builtin-unlisted", "builtin", "149.154.167.99", 443, 1, 0)
+    add("builtin-unlisted-v6", "builtin", "2001:db8::9", 443, 1, 0)
+
+    regular = (2, "149.154.167.240", 443, 0, 0, 0, 0, 0)
+    media = (2, "149.154.167.241", 443, 1, 0, 0, 0, 0)
+    restricted = (3, "149.154.167.242", 5222, 0, 1, 0, 0, 1)
+    cdn = (3, "149.154.167.243", 443, 0, 0, 1, 0, 0)
+    ipv6 = (4, "2001:b28:f23d:f001::a", 443, 0, 0, 0, 0, 0)
+    conflict_a = (2, "149.154.167.244", 443, 0, 0, 0, 0, 0)
+    conflict_b = (3, "149.154.167.244", 443, 0, 0, 0, 0, 0)
+    port_general = (2, "149.154.167.245", 443, 0, 0, 0, 0, 0)
+    port_specific = (2, "149.154.167.245", 5222, 0, 1, 0, 1, 1)
+    conflicting_cdn = (2, "149.154.167.246", 443, 0, 0, 1, 0, 0)
+    conflicting_regular = (2, "149.154.167.246", 443, 0, 0, 0, 0, 0)
+
+    add("official-regular", "official", regular[1], 443, 0, 0, [regular])
+    add("official-wrong-dc", "official", regular[1], 443, 0, 3, [regular])
+    add("official-unlisted", "official", "149.154.167.247", 443, 0, 0, [regular])
+    add("official-media-rejected", "official", media[1], 443, 0, 0, [media])
+    add("official-media-accepted", "official", media[1], 443, 1, 2, [media])
+    add("official-media-wrong-dc", "official", media[1], 443, 1, 3, [media])
+    add("official-port-rejected", "official", restricted[1], 443, 0, 0, [restricted])
+    add("official-port-accepted", "official", restricted[1], 5222, 0, 3, [restricted])
+    add("official-cdn-rejected", "official", cdn[1], 443, 0, 0, [cdn])
+    add("official-v6", "official", ipv6[1], 443, 0, 4, [ipv6])
+    add("official-ambiguous", "official", conflict_a[1], 443, 0, 0,
+        [conflict_a, conflict_b])
+    add("official-ambiguous-narrowed", "official", conflict_a[1], 443, 0, 3,
+        [conflict_a, conflict_b])
+    add("official-specific-port-selected", "official", port_general[1], 5222, 0, 2,
+        [port_general, port_specific])
+    add("official-general-port-selected", "official", port_general[1], 443, 0, 2,
+        [port_general, port_specific])
+    add("official-flag-ambiguity", "official", conflicting_cdn[1], 443, 0, 0,
+        [conflicting_cdn, conflicting_regular])
+    return "\n".join(cases) + "\n"
+
+
 def extract_donor(repo: Path, target: Path) -> Path:
     found = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", f"{DONOR_COMMIT}^{{commit}}"],
@@ -174,6 +250,7 @@ def main() -> int:
         rust_bin_dir = donor / "src" / "bin"
         rust_bin_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(Path(__file__).parent / "rust" / "main.rs", rust_bin_dir / "d2o-differential.rs")
+        shutil.copyfile(Path(__file__).parent / "rust" / "dc_map.rs", rust_bin_dir / "d2o-dc-map-differential.rs")
 
         c_binary = temp / "c-differential"
         command(
@@ -292,10 +369,59 @@ def main() -> int:
             print("\n".join(diff), file=sys.stderr)
             return 1
 
+        dc_map_input = dc_map_corpus().encode()
+        c_dc_binary = temp / "c-dc-map-differential"
+        command(
+            [
+                os.environ.get("CC", "cc"),
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pedantic",
+                "-D_POSIX_C_SOURCE=200809L",
+                f"-I{ROOT / 'telegram' / 'include'}",
+                str(Path(__file__).parent / "c" / "dc_map.c"),
+                str(ROOT / "telegram" / "src" / "dc_map.c"),
+                "-o",
+                str(c_dc_binary),
+            ]
+        )
+        c_dc_output = command(
+            [str(c_dc_binary)], input=dc_map_input, capture_output=True
+        ).stdout.decode()
+        rust_dc_output = command(
+            [
+                "cargo",
+                "run",
+                "--quiet",
+                "--locked",
+                "--manifest-path",
+                str(donor / "Cargo.toml"),
+                "--bin",
+                "d2o-dc-map-differential",
+            ],
+            cwd=donor,
+            input=dc_map_input,
+            capture_output=True,
+            env=env,
+        ).stdout.decode()
+        if c_dc_output != rust_dc_output:
+            diff = difflib.unified_diff(
+                rust_dc_output.splitlines(),
+                c_dc_output.splitlines(),
+                fromfile="Rust DC map",
+                tofile="C DC map",
+                lineterm="",
+            )
+            print("\n".join(diff), file=sys.stderr)
+            return 1
+
         case_count = len(test_input.splitlines())
         print(
             f"C/Rust: совпали {case_count} framing-сценариев и "
-            f"{len(rust_handshake_lines)} проверок Obfuscated2; donor {DONOR_COMMIT}"
+            f"{len(rust_handshake_lines)} проверок Obfuscated2, "
+            f"{len(dc_map_input.splitlines())} сценариев карты DC; donor {DONOR_COMMIT}"
         )
     return 0
 
