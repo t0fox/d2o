@@ -90,6 +90,18 @@ done:
     return rc;
 }
 
+int tg_mtproto_direct_server_stream_cipher(
+    const uint8_t init[TG_MTPROTO_HANDSHAKE_LEN], tg_mtproto_ctr *decrypt) {
+    uint8_t reversed[TG_MTPROTO_PREKEY_IV_LEN];
+    int rc;
+    if (!init || !decrypt || decrypt->ctx) return -1;
+    for (size_t i = 0; i < sizeof(reversed); ++i)
+        reversed[i] = init[55u - i];
+    rc = tg_mtproto_ctr_init(decrypt, reversed, reversed + 32);
+    OPENSSL_cleanse(reversed, sizeof(reversed));
+    return rc;
+}
+
 int tg_mtproto_aes_ige(uint8_t *data, size_t len, const uint8_t key[32],
                        const uint8_t iv[32], int encrypt) {
     EVP_CIPHER_CTX *ctx = NULL;

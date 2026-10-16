@@ -80,6 +80,7 @@ struct proxy_connection {
     tg_ws_upgrade_state ws_upgrade;
     tg_mtproto_ctr client_decrypt;
     tg_mtproto_ctr client_encrypt;
+    tg_mtproto_ctr server_decrypt;
     tg_mtproto_splitter splitter;
     tg_mtproto_proto wss_proto;
     tg_route_plan route_plan;
@@ -97,8 +98,18 @@ struct proxy_connection {
     size_t route_index;
     int route_health_index;
     int route_response_seen;
+    uint8_t response_header[4];
+    size_t response_header_len;
+    size_t response_header_needed;
+    int response_header_ack;
+    uint8_t response_prefix[40];
+    size_t response_packet_len;
+    size_t response_packet_seen;
+    size_t response_prefix_len;
+    int response_packet_padded;
     uint64_t route_started_ms;
     uint64_t hedge_due_ms;
+    size_t hedge_payload_offset;
     uint32_t tls_want;
     uint64_t wss_deadline_ms;
     int closed;
@@ -144,6 +155,8 @@ static int queue_wss_packet(void *opaque, const uint8_t *packet,
 static int process_client_payload(proxy_connection *connection,
                                   uint8_t *buffer, size_t length);
 static int hedge_flush_buffered_payload(proxy_connection *connection);
+static int hedge_candidate_flush_buffered_payload(
+    proxy_connection *candidate);
 static void hedge_cancel_candidates(proxy_connection *connection);
 static int hedge_promote_candidate(proxy_connection *candidate);
 static void advance_half_closes(proxy_connection *connection);
@@ -162,6 +175,16 @@ static void add_bytes(uint64_t *total, size_t amount) {
 static void add_u64(uint64_t *total, uint64_t amount) {
     if (amount > UINT64_MAX - *total) *total = UINT64_MAX;
     else *total += amount;
+}
+
+static uint32_t read_le32(const uint8_t *data) {
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+           ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+}
+
+static uint64_t read_le64(const uint8_t *data) {
+    return (uint64_t)read_le32(data) |
+           ((uint64_t)read_le32(data + 4) << 32);
 }
 
 static int set_nonblocking(int fd) {
@@ -196,7 +219,7 @@ static int queue_append_grow(byte_queue *queue, const uint8_t *data, size_t len,
     }
     size_t need = queue->len + len;
     if (need > queue->cap) {
-        size_t cap = queue->cap;
+        size_t cap = queue->cap ? queue->cap : 256u;
         while (cap < need) {
             if (cap > max_capacity / 2u) {
                 cap = max_capacity;
@@ -314,6 +337,7 @@ static void connection_close(proxy_connection *connection) {
         tg_mtproto_splitter_destroy(&connection->splitter);
     tg_mtproto_ctr_destroy(&connection->client_decrypt);
     tg_mtproto_ctr_destroy(&connection->client_encrypt);
+    tg_mtproto_ctr_destroy(&connection->server_decrypt);
     connection->client_fd = connection->upstream_fd = -1;
     proxy_connection **link = &server->connections;
     while (*link && *link != connection) link = &(*link)->next;
@@ -693,6 +717,14 @@ static void clear_wss_state(proxy_connection *connection) {
     }
     tg_mtproto_ctr_destroy(&connection->client_decrypt);
     tg_mtproto_ctr_destroy(&connection->client_encrypt);
+    tg_mtproto_ctr_destroy(&connection->server_decrypt);
+    connection->response_header_len = 0;
+    connection->response_header_needed = 0;
+    connection->response_header_ack = 0;
+    connection->response_packet_len = 0;
+    connection->response_packet_seen = 0;
+    connection->response_prefix_len = 0;
+    connection->response_packet_padded = 0;
     connection->wss_phase = WSS_NONE;
     connection->tls_want = 0;
     connection->wss_deadline_ms = 0;
@@ -961,6 +993,17 @@ static void connection_update(proxy_connection *connection) {
 static int hedge_promote_candidate(proxy_connection *candidate) {
     proxy_connection *parent = candidate->hedge_parent;
     if (!parent || parent->closed) return -1;
+    if (hedge_candidate_flush_buffered_payload(candidate) != 0 ||
+        candidate->hedge_payload_offset != parent->to_upstream.len) {
+        return -1;
+    }
+    if (candidate->to_client.len &&
+        queue_append_grow(&parent->to_client,
+                          candidate->to_client.data + candidate->to_client.head,
+                          candidate->to_client.len,
+                          TG_MTPROTO_MAX_PACKET) != 0) {
+        return -1;
+    }
     tg_epoll_proxy *server = parent->server;
     for (size_t i = 0; i < 2; ++i)
         if (parent->hedges[i] == candidate) parent->hedges[i] = NULL;
@@ -973,6 +1016,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
     parent->ws_upgrade = candidate->ws_upgrade;
     parent->client_decrypt = candidate->client_decrypt;
     parent->client_encrypt = candidate->client_encrypt;
+    parent->server_decrypt = candidate->server_decrypt;
     parent->splitter = candidate->splitter;
     parent->route_kind = candidate->route_kind;
     parent->wss_phase = candidate->wss_phase;
@@ -983,8 +1027,20 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
     parent->wss_subprotocol = candidate->wss_subprotocol;
     parent->route_health_index = candidate->route_health_index;
     parent->route_response_seen = candidate->route_response_seen;
+    memcpy(parent->response_header, candidate->response_header,
+           sizeof(parent->response_header));
+    parent->response_header_len = candidate->response_header_len;
+    parent->response_header_needed = candidate->response_header_needed;
+    parent->response_header_ack = candidate->response_header_ack;
+    memcpy(parent->response_prefix, candidate->response_prefix,
+           sizeof(parent->response_prefix));
+    parent->response_packet_len = candidate->response_packet_len;
+    parent->response_packet_seen = candidate->response_packet_seen;
+    parent->response_prefix_len = candidate->response_prefix_len;
+    parent->response_packet_padded = candidate->response_packet_padded;
     parent->route_started_ms = candidate->route_started_ms;
     parent->tls_want = candidate->tls_want;
+    parent->upstream_eof = candidate->upstream_eof;
     parent->wss_deadline_ms = 0;
     memcpy(parent->tls_hostname, candidate->tls_hostname,
            sizeof(parent->tls_hostname));
@@ -993,6 +1049,8 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
         .kind = 2, .connection = parent, .side = 1,
         .fd = parent->upstream_fd
     };
+    parent->to_upstream.head = 0;
+    parent->to_upstream.len = 0;
     parent->route_racing = 0;
     parent->hedge_due_ms = 0;
 
@@ -1006,6 +1064,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
     memset(&candidate->splitter, 0, sizeof(candidate->splitter));
     memset(&candidate->client_decrypt, 0, sizeof(candidate->client_decrypt));
     memset(&candidate->client_encrypt, 0, sizeof(candidate->client_encrypt));
+    memset(&candidate->server_decrypt, 0, sizeof(candidate->server_decrypt));
     candidate->closed = 1;
     candidate->promoted = 1;
     candidate->retired_next = server->retired;
@@ -1013,8 +1072,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
 
     hedge_cancel_candidates(parent);
     if (watch_update(server, &parent->upstream_watch,
-                     upstream_events(parent)) != 0 ||
-        hedge_flush_buffered_payload(parent) != 0) {
+                     upstream_events(parent)) != 0) {
         connection_close(parent);
         return 0;
     }
@@ -1142,6 +1200,20 @@ static int receive_client(proxy_connection *connection) {
                 if (queue_append(&connection->to_upstream, buffer,
                                  (size_t)n) != 0)
                     return -1;
+                for (size_t i = 0; i < 2; ++i) {
+                    proxy_connection *candidate = connection->hedges[i];
+                    if (!candidate || candidate->wss_phase != WSS_READY)
+                        continue;
+                    int flush_rc = hedge_candidate_flush_buffered_payload(candidate);
+                    int watch_rc = flush_rc == 0
+                        ? watch_update(connection->server,
+                                       &candidate->upstream_watch,
+                                       upstream_events(candidate)) : 0;
+                    if (flush_rc != 0 || watch_rc != 0) {
+                        hedge_fail_candidate(candidate);
+                        if (connection->closed) return -1;
+                    }
+                }
             } else if (process_client_payload(connection, buffer,
                                               (size_t)n) != 0) {
                 return -1;
@@ -1236,24 +1308,193 @@ static int hedge_flush_buffered_payload(proxy_connection *connection) {
     return 0;
 }
 
+static int hedge_candidate_flush_buffered_payload(
+    proxy_connection *candidate) {
+    proxy_connection *parent = candidate ? candidate->hedge_parent : NULL;
+    uint8_t buffer[TG_EPOLL_IO_CHUNK];
+    if (!parent || candidate->wss_phase != WSS_READY ||
+        candidate->hedge_payload_offset > parent->to_upstream.len)
+        return -1;
+    while (candidate->hedge_payload_offset < parent->to_upstream.len) {
+        size_t length = parent->to_upstream.len -
+                        candidate->hedge_payload_offset;
+        if (length > sizeof(buffer)) length = sizeof(buffer);
+        memcpy(buffer, parent->to_upstream.data + parent->to_upstream.head +
+                        candidate->hedge_payload_offset, length);
+        if (process_client_payload(candidate, buffer, length) != 0) return -1;
+        candidate->hedge_payload_offset += length;
+    }
+    return 0;
+}
+
+static int response_packet_valid(const proxy_connection *connection) {
+    if (connection->response_packet_padded &&
+        connection->response_packet_len >= 8u &&
+        connection->response_packet_len <= 16u &&
+        connection->response_prefix_len >= 8u &&
+        read_le32(connection->response_prefix) == UINT32_MAX)
+        return 2;
+    if (connection->response_prefix_len < 20) return 0;
+    if (read_le64(connection->response_prefix) == 0) {
+        if (connection->response_prefix_len < 20 ||
+            connection->response_packet_len < 24)
+            return 0;
+        uint64_t message_id = read_le64(connection->response_prefix + 8);
+        uint32_t message_len = read_le32(connection->response_prefix + 16);
+        if (!message_id || (message_id >> 63) || (message_id & 3u) != 1u ||
+            message_len < 4 ||
+            (size_t)message_len > connection->response_packet_len - 20u)
+            return 0;
+        size_t padding = connection->response_packet_len - 20u - message_len;
+        return connection->response_packet_padded ? padding <= 15u
+                                                  : padding == 0;
+    }
+    if (connection->response_prefix_len < 40 ||
+        connection->response_packet_len < 40)
+        return 0;
+    size_t encrypted_len = connection->response_packet_len - 24u;
+    return connection->response_packet_padded || (encrypted_len & 15u) == 0;
+}
+
+static int observe_mtproto_response(proxy_connection *connection,
+                                    const uint8_t *payload,
+                                    size_t payload_len) {
+    uint8_t decoded[TG_EPOLL_IO_CHUNK];
+    size_t offset = 0;
+    int response_seen = 0;
+    int result = -1;
+    if (!connection || !connection->server_decrypt.ctx ||
+        (payload_len && !payload))
+        goto cleanup;
+    while (offset < payload_len) {
+        if (!connection->response_packet_len) {
+            if (connection->response_header_needed == 0) {
+                uint8_t byte = payload[offset++];
+                if (tg_mtproto_ctr_xor(&connection->server_decrypt,
+                                       &byte, 1) != 0)
+                    goto cleanup;
+                connection->response_header[0] = byte;
+                connection->response_header_len = 1;
+                connection->response_header_ack = 0;
+                if (connection->wss_proto == TG_MTPROTO_ABRIDGED &&
+                    (byte & 0x80u)) {
+                    connection->response_header_ack = 1;
+                    connection->response_header_needed = 4u;
+                } else {
+                    connection->response_header_needed =
+                        connection->wss_proto == TG_MTPROTO_ABRIDGED &&
+                        byte == 0x7fu ? 4u : 1u;
+                }
+            }
+            while (connection->response_header_len <
+                       connection->response_header_needed &&
+                   offset < payload_len) {
+                uint8_t byte = payload[offset++];
+                if (tg_mtproto_ctr_xor(&connection->server_decrypt,
+                                       &byte, 1) != 0)
+                    goto cleanup;
+                connection->response_header[
+                    connection->response_header_len++] = byte;
+            }
+            if (connection->response_header_len <
+                connection->response_header_needed)
+                break;
+            if (connection->response_header_ack) {
+                connection->response_header_len = 0;
+                connection->response_header_needed = 0;
+                connection->response_header_ack = 0;
+                continue;
+            }
+            uint32_t packet_len;
+            connection->response_packet_padded = 0;
+            if (connection->wss_proto == TG_MTPROTO_ABRIDGED) {
+                uint32_t words = connection->response_header_needed == 1
+                    ? connection->response_header[0]
+                    : (uint32_t)connection->response_header[1] |
+                      ((uint32_t)connection->response_header[2] << 8) |
+                      ((uint32_t)connection->response_header[3] << 16);
+                if (!words || words > TG_MTPROTO_MAX_PACKET / 4u) goto cleanup;
+                packet_len = words * 4u;
+            } else {
+                uint32_t raw_len = read_le32(connection->response_header);
+                if (connection->wss_proto == TG_MTPROTO_INTERMEDIATE &&
+                    (raw_len & UINT32_C(0x80000000))) {
+                    connection->response_header_len = 0;
+                    connection->response_header_needed = 4u;
+                    continue;
+                }
+                connection->response_packet_padded =
+                    connection->wss_proto == TG_MTPROTO_PADDED_INTERMEDIATE;
+                packet_len = raw_len & UINT32_C(0x7fffffff);
+                if (packet_len < 8u ||
+                    packet_len > TG_MTPROTO_MAX_PACKET)
+                    goto cleanup;
+            }
+            connection->response_packet_len = packet_len;
+            connection->response_packet_seen = 0;
+            connection->response_prefix_len = 0;
+        }
+        size_t remaining = connection->response_packet_len -
+                           connection->response_packet_seen;
+        size_t amount = payload_len - offset;
+        if (amount > sizeof(decoded)) amount = sizeof(decoded);
+        if (amount > remaining) amount = remaining;
+        memcpy(decoded, payload + offset, amount);
+        if (tg_mtproto_ctr_xor(&connection->server_decrypt, decoded,
+                               amount) != 0)
+            goto cleanup;
+        size_t prefix_space = sizeof(connection->response_prefix) -
+                              connection->response_prefix_len;
+        size_t prefix_copy = amount < prefix_space ? amount : prefix_space;
+        if (prefix_copy) {
+            memcpy(connection->response_prefix +
+                       connection->response_prefix_len,
+                   decoded, prefix_copy);
+            connection->response_prefix_len += prefix_copy;
+        }
+        connection->response_packet_seen += amount;
+        offset += amount;
+        if (connection->response_packet_seen ==
+            connection->response_packet_len) {
+            int packet_status = response_packet_valid(connection);
+            if (packet_status <= 0) goto cleanup;
+            if (packet_status == 1) response_seen = 1;
+            connection->response_packet_len = 0;
+            connection->response_packet_seen = 0;
+            connection->response_prefix_len = 0;
+            connection->response_header_len = 0;
+            connection->response_header_needed =
+                connection->wss_proto == TG_MTPROTO_ABRIDGED ? 0u : 4u;
+            connection->response_header_ack = 0;
+        }
+    }
+    result = response_seen;
+cleanup:
+    OPENSSL_cleanse(decoded, sizeof(decoded));
+    return result;
+}
+
 static int queue_wss_response(void *opaque, const uint8_t *payload,
                               size_t payload_len) {
     proxy_connection *connection = opaque;
-    if (payload_len && !connection->route_response_seen &&
-        connection->route_health_index >= 0) {
-        route_health *health = &connection->server->route_health[
-            (size_t)connection->route_health_index];
-        uint64_t now = monotonic_ms();
-        health->cooldown_until_ms = 0;
-        health->last_success_ms = now;
-        health->latency_ms = now >= connection->route_started_ms
-            ? now - connection->route_started_ms : 0;
-        if (health->responses != UINT64_MAX) ++health->responses;
-        if ((health->kind == TG_ROUTE_CF_WORKER ||
-             health->kind == TG_ROUTE_CF_PROXY) &&
-            health->cf_responses != UINT64_MAX)
-            ++health->cf_responses;
+    int response = observe_mtproto_response(connection, payload, payload_len);
+    if (response < 0) return -1;
+    if (response > 0 && !connection->route_response_seen) {
         connection->route_response_seen = 1;
+        if (connection->route_health_index >= 0) {
+            route_health *health = &connection->server->route_health[
+                (size_t)connection->route_health_index];
+            uint64_t now = monotonic_ms();
+            health->cooldown_until_ms = 0;
+            health->last_success_ms = now;
+            health->latency_ms = now >= connection->route_started_ms
+                ? now - connection->route_started_ms : 0;
+            if (health->responses != UINT64_MAX) ++health->responses;
+            if ((health->kind == TG_ROUTE_CF_WORKER ||
+                 health->kind == TG_ROUTE_CF_PROXY) &&
+                health->cf_responses != UINT64_MAX)
+                ++health->cf_responses;
+        }
     }
     if (queue_append_grow(&connection->to_client, payload, payload_len,
                           TG_MTPROTO_MAX_PACKET) != 0)
@@ -1264,6 +1505,13 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
 }
 
 static int establish_wss_stream(proxy_connection *connection) {
+    if (connection->wss_proto < TG_MTPROTO_ABRIDGED ||
+        connection->wss_proto > TG_MTPROTO_PADDED_INTERMEDIATE ||
+        tg_mtproto_direct_server_stream_cipher(connection->handshake,
+                                                &connection->server_decrypt) != 0)
+        return -1;
+    connection->response_header_needed =
+        connection->wss_proto == TG_MTPROTO_ABRIDGED ? 0u : 4u;
     if (tg_ws_pump_init(&connection->ws_pump, connection->upstream_ssl) != 0)
         return -1;
     connection->ws_pump_ready = 1;
@@ -1359,8 +1607,14 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
             }
             if (rc == 1) {
                 if (establish_wss_stream(connection) != 0) return -1;
-                return connection->hedge_parent
-                    ? hedge_promote_candidate(connection) : 0;
+                if (connection->hedge_parent) {
+                    if (hedge_candidate_flush_buffered_payload(connection) != 0) {
+                        return -1;
+                    }
+                } else if (hedge_flush_buffered_payload(connection) != 0) {
+                    return -1;
+                }
+                continue;
             }
             if (SSL_pending(connection->upstream_ssl) > 0 ||
                 SSL_has_pending(connection->upstream_ssl))
@@ -1374,10 +1628,21 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
             if (events & EPOLLOUT) revents |= POLLOUT;
             if (events & EPOLLERR) revents |= POLLERR;
             if (events & (EPOLLHUP | EPOLLRDHUP)) revents |= POLLHUP;
-            if (tg_ws_pump_process(&connection->ws_pump, revents,
-                                   queue_wss_response, connection) != 0)
+            int pump_rc = tg_ws_pump_process(&connection->ws_pump, revents,
+                                             queue_wss_response, connection);
+            if (pump_rc != 0) {
                 return -1;
+            }
+            if (connection->hedge_parent && connection->route_response_seen) {
+                if (connection->ws_pump.closed)
+                    connection->upstream_eof = 1;
+                return hedge_promote_candidate(connection);
+            }
             if (connection->ws_pump.closed) {
+                if (connection->hedge_parent) {
+                    hedge_fail_candidate(connection);
+                    return 0;
+                }
                 if (!connection->route_response_seen)
                     route_health_failed(connection);
                 connection->upstream_eof = 1;
@@ -1570,8 +1835,13 @@ static int timeout_until_expiry(tg_epoll_proxy *server, int timeout_ms) {
             nearest = connection->hedge_due_ms;
         for (size_t i = 0; i < 2; ++i) {
             const proxy_connection *candidate = connection->hedges[i];
-            if (candidate && candidate->wss_deadline_ms < nearest)
-                nearest = candidate->wss_deadline_ms;
+            if (candidate) {
+                uint64_t expires = candidate->wss_phase != WSS_READY
+                    ? candidate->wss_deadline_ms
+                    : candidate->last_activity_ms +
+                      server->config.idle_timeout_ms;
+                if (expires < nearest) nearest = expires;
+            }
         }
     }
     if (nearest == UINT64_MAX) return timeout_ms;
@@ -1588,9 +1858,15 @@ static void expire_connections(tg_epoll_proxy *server) {
         proxy_connection *next = connection->next;
         for (size_t i = 0; i < 2 && !connection->closed; ++i) {
             proxy_connection *candidate = connection->hedges[i];
-            if (candidate && now >= candidate->wss_deadline_ms) {
-                hedge_fail_candidate(candidate);
-                break;
+            if (candidate) {
+                uint64_t expires = candidate->wss_phase != WSS_READY
+                    ? candidate->wss_deadline_ms
+                    : candidate->last_activity_ms +
+                      server->config.idle_timeout_ms;
+                if (now >= expires) {
+                    hedge_fail_candidate(candidate);
+                    break;
+                }
             }
         }
         if (!connection->closed && connection->route_racing &&

@@ -44,6 +44,9 @@ void tg_mtproto_ctr_destroy(tg_mtproto_ctr *ctx);
 int tg_mtproto_direct_stream_ciphers(
     const uint8_t init[TG_MTPROTO_HANDSHAKE_LEN],
     tg_mtproto_ctr *decrypt, tg_mtproto_ctr *encrypt);
+/* Создаёт server-to-client CTR-поток после Obfuscated2 init. */
+int tg_mtproto_direct_server_stream_cipher(
+    const uint8_t init[TG_MTPROTO_HANDSHAKE_LEN], tg_mtproto_ctr *decrypt);
 int tg_mtproto_aes_ige(uint8_t *data, size_t len, const uint8_t key[32],
                        const uint8_t iv[32], int encrypt);
 /* Пакует MTProto 2.0 crypto header; padding задаёт вызывающий код. */

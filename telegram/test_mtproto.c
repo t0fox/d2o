@@ -113,6 +113,23 @@ static void test_direct_stream_ciphers_skip_obfuscated2_init(void) {
     tg_mtproto_ctr_destroy(&encrypt);
 }
 
+static void test_direct_server_cipher_matches_obfuscated2_init(void) {
+    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN], input[48], expected[48];
+    tg_mtproto_ctr to_server = {0}, from_server = {0}, response = {0};
+    assert(tg_mtproto_make_obfuscated2_init(TG_MTPROTO_INTERMEDIATE, 2, 0,
+                                             handshake, &to_server,
+                                             &from_server) == 0);
+    for (size_t i = 0; i < sizeof(input); ++i)
+        input[i] = expected[i] = (uint8_t)(i * 9u + 3u);
+    assert(tg_mtproto_ctr_xor(&from_server, expected, sizeof(expected)) == 0);
+    assert(tg_mtproto_direct_server_stream_cipher(handshake, &response) == 0);
+    assert(tg_mtproto_ctr_xor(&response, input, sizeof(input)) == 0);
+    assert(memcmp(input, expected, sizeof(input)) == 0);
+    tg_mtproto_ctr_destroy(&to_server);
+    tg_mtproto_ctr_destroy(&from_server);
+    tg_mtproto_ctr_destroy(&response);
+}
+
 int main(void) {
     test_ctr_matches_nist_vector_across_partial_reads();
     test_direct_obfuscated2_vector_decodes_media_dc();
@@ -120,6 +137,7 @@ int main(void) {
     test_invalid_handshake_and_secret_inputs_are_rejected();
     test_reserved_protocol_prefixes_are_rejected();
     test_direct_stream_ciphers_skip_obfuscated2_init();
+    test_direct_server_cipher_matches_obfuscated2_init();
     puts("Тесты MTProto: ок");
     return 0;
 }

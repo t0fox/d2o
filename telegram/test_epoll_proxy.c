@@ -43,8 +43,15 @@ typedef struct {
     const char *expected_sni;
     const char *expected_path;
     int expect_binary_subprotocol;
+    int arbitrary_response;
+    int wait_for_second;
     int accepted_count;
+    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN];
+    size_t handshake_len;
     uint8_t expected_packet[12];
+    size_t expected_packet_len;
+    uint8_t response_packet[96];
+    size_t response_packet_len;
     atomic_int complete;
 } wss_server_fixture;
 
@@ -66,6 +73,64 @@ static const uint8_t test_handshake[64] = {
     0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
     0x87,0xae,0xb3,0xfe,0x05,0x9b,0x48,0x07
 };
+
+static void prepare_wss_response(wss_server_fixture *fixture,
+                                 const uint8_t handshake[64],
+                                 tg_mtproto_proto proto) {
+    uint8_t clear[12u + 4u + 40u + 1u] = {0};
+    size_t ack_len;
+    if (proto == TG_MTPROTO_PADDED_INTERMEDIATE) {
+        clear[0] = 8;
+        memset(clear + 4, 0xff, 4);
+        clear[8] = 1;
+        clear[9] = 2;
+        clear[10] = 3;
+        clear[11] = 4;
+        ack_len = 12u;
+    } else {
+        if (proto == TG_MTPROTO_ABRIDGED) clear[0] = 0x80;
+        else clear[3] = 0x80;
+        ack_len = 4u;
+    }
+
+    size_t header_len = proto == TG_MTPROTO_ABRIDGED ? 1u : 4u;
+    size_t padding_len = proto == TG_MTPROTO_PADDED_INTERMEDIATE ? 1u : 0u;
+    size_t packet_len = 40u + padding_len;
+    uint8_t *packet = clear + ack_len;
+    if (proto == TG_MTPROTO_ABRIDGED) {
+        packet[0] = 10;
+    } else {
+        packet[0] = (uint8_t)packet_len;
+        packet[1] = (uint8_t)(packet_len >> 8);
+        packet[2] = (uint8_t)(packet_len >> 16);
+        packet[3] = (uint8_t)(packet_len >> 24);
+    }
+    uint8_t *body = packet + header_len;
+    for (size_t i = 0; i < 8; ++i) body[i] = (uint8_t)(i + 1u);
+    for (size_t i = 0; i < 16; ++i) {
+        body[8 + i] = (uint8_t)(0x20u + i);
+        body[24 + i] = (uint8_t)(0x40u + i);
+    }
+    if (padding_len) body[40] = 0xa5;
+
+    size_t clear_len = ack_len + header_len + packet_len;
+    tg_mtproto_ctr server_encrypt = {0};
+    assert(tg_mtproto_direct_server_stream_cipher(handshake,
+                                                   &server_encrypt) == 0);
+    assert(tg_mtproto_ctr_xor(&server_encrypt, clear, clear_len) == 0);
+    memcpy(fixture->response_packet, clear, clear_len);
+    fixture->response_packet_len = clear_len;
+    tg_mtproto_ctr_destroy(&server_encrypt);
+}
+
+static void make_wss_test_handshake(tg_mtproto_proto proto,
+                                    uint8_t handshake[64]) {
+    tg_mtproto_ctr to_server = {0}, from_server = {0};
+    assert(tg_mtproto_make_obfuscated2_init(proto, 4, 1, handshake,
+                                             &to_server, &from_server) == 0);
+    tg_mtproto_ctr_destroy(&to_server);
+    tg_mtproto_ctr_destroy(&from_server);
+}
 
 static int original_destination(void *opaque, int fd,
                                 tg_listener_destination *out) {
@@ -261,16 +326,16 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
     char *key_line = strstr(request, "Sec-WebSocket-Key: ");
     assert(key_line);
     key_line += strlen("Sec-WebSocket-Key: ");
-    char source[64], accept[40], response[256];
+    char source[64], accept_value[40], response[256];
     int source_len = snprintf(source, sizeof(source), "%.24s%s", key_line, guid);
     uint8_t digest[SHA_DIGEST_LENGTH];
     unsigned int digest_len = 0;
     assert(source_len > 0 && (size_t)source_len < sizeof(source));
     assert(EVP_Digest(source, (size_t)source_len, digest, &digest_len,
                       EVP_sha1(), NULL) == 1 && digest_len == sizeof(digest));
-    assert(EVP_EncodeBlock((unsigned char *)accept, digest,
+    assert(EVP_EncodeBlock((unsigned char *)accept_value, digest,
                            (int)sizeof(digest)) == 28);
-    accept[28] = '\0';
+    accept_value[28] = '\0';
     int response_len = snprintf(response, sizeof(response),
         expect_binary_subprotocol
         ? "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
@@ -278,7 +343,7 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
           "Sec-WebSocket-Accept: %s\r\n\r\n"
         : "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
           "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
-        accept);
+        accept_value);
     assert(response_len > 0 && (size_t)response_len < sizeof(response));
     assert(ssl_write_exact(ssl, (const uint8_t *)response,
                            (size_t)response_len) == 0);
@@ -287,17 +352,51 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
     size_t payload_len = 0;
     assert(read_masked_client_frame(ssl, &opcode, payload, sizeof(payload),
                                     &payload_len) == 0);
-    assert(opcode == TG_WS_BINARY && payload_len == sizeof(test_handshake));
-    assert(memcmp(payload, test_handshake, sizeof(test_handshake)) == 0);
+    const uint8_t *expected_handshake = fixture->handshake_len
+        ? fixture->handshake : test_handshake;
+    size_t expected_handshake_len = fixture->handshake_len
+        ? fixture->handshake_len : sizeof(test_handshake);
+    assert(opcode == TG_WS_BINARY && payload_len == expected_handshake_len);
+    assert(memcmp(payload, expected_handshake, payload_len) == 0);
     assert(read_masked_client_frame(ssl, &opcode, payload, sizeof(payload),
                                     &payload_len) == 0);
-    assert(opcode == TG_WS_BINARY && payload_len == sizeof(fixture->expected_packet));
+    size_t expected_len = fixture->expected_packet_len
+        ? fixture->expected_packet_len : sizeof(fixture->expected_packet);
+    assert(opcode == TG_WS_BINARY && payload_len == expected_len);
     assert(memcmp(payload, fixture->expected_packet, payload_len) == 0);
-    assert(write_server_frame(ssl, TG_WS_BINARY, payload, payload_len) == 0);
-    assert(read_masked_client_frame(ssl, &opcode, payload, sizeof(payload),
-                                    &payload_len) == 0);
-    assert(opcode == TG_WS_CLOSE && payload_len == 0);
-    assert(write_server_frame(ssl, TG_WS_CLOSE, NULL, 0) == 0);
+    if (fixture->wait_for_second) {
+        struct pollfd wait = {.fd = fixture->listener, .events = POLLIN};
+        assert(poll(&wait, 1, 450) > 0);
+        int second = accept(fixture->listener, NULL, NULL);
+        assert(second >= 0);
+        fixture->accepted_count = 2;
+        fixture->wait_for_second = 0;
+        fixture->expected_sni = "kws4.web.telegram.org";
+        SSL_free(ssl);
+        close(fd);
+        SSL_CTX_free(context);
+        serve_direct_wss_connection(fixture, second);
+        return;
+    }
+    if (fixture->arbitrary_response) {
+        uint8_t invalid[4] = {0};
+        tg_mtproto_ctr server_encrypt = {0};
+        assert(tg_mtproto_direct_server_stream_cipher(test_handshake,
+                                                       &server_encrypt) == 0);
+        assert(tg_mtproto_ctr_xor(&server_encrypt, invalid,
+                                  sizeof(invalid)) == 0);
+        assert(write_server_frame(ssl, TG_WS_BINARY, invalid,
+                                  sizeof(invalid)) == 0);
+        tg_mtproto_ctr_destroy(&server_encrypt);
+    } else {
+        assert(write_server_frame(ssl, TG_WS_BINARY,
+                                  fixture->response_packet,
+                                  fixture->response_packet_len) == 0);
+        assert(read_masked_client_frame(ssl, &opcode, payload, sizeof(payload),
+                                        &payload_len) == 0);
+        assert(opcode == TG_WS_CLOSE && payload_len == 0);
+        assert(write_server_frame(ssl, TG_WS_CLOSE, NULL, 0) == 0);
+    }
     atomic_store(&fixture->complete, 1);
     SSL_free(ssl);
     close(fd);
@@ -317,21 +416,10 @@ static void *serve_hedged_wss(void *opaque) {
     wss_server_fixture *fixture = opaque;
     int first = accept(fixture->listener, NULL, NULL);
     assert(first >= 0);
-    struct pollfd wait = {.fd = fixture->listener, .events = POLLIN};
-    int ready = poll(&wait, 1, 450);
-    assert(ready >= 0);
-    if (ready > 0) {
-        int second = accept(fixture->listener, NULL, NULL);
-        assert(second >= 0);
-        fixture->accepted_count = 2;
-        close(first);
-        fixture->expected_sni = "kws4.web.telegram.org";
-        serve_direct_wss_connection(fixture, second);
-    } else {
-        fixture->accepted_count = 1;
-        fixture->expected_sni = "kws4-1.web.telegram.org";
-        serve_direct_wss_connection(fixture, first);
-    }
+    fixture->accepted_count = 1;
+    fixture->expected_sni = "kws4-1.web.telegram.org";
+    fixture->wait_for_second = 1;
+    serve_direct_wss_connection(fixture, first);
     return NULL;
 }
 
@@ -648,7 +736,8 @@ static void test_epoll_direct_wss_preserves_mtproto_packet_boundaries(void) {
     wss_server_fixture wss = {.listener = create_listener(&ws_port),
                               .cert_path = cert_path,
                               .key_path = key_path,
-                              .expect_binary_subprotocol = 1};
+                              .expect_binary_subprotocol = 1,
+                              .arbitrary_response = 1};
     atomic_init(&wss.complete, 0);
     memcpy(wss.expected_packet, (uint8_t[]){8,0,0,0,0x11,0x22,0x33,0x44,
                                              0x55,0x66,0x77,0x88},
@@ -712,16 +801,8 @@ static void test_epoll_direct_wss_preserves_mtproto_packet_boundaries(void) {
            (ssize_t)sizeof(encrypted_packet));
     assert(shutdown(client, SHUT_WR) == 0);
 
-    uint8_t echoed[sizeof(clear_packet)];
-    size_t received = 0;
-    while (received < sizeof(echoed)) {
-        struct pollfd wait = {.fd = client, .events = POLLIN};
-        assert(poll(&wait, 1, 5000) > 0);
-        ssize_t n = recv(client, echoed + received, sizeof(echoed) - received, 0);
-        assert(n > 0);
-        received += (size_t)n;
-    }
-    assert(memcmp(echoed, encrypted_packet, sizeof(echoed)) == 0);
+    uint8_t unexpected;
+    assert(recv(client, &unexpected, sizeof(unexpected), 0) == 0);
     assert(pthread_join(wss_thread, NULL) == 0);
     assert(atomic_load(&wss.complete) == 1 && fixture.routes == 1);
     close(client);
@@ -729,8 +810,8 @@ static void test_epoll_direct_wss_preserves_mtproto_packet_boundaries(void) {
     assert(pthread_join(proxy_thread, NULL) == 0);
     tg_epoll_proxy_stats route_stats;
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
-    assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 1 &&
-           route_stats.wss_failures == 0);
+    assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 0 &&
+           route_stats.wss_failures == 1);
     tg_epoll_proxy_destroy(proxy);
     close(listener);
     close(wss.listener);
@@ -740,7 +821,8 @@ static void test_epoll_direct_wss_preserves_mtproto_packet_boundaries(void) {
     assert(rmdir(directory) == 0);
 }
 
-static void test_epoll_hedged_wss_uses_second_live_candidate(void) {
+static void test_epoll_hedged_wss_uses_second_live_candidate(
+    tg_mtproto_proto proto) {
     char directory[] = "/tmp/d2k-tg-wss-hedge-XXXXXX";
     char cert_path[256], key_path[256];
     assert(mkdtemp(directory) != NULL);
@@ -763,14 +845,25 @@ static void test_epoll_hedged_wss_uses_second_live_candidate(void) {
                               .key_path = key_path,
                               .expect_binary_subprotocol = 1};
     atomic_init(&wss.complete, 0);
-    memcpy(wss.expected_packet, (uint8_t[]){8,0,0,0,0x11,0x22,0x33,0x44,
-                                             0x55,0x66,0x77,0x88},
-           sizeof(wss.expected_packet));
+    uint8_t handshake[64];
+    make_wss_test_handshake(proto, handshake);
+    memcpy(wss.handshake, handshake, sizeof(handshake));
+    wss.handshake_len = sizeof(handshake);
+    prepare_wss_response(&wss, handshake, proto);
+    static const uint8_t request_body[8] =
+        {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88};
+    size_t header_len = proto == TG_MTPROTO_ABRIDGED ? 1u : 4u;
+    wss.expected_packet_len = header_len + sizeof(request_body);
+    wss.expected_packet[0] =
+        proto == TG_MTPROTO_ABRIDGED ? 2u : (uint8_t)sizeof(request_body);
+    memset(wss.expected_packet + 1, 0, header_len - 1u);
+    memcpy(wss.expected_packet + header_len, request_body,
+           sizeof(request_body));
     tg_mtproto_ctr decrypt = {0}, encrypt = {0};
-    assert(tg_mtproto_direct_stream_ciphers(test_handshake, &decrypt,
+    assert(tg_mtproto_direct_stream_ciphers(handshake, &decrypt,
                                              &encrypt) == 0);
     assert(tg_mtproto_ctr_xor(&encrypt, wss.expected_packet,
-                              sizeof(wss.expected_packet)) == 0);
+                              wss.expected_packet_len) == 0);
     tg_mtproto_ctr_destroy(&decrypt);
     tg_mtproto_ctr_destroy(&encrypt);
     pthread_t wss_thread;
@@ -811,21 +904,22 @@ static void test_epoll_hedged_wss_uses_second_live_candidate(void) {
     struct timeval timeout = {.tv_sec = 5};
     assert(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                       sizeof(timeout)) == 0);
-    assert(send(client, test_handshake, sizeof(test_handshake), 0) ==
-           (ssize_t)sizeof(test_handshake));
-    assert(send(client, wss.expected_packet, sizeof(wss.expected_packet), 0) ==
-           (ssize_t)sizeof(wss.expected_packet));
+    assert(send(client, handshake, sizeof(handshake), 0) ==
+           (ssize_t)sizeof(handshake));
+    assert(send(client, wss.expected_packet, wss.expected_packet_len, 0) ==
+           (ssize_t)wss.expected_packet_len);
     assert(shutdown(client, SHUT_WR) == 0);
-    uint8_t echoed[sizeof(wss.expected_packet)];
+    uint8_t echoed[sizeof(wss.response_packet)];
     size_t received = 0;
-    while (received < sizeof(echoed)) {
+    while (received < wss.response_packet_len) {
         struct pollfd wait = {.fd = client, .events = POLLIN};
         assert(poll(&wait, 1, 5000) > 0);
-        ssize_t n = recv(client, echoed + received, sizeof(echoed) - received, 0);
+        ssize_t n = recv(client, echoed + received,
+                         wss.response_packet_len - received, 0);
         assert(n > 0);
         received += (size_t)n;
     }
-    assert(memcmp(echoed, wss.expected_packet, sizeof(echoed)) == 0);
+    assert(memcmp(echoed, wss.response_packet, wss.response_packet_len) == 0);
     assert(pthread_join(wss_thread, NULL) == 0);
     assert(wss.accepted_count == 2 && atomic_load(&wss.complete) == 1);
     close(client);
@@ -870,6 +964,7 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(void) {
         .expect_binary_subprotocol = 0
     };
     atomic_init(&worker.complete, 0);
+    prepare_wss_response(&worker, test_handshake, TG_MTPROTO_INTERMEDIATE);
     const uint8_t clear_packet[12] = {8,0,0,0,0x11,0x22,0x33,0x44,
                                       0x55,0x66,0x77,0x88};
     tg_mtproto_ctr decrypt = {0}, encrypt = {0};
@@ -928,16 +1023,18 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(void) {
                 sizeof(worker.expected_packet), 0) ==
            (ssize_t)sizeof(worker.expected_packet));
     assert(shutdown(client, SHUT_WR) == 0);
-    uint8_t echoed[sizeof(worker.expected_packet)];
+    uint8_t echoed[sizeof(worker.response_packet)];
     size_t received = 0;
-    while (received < sizeof(echoed)) {
+    while (received < worker.response_packet_len) {
         struct pollfd wait = {.fd = client, .events = POLLIN};
         assert(poll(&wait, 1, 5000) > 0);
-        ssize_t n = recv(client, echoed + received, sizeof(echoed) - received, 0);
+        ssize_t n = recv(client, echoed + received,
+                         worker.response_packet_len - received, 0);
         assert(n > 0);
         received += (size_t)n;
     }
-    assert(memcmp(echoed, worker.expected_packet, sizeof(echoed)) == 0);
+    assert(memcmp(echoed, worker.response_packet,
+                  worker.response_packet_len) == 0);
     assert(pthread_join(worker_thread, NULL) == 0);
     assert(atomic_load(&worker.complete) == 1 && fixture.routes == 1);
     close(client);
@@ -983,6 +1080,7 @@ static void test_epoll_cf_proxy_uses_mtproto_packet_framing(void) {
         .expect_binary_subprotocol = 1
     };
     atomic_init(&cf_proxy.complete, 0);
+    prepare_wss_response(&cf_proxy, test_handshake, TG_MTPROTO_INTERMEDIATE);
     const uint8_t clear_packet[12] = {8,0,0,0,0x11,0x22,0x33,0x44,
                                       0x55,0x66,0x77,0x88};
     tg_mtproto_ctr decrypt = {0}, encrypt = {0};
@@ -1039,16 +1137,18 @@ static void test_epoll_cf_proxy_uses_mtproto_packet_framing(void) {
                 sizeof(cf_proxy.expected_packet), 0) ==
            (ssize_t)sizeof(cf_proxy.expected_packet));
     assert(shutdown(client, SHUT_WR) == 0);
-    uint8_t echoed[sizeof(cf_proxy.expected_packet)];
+    uint8_t echoed[sizeof(cf_proxy.response_packet)];
     size_t received = 0;
-    while (received < sizeof(echoed)) {
+    while (received < cf_proxy.response_packet_len) {
         struct pollfd wait = {.fd = client, .events = POLLIN};
         assert(poll(&wait, 1, 5000) > 0);
-        ssize_t n = recv(client, echoed + received, sizeof(echoed) - received, 0);
+        ssize_t n = recv(client, echoed + received,
+                         cf_proxy.response_packet_len - received, 0);
         assert(n > 0);
         received += (size_t)n;
     }
-    assert(memcmp(echoed, cf_proxy.expected_packet, sizeof(echoed)) == 0);
+    assert(memcmp(echoed, cf_proxy.response_packet,
+                  cf_proxy.response_packet_len) == 0);
     assert(pthread_join(cf_thread, NULL) == 0);
     assert(atomic_load(&cf_proxy.complete) == 1 && fixture.routes == 1);
     close(client);
@@ -1171,7 +1271,10 @@ int main(void) {
     test_invalid_handshake_fails_closed();
     test_self_dial_target_is_rejected();
     test_epoll_direct_wss_preserves_mtproto_packet_boundaries();
-    test_epoll_hedged_wss_uses_second_live_candidate();
+    test_epoll_hedged_wss_uses_second_live_candidate(TG_MTPROTO_ABRIDGED);
+    test_epoll_hedged_wss_uses_second_live_candidate(TG_MTPROTO_INTERMEDIATE);
+    test_epoll_hedged_wss_uses_second_live_candidate(
+        TG_MTPROTO_PADDED_INTERMEDIATE);
     test_epoll_cf_worker_uses_raw_stream_framing();
     test_epoll_cf_proxy_uses_mtproto_packet_framing();
     test_epoll_direct_wss_rejection_falls_back_to_tcp();
