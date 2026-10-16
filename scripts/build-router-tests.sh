@@ -25,11 +25,10 @@ for ARCH in $ARCHES; do
     prefix="$ROOT/build/telegram/openssl-$ARCH"
     libdir="$prefix/lib"
     [ -d "$libdir" ] || libdir="$prefix/lib64"
-    # Includes retry jitter (floating-point on soft-float MIPS) and identity crypto.
+    # Cross-compile the C11 MTProto crypto vectors against the target OpenSSL.
     # shellcheck disable=SC2086
     "$BUILD_ZIG" cc -target "$TARGET" $TARGET_FLAGS -static -O2 -UNDEBUG -std=c11 \
         -I"$ROOT/telegram/include" -I"$prefix/include" \
-        "$ROOT/telegram/test_session.c" "$ROOT/telegram/src/session.c" \
-        "$ROOT/telegram/src/wire.c" "$ROOT/telegram/src/identity.c" \
-        -L"$libdir" -lssl -lcrypto -ldl -pthread -o "$OUT/tg-session-$ARCH"
+        "$ROOT/telegram/test_mtproto.c" "$ROOT/telegram/src/mtproto_crypto.c" \
+        -L"$libdir" -lssl -lcrypto -ldl -pthread -o "$OUT/tg-mtproto-$ARCH"
 done

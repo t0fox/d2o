@@ -9,7 +9,7 @@ module.exports=async function(visualFixture){
  const tgStatus=path.join(temp,'tg-status'),service=path.join(temp,'service');
  const pid=String(process.pid)+'\n';
  const writeLive=()=>fs.writeFileSync(live,JSON.stringify({...visualFixture.knowledge,linked:true,catalog_at:'local-browser-fixture'}));
- fs.writeFileSync(config,'MODE=apply\nTG_ENABLED=1\nTG_RELAY_URL=https://relay.example.invalid\nTG_RELAY_SECRET=public-test-fixture\n');
+ fs.writeFileSync(config,'MODE=apply\nTG_ENABLED=1\nTG_MODE=local\nTG_RELAY_URL=https://relay.example.invalid\nTG_RELAY_SECRET=public-test-fixture\n');
  for(const file of [engine,controller,telegram])fs.writeFileSync(file,pid);
  fs.writeFileSync(tgStatus,'connected\n');writeLive();
  fs.writeFileSync(service,'#!/usr/bin/env node\n'+

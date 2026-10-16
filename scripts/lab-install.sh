@@ -144,9 +144,7 @@ cp files/d2k-openwrt-init "$REL/files/"
 cp files/d2k-tg-firewall.sh files/d2k-tg-watchdog.sh files/d2k-instagram-dns.sh \
     files/d2k-instagram-dns-scheduler.sh files/meta-ranges.txt files/tg-roots.pem "$REL/files/"
 cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fake/"
-# The real package enables enrollment, but the isolated lab must never contact
-# the production VPS or Telegram. Point its copied template to closed local ports.
-sed -i 's|^TG_RELAY_URL=.*|TG_RELAY_URL=wss://127.0.0.1:11443/ws|; s/^TG_ENROLL_PORT=.*/TG_ENROLL_PORT=11444/' "$REL/files/config"
+# Probe endpoints are loopback-only in the isolated lab.
 sed -i 's|^PROBE_URL=.*|PROBE_URL=https://127.0.0.1:11443/|; s/^PROBE_IP=.*/PROBE_IP=127.0.0.1/' "$REL/files/d2k-tg-watchdog.sh"
 # Every path the installer will fetch must be staged: with D2K_LOCAL it dies
 # on the first missing file, before installing anything (install.sh fetch).
@@ -235,7 +233,7 @@ echo "== 1. чистая установка =="
 D2K_LOCAL="$REL" sh scripts/install.sh 2>&1 | tee /tmp/install1.log
 [ "$(tail -1 /tmp/install1.log)" != "" ] || true
 grep -q "готово" /tmp/install1.log || fail "установка с чистого состояния не прошла: $(tail -3 /tmp/install1.log)"
-[ "$(stat -c '%a' "$DIR/config")" = 600 ] || fail "конфигурация с relay-секретом должна быть доступна только root"
+[ "$(stat -c '%a' "$DIR/config")" = 600 ] || fail "конфигурация должна быть доступна только root"
 [ "$(grep -c '^MODE=apply$' "$DIR/config")" = 1 ] || fail "чистая установка должна включать активный режим D2K"
 [ "$(grep -c "^PANEL_LISTEN=$LAN_TEST_IP:8090$" "$DIR/config")" = 1 ] || fail "чистая установка не привязала панель к LAN-адресу"
 
@@ -261,11 +259,11 @@ done
 [ "$(grep -c '^instagram.com 157.240.9.174$' "$DIR/state/instagram-ip-hosts.tsv")" = 1 ] || fail "установщик не сохранил владение Instagram-записью"
 [ "$(grep -c '^www.instagram.com 157.240.9.175$' "$DIR/state/instagram-ip-hosts.tsv" || true)" = 0 ] || fail "установщик присвоил себе заранее существующую запись"
 [ -s "$DIR/files/tg-roots.pem" ] || fail "не установлен CA bundle Telegram"
-/opt/sbin/d2ktg --version | grep -q 'features=per-install-enrollment' || fail "нет автоматической регистрации C-туннеля"
+/opt/sbin/d2ktg --version | grep -q 'telegram-local-tcp-epoll' || fail "нет локального Telegram-прокси на C"
 [ "$(grep -c '^TG_ENABLED=1$' "$DIR/config")" = 1 ] || fail "Telegram должен быть включён по умолчанию"
-[ "$(grep -Ec '^[[:space:]]*TG_RELAY_SECRET=' "$DIR/config" || true)" = 0 ] || fail "шаблон не должен задавать relay secret активным ключом"
+[ "$(grep -c '^TG_MODE=local$' "$DIR/config")" = 1 ] || fail "Telegram должен использовать локальный режим"
+[ "$(grep -Ec '^[[:space:]]*TG_RELAY_(URL|SECRET)=|^[[:space:]]*TG_ENROLL_PORT=' "$DIR/config" || true)" = 0 ] || fail "новая конфигурация не должна содержать relay-поля"
 [ -e "$DIR/run/d2ktg.pid" ] || fail "Telegram не запущен установщиком"
-[ "$(stat -c '%a' "$DIR/state/tg.identity")" = 600 ] || fail "ключ установки доступен не только root"
 [ -x /opt/sbin/d2kpanel ] || fail "C-панель не установлена"
 [ ! -x /opt/sbin/d2k ] || fail "legacy Go-панель осталась установленной"
 [ -s "$DIR/panel/index.html" ] && [ -s "$DIR/panel/panel.css" ] && [ -s "$DIR/panel/panel.js" ] && [ -s "$DIR/panel/gsap.js" ] && [ -s "$DIR/panel/fonts/onest.woff2" ] && [ -s "$DIR/panel/fonts/jbmono.woff2" ] || fail "не установлены статические ресурсы панели"
@@ -287,8 +285,8 @@ done
 grep -q '"snapshot"' /tmp/d2k-panel-status.json || fail "API не вернул status snapshot"
 grep -q '"controls_enabled":true' /tmp/d2k-panel-status.json || fail "loopback-панель не включила управление сервисом"
 grep -q '"telegram_enabled":true' /tmp/d2k-panel-status.json || fail "API считает включённый Telegram выключенным"
-grep -q '"telegram_configured":true' /tmp/d2k-panel-status.json || fail "API не распознал регистрацию без общего секрета"
-grep -q '"telegram_status":"connecting"' /tmp/d2k-panel-status.json || fail "закрытый локальный порт не должен давать статус connected"
+grep -q '"telegram_configured":true' /tmp/d2k-panel-status.json || fail "API не распознал локальный режим Telegram"
+grep -q '"telegram_status":"local"' /tmp/d2k-panel-status.json || fail "панель не показала запущенный локальный прокси"
 if grep -q 'TG_RELAY_SECRET\|relay_secret\|telegram.*secret' /tmp/d2k-panel-status.json; then
     fail "API раскрыл поле или значение секрета ретранслятора"
 fi
@@ -320,18 +318,9 @@ for pid in $REAPPLY_PIDS; do wait "$pid" || REAPPLY_FAILED=1; done
 [ "$REAPPLY_FAILED" = 0 ] || fail "параллельное восстановление завершилось ошибкой"
 "$INIT" status | grep -q "правила: стоят" || fail "параллельное восстановление оставило firewall частичным"
 panel_post telegram-disable | grep -q '"ok":true' || fail "панель не выключила Telegram"
-sed -i '/^TG_RELAY_URL=/d; /^TG_ENROLL_PORT=/d' "$DIR/config"
-if panel_post telegram-enable >/tmp/d2k-telegram-enable.json; then
-    fail "панель включила Telegram без URL и relay secret"
-fi
-panel_curl -fsS http://127.0.0.1:8090/api/status -o /tmp/d2k-panel-telegram-unconfigured.json || fail "панель недоступна после отказа включить Telegram"
-grep -q '"telegram_enabled":false' /tmp/d2k-panel-telegram-unconfigured.json || fail "не настроенный Telegram остался включён после отказа"
 echo "== Telegram: локальный старт, redirect, отключение =="
-# Указываем только loopback-релей без слушателя. C-клиент проверяется как
-# процесс и firewall, но ни к VPS, ни к Telegram не подключается. Временный
-# контейнерный watchdog выключен, чтобы лабораторная проверка не делала
+# Временный контейнерный watchdog выключен, чтобы лаборатория не запускала
 # внешний health-probe.
-printf '\nTG_RELAY_URL=wss://127.0.0.1:11443/ws\nTG_RELAY_SECRET=lab-only-not-a-real-secret\n' >> "$DIR/config"
 chmod -x "$DIR/d2k-tg-watchdog.sh"
 panel_post telegram-enable | grep -q '"ok":true' || fail "панель не включила настроенный Telegram-туннель"
 await "[ -f \"$DIR/run/d2ktg.pid\" ]" || fail "d2ktg не создал pid-файл после включения"
@@ -373,6 +362,10 @@ panel_post reapply | grep -q '"ok":true' || fail "локальная панел�
 echo "установлено и работает"
 
 echo "== 2. переход версии =="
+# Имитируем прежнюю установку: обновление должно переключить relay на local,
+# сохранить выключатель и оставить старые поля без использования.
+sed -i 's/^TG_MODE=local$/TG_MODE=relay/' "$DIR/config"
+printf 'TG_RELAY_URL=wss://relay.invalid/ws\nTG_RELAY_SECRET=lab-old-secret\n' >> "$DIR/config"
 # Метка человека в конфигурации: обновление обязано её сохранить.
 echo "# метка человека" >> "$DIR/config"
 PID_BEFORE=$(cat "$DIR/run/d2kd.pid")
@@ -388,6 +381,8 @@ SHA_NEW=$(sha "$REL/builds/d2kpanel-linux-$ARCH")
 
 D2K_LOCAL="$REL" sh scripts/install.sh 2>&1 | tee /tmp/install2.log
 grep -q "готово" /tmp/install2.log || fail "переход версии не прошёл: $(tail -3 /tmp/install2.log)"
+[ "$(grep -c '^TG_MODE=local$' "$DIR/config")" = 1 ] || fail "обновление не мигрировало relay на локальный Telegram"
+grep -q '^TG_RELAY_SECRET=lab-old-secret$' "$DIR/config" || fail "миграция удалила сохранённое поле relay"
 [ "$(sha /opt/sbin/d2kpanel)" = "$SHA_NEW" ] || fail "после обновления на месте осталась старая C-панель"
 grep -q "^# метка человека" "$DIR/config" || fail "обновление затёрло конфигурацию человека"
 PID_AFTER=$(cat "$DIR/run/d2kd.pid")

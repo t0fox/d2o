@@ -92,15 +92,15 @@ exit 0`));
     sh('printf "arch %s %s\\n" "$1" "$2" >> "$CALLS"; printf "amd64\\n"'));
   for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, sh('exit 0'));
   fixture('builds/d2kpanel-linux-amd64', sh('echo features=telegram-control'));
-  fixture('builds/d2ktg-linux-amd64', sh('echo features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3'));
+  fixture('builds/d2ktg-linux-amd64', sh('echo features=telegram-local-tcp-epoll,instagram-ip-probe,meta-hosts-v3'));
   fixture('builds/d2kd-linux-amd64', sh('exit 0'));
   fixture('builds/d2kc-linux-amd64', sh('exit 2'));
   fixture('files/S99d2k', sh('printf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0'));
-  fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
+  fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_MODE=local\n');
   fixture('files/d2k-ppe-deoffload.sh', sh('d2k_ppe_remove() { :; }'));
   for (const name of ['d2k-fw-heal.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh',
     'd2k-instagram-dns-scheduler.sh', 'd2k-instagram-dns.sh', 'd2k-log-maintenance.sh', 'd2k-update.sh']) fixture(`files/${name}`, sh('exit 0'));
-  fixture('files/d2k-openwrt-init', fs.readFileSync(path.join(root, 'files/d2k-openwrt-init'), 'utf8')
+  fixture('files/d2k-openwrt-init', fs.readFileSync(path.join(root, 'files/d2k-openwrt-init'), 'utf8').replace(/\r\n/g, '\n')
     .replaceAll('/etc/rc.common', path.join(tmp, 'etc/rc.common')));
   for (const name of ['meta-ranges.txt', 'tg-roots.pem', 'fake/stun.bin', 'fake/quic_initial_dbankcloud_ru.bin']) fixture(`files/${name}`, 'fixture\n');
   for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'gsap.js', 'fonts/onest.woff2',
@@ -116,7 +116,7 @@ exit 0`));
 
   // Установщик под этот корень: тот же код, другие пути.
   const runtime = path.join(tmp, 'runtime');
-  const installer = fs.readFileSync(path.join(root, 'scripts/install.sh'), 'utf8')
+  const installer = fs.readFileSync(path.join(root, 'scripts/install.sh'), 'utf8').replace(/\r\n/g, '\n')
     .replaceAll('/opt', path.join(tmp, 'opt'))
     .replaceAll('/etc/openwrt_release', release)
     .replaceAll('/etc/rc.common', path.join(tmp, 'etc/rc.common'))

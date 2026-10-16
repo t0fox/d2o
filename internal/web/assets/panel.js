@@ -1717,6 +1717,7 @@
   var TG = {
     connected: { word: "Подключён", lamp: "ok", note: "Туннель установлен и держит соединение с ретранслятором." },
     connecting: { word: "Подключается", lamp: "warn", note: "Служба запущена и устанавливает соединение с ретранслятором." },
+    local: { word: "Локальный прокси", lamp: "warn", note: "Локальный прокси запущен. Доступность Telegram DC и реального MTProto-ответа ещё не подтверждена." },
     stopped: { word: "Остановлен", lamp: "idle", note: "Служба не запущена." },
     not_configured: { word: "Не настроен", lamp: "idle", note: "В конфигурации не заданы TG_RELAY_URL и TG_RELAY_SECRET (или порт записи). Без них туннель не включить." }
   };
@@ -1842,6 +1843,7 @@
   var TUN_LOOK = {
     connected: { tube: 1, ribs: 1, relay: 1, pwr: 1, tx: 0.3, rx: 0.3 },
     connecting: { tube: 1, ribs: 0.5, relay: 0.7, pwr: 1, tx: 0.2, rx: 0.5 },
+    local: { tube: 0.8, ribs: 0.7, relay: 0.25, pwr: 1, tx: 1, rx: 1 },
     stopped: { tube: 0.45, ribs: 1, relay: 0.6, pwr: 0.8, tx: 1, rx: 1 },
     not_configured: { tube: 1, ribs: 1, relay: 0.4, pwr: 1, tx: 1, rx: 1 }
   };
@@ -2065,6 +2067,9 @@
     } else if (st === "connecting") {
       if (!prev || prev === "not_configured") at = tunnelDrawIn(tl, R, at);
       tunnelSearchLoop(tl, R, at + 0.2);
+    } else if (st === "local") {
+      if (!prev || prev === "not_configured") at = tunnelDrawIn(tl, R, at);
+      tl.set(R.G, { tx: 1, rx: 1, link: 0, mIn: 0, mOut: 0 }, at);
     } else if (st === "stopped") {
       if (!prev || prev === "not_configured") at = tunnelDrawIn(tl, R, at) - 0.3;
       /* Шлагбаум падает с отскоком, перекладины прочерчиваются, когда стойки встали. */
@@ -2128,7 +2133,7 @@
     var info = TG[st];
     var busy = snap.control_state === "running" || !!this.pending;
     var body = this.$("telegram-body");
-    var key = JSON.stringify([st, snap.telegram_enabled, snap.telegram_configured, snap.controls_enabled, busy, this.pending]);
+    var key = JSON.stringify([st, snap.telegram_enabled, snap.telegram_configured, snap.telegram_stats, snap.controls_enabled, busy, this.pending]);
     if (!force && body.__d2kKey === key) return;
     var focused = doc.activeElement && body.contains(doc.activeElement) ? doc.activeElement.getAttribute("data-control") : null;
     body.__d2kKey = key;
@@ -2146,11 +2151,16 @@
     }
     var note = info.note;
     if (snap.telegram_enabled && st === "stopped") note = "Туннель включён в конфигурации, но служба не запущена.";
+    var children = [state, actions, scene, el(doc, "p", "tunnel-note", note)];
+    var stats = snap.telegram_stats;
+    if (stats && typeof stats.wss_attempts === "number") {
+      children.push(el(doc, "p", "tunnel-note", "Маршруты WSS: попыток " + stats.wss_attempts + ", сбоев " + stats.wss_failures + ", ответов " + stats.wss_responses + " (CF: " + stats.cf_wss_responses + ")."));
+    }
     body.setAttribute("data-state", st);
     /* Сцена одна на все состояния: смена состояния — переход на том же рисунке. */
     var prevState = body.__sceneState || "";
     var scene = body.__scene || (body.__scene = tunnelScene(doc));
-    body.replaceChildren(state, actions, scene, el(doc, "p", "tunnel-note", note));
+    body.replaceChildren.apply(body, children);
     if (prevState !== st) {
       body.__sceneState = st;
       tunnelMotion(body, st, prevState);
@@ -2263,7 +2273,7 @@
     set("nav-families", m.groups.length ? String(m.groups.length) : "");
     set("nav-boxes", m.boxes.length ? String(m.boxes.length) : "");
     var tg = m.snap.telegram_status;
-    set("nav-telegram", tg === "connected" ? "вкл" : tg === "connecting" ? "…" : "выкл");
+    set("nav-telegram", tg === "connected" ? "вкл" : tg === "local" ? "лок." : tg === "connecting" ? "…" : "выкл");
     var bad = list(m.snap.stages).filter(function (s) { return !s.built; }).length;
     set("nav-diagnostics", bad ? "!" + bad : "", bad ? "warn" : null);
   };

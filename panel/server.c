@@ -13,7 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/un.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -372,7 +374,7 @@ static void telegram_config_flags(const d2k_panel_config *cfg,int *enabled,int *
     *enabled=0;*configured=0;
     if(!cfg||!cfg->config_path)return;
     FILE *f=fopen(cfg->config_path,"r");if(!f)return;
-    char line[2048];int have_url=0,have_secret=0,have_enroll=0;
+    char line[2048];int mode_seen=0,local_mode=0,mode_valid=1;
     while(fgets(line,sizeof(line),f)) {
         char *p=line;while(*p==' '||*p=='\t')p++;
         if(*p=='#'||!*p)continue;
@@ -387,14 +389,14 @@ static void telegram_config_flags(const d2k_panel_config *cfg,int *enabled,int *
             if(strchr(eq,quote)){*configured=0;fclose(f);return;}
         }
         if(strcmp(p,"TG_ENABLED")==0)*enabled=strcmp(eq,"1")==0||strcmp(eq,"yes")==0;
-        else if(strcmp(p,"TG_RELAY_URL")==0)have_url=*eq!='\0';
-        else if(strcmp(p,"TG_RELAY_SECRET")==0)have_secret=*eq!='\0';
-        else if(strcmp(p,"TG_ENROLL_PORT")==0) {
-            char *tail;unsigned long port=strtoul(eq,&tail,10);
-            have_enroll=tail!=eq&&!*tail&&port>0&&port<=65535;
+        else if(strcmp(p,"TG_MODE")==0) {
+            if(mode_seen)mode_valid=0;
+            mode_seen=1;
+            if(strcmp(eq,"local")==0)local_mode=1;
+            else mode_valid=0;
         }
     }
-    fclose(f);*configured=have_url&&(have_secret||have_enroll);
+    fclose(f);*configured=mode_valid&&mode_seen&&local_mode;
 }
 
 static void telegram_status_value(const d2k_panel_config *cfg,int enabled,int configured,int *running,char out[24]) {
@@ -407,9 +409,106 @@ static void telegram_status_value(const d2k_panel_config *cfg,int enabled,int co
     char buf[64];ssize_t n=read(fd,buf,sizeof(buf)-1);close(fd);
     if(n<=0){snprintf(out,24,"%s",fallback);return;}buf[n]='\0';
     char *end=buf+strlen(buf);while(end>buf&&(end[-1]=='\r'||end[-1]=='\n'||end[-1]==' '||end[-1]=='\t'))*--end='\0';
-    if(strcmp(buf,"connected")==0||strcmp(buf,"connecting")==0||strcmp(buf,"stopped")==0||strcmp(buf,"not_configured")==0)
+    if(strcmp(buf,"connected")==0||strcmp(buf,"connecting")==0||strcmp(buf,"local")==0||strcmp(buf,"stopped")==0||strcmp(buf,"not_configured")==0)
         snprintf(out,24,"%.23s",buf);
     else snprintf(out,24,"%s",fallback);
+}
+
+static int telegram_stats_number(const char *json, const char *key,
+                                 char out[21]) {
+    const char *value = NULL;
+    size_t length = 0;
+    if (!json_top_value(json, key, &value, &length) || !length || length > 20)
+        return -1;
+    if (length > 1 && value[0] == '0') return -1;
+    for (size_t i = 0; i < length; i++)
+        if (value[i] < '0' || value[i] > '9') return -1;
+    memcpy(out, value, length);
+    out[length] = '\0';
+    return 0;
+}
+
+static void telegram_stats_value(const d2k_panel_config *cfg,
+                                 char out[512]) {
+    snprintf(out, 512, "null");
+    if (!cfg || !cfg->telegram_stats_path) return;
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    size_t path_length = strlen(cfg->telegram_stats_path);
+    if (!path_length || path_length >= sizeof(address.sun_path)) return;
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, cfg->telegram_stats_path, path_length + 1);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(fd);
+        return;
+    }
+    int connected = connect(fd, (struct sockaddr *)&address, sizeof(address));
+    if (connected != 0 && errno != EINPROGRESS && errno != EAGAIN &&
+        errno != EWOULDBLOCK) {
+        close(fd);
+        return;
+    }
+    long long deadline = monotonic_ms() + 1250;
+    if (connected != 0) {
+        struct pollfd ready = {.fd = fd, .events = POLLOUT};
+        int remaining = (int)(deadline - monotonic_ms());
+        int rc = remaining > 0 ? poll(&ready, 1, remaining) : 0;
+        int error = 0;
+        socklen_t error_length = sizeof(error);
+        if (rc <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &error,
+                                  &error_length) != 0 || error) {
+            close(fd);
+            return;
+        }
+    }
+
+    char raw[1024];
+    size_t used = 0;
+    int complete = 0;
+    while (monotonic_ms() < deadline) {
+        struct pollfd ready = {.fd = fd, .events = POLLIN};
+        int remaining = (int)(deadline - monotonic_ms());
+        int rc = poll(&ready, 1, remaining);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc <= 0 || (ready.revents & (POLLERR | POLLNVAL))) break;
+        if (used >= sizeof(raw) - 1) break;
+        ssize_t n = read(fd, raw + used, sizeof(raw) - 1 - used);
+        if (n > 0) {
+            used += (size_t)n;
+            continue;
+        }
+        if (n == 0) { complete = 1; break; }
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+        break;
+    }
+    close(fd);
+    if (!complete || !used) return;
+    raw[used] = '\0';
+    if (!json_valid_object(raw, raw + used)) return;
+    char active[21], maximum[21], started[21], from_client[21], from_upstream[21];
+    char wss_attempts[21], wss_failures[21], wss_responses[21], cf_responses[21];
+    if (telegram_stats_number(raw, "active_connections", active) != 0 ||
+        telegram_stats_number(raw, "max_connections", maximum) != 0 ||
+        telegram_stats_number(raw, "connections_started", started) != 0 ||
+        telegram_stats_number(raw, "bytes_from_clients", from_client) != 0 ||
+        telegram_stats_number(raw, "bytes_from_upstreams", from_upstream) != 0 ||
+        telegram_stats_number(raw, "wss_attempts", wss_attempts) != 0 ||
+        telegram_stats_number(raw, "wss_failures", wss_failures) != 0 ||
+        telegram_stats_number(raw, "wss_responses", wss_responses) != 0 ||
+        telegram_stats_number(raw, "cf_wss_responses", cf_responses) != 0)
+        return;
+    (void)snprintf(out, 512,
+                   "{\"active_connections\":%s,\"max_connections\":%s,"
+                   "\"connections_started\":%s,\"bytes_from_clients\":%s,"
+                   "\"bytes_from_upstreams\":%s,\"wss_attempts\":%s,"
+                   "\"wss_failures\":%s,\"wss_responses\":%s,"
+                   "\"cf_wss_responses\":%s}",
+                   active, maximum, started, from_client, from_upstream,
+                   wss_attempts, wss_failures, wss_responses, cf_responses);
 }
 
 static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
@@ -460,7 +559,7 @@ static int api_control(int fd, const d2k_panel_config *cfg, const char *req,
     if(strcmp(command,"telegram-enable")==0) {
         int enabled=0,configured=0;telegram_config_flags(cfg,&enabled,&configured);(void)enabled;
         if(!configured) {
-            static const char body[]="{\"ok\":false,\"message\":\"Сначала задайте TG_RELAY_URL и TG_RELAY_SECRET в конфигурации\"}";
+            static const char body[]="{\"ok\":false,\"message\":\"Укажите TG_MODE=local в конфигурации Telegram\"}";
             return response(fd,409,"Conflict","application/json; charset=utf-8",body,sizeof body-1);
         }
     }
@@ -703,8 +802,10 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     const char *panel_listen = cfg && cfg->panel_listen ? cfg->panel_listen : "127.0.0.1:8090";
     int queue = cfg ? cfg->queue_num : 2000;
     int telegram_enabled=0,telegram_configured=0,telegram_running=0;char telegram_status[24];
+    char telegram_stats[512];
     telegram_config_flags(cfg,&telegram_enabled,&telegram_configured);
     telegram_status_value(cfg,telegram_enabled,telegram_configured,&telegram_running,telegram_status);
+    telegram_stats_value(cfg,telegram_stats);
     buf_puts(b, "{\"taken\":"); buf_json_string(b, now_iso);
     buf_puts(b, ",\"version\":"); buf_json_string(b, cfg ? cfg->version : "dev");
     buf_puts(b, ",\"commit\":"); buf_json_string(b, cfg ? cfg->commit : "");
@@ -724,6 +825,8 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     buf_printf(b, ",\"telegram_enabled\":%s,\"telegram_configured\":%s,\"telegram_running\":%s,\"telegram_status\":",
                telegram_enabled?"true":"false",telegram_configured?"true":"false",telegram_running?"true":"false");
     buf_json_string(b,telegram_status);
+    buf_puts(b, ",\"telegram_stats\":");
+    buf_puts(b, telegram_stats);
     buf_puts(b, ",\"state_dir\":"); buf_json_string(b, state_dir);
     buf_puts(b, ",\"state_dir_note\":"); buf_json_string(b, state_note);
     buf_printf(b, ",\"queue_num\":%d,\"unknown_keys\":[", queue);

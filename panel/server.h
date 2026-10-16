@@ -21,6 +21,7 @@ typedef struct {
     const char *controller_pid_path;
     const char *telegram_pid_path;
     const char *telegram_status_path;
+    const char *telegram_stats_path;
     const char *const *unknown_keys;
     size_t unknown_key_count;
     long long started_epoch;

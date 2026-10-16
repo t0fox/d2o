@@ -7,29 +7,21 @@
 #include <string.h>
 #include <unistd.h>
 
-static void test_config_values_and_url(void) {
+static void test_config_values_and_legacy_fields(void) {
     char path[]="/tmp/d2k-tg-config-XXXXXX";int fd=mkstemp(path);assert(fd>=0);
     FILE *f=fdopen(fd,"w");assert(f);
-    fputs("MODE=apply\nTG_ENABLED=1\nTG_RELAY_URL='wss://213.176.74.63.nip.io/ws'\nTG_RELAY_SECRET='never-log-this'\nTG_IDENTITY=/opt/d2k/state/tg.identity\nTG_CA_BUNDLE=/opt/d2k/files/tg-roots.pem\nTG_STATUS=/opt/d2k/state/telegram.status\nTG_PORT=1443\n",f);assert(fclose(f)==0);
+    fputs("MODE=apply\nTG_ENABLED=1\nTG_MODE=local\n"
+          "TG_RELAY_URL='wss://213.176.74.63.nip.io/ws'\n"
+          "TG_RELAY_SECRET='old-secret'\nTG_IDENTITY=/opt/d2k/state/tg.identity\n"
+          "TG_CA_BUNDLE=/opt/d2k/files/tg-roots.pem\n"
+          "TG_STATUS=/opt/d2k/state/telegram.status\nTG_PORT=1443\n"
+          "TG_ENROLL_PORT=9443\n",f);assert(fclose(f)==0);
     tg_config cfg;assert(tg_config_read(path,&cfg)==0);unlink(path);
-    assert(cfg.enabled==1&&cfg.listen_port==1443&&strcmp(cfg.relay_secret,"never-log-this")==0);
-    tg_relay_url url;assert(tg_relay_url_parse(cfg.relay_url,&url)==0);
-    assert(strcmp(url.host,"213.176.74.63.nip.io")==0&&url.port==443&&strcmp(url.path,"/ws")==0);
+    assert(cfg.enabled==1&&cfg.local_mode&&cfg.listen_port==1443);
+    assert(strcmp(cfg.ca_bundle,"/opt/d2k/files/tg-roots.pem")==0);
+    assert(strcmp(cfg.status_path,"/opt/d2k/state/telegram.status")==0);
+    assert(strcmp(cfg.stats_socket_path,"/opt/d2k/state/telegram.stats.sock")==0);
     tg_config_clean(&cfg);
-}
-
-static void test_url_rejects_unsafe_or_unsupported_inputs(void) {
-    tg_relay_url url;
-    assert(tg_relay_url_parse("ws://relay.example/ws",&url)!=0);
-    assert(tg_relay_url_parse("wss://user@relay.example/ws",&url)!=0);
-    assert(tg_relay_url_parse("wss://relay.example/ws?secret=x",&url)!=0);
-    assert(tg_relay_url_parse("wss://relay.example/other",&url)!=0);
-    assert(tg_relay_url_parse("wss://relay.example:0/ws",&url)!=0);
-    assert(tg_relay_url_parse("wss://relay.example:65536/ws",&url)!=0);
-    assert(tg_relay_url_parse("wss://-relay.example/ws",&url)!=0);
-    assert(tg_relay_url_parse("wss://relay-.example/ws",&url)!=0);
-    assert(tg_relay_url_parse("wss://relay..example/ws",&url)!=0);
-    assert(tg_relay_url_parse("wss://relay.example:8443/ws",&url)==0&&url.port==8443);
 }
 
 static void test_duplicate_and_incomplete_keys_rejected(void) {
@@ -39,14 +31,80 @@ static void test_duplicate_and_incomplete_keys_rejected(void) {
     assert(tg_config_read("/path/that/does/not/exist",&cfg)!=0);
 }
 
-static void test_per_install_enrollment_needs_no_shared_secret(void) {
-    char path[]="/tmp/d2k-tg-enroll-config-XXXXXX";int fd=mkstemp(path);assert(fd>=0);
+static void test_local_mode_needs_no_relay_url_or_secret(void) {
+    char path[]="/tmp/d2k-tg-local-config-XXXXXX";int fd=mkstemp(path);assert(fd>=0);
     FILE *f=fdopen(fd,"w");assert(f);
-    fputs("TG_ENABLED=1\nTG_RELAY_URL=wss://213.176.74.63.nip.io/ws\nTG_ENROLL_PORT=9443\n",f);
-    assert(fclose(f)==0);tg_config cfg;assert(tg_config_read(path,&cfg)==0);
-    assert(cfg.enabled&&cfg.enroll_port==9443&&!cfg.relay_secret[0]);
-    f=fopen(path,"w");assert(f);fputs("TG_ENROLL_PORT=65536\n",f);assert(fclose(f)==0);
-    assert(tg_config_read(path,&cfg)!=0);unlink(path);
+    fputs("TG_ENABLED=1\nTG_MODE=local\nTG_DC_MAP_PATH=/tmp/tg-dc.json\nTG_STATS_SOCKET=/tmp/tg-stats.sock\n",f);
+    assert(fclose(f)==0);
+    tg_config cfg;assert(tg_config_read(path,&cfg)==0);unlink(path);
+    assert(cfg.enabled && cfg.local_mode);
+    assert(strcmp(cfg.dc_map_path,"/tmp/tg-dc.json")==0);
+    assert(strcmp(cfg.stats_socket_path,"/tmp/tg-stats.sock")==0);
+    tg_config_clean(&cfg);
+
+    f=fopen(path,"w");assert(f);
+    fputs("TG_ENABLED=1\nTG_MODE=local\nSTATE_DIR=/tmp/tg-state\n",f);
+    assert(fclose(f)==0);
+    assert(tg_config_read(path,&cfg)==0);
+    assert(strcmp(cfg.stats_socket_path,"/tmp/tg-state/telegram.stats.sock")==0);
+    tg_config_clean(&cfg);
+    unlink(path);
+}
+
+static void test_relay_mode_is_rejected(void) {
+    char path[] = "/tmp/d2k-tg-relay-mode-XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    FILE *file = fdopen(fd, "w");
+    assert(file);
+    fputs("TG_ENABLED=1\nTG_MODE=relay\n"
+          "TG_RELAY_URL=wss://relay.example/ws\n"
+          "TG_RELAY_SECRET=old-secret\n", file);
+    assert(fclose(file) == 0);
+
+    tg_config config;
+    assert(tg_config_read(path, &config) != 0);
+    unlink(path);
+}
+
+static void test_local_route_options_are_bounded_and_normalized(void) {
+    char path[] = "/tmp/d2k-tg-routes-XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    FILE *file = fdopen(fd, "w");
+    assert(file);
+    fputs("TG_ENABLED=1\nTG_MODE=local\n"
+          "TG_CF_WORKER_DOMAIN=HTTPS://Tunnel.Example/path,backup.example\n"
+          "TG_CF_DOMAIN=Edge.Example,edge2.example\n"
+          "TG_CF_BALANCE=1\nTG_WS_ROUTING=cf-first\n"
+          "TG_WS_HEDGE_DELAY_MS=250\nTG_WS_HEDGE_LIMIT=4\n"
+          "TG_DEFAULT_DOMAINS=1\n", file);
+    assert(fclose(file) == 0);
+
+    tg_config config;
+    assert(tg_config_read(path, &config) == 0);
+    assert(config.local_mode && config.cf_balance && config.default_domains);
+    assert(config.cf_worker_domain_count == 2);
+    assert(strcmp(config.cf_worker_domains[0], "tunnel.example") == 0);
+    assert(strcmp(config.cf_worker_domains[1], "backup.example") == 0);
+    assert(config.cf_proxy_domain_count == 2);
+    assert(strcmp(config.cf_proxy_domains[0], "edge.example") == 0);
+    assert(config.ws_routing == TG_WS_ROUTING_CF_FIRST);
+    assert(config.ws_hedge_delay_ms == 250 && config.ws_hedge_limit == 4);
+    tg_config_clean(&config);
+
+    file = fopen(path, "w");
+    assert(file);
+    fputs("TG_CF_WORKER_DOMAIN=127.0.0.1\n", file);
+    assert(fclose(file) == 0);
+    assert(tg_config_read(path, &config) != 0);
+
+    file = fopen(path, "w");
+    assert(file);
+    fputs("TG_WS_ROUTING=unknown\n", file);
+    assert(fclose(file) == 0);
+    assert(tg_config_read(path, &config) != 0);
+    unlink(path);
 }
 
 static void test_managed_resource_root(void) {
@@ -59,7 +117,9 @@ static void test_managed_resource_root(void) {
 }
 int main(void) {
     test_managed_resource_root();
-    test_config_values_and_url();test_url_rejects_unsafe_or_unsupported_inputs();
-    test_per_install_enrollment_needs_no_shared_secret();
+    test_config_values_and_legacy_fields();
+    test_local_mode_needs_no_relay_url_or_secret();
+    test_relay_mode_is_rejected();
+    test_local_route_options_are_bounded_and_normalized();
     test_duplicate_and_incomplete_keys_rejected();puts("config tests: ok");return 0;
 }

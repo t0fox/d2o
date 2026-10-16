@@ -190,6 +190,7 @@ TG_PORT=${TG_PORT:-1443}
 TGBIN=/opt/sbin/d2ktg
 TG_PID=$RUN/d2ktg.pid
 TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
+TG_STATS_SOCKET=${TG_STATS_SOCKET:-$STATE_DIR/telegram.stats.sock}
 TG_FIREWALL=$RELEASE/d2k-tg-firewall.sh
 TG_WATCHDOG=$RELEASE/d2k-tg-watchdog.sh
 TG_WD_PID=$RUN/d2k-tg-watchdog.pid
@@ -1368,6 +1369,7 @@ start_panel() {
             --listen "$PANEL_LISTEN" --state-dir "$STATE_DIR" --mode "$MODE" \
             --queue "$QUEUE_NUM" --service /opt/etc/init.d/S99d2k \
             --engine-pid "$DP_PID" --controller-pid "$CT_PID" \
+            --telegram-stats "$TG_STATS_SOCKET" \
             "$@" --log "$LOG/panel.log" \
             || { say "панель не запустилась — обход это не затрагивает"; return 1; }
     fi
@@ -1415,7 +1417,7 @@ telegram_start() {
     [ "${TG_ENABLED:-0}" = 1 ] || { write_telegram_status stopped; return 0; }
     [ -x "$TGBIN" ] || { say "Telegram включён, но нет $TGBIN"; write_telegram_status error; return 1; }
     "$TGBIN" --check-config "$CONF" >/dev/null 2>&1 || {
-        say "Telegram включён, но адрес релея или способ регистрации не настроены корректно"
+        say "Telegram включён, но конфигурация локального режима неверна"
         write_telegram_status not_configured
         return 1
     }
@@ -1449,7 +1451,7 @@ telegram_start() {
         spawn_daemon -S -b -m -p "$TG_WD_PID" -x "$TG_WATCHDOG" \
             || say "Telegram health watchdog не запустился"
     fi
-    say "Telegram TCP tunnel запущен на :$TG_PORT"
+    say "локальный Telegram TCP-прокси запущен на :$TG_PORT"
 }
 
 telegram_stop() {

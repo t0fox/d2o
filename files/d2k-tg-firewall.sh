@@ -5,6 +5,8 @@ set -eu
 SET4=d2k_tg_dc
 SET6=d2k_tg_dc6
 PORT=1443
+OUTBOUND_MARK=0x31
+OUTBOUND_COMMENT=d2k-tg-outbound
 CIDRS4="149.154.160.0/20 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 91.105.192.0/23 95.161.64.0/20 185.76.151.0/24"
 CIDRS6="2001:67c:4e8::/48 2001:b28:f23c::/47 2001:b28:f23f::/48 2a0a:f280:203::/48"
 
@@ -38,6 +40,7 @@ table inet $NFT_TABLE {
 	}
 	chain out {
 		type nat hook output priority -101; policy accept;
+		meta mark $OUTBOUND_MARK return
 		ip daddr @tg4 tcp dport 443 redirect to :$PORT
 	}
 	chain fwd6 {
@@ -55,6 +58,7 @@ EOF2
 nft_installed() {
     listed=$(nft list table inet "$NFT_TABLE" 2>/dev/null) || return 1
     [ "$(printf '%s\n' "$listed" | grep -c "redirect to :$PORT")" -eq 2 ] &&
+        [ "$(printf '%s\n' "$listed" | grep -c "meta mark $OUTBOUND_MARK return")" -eq 1 ] &&
         [ "$(printf '%s\n' "$listed" | grep -c 'reject with tcp reset')" -eq 2 ]
 }
 
@@ -84,6 +88,9 @@ ensure4() {
             ipt -t nat -I "$chain" 1 -p tcp --dport 443 -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || return 1
         ipt -t nat -C "$chain" -p tcp --dport 443 -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || return 1
     done
+    ipt -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN ||
+        ipt -t nat -I OUTPUT 1 -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || return 1
+    ipt -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || return 1
 }
 
 ensure6() {
@@ -126,6 +133,9 @@ ipt_stop() {
         while ipt -t nat -C "$chain" -p tcp --dport 443 -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT"; do
             ipt -t nat -D "$chain" -p tcp --dport 443 -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || break
         done
+    done
+    while ipt -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN; do
+        ipt -t nat -D OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || break
     done
     if command -v ip6tables >/dev/null 2>&1; then
         for chain in FORWARD OUTPUT; do

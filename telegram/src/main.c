@@ -4,24 +4,20 @@
 #define _POSIX_C_SOURCE 200809L
 #include "../../runtime/d2k_runtime.h"
 #include "tg_config.h"
-#include "tg_identity.h"
 #include "tg_net.h"
-#include "tg_register.h"
-#include "tg_enroll.h"
-#include "tg_session.h"
-#include "tg_tunnel.h"
-#include "tg_wire.h"
 #include "tg_tls.h"
-#include "tg_ws.h"
+#include "tg_dc_map.h"
+#include "tg_epoll_proxy.h"
+#include "tg_transparent.h"
+#include "tg_mtproto.h"
+#include "tg_mtproto_discovery.h"
+#include "tg_stats_socket.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <openssl/rand.h>
 #include <signal.h>
-#include <pthread.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,20 +26,10 @@
 #include <unistd.h>
 
 #define TG_BUILD "d2k-tg-0.3"
-#define TG_DEFAULT_WINDOW (2u*1024u*1024u)
+#define TG_DC_REFRESH_SECS (6u * 60u * 60u)
+#define TG_DC_REFRESH_RETRY_SECS (60u * 60u)
 
 static const char *health_path = "/tmp/d2k/d2ktg.health";
-static atomic_int health_running, external_available;
-typedef struct { int listener; } health_local;
-static void *health_thread(void *arg) {
-    const health_local *local=arg;
-    while(atomic_load(&health_running)) {
-        int ready=d2k_runtime_listener_ready(local->listener);
-        (void)d2k_runtime_heartbeat(health_path,NULL,0,ready,atomic_load(&external_available));
-        struct timespec delay={.tv_nsec=100000000L};(void)nanosleep(&delay,NULL);
-    }
-    return NULL;
-}
 static volatile sig_atomic_t stop_requested;
 
 static void on_signal(int signo) { (void)signo;stop_requested=1; }
@@ -63,146 +49,215 @@ static int write_status(const char *path,const char *value) {
     return 0;
 }
 
-static int create_listener(uint16_t port) {
-    int fd=socket(AF_INET,SOCK_STREAM,0),one=1;if(fd<0)return -1;
-    struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(port),.sin_addr={.s_addr=htonl(INADDR_ANY)}};
-    int flags=fcntl(fd,F_GETFL,0);
-    if(flags<0||fcntl(fd,F_SETFL,flags|O_NONBLOCK)!=0||
-       setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one))!=0||
-       bind(fd,(struct sockaddr *)&addr,sizeof(addr))!=0||listen(fd,256)!=0){close(fd);return -1;}
+static int create_local_listener(uint16_t port) {
+    int one = 1;
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        int flags = fcntl(fd, F_GETFL, 0);
+        int v6only = 0;
+        struct sockaddr_in6 address = {
+            .sin6_family = AF_INET6,
+            .sin6_port = htons(port),
+            .sin6_addr = IN6ADDR_ANY_INIT
+        };
+        if (flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 &&
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == 0 &&
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only,
+                       sizeof(v6only)) == 0 &&
+            bind(fd, (struct sockaddr *)&address, sizeof(address)) == 0 &&
+            listen(fd, 256) == 0)
+            return fd;
+        close(fd);
+    }
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int flags = fcntl(fd, F_GETFL, 0);
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr = {.s_addr = htonl(INADDR_ANY)}
+    };
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0 ||
+        bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(fd, 256) != 0) {
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
-typedef struct { SSL *ssl; } session_transport;
-static int session_send(void *opaque,const uint8_t *data,size_t len) {
-    session_transport *t=opaque;return tg_ws_write_binary(t->ssl,data,len);
-}
-static int session_read(void *opaque,uint8_t *dst,size_t cap,size_t *len) {
-    session_transport *t=opaque;int rc=tg_ws_read_binary(t->ssl,dst,cap,len);return rc==0?0:-1;
-}
-
-static int establish_ws(SSL_CTX *ctx,const tg_relay_url *url,SSL **out_ssl,int *out_fd) {
-    int fd=tg_tcp_connect_ipv4(url->host,url->port,10000);if(fd<0)return -1;
-    SSL *ssl=tg_tls_connect_fd(ctx,fd,url->host);
-    if(!ssl){close(fd);return -1;}
-    char host_header[320];int n=snprintf(host_header,sizeof(host_header),"%s:%u",url->host,(unsigned)url->port);
-    if(n<=0||(size_t)n>=sizeof(host_header)||tg_ws_upgrade(ssl,host_header,url->path)!=0){SSL_free(ssl);close(fd);return -1;}
-    *out_ssl=ssl;*out_fd=fd;return 0;
-}
-
-static void close_ws(SSL **ssl,int *fd) {
-    if(*ssl){SSL_free(*ssl);*ssl=NULL;}if(*fd>=0){close(*fd);*fd=-1;}
-}
-
-static int register_identity(const tg_config *cfg,const tg_relay_url *url,tg_identity *identity) {
-    if(!cfg->relay_secret[0])return tg_enroll_identity(url->host,cfg->enroll_port,cfg->ca_bundle,identity);
-    return tg_register_identity(url->host,url->port,url->host,cfg->ca_bundle,cfg->relay_secret,identity);
-}
-
-static int ensure_registered(const tg_config *cfg,const tg_relay_url *url,tg_identity *identity) {
-    int rc=register_identity(cfg,url,identity);
-    if(rc!=TG_REGISTER_ID_CONFLICT)return rc;
-    log_msg("relay reports an identity conflict; rotating the local installation identity");
-    tg_identity_cleanup(identity);
-    if(unlink(cfg->identity_path)!=0&&errno!=ENOENT)return -1;
-    if(tg_identity_load_or_mint(cfg->identity_path,identity)!=0)return -1;
-    return register_identity(cfg,url,identity);
-}
-
-static void interruptible_wait(uint32_t delay_ms) {
-    struct timespec req={.tv_sec=(time_t)(delay_ms/1000u),.tv_nsec=(long)(delay_ms%1000u)*1000000L};
-    while(!stop_requested&&nanosleep(&req,&req)!=0&&errno==EINTR){}
-}
-
-static double random_unit(void) {
-    uint64_t value=0;if(RAND_bytes((unsigned char *)&value,sizeof(value))!=1)return 0.5;
-    return (double)value/(double)UINT64_MAX;
-}
-
-static int run_daemon(const char *config_path) {
-    tg_config cfg;tg_relay_url url;tg_identity identity={0};SSL_CTX *ctx=NULL;int listener=-1,rc=1;pthread_t observer;int observer_started=0;health_local local={0};
-    if(tg_config_read(config_path,&cfg)!=0){log_msg("cannot read configuration");return 1;}
-    if(!cfg.enabled||!cfg.relay_url[0]||(!cfg.relay_secret[0]&&!cfg.enroll_port)){
-        (void)write_status(cfg.status_path,"not_configured\n");tg_config_clean(&cfg);return 0;
-    }
-    if(tg_relay_url_parse(cfg.relay_url,&url)!=0){log_msg("TG_RELAY_URL must be a valid wss://host[:port]/ws URL");(void)write_status(cfg.status_path,"error\n");goto done;}
-    ctx=tg_tls_client_context(cfg.ca_bundle);if(!ctx){log_msg("cannot load Telegram relay trust bundle");(void)write_status(cfg.status_path,"error\n");goto done;}
-    if(tg_identity_load_or_mint(cfg.identity_path,&identity)!=0){log_msg("cannot load or create the per-install relay identity");(void)write_status(cfg.status_path,"error\n");goto done;}
-    listener=create_listener(cfg.listen_port);if(listener<0){log_msg("cannot bind the Telegram redirect listener");(void)write_status(cfg.status_path,"error\n");goto done;}
-    struct sigaction sa;memset(&sa,0,sizeof(sa));sa.sa_handler=on_signal;sigemptyset(&sa.sa_mask);
-    (void)sigaction(SIGINT,&sa,NULL);(void)sigaction(SIGTERM,&sa,NULL);(void)signal(SIGPIPE,SIG_IGN);
-
-    local.listener=listener;atomic_store(&health_running,1);
-    /* Only the main thread handles termination: it owns stop_requested and
-     * its blocking reconnect wait must receive the signal to be interrupted. */
-    sigset_t termination,original_mask;sigemptyset(&termination);
-    sigaddset(&termination,SIGINT);sigaddset(&termination,SIGTERM);
-    if(pthread_sigmask(SIG_BLOCK,&termination,&original_mask)!=0){log_msg("cannot protect local observer signal mask");goto done;}
-    int create_rc=pthread_create(&observer,NULL,health_thread,&local);
-    if(create_rc==0)observer_started=1;
-    /* Restore even when creation fails; the observer inherited the blocked
-     * mask, while main resumes its original termination delivery policy. */
-    int restore_rc=pthread_sigmask(SIG_SETMASK,&original_mask,NULL);
-    if(restore_rc!=0){log_msg("cannot restore main signal mask");goto done;}
-    if(create_rc!=0){log_msg("cannot start local health observer");goto done;}
-    unsigned failures=0,fast_deaths=0;int healthy=0,identity_registered=0;
-    while(!stop_requested) {
-        atomic_store(&external_available,0);
-        (void)write_status(cfg.status_path,"connecting\n");
-        if(!identity_registered) {
-            int registered=ensure_registered(&cfg,&url,&identity);
-            if(registered!=0){log_msg("relay identity registration failed; will retry");failures++;
-                interruptible_wait(tg_reconnect_delay_ms(failures,0,healthy,random_unit()));continue;}
-            identity_registered=1;
-        }
-        SSL *ssl=NULL;int relay_fd=-1;int protocol_v2=1;uint32_t window=TG_DEFAULT_WINDOW;
-        if(establish_ws(ctx,&url,&ssl,&relay_fd)!=0){log_msg("verified relay WSS connection failed; will retry");failures++;
-            interruptible_wait(tg_reconnect_delay_ms(failures,0,healthy,random_unit()));continue;}
-        session_transport transport={.ssl=ssl};tg_session_io io={.ctx=&transport,.send_binary=session_send,.read_binary=session_read};
-        tg_session_state session={0};time_t began=time(NULL);
-        int auth=tg_session_authenticate_v2(&io,&identity,TG_BUILD,(int64_t)began,&session);
-        if(auth==TG_SESSION_FALLBACK_V1) {
-            close_ws(&ssl,&relay_fd);
-            if(establish_ws(ctx,&url,&ssl,&relay_fd)!=0){log_msg("could not reconnect for the explicit v1 protocol fallback");failures++;
-                interruptible_wait(tg_reconnect_delay_ms(failures,0,healthy,random_unit()));continue;}
-            transport.ssl=ssl;protocol_v2=0;
-            if(tg_session_authenticate_v1(&io,&identity,(int64_t)time(NULL))!=0){log_msg("v1 identity authentication failed");close_ws(&ssl,&relay_fd);failures++;
-                interruptible_wait(tg_reconnect_delay_ms(failures,0,healthy,random_unit()));continue;}
-            window=0;
-        } else if(auth!=TG_SESSION_V2_OK) {
-            log_msg("relay authentication failed; no protocol fallback is attempted");close_ws(&ssl,&relay_fd);failures++;fast_deaths++;
-            if(tg_reconnect_needs_reregister(fast_deaths)){int rer=ensure_registered(&cfg,&url,&identity);fast_deaths=0;identity_registered=rer==0;if(rer!=0)log_msg("identity re-registration after repeated fast failures failed");}
-            interruptible_wait(tg_reconnect_delay_ms(failures,session.retry_after,healthy,random_unit()));continue;
-        } else if(session.window)window=session.window;
-        atomic_store(&external_available,1);
-        (void)write_status(cfg.status_path,"connected\n");log_msg(protocol_v2?"relay session authenticated (mux v2)":"relay session authenticated (mux v1)");
-        tg_tunnel_config tunnel={.relay_ssl=ssl,.listener_fd=listener,.listen_port=cfg.listen_port,
-            .protocol_v2=protocol_v2,.window=window,.stop=&stop_requested};
-        int tunnel_rc=tg_tunnel_run(&tunnel);atomic_store(&external_available,0);close_ws(&ssl,&relay_fd);
-        time_t lifetime=time(NULL)-began;
-        if(lifetime>=60){healthy=1;failures=0;fast_deaths=0;}
-        else {healthy=0;failures++;fast_deaths++;}
-        if(tg_reconnect_needs_reregister(fast_deaths)){int rer=ensure_registered(&cfg,&url,&identity);fast_deaths=0;identity_registered=rer==0;if(rer!=0)log_msg("identity re-registration after repeated fast session deaths failed");}
-        if(!stop_requested){
-            if(tunnel_rc<0) { log_msg("relay session ended; reconnecting"); }
-            (void)write_status(cfg.status_path,"connecting\n");
-            interruptible_wait(tg_reconnect_delay_ms(failures,0,healthy,random_unit()));
+static int refresh_local_dc_map(tg_dc_map_store *store, int64_t now) {
+    static const struct {
+        const char *address;
+        uint32_t dc_id;
+    } bootstrap[] = {
+        {"149.154.175.50", 1},
+        {"2001:b28:f23d:f001::a", 1}
+    };
+    for (size_t i = 0; i < sizeof(bootstrap) / sizeof(bootstrap[0]); ++i) {
+        tg_dc_snapshot snapshot = {0};
+        if (tg_mtproto_discover_config(bootstrap[i].address, 443,
+                                       bootstrap[i].dc_id, 4000, 0x31, now,
+                                       &snapshot) == 0) {
+            int installed = tg_dc_map_store_install(store, &snapshot, now);
+            tg_dc_snapshot_destroy(&snapshot);
+            if (installed == 0) return 0;
         }
     }
-    (void)write_status(cfg.status_path,"stopped\n");rc=0;
+    return -1;
+}
+
+static int run_local_daemon(const char *config_path) {
+    static const uint16_t allowed_ports[] = {443};
+    static const char *const allowed_cidrs[] = {
+        "149.154.160.0/20", "91.108.4.0/22", "91.108.8.0/22",
+        "91.108.12.0/22", "91.108.16.0/22", "91.108.20.0/22",
+        "91.108.56.0/22", "91.105.192.0/23", "95.161.64.0/20",
+        "185.76.151.0/24", "2001:67c:4e8::/48", "2001:b28:f23c::/47",
+        "2001:b28:f23f::/48", "2a0a:f280:203::/48"
+    };
+    const uint16_t listen_ports[] = {TG_LISTEN_PORT};
+    tg_config cfg;
+    tg_dc_map_store map_store = {0};
+    tg_cf_domain_pool cf_domain_pool = {0};
+    tg_epoll_proxy *proxy = NULL;
+    SSL_CTX *tls_context = NULL;
+    tg_stats_socket stats_socket = {.fd = -1};
+    int listener = -1, rc = 1;
+    int64_t next_dc_refresh_at = 0;
+    if (tg_config_read(config_path, &cfg) != 0) {
+        log_msg("не удалось прочитать конфигурацию локального прокси");
+        return 1;
+    }
+    if (!cfg.enabled) {
+        (void)write_status(cfg.status_path, "stopped\n");
+        tg_config_clean(&cfg);
+        return 0;
+    }
+    int64_t now = (int64_t)time(NULL);
+    if (!cfg.local_mode || tg_dc_map_store_init(&map_store, cfg.dc_map_path) != 0 ||
+        tg_dc_map_store_load(&map_store, now) != 0) {
+        log_msg("не удалось инициализировать проверенную карту Telegram DC");
+        goto done;
+    }
+    if (tg_cf_domain_pool_init(&cf_domain_pool, cfg.cf_domain_cache_path,
+            &cfg.cf_proxy_domains[0][0], cfg.cf_proxy_domain_count,
+            cfg.default_domains) != 0) {
+        log_msg("не удалось загрузить проверенный пул CF-доменов");
+        goto done;
+    }
+    int initial_refresh_due = tg_dc_map_store_refresh_due(
+        &map_store, now, TG_DC_REFRESH_SECS);
+    if (initial_refresh_due) {
+        if (refresh_local_dc_map(&map_store, now) == 0) {
+            next_dc_refresh_at = now + TG_DC_REFRESH_SECS;
+        } else {
+            log_msg("не удалось обновить карту через Telegram; используется last-known-good или встроенная карта");
+            next_dc_refresh_at = now + TG_DC_REFRESH_RETRY_SECS;
+        }
+    } else {
+        next_dc_refresh_at = now + TG_DC_REFRESH_SECS;
+    }
+    tls_context = tg_tls_client_context(cfg.ca_bundle);
+    if (!tls_context) {
+        log_msg("не удалось загрузить доверенные сертификаты для direct WSS");
+        goto done;
+    }
+    listener = create_local_listener(cfg.listen_port);
+    if (listener < 0) {
+        log_msg("не удалось открыть IPv4/IPv6 listener локального прокси");
+        goto done;
+    }
+    tg_transparent_policy policy = {
+        .map_store = &map_store,
+        .allowed_ports = allowed_ports,
+        .allowed_port_count = sizeof(allowed_ports) / sizeof(allowed_ports[0]),
+        .allowed_cidrs = allowed_cidrs,
+        .allowed_cidr_count = sizeof(allowed_cidrs) / sizeof(allowed_cidrs[0])
+    };
+    tg_epoll_proxy_config proxy_config = {
+        .listener_fd = listener,
+        .queue_bytes = 64u * 1024u,
+        .memory_budget_bytes = 32u * 1024u * 1024u,
+        .configured_max_connections = 64,
+        .handshake_timeout_ms = 5000,
+        .idle_timeout_ms = 300000,
+        .socket_mark = 0x31,
+        .require_socket_mark = 1,
+        .enforce_self_dial = 1,
+        .enable_direct_wss = 1,
+        .tls_context = tls_context,
+        .routing_config = &cfg,
+        .cf_domain_pool = &cf_domain_pool,
+        .listen_ports = listen_ports,
+        .listen_port_count = sizeof(listen_ports) / sizeof(listen_ports[0]),
+        .select_target = tg_transparent_select_target,
+        .context = &policy
+    };
+    proxy = tg_epoll_proxy_create(&proxy_config);
+    if (!proxy) {
+        log_msg("не удалось запустить epoll-прокси с безопасным лимитом ресурсов");
+        goto done;
+    }
+    if (tg_stats_socket_open(&stats_socket, cfg.stats_socket_path) != 0)
+        log_msg("не удалось открыть локальный read-only socket статистики Telegram");
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    (void)sigaction(SIGINT, &sa, NULL);
+    (void)sigaction(SIGTERM, &sa, NULL);
+    (void)signal(SIGPIPE, SIG_IGN);
+    stop_requested = 0;
+    (void)write_status(cfg.status_path, "local\n");
+    log_msg("локальный Telegram TCP-прокси запущен через epoll");
+    rc = 0;
+    while (!stop_requested) {
+        if (stats_socket.fd >= 0 &&
+            tg_stats_socket_serve(&stats_socket, proxy) != 0)
+            log_msg("ошибка обслуживания локального socket статистики Telegram");
+        if (tg_epoll_proxy_step(proxy, 1000) < 0) {
+            log_msg("ошибка epoll runtime локального Telegram-прокси");
+            rc = 1;
+            break;
+        }
+        if (stats_socket.fd >= 0 &&
+            tg_stats_socket_serve(&stats_socket, proxy) != 0)
+            log_msg("ошибка обслуживания локального socket статистики Telegram");
+        int64_t refresh_now = (int64_t)time(NULL);
+        if (refresh_now >= next_dc_refresh_at &&
+            tg_dc_map_store_refresh_due(&map_store, refresh_now,
+                                       TG_DC_REFRESH_SECS)) {
+            if (refresh_local_dc_map(&map_store, refresh_now) == 0) {
+                next_dc_refresh_at = refresh_now + TG_DC_REFRESH_SECS;
+            } else {
+                log_msg("не удалось периодически обновить карту Telegram; используется last-known-good или встроенная карта");
+                next_dc_refresh_at = refresh_now + TG_DC_REFRESH_RETRY_SECS;
+            }
+        }
+        int ready = d2k_runtime_listener_ready(listener);
+        (void)d2k_runtime_heartbeat(health_path, NULL, 0, ready, ready);
+    }
+    (void)write_status(cfg.status_path, rc == 0 ? "stopped\n" : "error\n");
 done:
-    atomic_store(&health_running,0);if(observer_started)(void)pthread_join(observer,NULL);
-    if(listener>=0)close(listener);
-    if(ctx)SSL_CTX_free(ctx);
-    tg_identity_cleanup(&identity);tg_config_clean(&cfg);return rc;
+    tg_stats_socket_close(&stats_socket);
+    tg_epoll_proxy_destroy(proxy);
+    SSL_CTX_free(tls_context);
+    if (listener >= 0) close(listener);
+    tg_cf_domain_pool_destroy(&cf_domain_pool);
+    tg_dc_map_store_destroy(&map_store);
+    tg_config_clean(&cfg);
+    return rc;
 }
 
 static int check_config(const char *path) {
-    tg_config cfg;tg_relay_url url;
-    int ok=tg_config_read(path,&cfg)==0;
-    if(ok)ok=(cfg.relay_secret[0]||cfg.enroll_port)&&cfg.relay_url[0]&&access(cfg.ca_bundle,R_OK)==0&&
-        tg_relay_url_parse(cfg.relay_url,&url)==0;
-    tg_config_clean(&cfg);return ok?0:1;
+    tg_config cfg = {0};
+    int ok = tg_config_read(path, &cfg) == 0 && cfg.local_mode &&
+        cfg.listen_port == TG_LISTEN_PORT && cfg.dc_map_path[0] == '/' &&
+        access(cfg.ca_bundle, R_OK) == 0;
+    tg_config_clean(&cfg);
+    return ok ? 0 : 1;
 }
 
 static int redirect_log(const char *path) {
@@ -256,19 +311,96 @@ static int check_instagram_ip(const char *host,const char *ip,const char *ca) {
 }
 
 static int offline_self_check(void) {
-    uint8_t encoded[8], payload[2]={0x12,0x34}; tg_frame frame;
-    size_t n=tg_mux_encode(encoded,sizeof encoded,7,1,payload,sizeof payload);
-    if(n!=5||tg_mux_decode(encoded,n,&frame)!=0||frame.stream_id!=7||frame.type!=1||frame.payload_len!=2||memcmp(frame.payload,payload,2))return -1;
     return OPENSSL_init_ssl(0,NULL)==1?0:-1;
+}
+
+static int parse_unsigned_arg(const char *text, unsigned long max,
+                              unsigned long *value) {
+    if (!text || !*text || !value) return -1;
+    for (const char *p = text; *p; ++p)
+        if (*p < '0' || *p > '9') return -1;
+    errno = 0;
+    char *end = NULL;
+    unsigned long parsed = strtoul(text, &end, 10);
+    if (errno || !end || *end || parsed == 0 || parsed > max) return -1;
+    *value = parsed;
+    return 0;
+}
+
+static int check_telegram_dc(const char *address, const char *dc_text,
+                            const char *port_text) {
+    struct in_addr v4;
+    struct in6_addr v6;
+    unsigned long dc, port = 443;
+    if ((!inet_pton(AF_INET, address, &v4) &&
+         !inet_pton(AF_INET6, address, &v6)) ||
+        parse_unsigned_arg(dc_text, 999, &dc) != 0 ||
+        (port_text && parse_unsigned_arg(port_text, 65535, &port) != 0)) {
+        puts("{\"ok\":false,\"stage\":\"input\",\"error\":\"invalid_arguments\"}");
+        return 2;
+    }
+    tg_mtproto_probe_result result = {0};
+    tg_mtproto_probe_status status = tg_mtproto_probe_res_pq(
+        address, (uint16_t)port, (uint32_t)dc, 0, 8000, &result);
+    const char *stage = "input", *error = "invalid";
+    switch (result.stage) {
+    case TG_MTPROTO_PROBE_STAGE_TCP: stage = "tcp"; break;
+    case TG_MTPROTO_PROBE_STAGE_MTPROTO: stage = "mtproto"; break;
+    case TG_MTPROTO_PROBE_STAGE_RES_PQ: stage = "resPQ"; break;
+    default: break;
+    }
+    switch (status) {
+    case TG_MTPROTO_PROBE_OK: error = ""; break;
+    case TG_MTPROTO_PROBE_TIMEOUT: error = "timeout"; break;
+    case TG_MTPROTO_PROBE_CONNECT: error = "connect_failed"; break;
+    case TG_MTPROTO_PROBE_IO: error = "io_error"; break;
+    default: error = "invalid_resPQ"; break;
+    }
+    printf("{\"ok\":%s,\"stage\":\"%s\",\"dc\":%lu,\"address\":\"%s\",\"port\":%lu,\"latency_ms\":%llu,\"error\":\"%s\"}\n",
+           status == TG_MTPROTO_PROBE_OK ? "true" : "false", stage, dc,
+           address, port, (unsigned long long)result.latency_ms, error);
+    return status == TG_MTPROTO_PROBE_OK ? 0 : 1;
+}
+
+static int discover_telegram_dc(const char *address, const char *dc_text,
+                               const char *port_text) {
+    struct in_addr v4;
+    struct in6_addr v6;
+    unsigned long dc, port = 443;
+    if ((!inet_pton(AF_INET, address, &v4) &&
+         !inet_pton(AF_INET6, address, &v6)) ||
+        parse_unsigned_arg(dc_text, 999, &dc) != 0 ||
+        (port_text && parse_unsigned_arg(port_text, 65535, &port) != 0)) {
+        puts("{\"ok\":false,\"stage\":\"input\",\"error\":\"invalid_arguments\"}");
+        return 2;
+    }
+    tg_dc_snapshot snapshot = {0};
+    int rc = tg_mtproto_discover_config(address, (uint16_t)port,
+                                        (uint32_t)dc, 8000, 0,
+                                        (int64_t)time(NULL), &snapshot);
+    if (rc == 0) {
+        printf("{\"ok\":true,\"stage\":\"help.getConfig\",\"dc\":%lu,\"address\":\"%s\",\"port\":%lu,\"this_dc\":%u,\"endpoint_count\":%zu,\"config_date\":%lld,\"config_expires\":%lld}\n",
+               dc, address, port, snapshot.this_dc, snapshot.endpoint_count,
+               (long long)snapshot.config_date,
+               (long long)snapshot.config_expires);
+        tg_dc_snapshot_destroy(&snapshot);
+        return 0;
+    }
+    printf("{\"ok\":false,\"stage\":\"help.getConfig\",\"dc\":%lu,\"address\":\"%s\",\"port\":%lu,\"error\":\"discovery_failed\"}\n",
+           dc, address, port);
+    tg_dc_snapshot_destroy(&snapshot);
+    return 1;
 }
 
 int main(int argc,char **argv) {
     int offline = d2k_runtime_offline(argc, argv, "d2ktg", offline_self_check);
     if (offline >= 0) return offline;
     const char *config="/opt/d2k/config",*log_path=NULL;
-    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3 release=" D2K_RELEASE_ID);return 0;}
+    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=instagram-ip-probe,meta-hosts-v3,telegram-local-tcp-epoll,mtproto-respq,mtproto-auth,mtproto-v2,mtproto-help-config,mtproto-gzip-config release=" D2K_RELEASE_ID);return 0;}
     if(argc==5&&strcmp(argv[1],"--check-instagram-ip")==0)return check_instagram_ip(argv[2],argv[3],argv[4]);
-    if(argc==2&&strcmp(argv[1],"--help")==0){puts("d2ktg [--config FILE]");return 0;}
+    if((argc==4||argc==5)&&strcmp(argv[1],"--check-telegram-dc")==0)return check_telegram_dc(argv[2],argv[3],argc==5?argv[4]:NULL);
+    if((argc==4||argc==5)&&strcmp(argv[1],"--discover-telegram-dc")==0)return discover_telegram_dc(argv[2],argv[3],argc==5?argv[4]:NULL);
+    if(argc==2&&strcmp(argv[1],"--help")==0){puts("d2ktg [--config FILE] | --check-telegram-dc IP DC [PORT] | --discover-telegram-dc IP DC [PORT]");return 0;}
     if(argc==3&&strcmp(argv[1],"--check-config")==0)return check_config(argv[2]);
     for(int i=1;i<argc;i++) {
         if(strcmp(argv[i],"--health-file")==0&&i+1<argc)health_path=argv[++i];
@@ -277,5 +409,5 @@ int main(int argc,char **argv) {
         else {fprintf(stderr,"usage: d2ktg [--config FILE] [--log FILE]\n");return 2;}
     }
     if(redirect_log(log_path)!=0){fprintf(stderr,"d2ktg: cannot open configured log file\n");return 1;}
-    return run_daemon(config);
+    return run_local_daemon(config);
 }

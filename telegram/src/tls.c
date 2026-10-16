@@ -24,7 +24,8 @@ SSL *tg_tls_connect_fd(SSL_CTX *ctx, int fd, const char *hostname) {
     return tg_tls_connect_fd_sni(ctx, fd, hostname, hostname);
 }
 
-SSL *tg_tls_connect_fd_sni(SSL_CTX *ctx, int fd, const char *hostname, const char *sni) {
+SSL *tg_tls_prepare_client_fd(SSL_CTX *ctx, int fd, const char *hostname,
+                              const char *sni) {
     struct in_addr v4;
     struct in6_addr v6;
     int is_ip, ok;
@@ -40,8 +41,21 @@ SSL *tg_tls_connect_fd_sni(SSL_CTX *ctx, int fd, const char *hostname, const cha
                          : X509_VERIFY_PARAM_set1_host(param, hostname, 0) == 1);
     if (ok && !is_ip) ok = SSL_set_tlsext_host_name(ssl, sni) == 1;
     if (ok) ok = SSL_set_fd(ssl, fd) == 1;
-    if (ok) ok = SSL_connect(ssl) == 1;
-    if (ok) ok = SSL_get_verify_result(ssl) == X509_V_OK;
+    if (ok) {
+        SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE |
+                          SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        SSL_set_connect_state(ssl);
+        return ssl;
+    }
+    SSL_free(ssl);
+    return NULL;
+}
+
+SSL *tg_tls_connect_fd_sni(SSL_CTX *ctx, int fd, const char *hostname,
+                           const char *sni) {
+    SSL *ssl = tg_tls_prepare_client_fd(ctx, fd, hostname, sni);
+    int ok = ssl && SSL_connect(ssl) == 1 &&
+             SSL_get_verify_result(ssl) == X509_V_OK;
     if (!ok) { SSL_free(ssl); return NULL; }
     return ssl;
 }

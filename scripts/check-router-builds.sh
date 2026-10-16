@@ -34,12 +34,12 @@ for arch in $ARCHES; do
             *) timeout 20 "qemu-$cpu" "$bin" --version ;;
         esac
     done
-    for test in crypto quicwire plan-parse openssl-link-smoke tg-session; do
+    for test in crypto quicwire plan-parse openssl-link-smoke tg-mtproto; do
         timeout 60 "qemu-$cpu" "$ROOT/build/telegram/$test-$arch"
     done
     case "$arch" in
-        mips|mipsel) timeout 60 "qemu-$cpu" -cpu 4Kc "$ROOT/build/telegram/tg-session-$arch" ;;
-        x86) timeout 60 "qemu-$cpu" -cpu pentium2 "$ROOT/build/telegram/tg-session-$arch" ;;
+        mips|mipsel) timeout 60 "qemu-$cpu" -cpu 4Kc "$ROOT/build/telegram/tg-mtproto-$arch" ;;
+        x86) timeout 60 "qemu-$cpu" -cpu pentium2 "$ROOT/build/telegram/tg-mtproto-$arch" ;;
     esac
     case "$arch" in
         mips|mipsel)

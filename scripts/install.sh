@@ -533,8 +533,8 @@ esac
 "$TMP/d2kd" --help  >/dev/null 2>&1 || die "скачанный d2kd не запускается на этой системе"
 TG_VERSION=$("$TMP/d2ktg" --version 2>/dev/null) || die "скачанный d2ktg не запускается на этой системе"
 case "$TG_VERSION" in
-    *features=per-install-enrollment*) ;;
-    *) die "скачанный d2ktg устарел: в нём нет автоматической регистрации установки" ;;
+    *telegram-local-tcp-epoll*) ;;
+    *) die "скачанный d2ktg устарел: в нём нет локального Telegram-прокси" ;;
 esac
 case "$TG_VERSION" in
     *instagram-ip-probe*) ;;
@@ -698,21 +698,27 @@ if [ "$PANEL_LISTEN_CURRENT" = "127.0.0.1:8090" ]; then
     install_data_atomic "$TMP/config.lan" "$DIR/config"
     say "панель доступна в LAN: http://$PANEL_LAN_IP:8090/"
 fi
-# В конфигурации хранится relay secret. Содержимое сохраняем, но ограничиваем
-# чтение root даже при обновлении ранее установленного файла с более широкими
-# правами.
+# В старой конфигурации могут оставаться relay-учётные данные. Сохраняем их
+# при переходе и ограничиваем чтение файла root даже при обновлении.
 chmod 0600 "$DIR/config" || die "не защитить права конфигурации"
-# Upgrade the old unconfigured Telegram template without changing a user's
-# enable/disable choice or custom relay. No fleet credential is installed.
-TG_INSTALL_URL=$(sed -n 's/^TG_RELAY_URL=//p' "$DIR/config" | tail -n 1)
-if [ -z "$TG_INSTALL_URL" ]; then
-    printf '\nTG_RELAY_URL=wss://213.176.74.63.nip.io/ws\n' >> "$DIR/config"
-    TG_INSTALL_URL=wss://213.176.74.63.nip.io/ws
-fi
-if [ "$TG_INSTALL_URL" = wss://213.176.74.63.nip.io/ws ] &&
-   ! grep -q '^TG_ENROLL_PORT=' "$DIR/config"; then
-    printf 'TG_ENROLL_PORT=9443\n' >> "$DIR/config"
-fi
+# Переводим старую настройку на локальный режим. Старые поля сохраняются как
+# миграционные данные; новый runtime их не читает.
+TG_MODE_CURRENT=$(sed -n 's/^[[:space:]]*TG_MODE=//p' "$DIR/config" | tail -n 1 | tr -d "\"'")
+case "$TG_MODE_CURRENT" in
+    ""|relay)
+        if grep -q '^[[:space:]]*TG_MODE=' "$DIR/config"; then
+            sed 's/^[[:space:]]*TG_MODE=.*/TG_MODE=local/' "$DIR/config" > "$TMP/config.local" ||
+                die "не подготовить локальный режим Telegram"
+        else
+            cat "$DIR/config" > "$TMP/config.local" || die "не сохранить конфигурацию"
+            printf '\nTG_MODE=local\n' >> "$TMP/config.local" || die "не включить локальный режим Telegram"
+        fi
+        install_data_atomic "$TMP/config.local" "$DIR/config"
+        say "Telegram переведён в локальный режим; прежние поля relay сохранены"
+        ;;
+    local) ;;
+    *) die "неизвестное значение TG_MODE в $DIR/config" ;;
+esac
 # Instagram/WhatsApp DNS pins come from d2k's own C resolver on the VPS.
 # Checking 18 names can wait on silent edges, so the installer does not run it.
 # A success younger than a day is kept: a release must not send the whole
@@ -749,14 +755,16 @@ fi
 "$INIT" status
 if grep -q '^TG_ENABLED=1$' "$DIR/config"; then
     tg_wait=0
-    while [ "$tg_wait" -lt 30 ] && [ "$(cat "$DIR/state/telegram.status" 2>/dev/null || true)" != connected ]; do
+    tg_status=$(cat "$DIR/state/telegram.status" 2>/dev/null || true)
+    while [ "$tg_wait" -lt 30 ] && [ "$tg_status" != local ]; do
         sleep 1
         tg_wait=$((tg_wait + 1))
+        tg_status=$(cat "$DIR/state/telegram.status" 2>/dev/null || true)
     done
-    if [ "$(cat "$DIR/state/telegram.status" 2>/dev/null || true)" = connected ]; then
-        say "Telegram: персональная регистрация и подключение к релею подтверждены"
+    if [ "$tg_status" = local ]; then
+        say "Telegram: локальный прокси запущен"
     else
-        say "Telegram ещё не подключён; автоматические повторы продолжаются, состояние видно в панели"
+        say "Telegram не запустился; состояние и журнал доступны в панели и $DIR/log/telegram.log"
     fi
 fi
 PANEL_LISTEN=$(sed -n 's/^PANEL_LISTEN=//p' "$DIR/config" | tail -n 1)

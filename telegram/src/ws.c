@@ -134,42 +134,125 @@ static int get_header(const char *response, const char *name, char *out, size_t 
     return -1;
 }
 
-int tg_ws_upgrade(SSL *ssl, const char *host_header, const char *path) {
-    static const char guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    uint8_t random[16], digest[SHA_DIGEST_LENGTH];
-    char key[25], expected[32], response[16385], line[4096];
-    unsigned int digest_len = 0;
-    size_t used = 0;
-    if (!ssl || !host_header || !*host_header || !path || path[0] != '/') return -1;
-    if (strpbrk(host_header, "\r\n \t") || strpbrk(path, "\r\n \t")) return -1;
-    if (RAND_bytes(random, sizeof(random)) != 1) return -1;
-    int key_len = EVP_EncodeBlock((unsigned char *)key, random, sizeof(random));
-    if (key_len != 24) return -1;
-    key[24] = '\0';
-    int n = snprintf(line, sizeof(line),
-        "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
-        path, host_header, key);
-    if (n <= 0 || (size_t)n >= sizeof(line) || ssl_write_all(ssl, (uint8_t *)line, (size_t)n) != 0)
-        return -1;
-    while (used < sizeof(response)-1) {
-        if (ssl_read_all(ssl, (uint8_t *)response + used, 1) != 0) return -1;
-        ++used;
-        if (used >= 4 && memcmp(response + used - 4, "\r\n\r\n", 4) == 0) break;
+static int has_http_control(const char *value) {
+    for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
+        if ((*p < 0x20 && *p != '\t') || *p == 0x7f) return 1;
     }
-    if (used == sizeof(response)-1) return -1;
-    response[used] = '\0';
-    if (strncmp(response, "HTTP/1.1 101 ", 13) != 0 && strncmp(response, "HTTP/1.0 101 ", 13) != 0)
+    return 0;
+}
+
+int tg_ws_upgrade_start_ex(tg_ws_upgrade_state *state,
+                           const char *host_header, const char *path,
+                           const char *subprotocol, const char *origin,
+                           const char *user_agent) {
+    if (!state || !host_header || !*host_header || !path || path[0] != '/')
         return -1;
+    memset(state, 0, sizeof(*state));
+    if (has_http_control(host_header) || has_http_control(path) ||
+        strpbrk(host_header, " \t") || strpbrk(path, " \t"))
+        return -1;
+    if ((subprotocol && (!*subprotocol || has_http_control(subprotocol) ||
+                         strpbrk(subprotocol, " \t,") ||
+                         strlen(subprotocol) >= sizeof(state->subprotocol))) ||
+        (origin && (!*origin || has_http_control(origin))) ||
+        (user_agent && (!*user_agent || has_http_control(user_agent))))
+        return -1;
+    uint8_t random[16];
+    if (RAND_bytes(random, sizeof(random)) != 1) return -1;
+    int key_len = EVP_EncodeBlock((unsigned char *)state->key, random,
+                                  sizeof(random));
+    OPENSSL_cleanse(random, sizeof(random));
+    if (key_len != 24) return -1;
+    state->key[24] = '\0';
+    if (subprotocol)
+        memcpy(state->subprotocol, subprotocol, strlen(subprotocol) + 1u);
+    size_t used = 0;
+    int n = snprintf((char *)state->request + used,
+        sizeof(state->request) - used,
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+        "Sec-WebSocket-Version: 13\r\n",
+        path, host_header, state->key);
+    if (n <= 0 || (size_t)n >= sizeof(state->request) - used) {
+        state->failed = 1;
+        return -1;
+    }
+    used += (size_t)n;
+#define TG_WS_APPEND_HEADER(format, value) do { \
+    if (value) { \
+        n = snprintf((char *)state->request + used, \
+                     sizeof(state->request) - used, format, value); \
+        if (n <= 0 || (size_t)n >= sizeof(state->request) - used) { \
+            state->failed = 1; \
+            return -1; \
+        } \
+        used += (size_t)n; \
+    } \
+} while (0)
+    TG_WS_APPEND_HEADER("Sec-WebSocket-Protocol: %s\r\n", subprotocol);
+    TG_WS_APPEND_HEADER("Origin: %s\r\n", origin);
+    TG_WS_APPEND_HEADER("User-Agent: %s\r\n", user_agent);
+#undef TG_WS_APPEND_HEADER
+    n = snprintf((char *)state->request + used,
+                 sizeof(state->request) - used, "\r\n");
+    if (n != 2) {
+        state->failed = 1;
+        return -1;
+    }
+    used += (size_t)n;
+    state->request_len = used;
+    return 0;
+}
+
+int tg_ws_upgrade_start(tg_ws_upgrade_state *state, const char *host_header,
+                        const char *path) {
+    return tg_ws_upgrade_start_ex(state, host_header, path, NULL, NULL, NULL);
+}
+
+const uint8_t *tg_ws_upgrade_pending(const tg_ws_upgrade_state *state,
+                                    size_t *length) {
+    if (!length) return NULL;
+    *length = 0;
+    if (!state || state->failed || state->complete ||
+        state->request_offset > state->request_len ||
+        state->request_offset >= state->request_len)
+        return NULL;
+    *length = state->request_len - state->request_offset;
+    return state->request + state->request_offset;
+}
+
+int tg_ws_upgrade_advance(tg_ws_upgrade_state *state, size_t length) {
+    if (!state || state->failed || state->complete ||
+        state->request_offset > state->request_len ||
+        length > state->request_len - state->request_offset)
+        return -1;
+    state->request_offset += length;
+    return 0;
+}
+
+static int validate_upgrade_response(const tg_ws_upgrade_state *state) {
+    static const char guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    uint8_t digest[SHA_DIGEST_LENGTH];
+    char expected[32], source[64];
+    unsigned int digest_len = 0;
     char upgrade[64], connection[128], accept[64];
-    if (get_header(response, "Upgrade", upgrade, sizeof(upgrade)) != 0 ||
-        strcasecmp(upgrade, "websocket") != 0 ||
-        get_header(response, "Connection", connection, sizeof(connection)) != 0 ||
-        !header_has_token(connection, "upgrade") ||
-        get_header(response, "Sec-WebSocket-Accept", accept, sizeof(accept)) != 0)
+    if (strncmp(state->response, "HTTP/1.1 101 ", 13) != 0 &&
+        strncmp(state->response, "HTTP/1.0 101 ", 13) != 0)
         return -1;
-    char source[128];
-    n = snprintf(source, sizeof(source), "%s%s", key, guid);
+    if (get_header(state->response, "Upgrade", upgrade, sizeof(upgrade)) != 0 ||
+        strcasecmp(upgrade, "websocket") != 0 ||
+        get_header(state->response, "Connection", connection, sizeof(connection)) != 0 ||
+        !header_has_token(connection, "upgrade") ||
+        get_header(state->response, "Sec-WebSocket-Accept", accept, sizeof(accept)) != 0)
+        return -1;
+    if (state->subprotocol[0]) {
+        char selected[64];
+        if (get_header(state->response, "Sec-WebSocket-Protocol", selected,
+                       sizeof(selected)) != 0 ||
+            strcmp(selected, state->subprotocol) != 0)
+            return -1;
+    }
+    int n = snprintf(source, sizeof(source), "%s%s", state->key, guid);
     if (n <= 0 || (size_t)n >= sizeof(source) ||
         EVP_Digest(source, (size_t)n, digest, &digest_len, EVP_sha1(), NULL) != 1 ||
         digest_len != sizeof(digest)) return -1;
@@ -177,6 +260,60 @@ int tg_ws_upgrade(SSL *ssl, const char *host_header, const char *path) {
     if (n != 28) return -1;
     expected[28] = '\0';
     return strcmp(accept, expected) == 0 ? 0 : -1;
+}
+
+int tg_ws_upgrade_feed(tg_ws_upgrade_state *state, const uint8_t *data,
+                       size_t length, size_t *consumed) {
+    static const uint8_t end[] = "\r\n\r\n";
+    if (!state || (length && !data) || !consumed) return -1;
+    *consumed = 0;
+    if (state->failed) return -1;
+    if (state->complete) return 1;
+    if (!state->request_len || state->request_offset != state->request_len) {
+        state->failed = 1;
+        return -1;
+    }
+    while (*consumed < length) {
+        uint8_t byte = data[*consumed];
+        if ((byte < 0x20 && byte != '\r' && byte != '\n' && byte != '\t') ||
+            byte == 0x7f || state->response_len >= TG_WS_UPGRADE_MAX_HEADER) {
+            state->failed = 1;
+            return -1;
+        }
+        state->response[state->response_len++] = (char)byte;
+        ++*consumed;
+        if (state->response_len >= sizeof(end) - 1u &&
+            memcmp(state->response + state->response_len - (sizeof(end) - 1u),
+                   end, sizeof(end) - 1u) == 0) {
+            state->response[state->response_len] = '\0';
+            if (validate_upgrade_response(state) != 0) {
+                state->failed = 1;
+                return -1;
+            }
+            state->complete = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int tg_ws_upgrade(SSL *ssl, const char *host_header, const char *path) {
+    tg_ws_upgrade_state state = {0};
+    size_t pending_len = 0;
+    if (!ssl || tg_ws_upgrade_start(&state, host_header, path) != 0)
+        return -1;
+    const uint8_t *pending = tg_ws_upgrade_pending(&state, &pending_len);
+    if (!pending || ssl_write_all(ssl, pending, pending_len) != 0 ||
+        tg_ws_upgrade_advance(&state, pending_len) != 0)
+        return -1;
+    while (!state.complete) {
+        uint8_t byte;
+        size_t consumed = 0;
+        if (ssl_read_all(ssl, &byte, 1) != 0 ||
+            tg_ws_upgrade_feed(&state, &byte, 1, &consumed) < 0 || consumed != 1)
+            return -1;
+    }
+    return 0;
 }
 
 static int write_frame(SSL *ssl, uint8_t opcode, const uint8_t *payload, size_t len) {

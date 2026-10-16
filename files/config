@@ -15,9 +15,6 @@ D2K_PPE_DEOFFLOAD=1
 # на каждый поток слишком дорого процессору:
 # D2K_PPE_TCP_PORTS=80,443
 MARK=0x2d
-# Each router creates its own private identity and registers its public key.
 TG_ENABLED=1
-TG_RELAY_URL=wss://213.176.74.63.nip.io/ws
-TG_ENROLL_PORT=9443
-# Custom relays may use TG_RELAY_SECRET instead of the enrollment endpoint.
+TG_MODE=local
 # TG_PORT=1443

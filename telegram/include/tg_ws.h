@@ -6,11 +6,35 @@
 #include <openssl/ssl.h>
 #include <poll.h>
 
-#define TG_WS_MAX_MESSAGE (2u * 1024u * 1024u)
+#define TG_WS_MAX_MESSAGE (4u * 1024u * 1024u)
 #define TG_WS_BINARY 0x2u
 #define TG_WS_CLOSE 0x8u
 #define TG_WS_PING 0x9u
 #define TG_WS_PONG 0xau
+#define TG_WS_UPGRADE_MAX_HEADER 16384u
+
+typedef struct {
+    char key[25];
+    char subprotocol[64];
+    uint8_t request[1024];
+    size_t request_len, request_offset;
+    char response[TG_WS_UPGRADE_MAX_HEADER + 1u];
+    size_t response_len;
+    int complete, failed;
+} tg_ws_upgrade_state;
+
+int tg_ws_upgrade_start(tg_ws_upgrade_state *state, const char *host_header,
+                        const char *path);
+int tg_ws_upgrade_start_ex(tg_ws_upgrade_state *state,
+                           const char *host_header, const char *path,
+                           const char *subprotocol, const char *origin,
+                           const char *user_agent);
+const uint8_t *tg_ws_upgrade_pending(const tg_ws_upgrade_state *state,
+                                    size_t *length);
+int tg_ws_upgrade_advance(tg_ws_upgrade_state *state, size_t length);
+/* Возвращает 0 при неполном заголовке, 1 после валидного ответа и -1 при ошибке. */
+int tg_ws_upgrade_feed(tg_ws_upgrade_state *state, const uint8_t *data,
+                       size_t length, size_t *consumed);
 
 int tg_ws_encode_client_frame(uint8_t *dst, size_t cap, uint8_t opcode,
                               const uint8_t *payload, size_t payload_len,
@@ -35,6 +59,7 @@ int tg_ws_pump_init(tg_ws_pump *pump,SSL *ssl);
 void tg_ws_pump_destroy(tg_ws_pump *pump);
 int tg_ws_pump_queue_binary(tg_ws_pump *pump,const uint8_t *payload,size_t payload_len);
 int tg_ws_pump_queue_ping(tg_ws_pump *pump,const uint8_t *payload,size_t payload_len);
+int tg_ws_pump_queue_close(tg_ws_pump *pump);
 int tg_ws_pump_fd(const tg_ws_pump *pump);
 short tg_ws_pump_events(const tg_ws_pump *pump);
 int tg_ws_pump_process(tg_ws_pump *pump,short revents,tg_ws_message_cb callback,void *ctx);

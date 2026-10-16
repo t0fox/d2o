@@ -60,6 +60,7 @@ want 'type nat hook prerouting priority dstnat - 1; policy accept;'
 want 'type nat hook output priority -101; policy accept;'
 want 'type filter hook forward priority filter - 1; policy accept;'
 want 'type filter hook output priority filter - 1; policy accept;'
+want 'meta mark 0x31 return'
 want 'ip daddr @tg4 tcp dport 443 redirect to :1443'
 want 'ip6 daddr @tg6 meta l4proto tcp reject with tcp reset'
 [ "$(printf '%s\n' "$r" | grep -c 'redirect to :1443')" -eq 2 ] || fail "redirect must be in prerouting and output"
@@ -75,6 +76,9 @@ tg "$TMP/nftonly" sh "$TGFW" heal || fail "heal after the table was removed"
 sed '/redirect/d' "$TMP/nft/inet_d2k_tg" > "$TMP/x" && mv "$TMP/x" "$TMP/nft/inet_d2k_tg"
 tg "$TMP/nftonly" sh "$TGFW" heal || fail "heal with a lost rule"
 [ "$(table | grep -c 'redirect to :1443')" -eq 2 ] || fail "heal did not restore a lost redirect"
+sed '/meta mark 0x31 return/d' "$TMP/nft/inet_d2k_tg" > "$TMP/x" && mv "$TMP/x" "$TMP/nft/inet_d2k_tg"
+tg "$TMP/nftonly" sh "$TGFW" heal || fail "heal with a lost outbound mark exemption"
+[ "$(table | grep -c 'meta mark 0x31 return')" -eq 1 ] || fail "heal did not restore the outbound mark exemption"
 ok "heal leaves a healthy table alone and restores a lost one"
 
 printf 'table inet fw4 {\n}\n' > "$TMP/nft/inet_fw4"

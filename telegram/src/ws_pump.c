@@ -7,8 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#define TG_WS_PUMP_TX_LIMIT (4u*1024u*1024u)
 struct tg_ws_tx_frame { struct tg_ws_tx_frame *next; uint8_t *bytes; size_t len,offset,allocated; };
+#define TG_WS_PUMP_TX_LIMIT (TG_WS_MAX_MESSAGE + 14u + sizeof(struct tg_ws_tx_frame))
 
 static void release_frames(tg_ws_pump *p,tg_ws_tx_frame *frame) {
     while(frame){tg_ws_tx_frame *next=frame->next;p->tx_memory_bytes-=frame->allocated+sizeof(*frame);
@@ -48,6 +48,7 @@ static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,size_t 
 
 int tg_ws_pump_queue_binary(tg_ws_pump *p,const uint8_t *data,size_t len){return queue_opcode(p,TG_WS_BINARY,data,len);}
 int tg_ws_pump_queue_ping(tg_ws_pump *p,const uint8_t *data,size_t len){return queue_opcode(p,TG_WS_PING,data,len);}
+int tg_ws_pump_queue_close(tg_ws_pump *p){return queue_opcode(p,TG_WS_CLOSE,NULL,0);}
 int tg_ws_pump_fd(const tg_ws_pump *p){return p?p->fd:-1;}
 short tg_ws_pump_events(const tg_ws_pump *p){
     if(!p||p->failed||p->closed)return 0;

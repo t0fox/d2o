@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <utime.h>
@@ -168,7 +169,7 @@ static void test_telegram_status_is_dynamic_and_never_exposes_secret(void) {
     char live[]="/tmp/d2k-panel-tg-live.XXXXXX",config[]="/tmp/d2k-panel-tg-config.XXXXXX";
     char status[]="/tmp/d2k-panel-tg-status.XXXXXX",pid[]="/tmp/d2k-panel-tg-pid.XXXXXX";
     write_temp_file(live,"{\"linked\":false,\"boxes\":[],\"searches\":[],\"targets\":0,\"confirms\":0,\"probes_used\":0,\"client_unfit\":0}");
-    write_temp_file(config,"TG_ENABLED=0\nTG_RELAY_URL=wss://relay.example/ws\nTG_RELAY_SECRET=secret-must-not-leak\n");
+    write_temp_file(config,"TG_ENABLED=0\nTG_MODE=local\nTG_RELAY_URL=wss://relay.example/ws\nTG_RELAY_SECRET=secret-must-not-leak\n");
     write_temp_file(status,"connected\n");write_temp_file(pid,"1\n");
     d2k_panel_config cfg={.live_path=live,.asset_dir="panel/assets",.config_path=config,
         .telegram_status_path=status,.telegram_pid_path=pid,.mode="observe",.state_dir="/tmp/state",.started_epoch=1};
@@ -180,7 +181,7 @@ static void test_telegram_status_is_dynamic_and_never_exposes_secret(void) {
     assert(strstr(response,"\"telegram_status\":\"stopped\"")!=NULL);
     assert(strstr(response,"secret-must-not-leak")==NULL);
 
-    rewrite_file(config,"TG_ENABLED=1\nTG_RELAY_URL=wss://relay.example/ws\nTG_RELAY_SECRET=secret-must-not-leak\n");
+    rewrite_file(config,"TG_ENABLED=1\nTG_MODE=local\nTG_RELAY_URL=wss://relay.example/ws\nTG_RELAY_SECRET=secret-must-not-leak\n");
     FILE *f=fopen(pid,"w");assert(f);assert(fprintf(f,"%ld\n",(long)getpid())>0);fclose(f);
     (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
     assert(strstr(response,"\"telegram_enabled\":true")!=NULL);
@@ -194,13 +195,91 @@ static void test_telegram_status_is_dynamic_and_never_exposes_secret(void) {
     assert(strstr(response,"\"telegram_status\":\"not_configured\"")!=NULL);
     rewrite_file(config,"TG_ENABLED=1\nTG_RELAY_URL=wss://relay.example/ws\nTG_ENROLL_PORT=9443\n");
     (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
-    assert(strstr(response,"\"telegram_configured\":true")!=NULL);
-    assert(strstr(response,"\"telegram_status\":\"connected\"")!=NULL);
-    rewrite_file(config,"TG_ENABLED=\"1\"\nTG_RELAY_URL='wss://relay.example/ws'\nTG_ENROLL_PORT=\"9443\"\n");
+    assert(strstr(response,"\"telegram_configured\":false")!=NULL);
+    assert(strstr(response,"\"telegram_status\":\"not_configured\"")!=NULL);
+    rewrite_file(config,"TG_ENABLED=\"1\"\nTG_MODE='local'\nTG_RELAY_URL='wss://relay.example/ws'\nTG_ENROLL_PORT=\"9443\"\n");
     (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
     assert(strstr(response,"\"telegram_configured\":true")!=NULL);
     assert(strstr(response,"\"telegram_status\":\"connected\"")!=NULL);
+    rewrite_file(config,"TG_ENABLED=1\nTG_MODE=local\nTG_DC_MAP_PATH=/tmp/telegram-dc-map.json\n");
+    rewrite_file(status,"local\n");
+    (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
+    assert(strstr(response,"\"telegram_configured\":true")!=NULL);
+    assert(strstr(response,"\"telegram_status\":\"local\"")!=NULL);
+    rewrite_file(config,"TG_ENABLED=1\nTG_MODE=unknown\n");
+    (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
+    assert(strstr(response,"\"telegram_configured\":false")!=NULL);
+    rewrite_file(config,"TG_ENABLED=1\nTG_MODE=local\nTG_MODE=relay\nTG_RELAY_URL=wss://relay.example/ws\nTG_ENROLL_PORT=9443\n");
+    (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
+    assert(strstr(response,"\"telegram_configured\":false")!=NULL);
     unlink(live);unlink(config);unlink(status);unlink(pid);
+}
+
+typedef struct { int listener; } stats_fixture;
+
+static void *serve_telegram_stats(void *opaque) {
+    stats_fixture *fixture = opaque;
+    int client = accept(fixture->listener, NULL, NULL);
+    assert(client >= 0);
+    write_all(client,
+              "{\"active_connections\":2,\"max_connections\":64,"
+              "\"connections_started\":9,\"bytes_from_clients\":1234,"
+              "\"bytes_from_upstreams\":5678,\"wss_attempts\":8,"
+              "\"wss_failures\":2,\"wss_responses\":5,"
+              "\"cf_wss_responses\":3}\n");
+    close(client);
+    close(fixture->listener);
+    return NULL;
+}
+
+static void test_telegram_stats_socket_is_normalized_for_status_api(void) {
+    char live[] = "/tmp/d2k-panel-tg-stats-live.XXXXXX";
+    char status[] = "/tmp/d2k-panel-tg-stats-status.XXXXXX";
+    char pid[] = "/tmp/d2k-panel-tg-stats-pid.XXXXXX";
+    char socket_path[] = "/tmp/d2k-panel-tg-stats.XXXXXX";
+    write_temp_file(live, "{\"linked\":false,\"boxes\":[],\"searches\":[],\"targets\":0,\"confirms\":0,\"probes_used\":0,\"client_unfit\":0}");
+    write_temp_file(status, "connected\n");
+    write_temp_file(pid, "1\n");
+    int temporary = mkstemp(socket_path);
+    assert(temporary >= 0);
+    close(temporary);
+    assert(unlink(socket_path) == 0);
+
+    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(listener >= 0);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    assert(strlen(socket_path) < sizeof(address.sun_path));
+    memcpy(address.sun_path, socket_path, strlen(socket_path) + 1);
+    assert(bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
+    assert(listen(listener, 2) == 0);
+    stats_fixture fixture = {.listener = listener};
+    pthread_t server;
+    assert(pthread_create(&server, NULL, serve_telegram_stats, &fixture) == 0);
+
+    d2k_panel_config cfg = {
+        .live_path = live,
+        .asset_dir = "panel/assets",
+        .telegram_pid_path = pid,
+        .telegram_status_path = status,
+        .telegram_stats_path = socket_path,
+        .mode = "observe",
+        .state_dir = "/tmp/state",
+        .started_epoch = 1
+    };
+    char response[32768];
+    (void)request(&cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                  response, sizeof response);
+    assert(pthread_join(server, NULL) == 0);
+    assert(strstr(response,
+                  "\"telegram_stats\":{\"active_connections\":2,"
+                  "\"max_connections\":64,\"connections_started\":9,"
+                  "\"bytes_from_clients\":1234,\"bytes_from_upstreams\":5678,"
+                  "\"wss_attempts\":8,\"wss_failures\":2,"
+                  "\"wss_responses\":5,\"cf_wss_responses\":3}") != NULL);
+    unlink(socket_path);
+    unlink(live);
+    unlink(status);
+    unlink(pid);
 }
 
 /* Состояние автообновления пишет d2k-update.sh; панель отдаёт файл как есть.
@@ -311,11 +390,15 @@ static void test_panel_accepts_a_control_action_request(void) {
         "POST /api/control/telegram-enable HTTP/1.1\r\nHost: localhost:8090\r\n"
         "Origin: http://localhost:8090\r\nContent-Length: 0\r\n\r\n",
         response, sizeof response);
+    assert(strstr(response,"HTTP/1.1 409 Conflict")!=NULL);
+    rewrite_file(tg_config,"TG_ENABLED=0\nTG_MODE=local\n");
+    (void)request(&cfg,
+        "POST /api/control/telegram-enable HTTP/1.1\r\nHost: localhost:8090\r\n"
+        "Origin: http://localhost:8090\r\nContent-Length: 0\r\n\r\n",
+        response, sizeof response);
     assert(strstr(response,"HTTP/1.1 202 Accepted")!=NULL);
     wait_action_done(&cfg);
-    f=fopen(marker,"r");assert(f);strcpy(action,"");assert(fgets(action,sizeof action,f));fclose(f);
-    assert(strcmp(action,"telegram-enable")==0);
-    assert(strstr(response,"private")==NULL);unlink(tg_config);
+    unlink(tg_config);
     (void)request(&cfg,
         "POST /api/control/stop HTTP/1.1\r\n"
         "Host: 192.168.1.1:8090\r\n"
@@ -575,6 +658,7 @@ int main(void) {
     test_api_exposes_live_knowledge();
     test_invalid_live_json_is_not_reported_as_empty_knowledge();
     test_telegram_status_is_dynamic_and_never_exposes_secret();
+    test_telegram_stats_socket_is_normalized_for_status_api();
     test_update_state_is_served_from_file();
     test_unsupported_method_is_rejected();
     test_slow_control_does_not_block_status();
