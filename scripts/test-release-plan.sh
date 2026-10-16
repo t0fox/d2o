@@ -41,7 +41,7 @@ commit "init"
 run
 expect "no release without a fix or a feature" "$(key release)" false
 
-g tag d2k-20261012-2144-aaaaaaa
+g tag d2o-20261012-2144-aaaaaaa
 commit "ci: speed"
 commit "test(sched): hermetic"
 commit "docs(readme): rewrite"
@@ -59,8 +59,14 @@ commit "fix(S99d2k): five A&&B||C rewritten as real ifs"
 run
 short=$(g rev-parse --short=7 HEAD)
 expect "a fix since the last release makes one" "$(key release)" true
-expect "the id carries the time and the commit" "$(key id)" "d2k-20261013-0102-$short"
+expect "the id carries the time and the commit" "$(key id)" "d2o-20261013-0102-$short"
 expect "the version carries the date and the commit" "$(key version)" "13.10.2026 ($short)"
+if grep -qF -- '--title "D2O $VERSION"' "$ROOT/.github/workflows/release.yml"; then
+    echo "ok: the release title uses the D2O date and commit"
+else
+    echo "FAIL: the release title does not use the D2O date and commit" >&2
+    fails=$((fails + 1))
+fi
 expect "the release is the exact commit planned" "$(key sha)" "$(g rev-parse HEAD)"
 has "the fix is in the notes" "- fix(S99d2k): five A&&B||C rewritten as real ifs"
 lacks "ci is not in the notes" "ci: speed"
@@ -76,21 +82,21 @@ has "perf is in the notes" "- perf: faster probe"
 has "a combined type with fix counts" "- docs+fix: README and a missing test"
 has "a breaking change of any type counts" "- refactor(core)!: change the plan format"
 
-g tag d2k-20261013-0000-bbbbbbb
+g tag d2o-20261013-0000-bbbbbbb
 commit "test: more"
 g commit -q --allow-empty -m "chore: drop the old flag" -m "BREAKING CHANGE: the flag is gone"
 run
 expect "a BREAKING CHANGE footer makes a release" "$(key release)" true
 lacks "notes start after the last release" "feat(panel)"
 
-g tag d2k-20261013-0100-ccccccc
+g tag d2o-20261013-0100-ccccccc
 run FORCE=1
 expect "a released commit is never released again, even by hand" "$(key release)" false
 
 commit "ci: only ci"
 run FORCE=1
 expect "a manual run releases without a fix" "$(key release)" true
-has "a manual run without notes says what it is" "Выпуск D2K 13.10.2026 ($(g rev-parse --short=7 HEAD))"
+has "a manual run without notes says what it is" "Выпуск D2O 13.10.2026 ($(g rev-parse --short=7 HEAD))"
 
 run FORCE=1 NOTES="Две строки
 для людей"

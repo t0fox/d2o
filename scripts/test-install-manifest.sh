@@ -109,7 +109,7 @@ else
     #    real archive, built by the same script the release workflow runs.
     stage=$(mktemp -d "${TMPDIR:-/tmp}/d2k-manifest.XXXXXX") || fail "no temporary directory"
     trap 'rm -rf "$stage"' EXIT HUP INT TERM
-    RELEASE_ID=d2k-manifest-test ARCHES=$worst_arch \
+    RELEASE_ID=d2o-manifest-test ARCHES=$worst_arch \
         sh "$ROOT/scripts/package-release.sh" "$BUILDS" "$stage/out" >/dev/null ||
         fail "package-release.sh cannot package $worst_arch"
     mkdir "$stage/tree" || fail "no room to unpack"

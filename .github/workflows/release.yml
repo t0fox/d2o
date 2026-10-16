@@ -220,16 +220,16 @@ jobs:
           }
           superseded && exit 0
           # A run cancelled between "draft" and "public" leaves its draft.
-          # Only drafts of this workflow go: d2k-* and never published.
+          # Only drafts of this workflow go: d2o-* and never published.
           gh release list --limit 100 --json tagName,isDraft \
-            --jq '.[] | select(.isDraft and (.tagName | startswith("d2k-"))) | .tagName' |
+            --jq '.[] | select(.isDraft and (.tagName | startswith("d2o-"))) | .tagName' |
             while read -r t; do gh release delete "$t" --yes; done
           out="$RUNNER_TEMP/release"
           printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.txt"
           # Draft first: a draft has no tag and no download link yet. Routers
           # see the release only after every asset is uploaded.
           gh release create "$RELEASE_ID" --draft --target "$SHA" \
-            --title "d2o $VERSION" --notes-file "$RUNNER_TEMP/notes.txt" \
+            --title "D2O $VERSION" --notes-file "$RUNNER_TEMP/notes.txt" \
             "$out"/d2k-*.tar.gz "$out/latest.json" "$out/latest.json.sig"
           # The tag is made here. main can move in the seconds since the check.
           if ! gh release edit "$RELEASE_ID" --draft=false --latest; then

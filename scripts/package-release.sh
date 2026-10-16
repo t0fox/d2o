@@ -3,13 +3,13 @@
 # тем, что берёт установщик (scripts/install.sh, D2K_LOCAL), и latest.json с
 # хешами архивов. Подпись latest.json делает release.yml ключом из секрета.
 #
-#   RELEASE_ID=d2k-… [NOTES=…] [VERSION=…] sh scripts/package-release.sh BUILDS OUT
+#   RELEASE_ID=d2o-… [NOTES=…] [VERSION=…] sh scripts/package-release.sh BUILDS OUT
 set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 BUILDS=${1:?каталог сборок}
 OUT=${2:?каталог выпуска}
 : "${RELEASE_ID:?RELEASE_ID}"
-case "$RELEASE_ID" in [A-Za-z0-9]*) ;; *) echo "плохой RELEASE_ID" >&2; exit 1 ;; esac
+case "$RELEASE_ID" in d2o-*) ;; *) echo "плохой RELEASE_ID" >&2; exit 1 ;; esac
 case "$RELEASE_ID" in *[!A-Za-z0-9._-]*) echo "плохой RELEASE_ID" >&2; exit 1 ;; esac
 ARCHES=${ARCHES:-"arm64 arm mipsel mips mips64el amd64 x86 ppc64 riscv64"}
 VERSION=${VERSION:-$RELEASE_ID}
