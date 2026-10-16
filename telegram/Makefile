@@ -146,9 +146,9 @@ $(BUILD_DIR)/d2ktg: ../runtime/d2k_runtime.h ../runtime/d2k_protocol.h src/main.
 	mkdir -p $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -pthread -o $@ $(filter %.c,$^) $(OPENSSL_LIBS) $(ZLIB_LIBS)
 
-$(BUILD_DIR)/test-ws: test_ws.c src/ws.c src/net.c include/tg_ws.h include/tg_net.h
+$(BUILD_DIR)/test-ws: test_ws.c src/ws.c src/ws_pump.c src/net.c include/tg_ws.h include/tg_net.h
 	mkdir -p $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -o $@ test_ws.c src/ws.c src/net.c $(OPENSSL_LIBS)
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -o $@ test_ws.c src/ws.c src/ws_pump.c src/net.c $(OPENSSL_LIBS)
 
 
 $(BUILD_DIR)/test-tls: test_tls.c ../files/tg-roots.pem src/tls.c src/ws.c src/ws_pump.c include/tg_tls.h include/tg_ws.h
