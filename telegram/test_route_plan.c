@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 static void test_adaptive_plan_prefers_direct_then_worker_and_pool(void) {
     tg_route_plan plan;
