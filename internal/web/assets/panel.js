@@ -2151,6 +2151,7 @@
     }
     var note = info.note;
     if (snap.telegram_enabled && st === "stopped") note = "Туннель включён в конфигурации, но служба не запущена.";
+    var scene = body.__scene || (body.__scene = tunnelScene(doc));
     var children = [state, actions, scene, el(doc, "p", "tunnel-note", note)];
     var stats = snap.telegram_stats;
     if (stats && typeof stats.wss_attempts === "number") {
@@ -2159,7 +2160,6 @@
     body.setAttribute("data-state", st);
     /* Сцена одна на все состояния: смена состояния — переход на том же рисунке. */
     var prevState = body.__sceneState || "";
-    var scene = body.__scene || (body.__scene = tunnelScene(doc));
     body.replaceChildren.apply(body, children);
     if (prevState !== st) {
       body.__sceneState = st;
