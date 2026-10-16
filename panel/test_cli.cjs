@@ -33,7 +33,14 @@ async function main() {
   assert.notEqual(invalidOverride.status, 0, 'invalid CLI MODE must not bypass configuration validation');
 
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'd2k-panel-cli-'));
-  const port = 38000 + (process.pid % 20000);
+  const port = await new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once('error', reject);
+    probe.listen(0, '0.0.0.0', () => {
+      const address = probe.address();
+      probe.close((error) => error ? reject(error) : resolve(address.port));
+    });
+  });
   const stateDir = path.join(temp, 'state');
   const configPath = path.join(temp, 'config');
   const servicePath = path.join(temp, 'slow-service');
