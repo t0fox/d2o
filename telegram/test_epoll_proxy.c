@@ -1641,7 +1641,7 @@ static void test_epoll_cf_proxy_uses_mtproto_packet_framing(void) {
         .listener = create_listener(&ws_port),
         .cert_path = cert_path,
         .key_path = key_path,
-        .expected_sni = "kws4.cfproxy.test",
+        .expected_sni = "kws4-1.cfproxy.test",
         .expected_path = "/apiws",
         .expect_binary_subprotocol = 1
     };
