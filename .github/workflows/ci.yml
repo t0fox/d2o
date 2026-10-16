@@ -10,13 +10,13 @@ name: CI
 #        sanitizers   ASan + UBSan
 #        integration  scripts, panel in Chrome; install lifecycle needs build
 #   3. ci-ok           — the single required status check
-#   4. release         — push to main only, after ci-ok: release.yml decides
-#                        whether there is a fix or a feature to ship
+#
+# Сборка подписанного релиза запускается вручную после зелёного CI на main.
 #
 # Wall time is the slowest job of stage 2 (~7-8 minutes), not the sum.
 #
-# Heavy release packaging (static OpenSSL for d2ktg on nine CPUs) lives in
-# release.yml. CI proves the code; the release builds and signs the package.
+# Тяжёлая сборка релиза (OpenSSL для девяти архитектур) находится в release.yml
+# и запускается только вручную.
 
 on:
   push:
@@ -30,9 +30,8 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same ref makes the older run useless: only the head
-# commit is released or merged. Cancel the stale run instead of queueing the
-# new one behind it.
+# Новый push в ту же ветку делает старый CI неактуальным: проверять нужно верхушку.
+# Отменяем старый запуск, чтобы новый не ждал в очереди.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -319,24 +318,3 @@ jobs:
         run: exit 1
       - name: All required jobs succeeded
         run: echo "CI passed"
-
-  # ── Continuous delivery ───────────────────────────────────────────────────
-
-  release:
-    name: Release
-    # Only a green push to main ships; a pull request never does. A newer push
-    # cancels this run with the rest of CI (concurrency above): its own run
-    # releases the newer head, and publish itself refuses a commit main has left.
-    needs: ci-ok
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: write
-      checks: read  # required by the reusable release.yml for manual CI gate
-    # The signing key is a secret of the d2o-signing environment, and only
-    # the publish job inside release.yml enters it. Without "inherit" that
-    # job read it EMPTY (13.10.2026: "Could not read private key"), although
-    # the docs say a job-level environment is enough. The repository itself
-    # holds no secrets, so inherit hands over nothing beyond what the
-    # environment already guards.
-    uses: ./.github/workflows/release.yml
-    secrets: inherit # zizmor: ignore[secrets-inherit]

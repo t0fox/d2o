@@ -1,29 +1,11 @@
-name: D2K release
-# Continuous delivery from main. Nobody starts a release by hand:
-#
-#   push to main → CI (ci.yml) → ci-ok green → this workflow
-#     plan     scripts/release-plan.sh: is there a fix or a feature since the
-#              last release? No → stop here, nothing is built.
-#     build    nine CPUs in parallel, each tested under QEMU
-#     publish  archives, latest.json, Ed25519 signature; a draft release,
-#              then one switch makes it public and latest
-#
-# Routers take releases/latest/download/latest.json, check the signature with
-# the pinned key and install the archive for their CPU (files/d2k-update.sh).
-#
-# The manual run (Actions → D2K release → Run workflow) stays for one case:
-# release main now even without a fix or a feature.
+name: D2O release
+# Подписанный выпуск собирается только вручную из Actions.
+# Перед сборкой проверяется зелёный CI для точного коммита main.
 on:
-  workflow_call:
-    inputs:
-      notes:
-        description: Release notes; empty means the fix/feat list.
-        type: string
-        required: false
   workflow_dispatch:
     inputs:
       notes:
-        description: Что изменилось (покажется в панели). Пусто — список fix/feat с прошлого выпуска.
+        description: Что изменилось (покажется в панели). Пусто — список fix/feat с прошлого выпуска или название версии.
         type: string
         required: false
 
@@ -166,7 +148,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$PRIVATE_KEY" ]; then
-            echo "::error::D2O_ED25519_PRIVATE_KEY is empty: the d2o-signing environment secret did not reach this job (called from ci.yml without 'secrets: inherit'?)"
+            echo "::error::Секрет D2O_ED25519_PRIVATE_KEY отсутствует в environment d2o-signing"
             exit 1
           fi
           if ! PUBLIC_KEY_HEX=$(openssl pkey -pubin -in docs/d2o-release-public.pem -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d '[:space:]'); then
