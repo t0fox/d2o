@@ -95,26 +95,48 @@ static int parse_client_handshake(const tg_transparent_policy *policy,
     return 0;
 }
 
-int tg_transparent_select_target(
+int tg_transparent_select_route(
     void *opaque, const tg_listener_destination *original,
     const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
-    tg_listener_destination *upstream) {
+    tg_epoll_route_selection *selection) {
     const tg_transparent_policy *policy = opaque;
-    if (!policy || !handshake || !upstream ||
+    if (!policy || !handshake || !selection ||
         !destination_allowed(policy, original))
         return -1;
     tg_mtproto_init parsed;
     if (parse_client_handshake(policy, original, handshake, &parsed) != 0)
         return -1;
     int64_t now = (int64_t)time(NULL);
-    tg_dc_endpoint endpoint;
+    tg_dc_endpoint endpoint = {0};
     tg_dc_map_source source;
     int result = tg_dc_map_store_resolve(policy->map_store, now, original,
                                          parsed.is_media, parsed.dc_id, 1,
                                          &endpoint, &source);
+    /* Unknown destinations may only pass through unchanged when no DC hint
+     * was supplied. Never grant an arbitrary address a WSS/CF route. */
     if (result != TG_DC_LOOKUP_OK &&
         !(result == TG_DC_LOOKUP_NOT_LISTED && parsed.dc_id == 0))
         return -1;
-    *upstream = *original;
+    memset(selection, 0, sizeof(*selection));
+    selection->upstream = *original;
+    selection->dc_id = result == TG_DC_LOOKUP_OK ? endpoint.id : 0;
+    selection->is_media = parsed.is_media ||
+        (result == TG_DC_LOOKUP_OK && endpoint.media_only);
+    selection->proto = parsed.proto;
+    selection->tcp_only = result != TG_DC_LOOKUP_OK ||
+        endpoint.cdn || endpoint.tcpo_only;
+    return 0;
+}
+
+int tg_transparent_select_target(
+    void *opaque, const tg_listener_destination *original,
+    const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
+    tg_listener_destination *upstream) {
+    if (!upstream) return -1;
+    tg_epoll_route_selection selected;
+    if (tg_transparent_select_route(opaque, original, handshake,
+                                    &selected) != 0)
+        return -1;
+    *upstream = selected.upstream;
     return 0;
 }
