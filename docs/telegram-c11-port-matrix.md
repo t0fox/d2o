@@ -1,6 +1,8 @@
 # Матрица порта Telegram proxy: Rust → C11
 
-Аудит донора выполнен по `z2kOW` `d307c345ed7f7eedf02e52792d0a24bc832fe271`.
+Аудит донора сверен с `z2kOW` `4ef79fb99c30c233488623c04ec13c8097a614e0`.
+Дерево `platform/openwrt/tg-proxy` в этом HEAD совпадает с проверенной ревизией
+`d307c345ed7f7eedf02e52792d0a24bc832fe271` (`git diff` по этому пути пуст).
 Состояние C-кода и интеграции зафиксировано на 2026-10-16. Таблица различает
 реализованный код, локальные тесты и сценарии, которые ещё не проверены на
 настоящей сети или маршрутизаторе.
@@ -8,7 +10,7 @@
 | Возможность донора | Источник Rust | Реализация в d2o | Проверка и оставшийся предел |
 |---|---|---|---|
 | Obfuscated2, AES-256-CTR, DC ID, media flag, transport tags | `crypto.rs` | `mtproto_crypto.c`, `mtproto_auth.c`, `mtproto_auth_keys.inc`; используется локальным прокси | Векторы и тесты проходят. Нужна проверка с настоящим Telegram DC. |
-| Abridged, intermediate и padded intermediate; разбиение пакетов | `splitter.rs` | `mtproto_splitter.c`; для direct WSS и CF proxy сохраняются MTProto-границы, Worker использует потоковый режим | Unit-векторы и тест локального WSS проходят. C/Rust сравнение на общем наборе входов отсутствует. |
+| Abridged, intermediate и padded intermediate; разбиение пакетов | `splitter.rs` | `mtproto_splitter.c`; для direct WSS и CF proxy сохраняются MTProto-границы, Worker использует потоковый режим | Unit-векторы и тест локального WSS проходят. Разовая FFI-сверка с Rust HEAD `4ef79fb` дала те же кадры для трёх транспортных форматов, фрагментированного потока, сырого режима и отказа на пакете выше лимита; повторяемого дифференциального теста нет. |
 | Исходное назначение, IPv4/IPv6, разрешение Telegram DC | `transparent.rs`, `transparent_proxy.rs` | `listener.c` читает IPv4/IPv6 `SO_ORIGINAL_DST`; `transparent.c` проверяет DC-карту, порт, CIDR и защиту от собственного dial | Парсер и политика покрыты тестами. Kernel REDIRECT для IPv6 и фактический трафик на роутере не проверялись. |
 | TCP bridge, backpressure, закрытие и тайм-ауты | `transparent_proxy.rs`, `bridge.rs` | Linux `epoll` runtime, ограниченные очереди, неблокирующий TLS, WSS ping/pong/close, idle и handshake deadlines | Локальные тесты epoll, WSS и лимитов проходят. Стресс-тест на целевом роутере отсутствует. |
 | DC discovery, проверка `req_pq_multi/resPQ`, auth и `help.getConfig` | `dc_discovery.rs` | `mtproto_probe.c`, `mtproto_auth.c`, `mtproto_config.c`; демон обновляет карту через IPv4/IPv6 seed DC1, сохраняет LKG и повторяет неудачу позже | Парсеры и криптография покрыты векторами. CLI проверяет один указанный IP; полной автоматической диагностики DC1–DC5 нет. 2026-10-16 пять отдельных TCP probes для DC1–DC5 дошли до `resPQ` с совпавшим nonce; это не проверка WSS-маршрутов и не `help.getConfig`. Полного автоматического запуска матрицы DC1–DC5 нет. |
@@ -36,10 +38,19 @@ Direct WSS, CF Worker, CF proxy, TCP fallback, discovery, DoH, пул домен
 
 Полный критерий завершения пока не выполнен. Подтверждён живой TCP `resPQ`
 для DC1–DC5, но не WSS-доступ к Telegram, `help.getConfig` или реальные
-Worker/CF маршруты. Также не завершены автоматическая диагностика DC1–DC5,
-эквивалентность C/Rust, release-сборки архитектур, ABI/QEMU, ресурсные замеры
-на 128 MiB устройстве и физические Keenetic/OpenWrt сценарии. WSS-health
+Worker/CF маршруты. Остаются незакрытыми автоматическая диагностика DC1–DC5,
+проверка полной эквивалентности C/Rust runtime, release-сборки архитектур и
+ABI/QEMU, ресурсные замеры на 128 MiB устройстве и физические Keenetic/OpenWrt
+сценарии. WSS-health
 проверяет структуру transport packet, а не конкретный RPC.
+
+Для сверенного Rust HEAD выполнен `cargo test --locked --quiet` из временной
+архивной копии: 139 unit и 55 integration тестов прошли. Рабочее дерево donor
+не менялось. Дополнительно разовая FFI-сверка связала Rust-тесты с текущими
+`mtproto_splitter.c` и `mtproto_crypto.c`: две проверки подтвердили совпадение
+выходных кадров и отказа на слишком большом пакете. Тестовый стенд хранился
+только во временной копии, поэтому повторяемого межъязыкового теста в
+репозитории нет.
 
 Во время установки старые `relay-enroll` endpoint и сервер оставлены: они не
 используются новым локальным прокси и позволяют откатиться на прежний
