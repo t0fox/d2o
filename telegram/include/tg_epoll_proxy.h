@@ -48,6 +48,22 @@ typedef int (*tg_epoll_select_target_fn)(
     void *context, const tg_listener_destination *original,
     const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
     tg_listener_destination *upstream);
+
+/* Validated route metadata must survive handshake parsing. A missing DC hint
+ * can be resolved from the verified destination map, and secret-based MTProto
+ * handshakes must not be silently downgraded to direct TCP. */
+typedef struct {
+    tg_listener_destination upstream;
+    uint32_t dc_id;
+    int is_media;
+    tg_mtproto_proto proto;
+    int tcp_only;
+} tg_epoll_route_selection;
+
+typedef int (*tg_epoll_select_route_fn)(
+    void *context, const tg_listener_destination *original,
+    const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
+    tg_epoll_route_selection *selection);
 typedef int (*tg_epoll_resolve_domain_fn)(
     void *context, const char *domain, tg_listener_destination *upstream);
 
@@ -71,6 +87,7 @@ typedef struct {
     size_t listen_port_count;
     tg_epoll_original_destination_fn original_destination;
     tg_epoll_select_target_fn select_target;
+    tg_epoll_select_route_fn select_route;
     void *context;
 } tg_epoll_proxy_config;
 
