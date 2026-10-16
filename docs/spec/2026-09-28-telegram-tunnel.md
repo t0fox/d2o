@@ -28,7 +28,7 @@ The adjacent CDN HTTP tunnel on :1444 is not part of this Telegram feature.
   WINDOW replenishment, read/write idle timeout, ping/pong liveness, jittered
   reconnect, and ordered delivery of queued DATA before CLOSE.
 - Preserve local redirect behavior: donor IPv4 Telegram CIDRs in an ipset,
-  TCP/443 REDIRECT for PREROUTING and OUTPUT to :1443, IPv6 Telegram TCP
+  TCP/443 и TCP/5222 REDIRECT for PREROUTING and OUTPUT to :1443, IPv6 Telegram TCP
   fast-reset, conntrack cleanup, and NDM rule restoration. No UDP/QUIC tunnel.
 - Integrate config, independent start/stop/restart supervision, user disable,
   bounded logs, health status and a concise enable/status control in the

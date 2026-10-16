@@ -62,8 +62,10 @@ want 'type filter hook forward priority filter - 1; policy accept;'
 want 'type filter hook output priority filter - 1; policy accept;'
 want 'meta mark 0x31 return'
 want 'ip daddr @tg4 tcp dport 443 redirect to :1443'
+want 'ip daddr @tg4 tcp dport 5222 redirect to :1443'
 want 'ip6 daddr @tg6 meta l4proto tcp reject with tcp reset'
-[ "$(printf '%s\n' "$r" | grep -c 'redirect to :1443')" -eq 2 ] || fail "redirect must be in prerouting and output"
+[ "$(printf '%s\n' "$r" | grep -c 'tcp dport 443 redirect to :1443')" -eq 2 ] || fail "port 443 redirect must be in prerouting and output"
+[ "$(printf '%s\n' "$r" | grep -c 'tcp dport 5222 redirect to :1443')" -eq 2 ] || fail "port 5222 redirect must be in prerouting and output"
 [ "$(printf '%s\n' "$r" | grep -c 'reject with tcp reset')" -eq 2 ] || fail "IPv6 reject must be in forward and output"
 ok "start loads inet d2k_tg: sets, redirect (LAN and router), IPv6 fast-fail"
 
@@ -75,7 +77,7 @@ tg "$TMP/nftonly" sh "$TGFW" heal || fail "heal after the table was removed"
 [ -n "$(table)" ] || fail "heal did not restore the table"
 sed '/redirect/d' "$TMP/nft/inet_d2k_tg" > "$TMP/x" && mv "$TMP/x" "$TMP/nft/inet_d2k_tg"
 tg "$TMP/nftonly" sh "$TGFW" heal || fail "heal with a lost rule"
-[ "$(table | grep -c 'redirect to :1443')" -eq 2 ] || fail "heal did not restore a lost redirect"
+[ "$(table | grep -c 'redirect to :1443')" -eq 4 ] || fail "heal did not restore both Telegram port redirects"
 sed '/meta mark 0x31 return/d' "$TMP/nft/inet_d2k_tg" > "$TMP/x" && mv "$TMP/x" "$TMP/nft/inet_d2k_tg"
 tg "$TMP/nftonly" sh "$TGFW" heal || fail "heal with a lost outbound mark exemption"
 [ "$(table | grep -c 'meta mark 0x31 return')" -eq 1 ] || fail "heal did not restore the outbound mark exemption"
@@ -101,6 +103,8 @@ ok "a refused nft load fails start and heal and leaves no temp file"
 tg "$TMP/both" sh "$TGFW" start || fail "start with iptables present"
 grep -q 'iptables -w -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443' "$TMP/ipt.log" \
     || fail "start under nft did not clear the old iptables redirect"
+grep -q 'iptables -w -t nat -C PREROUTING -p tcp --dport 5222 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443' "$TMP/ipt.log" \
+    || fail "start under nft did not clear the old Telegram 5222 redirect"
 ! grep -q -- ' -I ' "$TMP/ipt.log" || fail "start under nft added iptables rules"
 : > "$TMP/ipt.log"
 tg "$TMP/both" sh "$TGFW" stop || fail "stop with both"

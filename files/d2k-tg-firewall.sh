@@ -5,6 +5,7 @@ set -eu
 SET4=d2k_tg_dc
 SET6=d2k_tg_dc6
 PORT=1443
+TCP_PORTS="443 5222"
 OUTBOUND_MARK=0x31
 OUTBOUND_COMMENT=d2k-tg-outbound
 CIDRS4="149.154.160.0/20 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 91.105.192.0/23 95.161.64.0/20 185.76.151.0/24"
@@ -26,6 +27,11 @@ fi
 NFT_TABLE=d2k_tg
 
 nft_list() { printf '%s' "$1" | sed 's/ /, /g'; }
+nft_redirects() {
+    for port in $TCP_PORTS; do
+        printf '\t\tip daddr @tg4 tcp dport %s redirect to :%s\n' "$port" "$PORT"
+    done
+}
 
 # Перехват (LAN — prerouting, сам роутер — output) раньше dstnat fw4; IPv6 —
 # быстрый отказ, как REJECT tcp-reset выше. Таблица целиком, одной транзакцией.
@@ -36,12 +42,12 @@ table inet $NFT_TABLE {
 	set tg6 { type ipv6_addr; flags interval; elements = { $(nft_list "$CIDRS6") }; }
 	chain pre {
 		type nat hook prerouting priority dstnat - 1; policy accept;
-		ip daddr @tg4 tcp dport 443 redirect to :$PORT
+		$(nft_redirects)
 	}
 	chain out {
 		type nat hook output priority -101; policy accept;
 		meta mark $OUTBOUND_MARK return
-		ip daddr @tg4 tcp dport 443 redirect to :$PORT
+		$(nft_redirects)
 	}
 	chain fwd6 {
 		type filter hook forward priority filter - 1; policy accept;
@@ -57,8 +63,11 @@ EOF2
 
 nft_installed() {
     listed=$(nft list table inet "$NFT_TABLE" 2>/dev/null) || return 1
-    [ "$(printf '%s\n' "$listed" | grep -c "redirect to :$PORT")" -eq 2 ] &&
-        [ "$(printf '%s\n' "$listed" | grep -c "meta mark $OUTBOUND_MARK return")" -eq 1 ] &&
+    [ "$(printf '%s\n' "$listed" | grep -c "redirect to :$PORT")" -eq 4 ] || return 1
+    for port in $TCP_PORTS; do
+        [ "$(printf '%s\n' "$listed" | grep -cF "tcp dport $port redirect to :$PORT")" -eq 2 ] || return 1
+    done
+    [ "$(printf '%s\n' "$listed" | grep -c "meta mark $OUTBOUND_MARK return")" -eq 1 ] &&
         [ "$(printf '%s\n' "$listed" | grep -c 'reject with tcp reset')" -eq 2 ]
 }
 
@@ -83,10 +92,12 @@ ensure4() {
     command -v ipset >/dev/null 2>&1 || return 1
     ipset create "$SET4" hash:net -exist 2>/dev/null || return 1
     for c in $CIDRS4; do ipset add "$SET4" "$c" -exist 2>/dev/null || return 1; done
-    for chain in PREROUTING OUTPUT; do
-        ipt -t nat -C "$chain" -p tcp --dport 443 -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" ||
-            ipt -t nat -I "$chain" 1 -p tcp --dport 443 -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || return 1
-        ipt -t nat -C "$chain" -p tcp --dport 443 -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || return 1
+    for port in $TCP_PORTS; do
+        for chain in PREROUTING OUTPUT; do
+            ipt -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" ||
+                ipt -t nat -I "$chain" 1 -p tcp --dport "$port" -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || return 1
+            ipt -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || return 1
+        done
     done
     ipt -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN ||
         ipt -t nat -I OUTPUT 1 -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || return 1
@@ -129,9 +140,11 @@ heal() {
 # времён Entware. Без iptables здесь нечего делать.
 ipt_stop() {
     command -v iptables >/dev/null 2>&1 || return 0
-    for chain in PREROUTING OUTPUT; do
-        while ipt -t nat -C "$chain" -p tcp --dport 443 -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT"; do
-            ipt -t nat -D "$chain" -p tcp --dport 443 -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || break
+    for port in $TCP_PORTS; do
+        for chain in PREROUTING OUTPUT; do
+            while ipt -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT"; do
+                ipt -t nat -D "$chain" -p tcp --dport "$port" -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || break
+            done
         done
     done
     while ipt -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN; do

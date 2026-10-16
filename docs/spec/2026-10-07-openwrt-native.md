@@ -94,8 +94,8 @@ flowtable мимо цепочек (замер 07.10: в очередь 4–5 п�
 ### Telegram — множества nft вместо ipset
 
 `d2k-tg-firewall.sh` на nft: таблица `inet d2k_tg` — множества `tg4`/`tg6`
-(`flags interval`), `nat` prerouting/output `priority dstnat - 1`
-`ip daddr @tg4 tcp dport 443 redirect to :TG_PORT`, filter forward/output
+(`flags interval`), `nat` prerouting/output `priority dstnat - 1` с отдельными
+REDIRECT для TCP/443 и TCP/5222, filter forward/output
 `ip6 daddr @tg6 meta l4proto tcp reject with tcp reset`. Отдельная таблица:
 туннель включается и выключается независимо от движка.
 

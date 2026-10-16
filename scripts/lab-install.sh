@@ -330,6 +330,8 @@ ipset test d2k_tg_dc 149.154.167.51 >/dev/null 2>&1 || fail "ipset не соде
 ! ipset test d2k_tg_dc 203.0.113.1 >/dev/null 2>&1 || fail "ipset ошибочно включает посторонний IPv4"
 iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "нет Telegram PREROUTING redirect"
 iptables -t nat -C OUTPUT -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "нет Telegram OUTPUT redirect"
+iptables -t nat -C PREROUTING -p tcp --dport 5222 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "нет Telegram PREROUTING redirect для 5222"
+iptables -t nat -C OUTPUT -p tcp --dport 5222 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "нет Telegram OUTPUT redirect для 5222"
 if ipset test d2k_tg_dc6 2001:67c:4e8::1 >/dev/null 2>&1; then
     echo "IPv6 Telegram set and rules are available"
     ip6tables -C FORWARD -p tcp -m set --match-set d2k_tg_dc6 dst -j REJECT --reject-with tcp-reset || fail "нет IPv6 Telegram fast-reject в FORWARD"
@@ -352,10 +354,13 @@ else
 fi
 rm -f /opt/sbin/curl
 iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "watchdog не восстановил Telegram redirect"
+iptables -t nat -C PREROUTING -p tcp --dport 5222 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "watchdog не сохранил Telegram redirect для 5222"
 panel_post telegram-disable | grep -q '"ok":true' || fail "панель не отключила Telegram-туннель"
 [ ! -e "$DIR/run/d2ktg.pid" ] || fail "pid-файл d2ktg остался после отключения"
 ! iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "PREROUTING redirect остался после отключения"
 ! iptables -t nat -C OUTPUT -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "OUTPUT redirect остался после отключения"
+! iptables -t nat -C PREROUTING -p tcp --dport 5222 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "PREROUTING redirect для 5222 остался после отключения"
+! iptables -t nat -C OUTPUT -p tcp --dport 5222 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 2>/dev/null || fail "OUTPUT redirect для 5222 остался после отключения"
 await "grep -q '^TG_ENABLED=0\$' \"$DIR/config\"" || fail "disable не сохранил TG_ENABLED=0"
 panel_post reapply | grep -q '"ok":true' || fail "локальная панель не восстановила правила"
 echo "установлено и работает"

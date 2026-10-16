@@ -205,10 +205,14 @@ jobs:
           - { component: core-compose,   run: 'sh scripts/ci-core-san-shard.sh compose' }
           - { component: core-rest-1,    run: 'sh scripts/ci-core-san-shard.sh rest-1' }
           - { component: core-rest-2,    run: 'sh scripts/ci-core-san-shard.sh rest-2' }
+          - { component: telegram,       run: 'make -C telegram san' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install OpenSSL headers for Telegram
+        if: matrix.component == 'telegram'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
       - name: ${{ matrix.run }}
         run: ${{ matrix.run }}
 

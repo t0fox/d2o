@@ -59,6 +59,10 @@ static void test_known_dc_is_validated_and_target_is_preserved(void) {
     assert(tg_transparent_select_target(&policy, &original, handshake,
                                         &upstream) == 0);
     assert(upstream.family == original.family && upstream.port == original.port);
+    destination(&original, "149.154.167.91", 5222);
+    assert(tg_transparent_select_target(&policy, &original, handshake,
+                                        &upstream) == 0);
+    assert(upstream.family == original.family && upstream.port == original.port);
     assert(memcmp(upstream.address, original.address, 4) == 0);
 }
 
@@ -78,6 +82,9 @@ static void test_policy_rejects_wrong_port_cidr_and_unlisted_dc(void) {
     };
     tg_listener_destination original, upstream;
     destination(&original, "149.154.167.91", 80);
+    assert(tg_transparent_select_target(&policy, &original, handshake,
+                                        &upstream) != 0);
+    destination(&original, "149.154.167.91", 5222);
     assert(tg_transparent_select_target(&policy, &original, handshake,
                                         &upstream) != 0);
     destination(&original, "8.8.8.8", 443);
