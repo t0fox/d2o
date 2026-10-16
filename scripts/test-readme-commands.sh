@@ -22,7 +22,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 printf '%s\n' "$target" > "$CURL_TARGET"
-printf 'printf "executed:%%s\\n" "${D2K_REF:-unset}" >> "$RUN_MARKER"\n' > "$target"
+printf 'printf "executed:%%s:%%s\\n" "${D2K_REF:-unset}" "${D2K_SOURCE:-unset}" >> "$RUN_MARKER"\n' > "$target"
 if [ -n "$proxy" ]; then
     printf '%s\n' "$proxy" >> "$GATE_LOG"
     [ "${GATE_FAIL:-0}" = 0 ] || exit 7
@@ -40,7 +40,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 printf '%s\n' "$target" > "$CURL_TARGET"
-printf 'printf "executed:%%s\\n" "${D2K_REF:-unset}" >> "$RUN_MARKER"\n' > "$target"
+printf 'printf "executed:%%s:%%s\\n" "${D2K_REF:-unset}" "${D2K_SOURCE:-unset}" >> "$RUN_MARKER"\n' > "$target"
 [ "${DOWNLOAD_FAIL:-0}" = 0 ] || exit 1
 EOF
 chmod +x "$WORK/bin/wget"
@@ -89,8 +89,8 @@ tool=curl
         [ "$(cat "$CURL_URL")" = "https://raw.githubusercontent.com/$expected_repo/main/scripts/$script.sh" ] \
             || { echo "команда $tool $script тянет не тот адрес" >&2; exit 1; }
         if [ "$script" = install ]; then
-            [ "$(cat "$RUN_MARKER")" = executed:main ] \
-                || { echo "установка $tool идёт не с ветки main" >&2; exit 1; }
+            [ "$(cat "$RUN_MARKER")" = executed:unset:release ] \
+                || { echo "установка $tool не использует подписанный релиз" >&2; exit 1; }
         fi
         # Сперва через проводник на VPS.
         [ "$(head -1 "$GATE_LOG")" = "http://213.176.74.63:9444" ] \
