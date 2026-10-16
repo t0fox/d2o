@@ -143,8 +143,7 @@ cp files/d2k-openwrt-init "$REL/files/"
 cp files/d2k-tg-firewall.sh files/d2k-tg-watchdog.sh files/d2k-instagram-dns.sh \
     files/d2k-instagram-dns-scheduler.sh files/meta-ranges.txt files/tg-roots.pem "$REL/files/"
 cp files/fake/stun.bin files/fake/quic_initial_dbankcloud_ru.bin "$REL/files/fake/"
-# Probe endpoints are loopback-only in the isolated lab.
-sed -i 's|^PROBE_URL=.*|PROBE_URL=https://127.0.0.1:11443/|; s/^PROBE_IP=.*/PROBE_IP=127.0.0.1/' "$REL/files/d2k-tg-watchdog.sh"
+# В лаборатории watchdog также проверяет только локальный heartbeat d2ktg.
 # Every path the installer will fetch must be staged: with D2K_LOCAL it dies
 # on the first missing file, before installing anything (install.sh fetch).
 for staged in $(sed -n 's/^fetch "\([^"]*\)".*/\1/p' scripts/install.sh | sed "s/\\\$ARCH/$ARCH/"); do
@@ -318,8 +317,7 @@ for pid in $REAPPLY_PIDS; do wait "$pid" || REAPPLY_FAILED=1; done
 "$INIT" status | grep -q "правила: стоят" || fail "параллельное восстановление оставило firewall частичным"
 panel_post telegram-disable | grep -q '"ok":true' || fail "панель не выключила Telegram"
 echo "== Telegram: локальный старт, redirect, отключение =="
-# Временный контейнерный watchdog выключен, чтобы лаборатория не запускала
-# внешний health-probe.
+# Сторож включается отдельно, после запуска d2ktg и появления heartbeat.
 chmod -x "$DIR/d2k-tg-watchdog.sh"
 panel_post telegram-enable | grep -q '"ok":true' || fail "панель не включила настроенный Telegram-туннель"
 await "[ -f \"$DIR/run/d2ktg.pid\" ]" || fail "d2ktg не создал pid-файл после включения"
@@ -340,8 +338,6 @@ else
     echo "IPv6 Telegram rules unavailable in this container kernel (donor behavior is best-effort)"
 fi
 iptables -t nat -D PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443
-printf '#!/bin/sh\nexit 0\n' > /opt/sbin/curl
-chmod +x /opt/sbin/curl
 chmod +x "$DIR/d2k-tg-watchdog.sh"
 if timeout 2 "$DIR/d2k-tg-watchdog.sh" >/tmp/d2k-tg-watchdog.log 2>&1; then
     fail "watchdog неожиданно завершился вместо продолжения цикла"
@@ -352,7 +348,6 @@ else
         fail "локальный watchdog завершился с кодом $WATCHDOG_RC"
     }
 fi
-rm -f /opt/sbin/curl
 iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "watchdog не восстановил Telegram redirect"
 iptables -t nat -C PREROUTING -p tcp --dport 5222 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "watchdog не сохранил Telegram redirect для 5222"
 panel_post telegram-disable | grep -q '"ok":true' || fail "панель не отключила Telegram-туннель"
