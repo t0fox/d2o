@@ -68,7 +68,9 @@ static int destination_allowed(const tg_transparent_policy *policy,
 static int parse_client_handshake(const tg_transparent_policy *policy,
                                   const tg_listener_destination *destination,
                                   const uint8_t *handshake,
-                                  tg_mtproto_init *parsed) {
+                                  tg_mtproto_init *parsed,
+                                  int *used_official_secret) {
+    *used_official_secret = 0;
     if (tg_mtproto_parse_obfuscated2(handshake, parsed) == 0) return 0;
     const tg_dc_snapshot *snapshot = tg_dc_map_store_current(policy->map_store);
     tg_dc_secret secrets[TG_TRANSPARENT_MAX_SECRETS];
@@ -92,6 +94,7 @@ static int parse_client_handshake(const tg_transparent_policy *policy,
     }
     if (!found) return -1;
     *parsed = selected;
+    *used_official_secret = 1;
     return 0;
 }
 
@@ -104,7 +107,9 @@ int tg_transparent_select_route(
         !destination_allowed(policy, original))
         return -1;
     tg_mtproto_init parsed;
-    if (parse_client_handshake(policy, original, handshake, &parsed) != 0)
+    int used_official_secret = 0;
+    if (parse_client_handshake(policy, original, handshake, &parsed,
+                               &used_official_secret) != 0)
         return -1;
     int64_t now = (int64_t)time(NULL);
     tg_dc_endpoint endpoint = {0};
@@ -123,8 +128,8 @@ int tg_transparent_select_route(
     selection->is_media = parsed.is_media ||
         (result == TG_DC_LOOKUP_OK && endpoint.media_only);
     selection->proto = parsed.proto;
-    selection->tcp_only = result != TG_DC_LOOKUP_OK ||
-        endpoint.cdn || endpoint.tcpo_only;
+    selection->tcp_only = used_official_secret ||
+        result != TG_DC_LOOKUP_OK || endpoint.cdn || endpoint.tcpo_only;
     return 0;
 }
 
