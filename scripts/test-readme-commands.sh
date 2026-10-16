@@ -84,7 +84,7 @@ tool=curl
         DOWNLOAD_FAIL=0 sh -c "$command"
         [ -s "$RUN_MARKER" ]
         [ ! -e "$(cat "$CURL_TARGET")" ]
-        expected_repo=necronicle/d2k
+        expected_repo=t0fox/d2o
         [ "$script" != install ] || expected_repo=t0fox/d2o
         [ "$(cat "$CURL_URL")" = "https://raw.githubusercontent.com/$expected_repo/main/scripts/$script.sh" ] \
             || { echo "команда $tool $script тянет не тот адрес" >&2; exit 1; }
