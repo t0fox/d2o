@@ -108,6 +108,19 @@ static void test_http_body_parser_accepts_bounded_chunked_response(void) {
         sizeof(oversized) - 1u, body, sizeof(body), &body_len) != 0);
 }
 
+static void test_http_body_parser_accepts_content_length_response(void) {
+    static const uint8_t response[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+        "Connection: close\r\n\r\nhello";
+    uint8_t body[8] = {0};
+    size_t body_len = 0;
+    assert(tg_route_dns_parse_http_response(response, sizeof(response) - 1u,
+                                            body, sizeof(body), &body_len) == 0);
+    assert(body_len == 5 && memcmp(body, "hello", body_len) == 0);
+    assert(tg_route_dns_parse_http_response(response, sizeof(response) - 2u,
+                                            body, sizeof(body), &body_len) != 0);
+}
+
 static void test_cache_returns_bounded_public_addresses(void) {
     resolver_fixture fixture = {0};
     assert(pthread_mutex_init(&fixture.mutex, NULL) == 0);
@@ -148,6 +161,7 @@ static void test_private_and_invalid_results_are_rejected(void) {
 int main(void) {
     test_doh_dns_message_validation();
     test_http_body_parser_accepts_bounded_chunked_response();
+    test_http_body_parser_accepts_content_length_response();
     test_cache_returns_bounded_public_addresses();
     test_private_and_invalid_results_are_rejected();
     puts("Тесты DNS-кэша Telegram-маршрутов: ок");

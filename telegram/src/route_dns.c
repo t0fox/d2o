@@ -392,6 +392,35 @@ static int ssl_write_all(SSL *ssl, int fd, const uint8_t *data, size_t length,
     return 0;
 }
 
+static int http_response_has_explicit_framing(const uint8_t *response,
+                                              size_t length) {
+    const uint8_t *separator = NULL;
+    for (size_t i = 0; i + 3u < length; ++i)
+        if (memcmp(response + i, "\r\n\r\n", 4) == 0) {
+            separator = response + i;
+            break;
+        }
+    if (!separator) return 0;
+    size_t header_len = (size_t)(separator - response);
+    if (header_len > 4096u) return 0;
+    char headers[4097];
+    memcpy(headers, response, header_len);
+    headers[header_len] = '\0';
+    char *line = strstr(headers, "\r\n");
+    while (line) {
+        line += 2;
+        if (!*line) break;
+        char *end = strstr(line, "\r\n");
+        if (end) *end = '\0';
+        if (strncasecmp(line, "Content-Length:", 15) == 0 ||
+            (strncasecmp(line, "Transfer-Encoding:", 18) == 0 &&
+             strcasestr(line + 18, "chunked"))) return 1;
+        if (!end) break;
+        line = end;
+    }
+    return 0;
+}
+
 static int ssl_read_response(SSL *ssl, int fd,
                              uint8_t response[TG_ROUTE_HTTPS_RESPONSE_MAX],
                              size_t *length, uint64_t deadline) {
@@ -403,6 +432,13 @@ static int ssl_read_response(SSL *ssl, int fd,
         if (rc == 1) {
             if (!received) return -1;
             *length += received;
+            if (http_response_has_explicit_framing(response, *length)) {
+                uint8_t body[TG_ROUTE_HTTPS_BODY_MAX];
+                size_t body_len = 0;
+                if (tg_route_dns_parse_http_response(
+                        response, *length, body, sizeof(body), &body_len) == 0)
+                    return 0;
+            }
             continue;
         }
         int error = SSL_get_error(ssl, rc);
