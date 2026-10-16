@@ -37,16 +37,17 @@ static void test_local_mode_needs_no_relay_url_or_secret(void) {
     fputs("TG_ENABLED=1\nTG_MODE=local\nTG_DC_MAP_PATH=/tmp/tg-dc.json\nTG_STATS_SOCKET=/tmp/tg-stats.sock\n",f);
     assert(fclose(f)==0);
     tg_config cfg;assert(tg_config_read(path,&cfg)==0);unlink(path);
-    assert(cfg.enabled && cfg.local_mode);
+    assert(cfg.enabled && cfg.local_mode && cfg.default_domains);
     assert(strcmp(cfg.dc_map_path,"/tmp/tg-dc.json")==0);
     assert(strcmp(cfg.stats_socket_path,"/tmp/tg-stats.sock")==0);
     tg_config_clean(&cfg);
 
     f=fopen(path,"w");assert(f);
-    fputs("TG_ENABLED=1\nTG_MODE=local\nSTATE_DIR=/tmp/tg-state\n",f);
+    fputs("TG_ENABLED=1\nTG_MODE=local\nSTATE_DIR=/tmp/tg-state\nTG_DEFAULT_DOMAINS=0\n",f);
     assert(fclose(f)==0);
     assert(tg_config_read(path,&cfg)==0);
     assert(strcmp(cfg.stats_socket_path,"/tmp/tg-state/telegram.stats.sock")==0);
+    assert(!cfg.default_domains);
     tg_config_clean(&cfg);
     unlink(path);
 }

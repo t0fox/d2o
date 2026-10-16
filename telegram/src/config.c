@@ -134,6 +134,7 @@ int tg_config_read(const char *path,tg_config *out) {
     out->ws_routing=TG_WS_ROUTING_ADAPTIVE;
     out->ws_hedge_delay_ms=125;
     out->ws_hedge_limit=8;
+    out->default_domains=1;
     if(copy_value(out->ca_bundle,sizeof(out->ca_bundle),"/opt/d2k/files/tg-roots.pem")||
        copy_value(out->status_path,sizeof(out->status_path),"/opt/d2k/state/telegram.status")||
        copy_value(out->dc_map_path,sizeof(out->dc_map_path),"/opt/d2k/state/telegram-dc-map.json")||
