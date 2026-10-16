@@ -106,7 +106,7 @@ nfq6_direct() {
 
 echo "== подготовка контейнера =="
 apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq iptables ipset iproute2 openssl ca-certificates >/dev/null 2>&1
+apt-get install -y -qq iptables ipset iproute2 openssl ca-certificates libssl-dev zlib1g-dev pkg-config >/dev/null 2>&1
 command -v start-stop-daemon >/dev/null || fail "нет start-stop-daemon — установщик на такой системе не работает"
 
 case "$(uname -m)" in
@@ -126,11 +126,10 @@ mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets" "$REL/script
 cp scripts/select-panel-ip.sh scripts/architecture.sh scripts/check-cpu.sh "$REL/scripts/"
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
-# d2ktg берётся готовым из builds/ — единственный бинарник, который там
-# остался в git. Его собирают со статическим OpenSSL, это минуты на арку, а
-# лаборатория проверяет установку, не сам туннель. Остальные три собираются
-# выше нативно; на роутер все четыре идут только подписанным выпуском.
-cp builds/d2ktg-linux-arm64 "$REL/builds/d2ktg-linux-$ARCH"
+# Для лабораторной установки собирается текущий C-прокси. Статический OpenSSL
+# для роутерного выпуска по-прежнему собирает scripts/build-router.sh.
+make -s -C telegram BUILD_DIR=build-lab d2ktg
+cp telegram/build-lab/d2ktg "$REL/builds/d2ktg-linux-$ARCH"
 make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
