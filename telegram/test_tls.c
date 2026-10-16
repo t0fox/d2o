@@ -98,12 +98,16 @@ static void *serve_ws(void *opaque) {
     assert(frame[0] == 0x82 && (frame[1] & 0x80) && (frame[1] & 0x7f) == 5);
     assert(ssl_read_exact(ssl, frame + 2, 9) == 0);
     for (size_t i=0; i<5; ++i) assert((uint8_t)(frame[6+i] ^ frame[2+i%4]) == "hello"[i]);
+    const uint8_t first_fragment[] = {0x02,0x01,'o'};
+    assert(ssl_write_exact(ssl, first_fragment, sizeof(first_fragment)) == 0);
     const uint8_t ping[] = {0x89,0x01,'p'};
     assert(ssl_write_exact(ssl, ping, sizeof(ping)) == 0);
     assert(ssl_read_exact(ssl, frame, 7) == 0);
     assert(frame[0] == 0x8a && frame[1] == 0x81 && frame[6] == ('p' ^ frame[2]));
-    const uint8_t binary[] = {0x82,0x02,'o','k'};
-    assert(ssl_write_exact(ssl, binary, sizeof(binary)) == 0);
+    const uint8_t last_fragment[] = {0x80,0x01,'k'};
+    assert(ssl_write_exact(ssl, last_fragment, sizeof(last_fragment)) == 0);
+    const uint8_t text_frame[] = {0x81,0x01,'x'};
+    assert(ssl_write_exact(ssl, text_frame, sizeof(text_frame)) == 0);
     const uint8_t close_frame[] = {0x88,0x00};
     assert(ssl_write_exact(ssl, close_frame, sizeof(close_frame)) == 0);
     SSL_free(ssl); close(fd); SSL_CTX_free(ctx);
@@ -353,7 +357,7 @@ static void test_shipped_relay_trust_bundle_loads(void) {
     assert(ctx!=NULL);SSL_CTX_free(ctx);
 }
 
-static void test_websocket_upgrade_binary_and_ping(void) {
+static void test_websocket_upgrade_fragmentation_and_text_rejection(void) {
     char dir[] = "/tmp/d2k-tg-ws-XXXXXX", cert_path[256], key_path[256];
     EVP_PKEY *key; X509 *cert; SSL_CTX *client_ctx; SSL *ssl;
     pthread_t thread; server_args args = {0};
@@ -372,11 +376,14 @@ static void test_websocket_upgrade_binary_and_ping(void) {
     assert(tg_ws_upgrade(ssl,"relay.test:443","/ws")==0);
     assert(tg_ws_pump_init(&pump,ssl)==0);
     assert(tg_ws_pump_queue_binary(&pump,(const uint8_t *)"hello",5)==0);
-    for(unsigned i=0;i<50&&!capture.received;i++) {
+    int process_result=0;
+    for(unsigned i=0;i<50&&process_result==0;i++) {
         struct pollfd pfd={.fd=tg_ws_pump_fd(&pump),.events=tg_ws_pump_events(&pump)};
         int rc=poll(&pfd,1,200); assert(rc>=0);
-        assert(tg_ws_pump_process(&pump,pfd.revents,capture_message,&capture)==0);
+        process_result=tg_ws_pump_process(&pump,pfd.revents,capture_message,&capture);
+        if(process_result!=0)break;
     }
+    assert(process_result==-1 && pump.failed);
     assert(capture.received && capture.len==2 && memcmp(capture.data,"ok",2)==0);
     assert(pump.tx_bytes==0 && pump.tx_memory_bytes==0 && pump.tx_head==NULL);
     tg_ws_pump_destroy(&pump);
@@ -460,7 +467,7 @@ int main(void) {
     test_websocket_upgrade_rejects_invalid_state_and_controls();
     test_sni_and_certificate_validation();
     test_shipped_relay_trust_bundle_loads();
-    test_websocket_upgrade_binary_and_ping();
+    test_websocket_upgrade_fragmentation_and_text_rejection();
     puts("TLS verification tests: ok");
     return 0;
 }

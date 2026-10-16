@@ -1934,7 +1934,9 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config) {
     server->max_connections = max_connections;
     if (config->enable_direct_wss) {
         size_t base_reservation;
-        size_t wss_extra = 4u * (size_t)TG_MTPROTO_MAX_PACKET;
+        /* Буфер сборки фрагментированного WebSocket-сообщения. */
+        size_t wss_extra = 4u * (size_t)TG_MTPROTO_MAX_PACKET +
+                          TG_WS_MAX_MESSAGE;
         if (max_connections > SIZE_MAX / per_connection) {
             free(server);
             errno = EOVERFLOW;

@@ -21,6 +21,7 @@ DONOR_URL = "https://github.com/t0fox/z2kOW.git"
 DONOR_COMMIT = "4ef79fb99c30c233488623c04ec13c8097a614e0"
 DONOR_SUBTREE = PurePosixPath("platform/openwrt/tg-proxy")
 TEST_SECRET = "2a519e5be6c3219c69879e5fa2a0eab8"
+WS_MAX_MESSAGE = 4 * 1024 * 1024
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -186,6 +187,109 @@ def dc_map_corpus() -> str:
     return "\n".join(cases) + "\n"
 
 
+
+def websocket_frame(opcode: int, payload: bytes = b"", *, fin: bool = True) -> bytes:
+    first = (0x80 if fin else 0) | opcode
+    length = len(payload)
+    if length < 126:
+        header = bytes((first, length))
+    elif length <= 0xFFFF:
+        header = bytes((first, 126)) + length.to_bytes(2, "big")
+    else:
+        header = bytes((first, 127)) + length.to_bytes(8, "big")
+    return header + payload
+
+
+def websocket_corpus() -> str:
+    close = websocket_frame(0x8)
+    cases: list[tuple[str, int, bytes]] = []
+
+    def add(case_id: str, wire: bytes, chunk: int = 7) -> None:
+        cases.append((case_id, chunk, wire))
+
+    add("binary", websocket_frame(0x2, b"mtproto") + close, 1)
+    add(
+        "binary-fragments-ping-pong",
+        websocket_frame(0x2, b"mtproto-", fin=False)
+        + websocket_frame(0x9, b"p")
+        + websocket_frame(0x0, b"payload", fin=True)
+        + websocket_frame(0xA, b"p")
+        + close,
+        3,
+    )
+    add(
+        "empty-fragments",
+        websocket_frame(0x2, b"", fin=False)
+        + websocket_frame(0x0, b"part-", fin=False)
+        + websocket_frame(0x9, b"")
+        + websocket_frame(0x0, b"end", fin=True)
+        + close,
+        2,
+    )
+    text = "Telegram ✓".encode()
+    add(
+        "text-utf8-split",
+        websocket_frame(0x1, text[:-1], fin=False)
+        + websocket_frame(0x0, text[-1:], fin=True)
+        + close,
+        1,
+    )
+    add("empty-binary", websocket_frame(0x2) + close, 2)
+    add("length-125", websocket_frame(0x2, b"a" * 125) + close, 31)
+    add("length-126", websocket_frame(0x2, b"b" * 126) + close, 37)
+    add("length-65535", websocket_frame(0x2, b"c" * 65535) + close, 4093)
+    add("length-65536", websocket_frame(0x2, b"d" * 65536) + close, 8191)
+    add("invalid-continuation", websocket_frame(0x0, b"x") + close)
+    add(
+        "invalid-nested-binary",
+        websocket_frame(0x2, b"a", fin=False)
+        + websocket_frame(0x2, b"b")
+        + close,
+    )
+    add("invalid-fragmented-ping", websocket_frame(0x9, b"p", fin=False) + close)
+    add("invalid-rsv", b"\xc2\x00" + close)
+    add("invalid-masked-server-frame", b"\x82\x80\x00\x00\x00\x00" + close)
+    add("invalid-text-utf8", websocket_frame(0x1, b"\xc0\x80") + close)
+    add("invalid-close-one-byte", websocket_frame(0x8, b"\x03"))
+    add("invalid-close-utf8", websocket_frame(0x8, b"\x03\xe8\xff"))
+    add("incomplete-header", b"\x82")
+    add("incomplete-payload", b"\x82\x05ab")
+    first_len = WS_MAX_MESSAGE // 2 + 1
+    second_len = WS_MAX_MESSAGE - first_len + 1
+    add(
+        "message-limit",
+        websocket_frame(0x2, b"x" * first_len, fin=False)
+        + websocket_frame(0x0, b"y" * second_len)
+        + close,
+        131071,
+    )
+
+    rng = random.Random(0xD20F12)
+    for index in range(24):
+        length = rng.randint(2, 2048)
+        payload = rng.randbytes(length)
+        part_count = rng.randint(2, min(8, length))
+        cuts = sorted(rng.sample(range(1, length), part_count - 1))
+        boundaries = [0, *cuts, length]
+        wire = bytearray()
+        for part_index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+            final = part_index == part_count - 1
+            wire.extend(
+                websocket_frame(
+                    0x2 if part_index == 0 else 0x0,
+                    payload[start:end],
+                    fin=final,
+                )
+            )
+            if not final and rng.random() < 0.65:
+                wire.extend(websocket_frame(0x9, rng.randbytes(rng.randint(0, 8))))
+        wire.extend(close)
+        add(f"random-fragments-{index}", bytes(wire), rng.randint(1, 257))
+
+    return "\n".join(
+        f"{case_id}\t{chunk}\t{wire.hex()}" for case_id, chunk, wire in cases
+    ) + "\n"
+
 def extract_donor(repo: Path, target: Path) -> Path:
     found = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", f"{DONOR_COMMIT}^{{commit}}"],
@@ -251,6 +355,7 @@ def main() -> int:
         rust_bin_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(Path(__file__).parent / "rust" / "main.rs", rust_bin_dir / "d2o-differential.rs")
         shutil.copyfile(Path(__file__).parent / "rust" / "dc_map.rs", rust_bin_dir / "d2o-dc-map-differential.rs")
+        shutil.copyfile(Path(__file__).parent / "rust" / "ws_frames.rs", rust_bin_dir / "d2o-ws-frame-differential.rs")
 
         c_binary = temp / "c-differential"
         command(
@@ -301,6 +406,57 @@ def main() -> int:
                 c_output.splitlines(),
                 fromfile="Rust",
                 tofile="C",
+                lineterm="",
+            )
+            print("\n".join(diff), file=sys.stderr)
+            return 1
+
+        ws_input = websocket_corpus().encode()
+        c_ws_binary = temp / "c-ws-frame-differential"
+        command(
+            [
+                os.environ.get("CC", "cc"),
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pedantic",
+                "-D_POSIX_C_SOURCE=200809L",
+                f"-I{ROOT / 'telegram' / 'include'}",
+                str(Path(__file__).parent / "c" / "ws_frames.c"),
+                str(ROOT / "telegram" / "src" / "ws_pump.c"),
+                str(ROOT / "telegram" / "src" / "ws.c"),
+                "-lssl",
+                "-lcrypto",
+                "-o",
+                str(c_ws_binary),
+            ]
+        )
+        c_ws_output = command(
+            [str(c_ws_binary)], input=ws_input, capture_output=True
+        ).stdout.decode()
+        rust_ws_output = command(
+            [
+                "cargo",
+                "run",
+                "--quiet",
+                "--locked",
+                "--manifest-path",
+                str(donor / "Cargo.toml"),
+                "--bin",
+                "d2o-ws-frame-differential",
+            ],
+            cwd=donor,
+            input=ws_input,
+            capture_output=True,
+            env=env,
+        ).stdout.decode()
+        if c_ws_output != rust_ws_output:
+            diff = difflib.unified_diff(
+                rust_ws_output.splitlines(),
+                c_ws_output.splitlines(),
+                fromfile="Rust WebSocket",
+                tofile="C WebSocket",
                 lineterm="",
             )
             print("\n".join(diff), file=sys.stderr)
@@ -419,9 +575,11 @@ def main() -> int:
 
         case_count = len(test_input.splitlines())
         print(
-            f"C/Rust: совпали {case_count} framing-сценариев и "
-            f"{len(rust_handshake_lines)} проверок Obfuscated2, "
-            f"{len(dc_map_input.splitlines())} сценариев карты DC; donor {DONOR_COMMIT}"
+            f"C/Rust: совпали {case_count} framing-сценариев, "
+            f"{len(ws_input.splitlines())} WebSocket-сценариев, "
+            f"{len(rust_handshake_lines)} проверок Obfuscated2 и "
+            f"{len(dc_map_input.splitlines())} сценариев карты DC; "
+            f"donor {DONOR_COMMIT}"
         )
     return 0
 

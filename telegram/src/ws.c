@@ -333,53 +333,80 @@ int tg_ws_write_binary(SSL *ssl, const uint8_t *payload, size_t payload_len) {
 
 int tg_ws_read_binary(SSL *ssl, uint8_t *dst, size_t cap, size_t *payload_len) {
     uint8_t first[10], *frame = NULL;
+    size_t frame_len = 0;
+    tg_ws_reassembly reassembly = {0};
     if (!ssl || !dst || !payload_len) return -1;
+    *payload_len = 0;
     for (;;) {
-        uint64_t n;
-        size_t hlen;
-        if (ssl_read_all(ssl, first, 2) != 0) return -1;
-        if ((first[0] & 0x70) != 0 || (first[0] & 0x80) == 0 || (first[1] & 0x80) != 0)
-            return -1;
-        uint8_t op = first[0] & 15;
-        if ((first[1] & 127) < 126) { n = first[1] & 127; hlen = 2; }
-        else if ((first[1] & 127) == 126) {
-            if (ssl_read_all(ssl, first + 2, 2) != 0) return -1;
-            n = ((uint64_t)first[2] << 8) | first[3];
-            if (n < 126) return -1;
-            hlen = 4;
+        uint64_t wire_len;
+        size_t header;
+        if (ssl_read_all(ssl, first, 2) != 0) goto fail;
+        if ((first[1] & 0x7fu) < 126u) {
+            wire_len = first[1] & 0x7fu;
+            header = 2;
+        } else if ((first[1] & 0x7fu) == 126u) {
+            if (ssl_read_all(ssl, first + 2, 2) != 0) goto fail;
+            wire_len = ((uint64_t)first[2] << 8) | first[3];
+            header = 4;
         } else {
-            if (ssl_read_all(ssl, first + 2, 8) != 0 || (first[2] & 0x80) != 0) return -1;
-            n = 0; for (size_t i = 0; i < 8; ++i) n = (n << 8) | first[2+i];
-            if (n <= UINT16_MAX || n > TG_WS_MAX_MESSAGE) return -1;
-            hlen = 10;
+            if (ssl_read_all(ssl, first + 2, 8) != 0) goto fail;
+            wire_len = 0;
+            for (size_t i = 0; i < 8; ++i)
+                wire_len = (wire_len << 8) | first[2 + i];
+            header = 10;
         }
-        if (n > TG_WS_MAX_MESSAGE || n > SIZE_MAX - hlen ||
-            (op >= 8 && (n > 125 || (first[0] & 0x80) == 0))) return -1;
-        frame = OPENSSL_malloc(hlen + (size_t)n);
-        if (!frame) return -1;
-        memcpy(frame, first, hlen);
-        if (n && ssl_read_all(ssl, frame + hlen, (size_t)n) != 0) goto fail;
-        uint8_t opcode; const uint8_t *body; size_t body_len, consumed;
-        if (tg_ws_decode_server_frame(frame, hlen + (size_t)n, TG_WS_MAX_MESSAGE,
-                                      &opcode, &body, &body_len, &consumed) != 0 ||
-            consumed != hlen + (size_t)n) goto fail;
-        if (opcode == TG_WS_PING) {
-            int rc = write_frame(ssl, TG_WS_PONG, body, body_len);
-            OPENSSL_clear_free(frame, hlen + (size_t)n); frame = NULL;
-            if (rc != 0) return -1;
+        if (wire_len > TG_WS_MAX_MESSAGE || wire_len > SIZE_MAX - header)
+            goto fail;
+        frame_len = header + (size_t)wire_len;
+        frame = OPENSSL_malloc(frame_len);
+        if (!frame) goto fail;
+        memcpy(frame, first, header);
+        if (wire_len && ssl_read_all(ssl, frame + header,
+                                     (size_t)wire_len) != 0)
+            goto fail;
+
+        uint8_t opcode = 0;
+        const uint8_t *body = NULL;
+        size_t body_len = 0, consumed = 0;
+        int ready = tg_ws_reassembly_feed(&reassembly, frame, frame_len,
+                    TG_WS_MAX_MESSAGE, &opcode, &body, &body_len, &consumed);
+        if ((ready != 1 && ready != 2) || consumed != frame_len) goto fail;
+        if (ready == 2) {
+            OPENSSL_clear_free(frame, frame_len);
+            frame = NULL;
+            frame_len = 0;
             continue;
         }
-        if (opcode == TG_WS_PONG) { OPENSSL_clear_free(frame, hlen + (size_t)n); frame=NULL; continue; }
+        if (opcode == TG_WS_PING) {
+            int rc = write_frame(ssl, TG_WS_PONG, body, body_len);
+            OPENSSL_clear_free(frame, frame_len);
+            frame = NULL;
+            frame_len = 0;
+            if (rc != 0) goto fail;
+            continue;
+        }
+        if (opcode == TG_WS_PONG) {
+            OPENSSL_clear_free(frame, frame_len);
+            frame = NULL;
+            frame_len = 0;
+            continue;
+        }
         if (opcode == TG_WS_CLOSE) {
             (void)write_frame(ssl, TG_WS_CLOSE, body, body_len);
-            OPENSSL_clear_free(frame, hlen + (size_t)n); return -2;
+            OPENSSL_clear_free(frame, frame_len);
+            tg_ws_reassembly_destroy(&reassembly);
+            return -2;
         }
         if (opcode != TG_WS_BINARY || body_len > cap) goto fail;
-        memcpy(dst, body, body_len); *payload_len = body_len;
-        OPENSSL_clear_free(frame, hlen + (size_t)n);
+        memcpy(dst, body, body_len);
+        *payload_len = body_len;
+        OPENSSL_clear_free(frame, frame_len);
+        tg_ws_reassembly_destroy(&reassembly);
         return 0;
-fail:
-        OPENSSL_clear_free(frame, hlen + (size_t)n);
-        return -1;
     }
+
+fail:
+    OPENSSL_clear_free(frame, frame_len);
+    tg_ws_reassembly_destroy(&reassembly);
+    return -1;
 }

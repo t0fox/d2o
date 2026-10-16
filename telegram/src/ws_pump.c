@@ -27,7 +27,8 @@ int tg_ws_pump_init(tg_ws_pump *p,SSL *ssl) {
 
 void tg_ws_pump_destroy(tg_ws_pump *p) {
     if(!p) { return; }
-    release_frames(p,p->tx_head);free(p->rx);memset(p,0,sizeof(*p));p->fd=-1;
+    release_frames(p,p->tx_head);tg_ws_reassembly_destroy(&p->reassembly);
+    free(p->rx);memset(p,0,sizeof(*p));p->fd=-1;
 }
 
 static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,size_t len) {
@@ -57,30 +58,166 @@ short tg_ws_pump_events(const tg_ws_pump *p){
     return events;
 }
 
-/* Returns 0 for an incomplete frame, 1 for a complete one and -1 for invalid. */
-static int complete_frame(const uint8_t *b,size_t len,size_t *total) {
-    if(len<2)return 0;
-    if((b[0]&0x70)||(b[0]&0x80)==0||(b[1]&0x80))return -1;
-    uint8_t op=b[0]&15;
-    if(op!=TG_WS_BINARY&&op!=TG_WS_CLOSE&&op!=TG_WS_PING&&op!=TG_WS_PONG)return -1;
-    uint64_t n;size_t header;
-    if((b[1]&127)<126){n=b[1]&127;header=2;}
-    else if((b[1]&127)==126){if(len<4)return 0;n=((uint64_t)b[2]<<8)|b[3];if(n<126)return -1;header=4;}
-    else{if(len<10)return 0;if(b[2]&0x80)return -1;n=0;for(size_t i=0;i<8;i++)n=(n<<8)|b[2+i];if(n<=UINT16_MAX)return -1;header=10;}
-    if(n>TG_WS_MAX_MESSAGE||(op>=8&&(n>125||(b[0]&0x80)==0))||n>SIZE_MAX-header)return -1;
-    *total=header+(size_t)n;return len>=*total?1:0;
+static int append_fragment(tg_ws_reassembly *state, const uint8_t *data,
+                           size_t len, size_t limit) {
+    if (state->len > limit || len > limit - state->len) return -1;
+    size_t needed = state->len + len;
+    if (needed > state->cap) {
+        size_t cap = state->cap ? state->cap : 256u;
+        while (cap < needed) {
+            if (cap > limit / 2u) { cap = limit; break; }
+            cap *= 2u;
+        }
+        if (cap < needed) return -1;
+        uint8_t *buffer = OPENSSL_malloc(cap);
+        if (!buffer) return -1;
+        if (state->len) memcpy(buffer, state->data, state->len);
+        OPENSSL_clear_free(state->data, state->cap);
+        state->data = buffer;
+        state->cap = cap;
+    }
+    if (len) memcpy(state->data + state->len, data, len);
+    state->len = needed;
+    return 0;
+}
+
+void tg_ws_reassembly_destroy(tg_ws_reassembly *state) {
+    if (!state) return;
+    OPENSSL_clear_free(state->data, state->cap);
+    memset(state, 0, sizeof(*state));
+}
+
+static int valid_utf8(const uint8_t *data, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        uint8_t lead = data[i++];
+        if (lead <= 0x7fu) continue;
+        size_t tails;
+        uint8_t second_min = 0x80u, second_max = 0xbfu;
+        if (lead >= 0xc2u && lead <= 0xdfu) tails = 1;
+        else if (lead == 0xe0u) { tails = 2; second_min = 0xa0u; }
+        else if ((lead >= 0xe1u && lead <= 0xecu) ||
+                 (lead >= 0xeeu && lead <= 0xefu)) tails = 2;
+        else if (lead == 0xedu) { tails = 2; second_max = 0x9fu; }
+        else if (lead == 0xf0u) { tails = 3; second_min = 0x90u; }
+        else if (lead >= 0xf1u && lead <= 0xf3u) tails = 3;
+        else if (lead == 0xf4u) { tails = 3; second_max = 0x8fu; }
+        else return 0;
+        if (tails > len - i || data[i] < second_min ||
+            data[i] > second_max) return 0;
+        for (size_t j = 1; j < tails; ++j)
+            if ((data[i + j] & 0xc0u) != 0x80u) return 0;
+        i += tails;
+    }
+    return 1;
+}
+
+/* Обрабатывает один серверный кадр и собирает фрагментированные сообщения. */
+int tg_ws_reassembly_feed(tg_ws_reassembly *state, const uint8_t *src,
+                          size_t len, size_t max_payload, uint8_t *opcode,
+                          const uint8_t **payload, size_t *payload_len,
+                          size_t *consumed) {
+    uint64_t wire_len;
+    size_t header;
+    if (!state || !src || !opcode || !payload || !payload_len || !consumed)
+        return -1;
+    *payload = NULL;
+    *payload_len = 0;
+    *consumed = 0;
+    if (max_payload > TG_WS_MAX_MESSAGE) max_payload = TG_WS_MAX_MESSAGE;
+    if (len < 2) return 0;
+    if ((src[0] & 0x70u) != 0 || (src[1] & 0x80u) != 0) return -1;
+
+    uint8_t fin = src[0] >> 7;
+    uint8_t op = src[0] & 0x0fu;
+    if (op != TG_WS_CONTINUATION && op != TG_WS_TEXT && op != TG_WS_BINARY &&
+        op != TG_WS_CLOSE && op != TG_WS_PING && op != TG_WS_PONG)
+        return -1;
+
+    if ((src[1] & 0x7fu) < 126u) {
+        wire_len = src[1] & 0x7fu;
+        header = 2;
+    } else if ((src[1] & 0x7fu) == 126u) {
+        if (len < 4) return 0;
+        wire_len = ((uint64_t)src[2] << 8) | src[3];
+        if (wire_len < 126u) return -1;
+        header = 4;
+    } else {
+        if (len < 10) return 0;
+        if ((src[2] & 0x80u) != 0) return -1;
+        wire_len = 0;
+        for (size_t i = 0; i < 8; ++i)
+            wire_len = (wire_len << 8) | src[2 + i];
+        if (wire_len <= UINT16_MAX) return -1;
+        header = 10;
+    }
+    if (wire_len > max_payload || wire_len > SIZE_MAX - header) return -1;
+    if (op >= TG_WS_CLOSE && (wire_len > 125u || !fin)) return -1;
+    size_t total = header + (size_t)wire_len;
+    if (len < total) return 0;
+    *consumed = total;
+
+    if (op == TG_WS_CLOSE &&
+        (wire_len == 1u ||
+         (wire_len > 2u && !valid_utf8(src + header + 2u,
+                                      (size_t)wire_len - 2u))))
+        return -1;
+    if (op >= TG_WS_CLOSE) {
+        *opcode = op;
+        *payload = src + header;
+        *payload_len = (size_t)wire_len;
+        return 1;
+    }
+
+    if (op == TG_WS_TEXT || op == TG_WS_BINARY) {
+        if (state->fragmented) return -1;
+        if (fin) {
+            if (op == TG_WS_TEXT &&
+                !valid_utf8(src + header, (size_t)wire_len))
+                return -1;
+            *opcode = op;
+            *payload = src + header;
+            *payload_len = (size_t)wire_len;
+            return 1;
+        }
+        state->fragmented = 1;
+        state->opcode = op;
+        state->len = 0;
+        return append_fragment(state, src + header, (size_t)wire_len,
+                               max_payload) == 0 ? 2 : -1;
+    }
+
+    if (!state->fragmented) return -1;
+    if (append_fragment(state, src + header, (size_t)wire_len,
+                        max_payload) != 0)
+        return -1;
+    if (!fin) return 2;
+    if (state->opcode == TG_WS_TEXT && !valid_utf8(state->data, state->len))
+        return -1;
+    *opcode = state->opcode;
+    *payload = state->data;
+    *payload_len = state->len;
+    state->fragmented = 0;
+    state->opcode = 0;
+    state->len = 0;
+    return 1;
 }
 
 static int dispatch_frames(tg_ws_pump *p,tg_ws_message_cb callback,void *ctx) {
-    while(p->rx_len){size_t total=0;int ready=complete_frame(p->rx,p->rx_len,&total);
-        if(ready<0) { return -1; }
-        if(ready==0) { return 0; }
-        uint8_t op;const uint8_t *data;size_t len,used;
-        if(tg_ws_decode_server_frame(p->rx,total,TG_WS_MAX_MESSAGE,&op,&data,&len,&used)!=0||used!=total)return -1;
-        if(op==TG_WS_PING){if(queue_opcode(p,TG_WS_PONG,data,len)!=0)return -1;}
-        else if(op==TG_WS_CLOSE){p->closed=1;return 0;}
-        else if(op==TG_WS_BINARY&&callback&&callback(ctx,data,len)!=0)return -1;
-        memmove(p->rx,p->rx+total,p->rx_len-total);p->rx_len-=total;
+    while(p->rx_len){
+        uint8_t op=0;const uint8_t *data=NULL;size_t len=0,used=0;
+        int ready=tg_ws_reassembly_feed(&p->reassembly,p->rx,p->rx_len,
+                    TG_WS_MAX_MESSAGE,&op,&data,&len,&used);
+        if(ready<0)return -1;
+        if(ready==0)return 0;
+        if(ready==1){
+            if(op==TG_WS_PING){if(queue_opcode(p,TG_WS_PONG,data,len)!=0)return -1;}
+            else if(op==TG_WS_CLOSE){p->closed=1;return 0;}
+            else if(op==TG_WS_TEXT)return -1;
+            else if(op==TG_WS_BINARY&&callback&&
+                    callback(ctx,data,len)!=0)return -1;
+        }
+        memmove(p->rx,p->rx+used,p->rx_len-used);p->rx_len-=used;
     }
     return 0;
 }
