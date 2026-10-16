@@ -27,7 +27,7 @@
 | Пределы FD и RAM | `limits.rs` | `limits.c` рассчитывает лимит соединений по FD и памяти; daemon задаёт бюджет 32 MiB, предел 64 клиента и ограничивает WSS/hedge ресурсы | Unit-тесты и ASan/UBSan проходят. RSS idle daemon после запуска со stats socket — 8 352 KiB в WSL, без клиентов; поведение под нагрузкой и на устройстве с 128 MiB не измерялось. |
 | Конфигурация и удаление relay client | `config.rs`, `server.rs`, `runtime.rs` | `d2ktg` принимает только `TG_MODE=local`; старые relay URL/secret/enroll ключи не разбираются. Установщик переводит старый `relay` в `local`, сохраняя старые поля с правами `0600` | Тесты конфигурации, панели, release и runtime install проходят. Отдельный `relay-enroll` сервер оставлен для совместимости прежних установок и существующего Meta DNS resolver; новый `d2ktg` к нему не обращается. |
 | Keenetic и OpenWrt lifecycle/firewall | OpenWrt integration | Установщик выбирает собственную таблицу nftables для fw4 или iptables для Keenetic/fw3; init, enable/disable и uninstall управляются штатно | Release/OpenWrt/runtime test scripts проходят. Docker lab, физический OpenWrt и Keenetic в этом прогоне недоступны. |
-| Сборка, ABI, размер бинарника и регрессии | Makefile, CI, release scripts | `telegram/Makefile` и release cross-build используют явный локальный список исходников; client relay/session/stream/tunnel модули удалены | Native tests, ASan/UBSan и GCC `-fanalyzer` выполнены. Текущий x86_64 dynamic binary: 157 396 байт text+data+bss, ELF с debug symbols — 610 704 байта. Zig и Docker отсутствуют, поэтому 9-архитектурный static build, QEMU ABI и release sizes не проверены. |
+| Сборка, ABI, размер бинарника и регрессии | Makefile, CI, release scripts | `telegram/Makefile` и release cross-build используют явный локальный список исходников; client relay/session/stream/tunnel модули удалены | Native tests, ASan/UBSan и GCC `-fanalyzer` выполнены. Текущий x86_64 dynamic binary: 157 396 байт text+data+bss, ELF с debug symbols — 610 704 байта. Zig 0.16.0 и 0.14.1, проверенные по SHA-256, использованы для кросс-сборки статических релизных бинарников всех 9 архитектур; QEMU подтвердил отсутствие динамических зависимостей и успешный запуск. Под QEMU прошли проверки криптографии, QUIC wire, разбора планов, OpenSSL и MTProto. Размеры бинарника d2ktg после strip: arm64 2 803 240, arm 2 580 216, mipsel 3 917 140, mips 3 920 596, mips64el 4 042 448, amd64 3 950 152, x86 2 606 964, ppc64 3 406 392, riscv64 2 486 480 байт. |
 
 ## Результат
 
@@ -36,13 +36,15 @@ Direct WSS, CF Worker, CF proxy, TCP fallback, discovery, DoH, пул домен
 адаптивный выбор и opt-in hedge представлены в коде и имеют локальные тесты.
 Успех WSS и hedge проверяется для трёх транспортных форматов.
 
-Полный критерий завершения пока не выполнен. Живые TCP и WSS `resPQ`, а также
-TCP `help.getConfig` подтверждены для DC1–DC5. Реальные Worker/CF маршруты не
-проверены. Остаются незакрытыми диагностика CF-маршрутов, проверка полной
-эквивалентности C/Rust runtime, release-сборки архитектур и ABI/QEMU, ресурсные
-замеры на 128 MiB устройстве и физические
-Keenetic/OpenWrt сценарии. WSS-health
-проверяет структуру transport packet, а не конкретный RPC.
+Полный критерий завершения пока не выполнен. Живые TCP и WSS resPQ, а также
+TCP help.getConfig подтверждены для DC1–DC5. Статические релизные бинарники собраны
+для всех 9 архитектур и прошли под QEMU проверки ABI, запуска, криптографии,
+QUIC wire, разбора планов, OpenSSL и MTProto (размеры приведены в таблице). Реальные Worker/CF маршруты и
+DoH запросы, фазовая CF-диагностика и повторяемый дифференциальный тест C/Rust runtime
+не проверены. Ресурсные замеры на 128 MiB устройстве и физические
+Keenetic/OpenWrt сценарии остались за пределами этого прогона; на роутер
+ничего не устанавливалось. WSS-health проверяет структуру transport packet,
+а не конкретный RPC.
 
 Для сверенного Rust HEAD выполнен `cargo test --locked --quiet` из временной
 архивной копии: 139 unit и 55 integration тестов прошли. Рабочее дерево donor
