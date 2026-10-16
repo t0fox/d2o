@@ -5,6 +5,7 @@ set -eu
 # static musl archive for the selected router architecture.
 OPENSSL_COMMIT=f4dc4d58b48d346a8270183f89acf826d459b0ca
 ZLIB_COMMIT=51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf
+SIZE_CFLAGS='-ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables'
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/scripts/build-target.sh"
 ZIG=$BUILD_ZIG
@@ -73,7 +74,6 @@ cd "$OBJ_DIR"
 # доступность ED25519; новый d2ktg этот алгоритм не использует.
 # C-код не использует раскрутку стека; её отключение оставлено как отдельная
 # оптимизация размера, которую нужно учитывать при изменении toolchain.
-SIZE_CFLAGS='-ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables'
 UNUSED_FEATURES='no-dsa no-cms no-ct no-ocsp no-srp no-comp no-engine no-dynamic-engine
     no-dtls no-ssl3 no-idea no-rc2 no-rc4 no-rc5 no-des no-bf no-cast no-camellia no-aria
     no-seed no-sm2 no-sm3 no-sm4 no-gost no-md4 no-mdc2 no-whirlpool no-ts no-rfc3779
