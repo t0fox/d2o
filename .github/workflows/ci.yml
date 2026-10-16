@@ -89,6 +89,7 @@ jobs:
 
   differential:
     name: Differential — Telegram Rust/C
+    needs: [lint, warnings]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -140,7 +141,7 @@ jobs:
           ls -l out
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: d2k-${{ matrix.arch }}
+          name: d2o-ci-${{ matrix.arch }}
           path: out/
           retention-days: 7
           if-no-files-found: error
@@ -330,7 +331,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
-    # The signing key is a secret of the d2k-signing environment, and only
+    # The signing key is a secret of the d2o-signing environment, and only
     # the publish job inside release.yml enters it. Without "inherit" that
     # job read it EMPTY (13.10.2026: "Could not read private key"), although
     # the docs say a job-level environment is enough. The repository itself

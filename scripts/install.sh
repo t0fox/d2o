@@ -13,7 +13,7 @@
 #     собственный установщик с D2K_LOCAL.
 set -eu
 
-REPO=${D2K_REPO:-necronicle/d2k}
+REPO=${D2K_REPO:-t0fox/d2o}
 REF=${D2K_REF:-main}
 BASE=${D2K_BASE:-https://raw.githubusercontent.com/$REPO/$REF}
 
@@ -35,7 +35,7 @@ SOURCE=${D2K_SOURCE:-release}
 # Совпадение ключа с переменной репозитория сторожит .github/workflows/release.yml.
 LATEST=${D2K_UPDATE_LATEST:-https://github.com/$REPO/releases/latest/download}
 DOWNLOAD=${D2K_UPDATE_DOWNLOAD:-https://github.com/$REPO/releases/download}
-KEY=${D2K_UPDATE_KEY:-MCowBQYDK2VwAyEAqZkq/DsxeFJ1MCEEyFa7yzm80XiWf+cHPR1JsybbMPQ=}
+KEY=${D2K_UPDATE_KEY:-MCowBQYDK2VwAyEA2Pxc0karhBR0bvHAaqpuq2m2Z4p1s+NBRf9Vz3xI7nE=}
 
 DIR=/opt/d2k
 SBIN=/opt/sbin

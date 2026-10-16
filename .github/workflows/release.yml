@@ -1,4 +1,4 @@
-name: D2K release
+name: d2o release
 # Continuous delivery from main. Nobody starts a release by hand:
 #
 #   push to main → CI (ci.yml) → ci-ok green → this workflow
@@ -11,7 +11,7 @@ name: D2K release
 # Routers take releases/latest/download/latest.json, check the signature with
 # the pinned key and install the archive for their CPU (files/d2k-update.sh).
 #
-# The manual run (Actions → D2K release → Run workflow) stays for one case:
+# The manual run (Actions → d2o release → Run workflow) stays for one case:
 # release main now even without a fix or a feature.
 on:
   workflow_call:
@@ -112,12 +112,12 @@ jobs:
     needs: [plan, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: d2k-signing
+    environment: d2o-signing
     permissions:
       contents: write
     # One publish at a time. A newer one waits; it is not cancelled midway.
     concurrency:
-      group: d2k-release-publish
+      group: d2o-release-publish
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}
@@ -146,12 +146,21 @@ jobs:
         run: D2K_BUILDS="$RUNNER_TEMP/builds" sh scripts/test-install-manifest.sh
       - name: Archives, latest.json and signature
         env:
-          PRIVATE_KEY: ${{ secrets.D2K_ED25519_PRIVATE_KEY }}
-          PUBLIC_KEY_HEX: ${{ vars.D2K_SIGNING_PUBLIC_KEY }}
+          PRIVATE_KEY: ${{ secrets.D2O_ED25519_PRIVATE_KEY }}
+          PUBLIC_KEY_HEX: ${{ vars.D2O_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           if [ -z "$PRIVATE_KEY" ]; then
-            echo "::error::D2K_ED25519_PRIVATE_KEY is empty: the d2k-signing environment secret did not reach this job (called from ci.yml without 'secrets: inherit'?)"
+            echo "::error::D2O_ED25519_PRIVATE_KEY is empty: the d2o-signing environment secret did not reach this job (called from ci.yml without 'secrets: inherit'?)"
+            exit 1
+          fi
+          if ! [[ "$PUBLIC_KEY_HEX" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::D2O_SIGNING_PUBLIC_KEY is missing or malformed"
+            exit 1
+          fi
+          signing_pub=$(printf '%s\n' "$PRIVATE_KEY" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | od -An -tx1 | tr -d '[:space:]')
+          if [ "$signing_pub" != "$PUBLIC_KEY_HEX" ]; then
+            echo "::error::d2o signing secret and public key do not match"
             exit 1
           fi
           out="$RUNNER_TEMP/release"
@@ -169,7 +178,7 @@ jobs:
           pub=$(python3 -c 'import base64,os; print(base64.b64encode(bytes.fromhex("302a300506032b6570032100"+os.environ["PUBLIC_KEY_HEX"])).decode())')
           for pinned in files/d2k-update.sh scripts/install.sh; do
             grep -qF "$pub" "$pinned" ||
-              { echo "::error::$pinned pins a signing key other than D2K_SIGNING_PUBLIC_KEY"; exit 1; }
+              { echo "::error::$pinned pins a signing key other than D2O_SIGNING_PUBLIC_KEY"; exit 1; }
           done
           printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$pub" > "$RUNNER_TEMP/public.pem"
           openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/public.pem" -rawin \
@@ -197,14 +206,14 @@ jobs:
           # A run cancelled between "draft" and "public" leaves its draft.
           # Only drafts of this workflow go: d2k-* and never published.
           gh release list --limit 100 --json tagName,isDraft \
-            --jq '.[] | select(.isDraft and (.tagName | startswith("d2k-"))) | .tagName' |
+            --jq '.[] | select(.isDraft and (.tagName | startswith("d2o-"))) | .tagName' |
             while read -r t; do gh release delete "$t" --yes; done
           out="$RUNNER_TEMP/release"
           printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.txt"
           # Draft first: a draft has no tag and no download link yet. Routers
           # see the release only after every asset is uploaded.
           gh release create "$RELEASE_ID" --draft --target "$SHA" \
-            --title "D2K $VERSION" --notes-file "$RUNNER_TEMP/notes.txt" \
+            --title "d2o $VERSION" --notes-file "$RUNNER_TEMP/notes.txt" \
             "$out"/d2k-*.tar.gz "$out/latest.json" "$out/latest.json.sig"
           # The tag is made here. main can move in the seconds since the check.
           if ! gh release edit "$RELEASE_ID" --draft=false --latest; then
