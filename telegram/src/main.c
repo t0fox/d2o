@@ -392,6 +392,24 @@ static int discover_telegram_dc(const char *address, const char *dc_text,
     return 1;
 }
 
+static int check_telegram_dc_matrix(void) {
+    static const struct {
+        const char *address;
+        const char *dc;
+    } targets[] = {
+        {"149.154.175.50", "1"},
+        {"149.154.167.51", "2"},
+        {"149.154.175.100", "3"},
+        {"149.154.167.91", "4"},
+        {"149.154.171.5", "5"}
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); ++i)
+        if (check_telegram_dc(targets[i].address, targets[i].dc, NULL) != 0)
+            failed = 1;
+    return failed;
+}
+
 int main(int argc,char **argv) {
     int offline = d2k_runtime_offline(argc, argv, "d2ktg", offline_self_check);
     if (offline >= 0) return offline;
@@ -400,7 +418,8 @@ int main(int argc,char **argv) {
     if(argc==5&&strcmp(argv[1],"--check-instagram-ip")==0)return check_instagram_ip(argv[2],argv[3],argv[4]);
     if((argc==4||argc==5)&&strcmp(argv[1],"--check-telegram-dc")==0)return check_telegram_dc(argv[2],argv[3],argc==5?argv[4]:NULL);
     if((argc==4||argc==5)&&strcmp(argv[1],"--discover-telegram-dc")==0)return discover_telegram_dc(argv[2],argv[3],argc==5?argv[4]:NULL);
-    if(argc==2&&strcmp(argv[1],"--help")==0){puts("d2ktg [--config FILE] | --check-telegram-dc IP DC [PORT] | --discover-telegram-dc IP DC [PORT]");return 0;}
+    if(argc==2&&strcmp(argv[1],"--check-telegram-dc-matrix")==0)return check_telegram_dc_matrix();
+    if(argc==2&&strcmp(argv[1],"--help")==0){puts("d2ktg [--config FILE] | --check-telegram-dc-matrix | --check-telegram-dc IP DC [PORT] | --discover-telegram-dc IP DC [PORT]");return 0;}
     if(argc==3&&strcmp(argv[1],"--check-config")==0)return check_config(argv[2]);
     for(int i=1;i<argc;i++) {
         if(strcmp(argv[i],"--health-file")==0&&i+1<argc)health_path=argv[++i];
