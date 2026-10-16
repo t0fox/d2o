@@ -126,13 +126,16 @@ README z2k) или переименуйте файл `/opt/etc/init.d/S99zapret2
 Выполните в том же SSH-терминале Entware:
 
 ```sh
-(f=$(mktemp); u=https://raw.githubusercontent.com/necronicle/d2k/main/scripts/install.sh; { curl -fsSL --proxy http://213.176.74.63:9444 --connect-timeout 8 --max-time 120 "$u" -o "$f" || curl -fsSL --connect-timeout 10 --max-time 120 "$u" -o "$f"; } && D2K_REF=main sh "$f"; r=$?; rm -f "$f"; exit "$r")
+(f=$(mktemp); u=https://raw.githubusercontent.com/t0fox/d2o/main/scripts/install.sh; { curl -fsSL --proxy http://213.176.74.63:9444 --connect-timeout 8 --max-time 120 "$u" -o "$f" || curl -fsSL --connect-timeout 10 --max-time 120 "$u" -o "$f"; } && D2K_REPO=t0fox/d2o D2K_REF=main D2K_SOURCE=ref sh "$f"; r=$?; rm -f "$f"; exit "$r")
 ```
 
-В конце установщик печатает адрес панели. Дальше — раздел
+Команда устанавливает текущий `main` из `t0fox/d2o` без проверки подписи;
+установщик сохраняет этот репозиторий для проверки обновлений. До публикации
+подписанного выпуска обновляйте сборку повторным запуском команды. В конце установщик печатает
+адрес панели. Дальше — раздел
 [Проверка после установки](#проверка-после-установки).
 
-Выполните команду один раз. Потом D2K обновляет себя сам.
+После публикации подписанного выпуска в `t0fox/d2o` D2K сможет устанавливать его штатным автообновлением.
 
 ---
 

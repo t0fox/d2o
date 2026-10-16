@@ -105,6 +105,15 @@ cleanup() {
     TMP=
 }
 trap cleanup EXIT INT TERM
+case "$REPO" in
+    */*) ;;
+    *) die "неверный GitHub-репозиторий: $REPO" ;;
+esac
+case "$REPO" in
+    *//*|*/*/*|/*|*/|*[!A-Za-z0-9._/-]*)
+        die "неверный GitHub-репозиторий: $REPO"
+        ;;
+esac
 
 # --- арка ----------------------------------------------------------------
 #
@@ -697,6 +706,15 @@ if [ "$PANEL_LISTEN_CURRENT" = "127.0.0.1:8090" ]; then
         die "не настроить LAN-адрес панели"
     install_data_atomic "$TMP/config.lan" "$DIR/config"
     say "панель доступна в LAN: http://$PANEL_LAN_IP:8090/"
+fi
+# Установка из форка должна и дальше искать подписанные обновления в том же репозитории.
+if [ "$REPO" != necronicle/d2k ]; then
+    sed '/^D2K_REPO=/d' "$DIR/config" > "$TMP/config.repo" ||
+        die "не подготовить источник обновлений"
+    printf 'D2K_REPO=%s\n' "$REPO" >> "$TMP/config.repo" ||
+        die "не сохранить источник обновлений"
+    install_data_atomic "$TMP/config.repo" "$DIR/config" ||
+        die "не сохранить источник обновлений"
 fi
 # В старой конфигурации могут оставаться relay-учётные данные. Сохраняем их
 # при переходе и ограничиваем чтение файла root даже при обновлении.
