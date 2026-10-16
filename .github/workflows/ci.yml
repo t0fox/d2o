@@ -331,6 +331,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
+      checks: read  # required by the reusable release.yml for manual CI gate
     # The signing key is a secret of the d2o-signing environment, and only
     # the publish job inside release.yml enters it. Without "inherit" that
     # job read it EMPTY (13.10.2026: "Could not read private key"), although
