@@ -1209,7 +1209,7 @@ static int route_after_handshake(proxy_connection *connection) {
     int prefer_cf = policy == TG_WS_ROUTING_ADAPTIVE && have_preferred &&
         (preferred.kind == TG_ROUTE_CF_WORKER ||
          preferred.kind == TG_ROUTE_CF_PROXY);
-    if (tg_route_plan_build(connection->route_dc_id,
+    if (tg_route_plan_build(selection.tcp_only ? 0 : connection->route_dc_id,
                             connection->route_is_media, policy, prefer_cf,
                             worker_count, cf_count,
                             &connection->route_plan) != 0)
