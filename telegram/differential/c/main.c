@@ -81,22 +81,35 @@ static tg_mtproto_proto parse_proto(const char *name) {
     return 0;
 }
 
+static const char *proto_text(tg_mtproto_proto proto) {
+    switch (proto) {
+    case TG_MTPROTO_ABRIDGED: return "abridged";
+    case TG_MTPROTO_INTERMEDIATE: return "intermediate";
+    case TG_MTPROTO_PADDED_INTERMEDIATE: return "padded-intermediate";
+    default: return "invalid";
+    }
+}
+
+static int split_fields(char *line, char **fields, size_t count) {
+    fields[0] = line;
+    for (size_t i = 1; i < count; ++i) {
+        char *separator = strchr(fields[i - 1], '\t');
+        if (!separator) return -1;
+        *separator = '\0';
+        fields[i] = separator + 1;
+    }
+    return strchr(fields[count - 1], '\t') ? -1 : 0;
+}
+
 static const char *status_text(int rc) {
     if (rc == TG_MTPROTO_SPLIT_OK) return "OK";
     if (rc == TG_MTPROTO_SPLIT_TOO_LARGE) return "TOO_LARGE";
     return "ERROR";
 }
 
-static int run_case(char *line) {
+static int run_splitter_case(char *line) {
     char *fields[5];
-    fields[0] = line;
-    for (size_t i = 1; i < 5; ++i) {
-        char *separator = strchr(fields[i - 1], '\t');
-        if (!separator) return -1;
-        *separator = '\0';
-        fields[i] = separator + 1;
-    }
-    if (strchr(fields[4], '\t')) return -1;
+    if (split_fields(line, fields, 5) != 0) return -1;
 
     tg_mtproto_proto proto = parse_proto(fields[1]);
     uint8_t *key = NULL, *iv = NULL;
@@ -152,6 +165,69 @@ static int run_case(char *line) {
     return 0;
 }
 
+static int run_secret_handshake(char *line) {
+    char *fields[3];
+    if (split_fields(line, fields, 3) != 0) return -1;
+
+    uint8_t *secret = NULL, *packet = NULL;
+    size_t secret_len = 0, packet_len = 0;
+    if (decode_hex(fields[1], &secret, &secret_len) != 0 ||
+        decode_hex(fields[2], &packet, &packet_len) != 0 ||
+        packet_len != TG_MTPROTO_HANDSHAKE_LEN) {
+        free(secret);
+        free(packet);
+        return -1;
+    }
+
+    tg_mtproto_init parsed = {0};
+    int rc = tg_mtproto_parse_secret(packet, secret, secret_len, &parsed);
+    printf("%s\tSECRET\t", fields[0]);
+    if (rc != 0) {
+        puts("REJECT");
+    } else {
+        printf("OK\t%s\t%u\t%d\t", proto_text(parsed.proto), parsed.dc_id,
+               parsed.is_media != 0);
+        print_hex(parsed.prekey_iv, sizeof(parsed.prekey_iv));
+        putchar('\n');
+    }
+    free(secret);
+    free(packet);
+    return 0;
+}
+
+static int run_direct_handshake(char *line) {
+    char *fields[2];
+    if (split_fields(line, fields, 2) != 0) return -1;
+
+    uint8_t *packet = NULL;
+    size_t packet_len = 0;
+    if (decode_hex(fields[1], &packet, &packet_len) != 0 ||
+        packet_len != TG_MTPROTO_HANDSHAKE_LEN) {
+        free(packet);
+        return -1;
+    }
+
+    tg_mtproto_init parsed = {0};
+    int rc = tg_mtproto_parse_obfuscated2(packet, &parsed);
+    printf("%s\tDIRECT\t", fields[0]);
+    if (rc != 0) {
+        puts("REJECT");
+    } else {
+        printf("OK\t%s\t%u\t%d\t", proto_text(parsed.proto), parsed.dc_id,
+               parsed.is_media != 0);
+        print_hex(parsed.prekey_iv, sizeof(parsed.prekey_iv));
+        putchar('\n');
+    }
+    free(packet);
+    return 0;
+}
+
+static int run_line(char *line) {
+    if (strncmp(line, "secret\t", 7) == 0) return run_secret_handshake(line + 7);
+    if (strncmp(line, "direct\t", 7) == 0) return run_direct_handshake(line + 7);
+    return run_splitter_case(line);
+}
+
 int main(void) {
     char *line = NULL;
     size_t cap = 0;
@@ -161,7 +237,7 @@ int main(void) {
         ++line_number;
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             line[--len] = '\0';
-        if (run_case(line) != 0) {
+        if (run_line(line) != 0) {
             fprintf(stderr, "неверный сценарий differential test, строка %zu\n",
                     line_number);
             free(line);

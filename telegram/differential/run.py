@@ -20,6 +20,7 @@ import tomllib
 DONOR_URL = "https://github.com/t0fox/z2kOW.git"
 DONOR_COMMIT = "4ef79fb99c30c233488623c04ec13c8097a614e0"
 DONOR_SUBTREE = PurePosixPath("platform/openwrt/tg-proxy")
+TEST_SECRET = "2a519e5be6c3219c69879e5fa2a0eab8"
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -96,6 +97,17 @@ def corpus() -> str:
         piece_field = ";".join(piece.hex() for piece in pieces)
         lines.append(f"{case_id}\t{proto}\t{key}\t{iv}\t{piece_field}")
     return "\n".join(lines) + "\n"
+
+
+def handshake_requests() -> str:
+    requests = []
+    dc_ids = (1, 2, 3, 4, 5, -1, -2, -3, -4, -5)
+    for proto in ("abridged", "intermediate", "padded-intermediate"):
+        for dc_id in dc_ids:
+            case_id = f"{proto}-{dc_id}"
+            requests.append(f"secret\tsecret-{case_id}\t{proto}\t{dc_id}\t{TEST_SECRET}")
+            requests.append(f"direct\tdirect-{case_id}\t{proto}\t{dc_id}")
+    return "\n".join(requests) + "\n"
 
 
 def extract_donor(repo: Path, target: Path) -> Path:
@@ -217,8 +229,74 @@ def main() -> int:
             print("\n".join(diff), file=sys.stderr)
             return 1
 
+        handshake_vectors = command(
+            [
+                "cargo",
+                "run",
+                "--quiet",
+                "--locked",
+                "--manifest-path",
+                str(donor / "Cargo.toml"),
+                "--bin",
+                "d2o-differential",
+                "--",
+                "--generate-handshakes",
+            ],
+            cwd=donor,
+            input=handshake_requests().encode(),
+            capture_output=True,
+            env=env,
+        ).stdout.decode()
+
+        c_handshake_lines = []
+        rust_handshake_lines = []
+        for line in handshake_vectors.splitlines():
+            fields = line.split("\t")
+            if fields[0] == "secret" and len(fields) == 8:
+                _, case_id, proto, dc_id, media, prekey, handshake, wrong_secret = fields
+                c_handshake_lines.extend(
+                    (
+                        f"secret\t{case_id}\t{TEST_SECRET}\t{handshake}",
+                        f"secret\t{case_id}-wrong\t{wrong_secret}\t{handshake}",
+                    )
+                )
+                rust_handshake_lines.extend(
+                    (
+                        f"{case_id}\tSECRET\tOK\t{proto}\t{dc_id}\t{media}\t{prekey}",
+                        f"{case_id}-wrong\tSECRET\tREJECT",
+                    )
+                )
+            elif fields[0] == "direct" and len(fields) == 7:
+                _, case_id, proto, dc_id, media, prekey, handshake = fields
+                c_handshake_lines.append(f"direct\t{case_id}\t{handshake}")
+                rust_handshake_lines.append(
+                    f"{case_id}\tDIRECT\tOK\t{proto}\t{dc_id}\t{media}\t{prekey}"
+                )
+            else:
+                raise RuntimeError(f"неверный Rust handshake vector: {line}")
+
+        c_handshake_output = command(
+            [str(c_binary)],
+            input=("\n".join(c_handshake_lines) + "\n").encode(),
+            capture_output=True,
+        ).stdout.decode()
+        rust_handshake_output = "\n".join(rust_handshake_lines) + "\n"
+        if c_handshake_output != rust_handshake_output:
+            diff = difflib.unified_diff(
+                rust_handshake_output.splitlines(),
+                c_handshake_output.splitlines(),
+                fromfile="Rust handshake",
+                tofile="C handshake",
+                lineterm="",
+            )
+            print("\n".join(diff), file=sys.stderr)
+            return 1
+
         case_count = len(test_input.splitlines())
-        print(f"C/Rust: совпали {case_count} воспроизводимых сценариев MTProto framing; donor {DONOR_COMMIT}")
+        print(
+            f"C/Rust: совпали {case_count} framing-сценариев и "
+            f"{len(rust_handshake_lines)} проверок Obfuscated2; donor {DONOR_COMMIT}"
+        )
     return 0
 
 

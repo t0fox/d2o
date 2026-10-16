@@ -10,7 +10,8 @@
 | Возможность донора | Источник Rust | Реализация в d2o | Проверка и оставшийся предел |
 |---|---|---|---|
 | Obfuscated2, AES-256-CTR, DC ID, media flag, transport tags | `crypto.rs` | `mtproto_crypto.c`, `mtproto_auth.c`, `mtproto_auth_keys.inc`; используется локальным прокси | Векторы и тесты проходят. 2026-10-16 прямые TCP и WSS probes подтвердили `resPQ` с совпавшим nonce на DC1–DC5. |
-| Abridged, intermediate и padded intermediate; разбиение пакетов | `splitter.rs` | `mtproto_splitter.c`; для direct WSS и CF proxy сохраняются MTProto-границы, Worker использует потоковый режим | `telegram/differential/run.py` на Rust HEAD `4ef79fb` сравнивает три транспортных формата, несколько пакетов, произвольные границы чтений, CTR, raw mode, EOF flush и oversize на 144 воспроизводимых сценариях; расхождений нет. Это не сверяет полный runtime и выбор маршрутов. |
+| Obfuscated2 handshake, secret и protocol tags | `crypto.rs` | `mtproto_crypto.c` | Differential runner проверяет direct init и secret handshake для normal/media DC1–DC5 во всех трёх transport tags, включая неверный secret; 90 C-парсерных сравнений проходят. Случайные handshake сравниваются по protocol invariants. |
+| Abridged, intermediate и padded intermediate; разбиение пакетов | `splitter.rs` | `mtproto_splitter.c`; для direct WSS и CF proxy сохраняются MTProto-границы, Worker использует потоковый режим | `telegram/differential/run.py` на Rust HEAD `4ef79fb` сравнивает несколько пакетов, произвольные границы чтений, CTR, raw mode, EOF flush и oversize на 144 воспроизводимых сценариях; расхождений нет. Это не сверяет полный runtime и выбор маршрутов. |
 | Исходное назначение, IPv4/IPv6, разрешение Telegram DC | `transparent.rs`, `transparent_proxy.rs` | `listener.c` читает IPv4/IPv6 `SO_ORIGINAL_DST`; `transparent.c` проверяет DC-карту, порт, CIDR и защиту от собственного dial | Парсер и политика покрыты тестами. Kernel REDIRECT для IPv6 и фактический трафик на роутере не проверялись. |
 | TCP bridge, backpressure, закрытие и тайм-ауты | `transparent_proxy.rs`, `bridge.rs` | Linux `epoll` runtime, ограниченные очереди, неблокирующий TLS, WSS ping/pong/close, idle и handshake deadlines | Локальные тесты epoll, WSS и лимитов проходят. Стресс-тест на целевом роутере отсутствует. |
 | DC discovery, проверка `req_pq_multi/resPQ`, auth и `help.getConfig` | `dc_discovery.rs` | `mtproto_probe.c`, `mtproto_auth.c`, `mtproto_config.c`; демон обновляет карту через IPv4/IPv6 seed DC1, сохраняет LKG и повторяет неудачу позже | Парсеры и криптография покрыты векторами. Одиночный CLI проверяет указанный IP; `--check-telegram-dc-matrix` и `--discover-telegram-dc-matrix` проверяют DC1–DC5. 2026-10-16 все пять TCP probes дошли до `resPQ`, а `help.getConfig` вернул совпавший `this_dc` и 19 endpoints. |
@@ -51,8 +52,9 @@ Keenetic/OpenWrt сценарии остались за пределами эт�
 не менялось. Повторяемый `telegram/differential/run.py` закрепляет донорский
 Rust SHA и собирает временный runner рядом с неизменённой копией донора. Он
 сравнивает `splitter.rs`/`crypto.rs` с `mtproto_splitter.c`/`mtproto_crypto.c`
-на 144 сценариях; текущая проверка прошла без расхождений. Сверка остальных
-перечисленных выше runtime-функций и маршрутов ещё не реализована.
+на 144 framing-сценариях и 90 проверках Obfuscated2; текущая проверка прошла без
+расхождений. Сверка остальных перечисленных выше runtime-функций и маршрутов
+ещё не реализована.
 
 Для `help.getConfig` C-парсер пропускает корректный `msg_container` только с
 управляющими сообщениями `new_session_created` и `msgs_ack`, затем принимает

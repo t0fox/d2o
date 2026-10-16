@@ -19,5 +19,13 @@ Rust runner. Исходники донора не изменяются. Для �
 AES-256-CTR, raw mode, неполный пакет на EOF и отклонение пакета больше 4 МиБ.
 Seed генератора закреплён в `run.py`.
 
-Это повторяемая сверка framing и CTR. Она не утверждает эквивалентность полного
-runtime, выбора маршрута, TCP/TLS/WebSocket или жизненного цикла соединений.
+Дополнительно Rust создаёт 30 secret Obfuscated2 handshakes для normal/media
+DC1–DC5 и трёх transport tags; C сверяет поля через `tg_mtproto_parse_secret`
+и отклонение неверного secret. Ещё 30 Rust direct init проверяются через
+`tg_mtproto_parse_obfuscated2`. Генерируемые handshake содержат случайные
+байты; сравниваются проверяемые протоколом инварианты, а не сами случайные
+пакеты. Всего C/Rust прогоняет 90 сравнений handshake.
+
+Это повторяемая сверка handshake, framing и CTR. Она не утверждает
+эквивалентность полного runtime, выбора маршрута, TCP/TLS/WebSocket или
+жизненного цикла соединений.

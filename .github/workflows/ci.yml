@@ -100,7 +100,7 @@ jobs:
           toolchain: 1.98.0
       - name: Install OpenSSL headers
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
-      - name: Compare Rust/C MTProto framing
+      - name: Compare Rust/C MTProto crypto and framing
         run: python3 telegram/differential/run.py
 
   # ── Stage 2: build and unit tests ─────────────────────────────────────────

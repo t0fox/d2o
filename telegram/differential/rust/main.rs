@@ -1,6 +1,10 @@
 use std::io::{self, BufRead};
 
-use z2kow_tg_transparent::crypto::{ProtoTag, make_cipher};
+use cipher::StreamCipher;
+use z2kow_tg_transparent::crypto::{
+    ProtoTag, generate_client_handshake, generate_relay_init, make_cipher,
+    parse_handshake,
+};
 use z2kow_tg_transparent::splitter::MsgSplitter;
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
@@ -69,11 +73,114 @@ fn run_case(line: &str) -> Result<String, String> {
     Ok(format!("{}\t{}\t{}", fields[0], status, encoded))
 }
 
-fn main() {
+fn parse_proto(name: &str) -> Result<ProtoTag, String> {
+    match name {
+        "abridged" => Ok(ProtoTag::Abridged),
+        "intermediate" => Ok(ProtoTag::Intermediate),
+        "padded-intermediate" => Ok(ProtoTag::PaddedIntermediate),
+        _ => Err("неизвестный протокол".into()),
+    }
+}
+
+fn proto_name(proto: ProtoTag) -> &'static str {
+    match proto {
+        ProtoTag::Abridged => "abridged",
+        ProtoTag::Intermediate => "intermediate",
+        ProtoTag::PaddedIntermediate => "padded-intermediate",
+    }
+}
+
+fn generate_handshake_case(line: &str) -> Result<String, String> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    match fields.first().copied() {
+        Some("secret") if fields.len() == 5 => {
+            let proto = parse_proto(fields[2])?;
+            let signed_dc = fields[3]
+                .parse::<i16>()
+                .map_err(|_| "неверный DC index".to_owned())?;
+            let secret = decode_hex(fields[4])?;
+            let (handshake, _, _) = generate_client_handshake(&secret, signed_dc, proto);
+            let parsed = parse_handshake(&handshake, &secret)
+                .ok_or_else(|| "Rust не распознал созданный secret handshake".to_owned())?;
+            if parsed.proto != proto
+                || parsed.dc_id != u32::from(signed_dc.unsigned_abs())
+                || parsed.is_media != signed_dc.is_negative()
+            {
+                return Err("Rust изменил поля secret handshake".into());
+            }
+
+            let mut wrong_secret = secret.clone();
+            if wrong_secret.is_empty() {
+                wrong_secret.push(1);
+            } else {
+                wrong_secret[0] ^= 1;
+            }
+            if parse_handshake(&handshake, &wrong_secret).is_some() {
+                return Err("Rust принял handshake с неверным secret".into());
+            }
+
+            Ok(format!(
+                "secret\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                fields[1],
+                proto_name(parsed.proto),
+                parsed.dc_id,
+                u8::from(parsed.is_media),
+                encode_hex(&parsed.prekey_and_iv),
+                encode_hex(&handshake),
+                encode_hex(&wrong_secret),
+            ))
+        }
+        Some("direct") if fields.len() == 4 => {
+            let proto = parse_proto(fields[2])?;
+            let signed_dc = fields[3]
+                .parse::<i16>()
+                .map_err(|_| "неверный DC index".to_owned())?;
+            let handshake = generate_relay_init(proto, signed_dc);
+            let mut plaintext = handshake;
+            make_cipher(&handshake[8..40], &handshake[40..56])
+                .apply_keystream(&mut plaintext);
+            let parsed_proto = &plaintext[56..60];
+            let parsed_dc = i16::from_le_bytes([plaintext[60], plaintext[61]]);
+            if parsed_proto != proto.as_bytes() || parsed_dc != signed_dc {
+                return Err("Rust создал неверный direct handshake".into());
+            }
+
+            Ok(format!(
+                "direct\t{}\t{}\t{}\t{}\t{}\t{}",
+                fields[1],
+                proto_name(proto),
+                u32::from(signed_dc.unsigned_abs()),
+                u8::from(signed_dc.is_negative()),
+                encode_hex(&handshake[8..56]),
+                encode_hex(&handshake),
+            ))
+        }
+        _ => Err("неверная строка запроса handshake".into()),
+    }
+}
+
+fn run_splitter() {
     for (line_number, line) in io::stdin().lock().lines().enumerate() {
         let line = line.unwrap_or_else(|error| panic!("stdin line {}: {error}", line_number + 1));
         let result = run_case(&line)
             .unwrap_or_else(|error| panic!("scenario {}: {error}", line_number + 1));
         println!("{result}");
+    }
+}
+
+fn run_handshake_generation() {
+    for (line_number, line) in io::stdin().lock().lines().enumerate() {
+        let line = line.unwrap_or_else(|error| panic!("stdin line {}: {error}", line_number + 1));
+        let result = generate_handshake_case(&line)
+            .unwrap_or_else(|error| panic!("scenario {}: {error}", line_number + 1));
+        println!("{result}");
+    }
+}
+
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--generate-handshakes") {
+        run_handshake_generation();
+    } else {
+        run_splitter();
     }
 }
