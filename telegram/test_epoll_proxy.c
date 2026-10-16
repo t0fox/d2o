@@ -168,7 +168,8 @@ static int resolve_test_route_domain(void *opaque, const char *domain,
     proxy_fixture *fixture = opaque;
     ++fixture->resolve_calls;
     if (strcmp(domain, "worker.test") != 0 &&
-        strcmp(domain, "cfproxy.test") != 0) return -1;
+        strcmp(domain, "kws4.cfproxy.test") != 0 &&
+        strcmp(domain, "kws4-1.cfproxy.test") != 0) return -1;
     *out = fixture->upstream;
     return 0;
 }
@@ -244,7 +245,7 @@ static X509 *make_wss_test_cert(EVP_PKEY *key) {
     X509_EXTENSION_free(extension);
     extension = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name,
         "DNS:kws4.web.telegram.org,DNS:kws4-1.web.telegram.org,"
-        "DNS:worker.test,DNS:cfproxy.test,IP:127.0.0.1");
+        "DNS:worker.test,DNS:kws4.cfproxy.test,DNS:kws4-1.cfproxy.test,IP:127.0.0.1");
     assert(extension && X509_add_ext(cert, extension, -1) == 1);
     X509_EXTENSION_free(extension);
     assert(X509_sign(cert, key, EVP_sha256()) > 0);
@@ -1640,7 +1641,7 @@ static void test_epoll_cf_proxy_uses_mtproto_packet_framing(void) {
         .listener = create_listener(&ws_port),
         .cert_path = cert_path,
         .key_path = key_path,
-        .expected_sni = "cfproxy.test",
+        .expected_sni = "kws4.cfproxy.test",
         .expected_path = "/apiws",
         .expect_binary_subprotocol = 1
     };
