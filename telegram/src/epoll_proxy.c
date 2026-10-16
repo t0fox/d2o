@@ -29,6 +29,9 @@
 #define TG_EPOLL_MAX_LISTEN_PORTS 16u
 #define TG_ROUTE_HEALTH_MAX 256u
 #define TG_HEDGE_DELAY_DEFAULT_MS 125u
+#ifndef TG_ROUTE_HEALTH_COOLDOWN_MS
+#define TG_ROUTE_HEALTH_COOLDOWN_MS 30000u
+#endif
 
 enum { WSS_NONE, WSS_TLS, WSS_UPGRADE_WRITE, WSS_UPGRADE_READ, WSS_READY };
 
@@ -421,7 +424,7 @@ static void route_health_failed(proxy_connection *connection) {
         (size_t)connection->route_health_index];
     if (!health->used) return;
     if (health->failures != UINT64_MAX) ++health->failures;
-    health->cooldown_until_ms = monotonic_ms() + 30000u;
+    health->cooldown_until_ms = monotonic_ms() + TG_ROUTE_HEALTH_COOLDOWN_MS;
 }
 
 static size_t route_worker_count(const tg_epoll_proxy *server);

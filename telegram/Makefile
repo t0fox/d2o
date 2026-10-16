@@ -52,7 +52,7 @@ test-epoll-proxy: $(BUILD_DIR)/test-epoll-proxy
 
 $(BUILD_DIR)/test-epoll-proxy: test_epoll_proxy.c src/epoll_proxy.c src/stats_socket.c src/limits.c src/listener.c src/tls.c src/ws.c src/ws_pump.c src/mtproto_crypto.c src/mtproto_splitter.c src/cf_domains.c src/route_plan.c src/route_dns.c include/tg_epoll_proxy.h include/tg_stats_socket.h include/tg_mtproto.h include/tg_mtproto_splitter.h include/tg_tls.h include/tg_ws.h include/tg_cf_domains.h include/tg_route_plan.h include/tg_route_dns.h
 	mkdir -p $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -pthread -o $@ test_epoll_proxy.c src/epoll_proxy.c src/stats_socket.c src/limits.c src/listener.c src/tls.c src/ws.c src/ws_pump.c src/mtproto_crypto.c src/mtproto_splitter.c src/cf_domains.c src/route_plan.c src/route_dns.c $(OPENSSL_LIBS)
+	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -DTG_ROUTE_HEALTH_COOLDOWN_MS=1000u -pthread -o $@ test_epoll_proxy.c src/epoll_proxy.c src/stats_socket.c src/limits.c src/listener.c src/tls.c src/ws.c src/ws_pump.c src/mtproto_crypto.c src/mtproto_splitter.c src/cf_domains.c src/route_plan.c src/route_dns.c $(OPENSSL_LIBS)
 
 test-limits: $(BUILD_DIR)/test-limits
 	./$(BUILD_DIR)/test-limits
