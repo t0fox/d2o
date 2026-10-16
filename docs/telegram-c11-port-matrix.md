@@ -1,8 +1,9 @@
 # Матрица порта Telegram proxy: Rust → C11
 
-Аудит донора сверен с `z2kOW` `4ef79fb99c30c233488623c04ec13c8097a614e0`.
-Дерево `platform/openwrt/tg-proxy` в этом HEAD совпадает с проверенной ревизией
-`d307c345ed7f7eedf02e52792d0a24bc832fe271` (`git diff` по этому пути пуст).
+Аудит кода Telegram-донора выполнен на `z2kOW` `4ef79fb99c30c233488623c04ec13c8097a614e0`.
+Текущий `z2kOW/main` — `9fc14bb67c3147b51d6d022575c9bba8f8f9ed2d`, на 10 коммитов
+впереди аудита; сравнение подтверждает, что `platform/openwrt/tg-proxy` не менялся
+и остаётся на проверенной ревизии `d307c345ed7f7eedf02e52792d0a24bc832fe271`.
 Состояние C-кода и интеграции зафиксировано на 2026-10-16. Таблица различает
 реализованный код, локальные тесты и сценарии, которые ещё не проверены на
 настоящей сети или маршрутизаторе.
@@ -11,7 +12,7 @@
 |---|---|---|---|
 | Obfuscated2, AES-256-CTR, DC ID, media flag, transport tags | `crypto.rs` | `mtproto_crypto.c`, `mtproto_auth.c`, `mtproto_auth_keys.inc`; используется локальным прокси | Векторы и тесты проходят. Первый прогон 2026-10-16: прямые TCP и WSS-проверки подтвердили `resPQ` с совпавшим nonce на DC1–DC5. |
 | Obfuscated2 handshake, secret и protocol tags | `crypto.rs` | `mtproto_crypto.c` | Differential runner проверяет direct init и secret handshake для normal/media DC1–DC5 во всех трёх transport tags, включая неверный secret; 90 C-парсерных сравнений проходят. Случайные handshake сравниваются по protocol invariants. |
-| Abridged, intermediate и padded intermediate; разбиение пакетов | `splitter.rs` | `mtproto_splitter.c`; для direct WSS и CF proxy сохраняются MTProto-границы, Worker использует потоковый режим | `telegram/differential/run.py` на Rust HEAD `4ef79fb` сравнивает несколько пакетов, произвольные границы чтений, CTR, raw mode, EOF flush и oversize на 144 воспроизводимых сценариях; расхождений нет. Это не сверяет полный runtime и выбор маршрутов. |
+| Abridged, intermediate и padded intermediate; разбиение пакетов | `splitter.rs` | `mtproto_splitter.c`; для direct WSS и CF proxy сохраняются MTProto-границы, Worker использует потоковый режим | `telegram/differential/run.py` на текущем Rust HEAD `9fc14bb` сравнивает несколько пакетов, произвольные границы чтений, CTR, raw mode, EOF flush и oversize на 144 воспроизводимых сценариях; расхождений нет. Это не сверяет полный runtime и выбор маршрутов. |
 | WebSocket binary/text, управляющие кадры и фрагментация сообщений | `ws_client.rs`, `bridge.rs`, Tungstenite 0.24 | `tg_ws_reassembly_feed` собирает сообщения в событийном `tg_ws_pump`; ping/pong обрабатываются между фрагментами, соблюдаются лимит сообщения и UTF-8 для text/close | Сверка C/Rust охватывает 44 сценария: частичные чтения, длины 125/126/65535/65536, фрагменты, ping/pong, неверный порядок, UTF-8 и превышение 4 МиБ. TLS-регрессионный тест проверяет сборку фрагментированного binary-сообщения с ping между кадрами и отказ pump от text-сообщения. Живая WSS-сеть здесь не участвует. |
 | Исходное назначение, IPv4/IPv6, разрешение Telegram DC | `transparent.rs`, `transparent_proxy.rs` | `listener.c` читает IPv4/IPv6 `SO_ORIGINAL_DST`; `transparent.c` проверяет DC-карту, порт, CIDR и защиту от собственного dial | Парсер и политика покрыты тестами. Kernel REDIRECT для IPv6 и фактический трафик на роутере не проверялись. |
 | TCP bridge, backpressure, закрытие и тайм-ауты | `transparent_proxy.rs`, `bridge.rs` | Linux `epoll` runtime, ограниченные очереди, неблокирующий TLS, WSS ping/pong/close, idle и handshake deadlines | Локальные тесты epoll, WSS и лимитов проходят. Стресс-тест на целевом роутере отсутствует. |

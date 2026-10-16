@@ -18,7 +18,7 @@ import tomllib
 
 
 DONOR_URL = "https://github.com/t0fox/z2kOW.git"
-DONOR_COMMIT = "4ef79fb99c30c233488623c04ec13c8097a614e0"
+DONOR_COMMIT = "9fc14bb67c3147b51d6d022575c9bba8f8f9ed2d"
 DONOR_SUBTREE = PurePosixPath("platform/openwrt/tg-proxy")
 TEST_SECRET = "2a519e5be6c3219c69879e5fa2a0eab8"
 WS_MAX_MESSAGE = 4 * 1024 * 1024
