@@ -159,12 +159,17 @@ async function main(){
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
   await until('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state==="idle"','empty C11 snapshot clears active route state');
   await wait(350);
+  const sessionBeforeResponse={...fixture.telegramStats.active_sessions[0],telegram_response_seen:false,events:[]};
+  panel.telegramStats({...fixture.telegramStats,active_connections:1,active_sessions:[sessionBeforeResponse]});
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("[data-tg-session-count]").textContent==="1"','C11 reports a new session before its first response');
+  await until('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state==="active"','selected route is active before response confirmation');
   await evaluate('(()=>{const canvas=document.querySelector("#telegram-body .tg-flow-canvas");const proto=CanvasRenderingContext2D.prototype;const arc=proto.arc;window.__tgResponseXs=[];window.__tgOriginalArc=arc;proto.arc=function(x,y,r,...args){if(this.canvas===canvas&&this.globalCompositeOperation==="lighter"&&r>=2.4&&r<=2.6)window.__tgResponseXs.push(x);return arc.call(this,x,y,r,...args)};return true})()');
-  const confirmedSession={...fixture.telegramStats.active_sessions[0],telegram_response_seen:true,
+  const confirmedSession={...sessionBeforeResponse,telegram_response_seen:true,
    events:[{sequence:1,branch:'direct',transport:'direct_wss',state:'first_binary_response'}]};
   panel.telegramStats({...fixture.telegramStats,active_connections:1,active_sessions:[confirmedSession]});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
-  await until('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state==="active"','confirmed C11 response activates its route');
+  await until('document.querySelector(".tg-flow-session").textContent.includes("Ответ Telegram подтверждён")&&window.__tgResponseXs.length>3','confirmed C11 response is animated after observation');
   await wait(350);
   const responseMovement=await evaluate('({first:window.__tgResponseXs[0],last:window.__tgResponseXs.at(-1),count:window.__tgResponseXs.length})');
   assert.ok(responseMovement.count>3,'confirmed response is animated');
