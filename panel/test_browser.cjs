@@ -170,7 +170,7 @@ async function main(){
   panel.telegramStats({...fixture.telegramStats,active_connections:1,active_sessions:[confirmedSession]});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
   await until('document.querySelector(".tg-flow-session").textContent.includes("Ответ Telegram подтверждён")&&window.__tgResponseXs.length>3','confirmed C11 response is animated after observation');
-  await wait(350);
+  await wait(await evaluate('window.D2kTelegramFlow.motionProfile.responseDurationMs*0.35'));
   const responseMovement=await evaluate('({first:window.__tgResponseXs[0],last:window.__tgResponseXs.at(-1),count:window.__tgResponseXs.length})');
   assert.ok(responseMovement.count>3,'confirmed response is animated');
   assert.ok(responseMovement.first>responseMovement.last+20,'подтверждённый ответ движется от DC к клиенту');
