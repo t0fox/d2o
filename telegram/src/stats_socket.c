@@ -90,18 +90,39 @@ static int append_active_sessions(char *buffer, size_t capacity, size_t *used,
             const tg_route_session_event *event = &session->events[j];
             const char *transport = route_transport_name(event->transport);
             if (!transport || stats_append(buffer, capacity, used,
-                "%s{\"sequence\":%" PRIu64 ",\"branch\":\"%s\","
-                "\"transport\":\"%s\",\"state\":\"%s\"}",
+            "%s{\"sequence\":%" PRIu64 ",\"age_ms\":%" PRIu64
+            ",\"failure_stage\":%u,\"branch\":\"%s\","
+            "\"transport\":\"%s\",\"state\":\"%s\"}",
                 j ? "," : "", event->sequence,
+            stats->monotonic_time_ms >= event->timestamp_ms
+                ? stats->monotonic_time_ms - event->timestamp_ms : 0,
+            (unsigned)event->failure_stage,
                 event->branch ? "fallback" : "direct", transport,
                 route_state_name(event->state)) != 0)
                 return -1;
         }
         if (stats_append(buffer, capacity, used, "]}") != 0) return -1;
     }
+    if (stats_append(buffer, capacity, used,
+        "],\"route_sessions_truncated\":%s,\"route_cooldown_ms\":%u"
+        ",\"route_cooldowns\":[",
+        stats->route_sessions_truncated ? "true" : "false",
+        stats->route_cooldown_ms) != 0)
+        return -1;
+    for (size_t i = 0; i < stats->route_cooldowns_count; ++i) {
+        const tg_route_cooldown *cooldown = &stats->route_cooldowns[i];
+        const char *transport = route_transport_name(cooldown->transport);
+        if (!transport || stats_append(buffer, capacity, used,
+            "%s{\"dc\":%u,\"is_media\":%s,\"transport\":\"%s\","
+            "\"remaining_ms\":%" PRIu64 ",\"failure_stage\":%u}",
+            i ? "," : "", cooldown->dc,
+            cooldown->is_media ? "true" : "false", transport,
+            cooldown->remaining_ms, (unsigned)cooldown->failure_stage) != 0)
+            return -1;
+    }
     return stats_append(buffer, capacity, used,
-        "],\"route_sessions_truncated\":%s,",
-        stats->route_sessions_truncated ? "true" : "false");
+        "],\"route_cooldowns_truncated\":%s,",
+        stats->route_cooldowns_truncated ? "true" : "false");
 }
 
 static int set_socket_flags(int fd) {

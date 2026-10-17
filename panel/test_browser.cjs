@@ -14,20 +14,27 @@ chrome.on('error',e=>{chromeError+=e.message;});
 chrome.stderr.on('data',data=>{chromeError=(chromeError+data.toString()).slice(-4000);});
 const now=Date.now(),iso=s=>new Date(now-s*1000).toISOString();
 const fixture={telegramStats:{
- active_connections:3,process_started_at:100,accepted_connections:77,max_connections:256,
+ active_connections:4,process_started_at:100,accepted_connections:77,max_connections:256,
  connections_started:77,bytes_from_clients:1200,bytes_from_upstreams:980,wss_attempts:12,
  wss_failures:2,wss_responses:5,cf_wss_responses:1,last_success_dc:2,last_success_route:1,
  last_success_latency_ms:42,last_success_age_ms:100,last_failure_dc:4,last_failure_route:3,
  last_failure_stage:4,last_failure_age_ms:9000,route_sessions_truncated:false,
+ route_cooldown_ms:30000,route_cooldowns:[{dc:4,is_media:true,transport:'direct_wss',remaining_ms:28750,failure_stage:3}],
+ client_response_latency_samples:5,client_response_latency_p50_us:42700,client_response_latency_p95_us:187000,
  active_sessions:[
   {id:71,dc:2,is_media:false,stage:'upstream_ready',direct_state:'selected',direct_transport:'direct_wss',
    fallback_state:'idle',fallback_transport:null,selected_transport:'direct_wss',telegram_response_seen:false,events:[]},
-  {id:72,dc:2,is_media:true,stage:'routing',direct_state:'failed',direct_transport:'direct_wss',
+  {id:72,dc:4,is_media:true,stage:'routing',direct_state:'failed',direct_transport:'direct_wss',
    fallback_state:'connecting',fallback_transport:'cloudflare_worker',selected_transport:null,telegram_response_seen:false,
-   events:[{sequence:1,branch:'direct',transport:'direct_wss',state:'connecting'},
-    {sequence:2,branch:'direct',transport:'direct_wss',state:'failed'},
-    {sequence:3,branch:'fallback',transport:'cloudflare_worker',state:'connecting'}]},
-  {id:73,dc:null,is_media:null,stage:'upstream_ready',direct_state:'selected',
+   events:[{sequence:1,age_ms:390,branch:'direct',transport:'direct_wss',state:'connecting'},
+    {sequence:2,age_ms:120,failure_stage:3,branch:'direct',transport:'direct_wss',state:'failed'},
+    {sequence:3,age_ms:80,branch:'fallback',transport:'cloudflare_worker',state:'connecting'}]},
+  {id:73,dc:203,is_media:true,stage:'first_wss_binary_response',direct_state:'selected',
+   direct_transport:'cloudflare_proxy',fallback_state:'idle',fallback_transport:null,
+   selected_transport:'cloudflare_proxy',telegram_response_seen:true,
+   events:[{sequence:1,age_ms:220,branch:'direct',transport:'cloudflare_proxy',state:'selected'},
+    {sequence:2,age_ms:40,branch:'direct',transport:'cloudflare_proxy',state:'first_binary_response'}]},
+  {id:74,dc:null,is_media:null,stage:'upstream_ready',direct_state:'selected',
    direct_transport:'tcp_passthrough',fallback_state:'idle',fallback_transport:null,
    selected_transport:'tcp_passthrough',telegram_response_seen:false,events:[]}
  ]},knowledge:{
@@ -84,7 +91,7 @@ async function main(){
     const protectedRects=brand.concat([...range.getClientRects()]);
     const intersects=(a,b)=>a.left<b.right&&a.right>b.left&&a.top<b.bottom&&a.bottom>b.top;
     return {overflow:document.documentElement.scrollWidth>innerWidth,
-     telegramCanvasHeight:document.querySelector("#telegram-body .tg-flow-canvas")?.getBoundingClientRect().height||0,
+     telegramCanvas:(()=>{const r=document.querySelector("#telegram-body .tg-flow-canvas")?.getBoundingClientRect();return r?{width:r.width,height:r.height,ratio:r.width/r.height}:null})(),
      bad:buttons.filter(x=>{const r=x.getBoundingClientRect();return r.left<0||r.right>innerWidth||r.top<0||r.height<44||r.width<44}).map(x=>x.dataset.control),
      overlaps:buttons.filter((x,i)=>protectedRects.some(r=>intersects(x.getBoundingClientRect(),r))||buttons.slice(i+1).some(y=>intersects(x.getBoundingClientRect(),y.getBoundingClientRect()))).map(x=>x.dataset.control)};
    })()`);
@@ -92,7 +99,10 @@ async function main(){
    if(state.overflow)console.log('overflow by',await evaluate('[...document.body.querySelectorAll("*")].filter(x=>{const r=x.getBoundingClientRect();return r.width&&r.right>innerWidth+1}).map(x=>x.tagName+"."+(x.getAttribute("class")||"")+" right="+Math.round(x.getBoundingClientRect().right)+" style="+(x.getAttribute("style")||"")).slice(0,8)'));
    if(out){const s=await call('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(out,'panel-'+name+'.png'),Buffer.from(s.data,'base64'))}
    assert.equal(state.overflow,false,name+' horizontal overflow');
-   if(width<=640)assert(state.telegramCanvasHeight>=148&&state.telegramCanvasHeight<=176,name+' Telegram diagram fits the phone layout');
+   if(width<=640)assert(state.telegramCanvas&&state.telegramCanvas.height>=210&&state.telegramCanvas.height<=248,
+    name+' Telegram diagram gives route labels room on phones');
+   else assert(state.telegramCanvas&&Math.abs(state.telegramCanvas.ratio-900/420)<0.02,
+    name+' Telegram diagram keeps the source composition on wider screens');
    assert.deepEqual(state.bad,[],name+' engine controls must be visible 44px targets in the masthead');
    assert.deepEqual(state.overlaps,[],name+' controls must not overlap the brand, engine status or one another');
    await evaluate('scrollTo(0,400)');await wait(120);
@@ -124,6 +134,7 @@ async function main(){
   // Коробки свёрнуты по умолчанию; C11 показывает активные сессии и реальные маршруты.
   assert.deepEqual(await evaluate('[...document.querySelectorAll(".crate")].map(c=>c.open)'),[false],'boxes start collapsed');
   assert.match(await evaluate('document.querySelector(".crate-label").textContent'),/4цели · 1 план/);
+  await until('document.querySelector("#telegram-body").dataset.state==="connected"','C11 connected status renders in Telegram panel');
   assert.equal(await evaluate('document.querySelector("#telegram-body").dataset.state'),'connected');
   assert.equal(await evaluate('!!document.querySelector("#telegram-body .tg-flow-canvas")'),true,'C11 route canvas is present');
 
@@ -134,53 +145,87 @@ async function main(){
   const tunnelShot=async name=>{if(!shots)return;
    const b=await evaluate('(()=>{const r=document.querySelector("#telegram-body").getBoundingClientRect();return {x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}})()');
    const s=await call('Page.captureScreenshot',{format:'png',clip:{...b,scale:2}});fs.writeFileSync(path.join(shots,name+'.png'),Buffer.from(s.data,'base64'))};
+  const tunnelViewportShot=async name=>{if(!shots)return;
+   const s=await call('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(shots,name+'.png'),Buffer.from(s.data,'base64'))};
   const tunnelState=async st=>{panel.telegram(st);await until('document.querySelector("#telegram-body").dataset.state==="'+st+'"','tunnel must reach '+st)};
   await evaluate('(()=>{window.tgFlowCanvas=document.querySelector("#telegram-body .tg-flow-canvas");return true})()');
+  const flowCanvasSize=await evaluate('(()=>{const r=document.querySelector("#telegram-body .tg-flow-canvas").getBoundingClientRect();return {width:r.width,height:r.height}})()');
+  assert.ok(Math.abs(flowCanvasSize.width / flowCanvasSize.height - 900 / 420) < 0.01,
+    'canvas keeps the source prototype 900×420 composition ratio');
   assert.equal(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state'),'mixed','C11 sessions show active and connecting route states');
-  assert.match(await evaluate('document.querySelector("#tg-flow-caption").textContent'),/DC2 · media 1/);
-  assert.equal(await evaluate('document.querySelector("[data-tg-session-count]").textContent'),'3');
-  assert.equal(await evaluate('document.querySelectorAll(".tg-flow-session").length'),3,'the compact session block follows active C11 sessions');
+  assert.match(await evaluate('document.querySelector("#tg-flow-caption").textContent'),/Несколько DC · media 2/);
+  assert.equal(await evaluate('document.querySelector("[data-tg-session-count]").textContent'),'4');
+  assert.equal(await evaluate('document.querySelectorAll(".tg-flow-session").length'),4,'the compact session block follows active C11 sessions');
   assert.match(await evaluate('document.querySelector("[data-tg-active-sessions]").textContent'),/DC2 · основная[\s\S]*Прямой WSS[\s\S]*ответ Telegram/);
-  assert.match(await evaluate('document.querySelector("[data-tg-active-sessions]").textContent'),/DC2 · media[\s\S]*Cloudflare Worker/);
+  assert.match(await evaluate('document.querySelector("[data-tg-active-sessions]").textContent'),/DC4 · media[\s\S]*Cloudflare Worker/);
+  assert.match(await evaluate('document.querySelector("[data-tg-active-sessions]").textContent'),/DC2 · media[\s\S]*Прокси Cloudflare[\s\S]*Ответ Telegram подтверждён/);
   assert.equal(await evaluate('document.querySelector("[data-tg-accepted-count]").textContent'),'77');
   assert.equal(await evaluate('document.querySelector("[data-tg-confirmed-count]").textContent'),'5');
+  assert.equal(await evaluate('document.querySelector("[data-tg-active-count]").textContent'),'4');
+  assert.equal(await evaluate('document.querySelector("[data-tg-latency]").textContent'),'p50 43 мс · p95 187 мс',
+    'C11 microseconds are shown as milliseconds');
+  assert.equal(await evaluate('document.querySelector("[data-tg-wss]").textContent'),'2 / 12');
+  assert.equal(await evaluate('document.querySelector("[data-tg-traffic]").textContent'),'1,2 КБ / 980 Б');
   assert.match(await evaluate('document.querySelector("[data-tg-last-success]").textContent'),/DC2 · прямой WSS/);
   assert.doesNotMatch(await evaluate('document.querySelector("[data-tg-active-sessions]").textContent'),/sequence|first_binary_response|fallback_state/);
-  assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Клиент → d2o.*Ответ Telegram не подтверждён/);
-  assert.doesNotMatch(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Прокси Cloudflare|Резервный TCP/,
+  assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Клиент → d2o.*Ответ Telegram подтверждён/);
+  assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/отказ на воротах TLS.*пауза 1 маршрута/,
+    'failure gate and live route cooldown are announced from C11 statistics');
+  assert.doesNotMatch(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Резервный TCP/,
     'unused routes are omitted from the diagram');
   assert.doesNotMatch(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/d2ktg C11/);
   assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Прямой TCP passthrough/);
   assert.equal(await evaluate('window.tgFlowCanvas===document.querySelector("#telegram-body .tg-flow-canvas")'),true,'route canvas is mounted once');
+  await wait(700);
   await tunnelShot('1-connected');
+  if(shots){
+   await tunnelViewportShot('telegram-desktop');
+   await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+   await evaluate('document.querySelector("#telegram").scrollIntoView({block:"center"})');await wait(200);
+   await tunnelViewportShot('telegram-mobile');
+   await call('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});
+   await evaluate('document.querySelector("#telegram").scrollIntoView({block:"center"})');await wait(120);
+  }
 
   // Подтверждённый ответ идёт от Telegram DC обратно к клиенту.
   panel.telegramStats({...fixture.telegramStats,active_connections:0,active_sessions:[]});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
-  await until('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state==="idle"','empty C11 snapshot clears active route state');
+  await until('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state==="cooling"','empty C11 snapshot preserves a live route cooldown');
+  assert.equal(await evaluate('document.querySelectorAll(".tg-flow-session").length'),0,'cooldown is shown without inventing active sessions');
+  panel.telegramStats({...fixture.telegramStats,active_connections:0,active_sessions:[],route_cooldowns:[]});
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state==="idle"','expired route cooldown clears from C11 stats');
   await wait(350);
   const sessionBeforeResponse={...fixture.telegramStats.active_sessions[0],telegram_response_seen:false,events:[]};
   panel.telegramStats({...fixture.telegramStats,active_connections:1,active_sessions:[sessionBeforeResponse]});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
   await until('document.querySelector("[data-tg-session-count]").textContent==="1"','C11 reports a new session before its first response');
   await until('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state==="active"','selected route is active before response confirmation');
-  await evaluate('(()=>{const canvas=document.querySelector("#telegram-body .tg-flow-canvas");const proto=CanvasRenderingContext2D.prototype;const arc=proto.arc;window.__tgResponseXs=[];window.__tgOriginalArc=arc;proto.arc=function(x,y,r,...args){if(this.canvas===canvas&&this.globalCompositeOperation==="lighter"&&r>=1.8&&r<=2.2)window.__tgResponseXs.push(x);return arc.call(this,x,y,r,...args)};return true})()');
+  await evaluate('(()=>{const canvas=document.querySelector("#telegram-body .tg-flow-canvas");const proto=CanvasRenderingContext2D.prototype;const arc=proto.arc,lineTo=proto.lineTo;window.__tgResponseXs=[];window.__tgEcgSamples=0;window.__tgOriginalArc=arc;window.__tgOriginalLineTo=lineTo;proto.arc=function(x,y,r,...args){if(this.canvas===canvas&&this.globalCompositeOperation==="lighter"&&r>=1.8&&r<=2.2)window.__tgResponseXs.push(x);return arc.call(this,x,y,r,...args)};proto.lineTo=function(x,y,...args){if(this.canvas===canvas&&this.globalCompositeOperation==="source-over"&&x>=100&&x<=266&&Math.abs(y-210)>0.1)window.__tgEcgSamples++;return lineTo.call(this,x,y,...args)};return true})()');
+  await wait(120);
+  assert.equal(await evaluate('window.__tgResponseXs.length'),0,'upstream_ready does not invent a Telegram response pulse');
+  assert.equal(await evaluate('window.__tgEcgSamples'),0,'the client ECG stays quiet before a confirmed MTProto response');
+  await evaluate('window.__tgResponseStartedAt=performance.now()');
   const confirmedSession={...sessionBeforeResponse,telegram_response_seen:true,
    events:[{sequence:1,branch:'direct',transport:'direct_wss',state:'first_binary_response'}]};
   panel.telegramStats({...fixture.telegramStats,active_connections:1,active_sessions:[confirmedSession]});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
-  await until('document.querySelector(".tg-flow-session").textContent.includes("Ответ Telegram подтверждён")&&window.__tgResponseXs.length>3','confirmed C11 response is animated after observation');
+  await until('document.querySelector(".tg-flow-session").textContent.includes("Ответ Telegram подтверждён")','confirmed response reaches the live session row');
+  await wait(180);
+  await until('window.__tgResponseXs.length>3','confirmed C11 response is animated after observation');
   await wait(await evaluate('window.D2kTelegramFlow.motionProfile.responseDurationMs*0.35'));
   const responseMovement=await evaluate('({first:window.__tgResponseXs[0],last:window.__tgResponseXs.at(-1),count:window.__tgResponseXs.length})');
   assert.ok(responseMovement.count>3,'confirmed response is animated');
   assert.ok(responseMovement.first>responseMovement.last+20,'подтверждённый ответ движется от DC к клиенту');
-  await evaluate('CanvasRenderingContext2D.prototype.arc=window.__tgOriginalArc;delete window.__tgOriginalArc');
+  await wait(await evaluate('Math.max(0,window.D2kTelegramFlow.motionProfile.responseDurationMs-(performance.now()-window.__tgResponseStartedAt)+80)'));
+  await until('window.__tgEcgSamples>0','the client ECG pulses when the confirmed response reaches the client');
+  await evaluate('CanvasRenderingContext2D.prototype.arc=window.__tgOriginalArc;CanvasRenderingContext2D.prototype.lineTo=window.__tgOriginalLineTo;delete window.__tgOriginalArc;delete window.__tgOriginalLineTo');
 
   // Свежий отказ всех WSS-маршрутов не должен выглядеть как активное подключение из-за старого ответа.
-  await evaluate('(()=>{const canvas=document.querySelector("#telegram-body .tg-flow-canvas");const proto=CanvasRenderingContext2D.prototype;const moveTo=proto.moveTo;window.__tgIncomingPathDraws=0;window.__tgOriginalMoveTo=moveTo;proto.moveTo=function(x,y){if(this.canvas===canvas&&this.globalCompositeOperation==="source-over"&&x===60&&y===170)window.__tgIncomingPathDraws++;return moveTo.call(this,x,y)};return true})()');
+  await evaluate('(()=>{const canvas=document.querySelector("#telegram-body .tg-flow-canvas");const proto=CanvasRenderingContext2D.prototype;const moveTo=proto.moveTo;window.__tgIncomingPathDraws=0;window.__tgOriginalMoveTo=moveTo;proto.moveTo=function(x,y){if(this.canvas===canvas&&this.globalCompositeOperation==="source-over"&&x===70&&y===210)window.__tgIncomingPathDraws++;return moveTo.call(this,x,y)};return true})()');
   panel.telegram('local');
   panel.telegramStats({...fixture.telegramStats,active_connections:0,active_sessions:[],
-   last_failure_age_ms:100,last_success_age_ms:10000});
+   route_cooldowns:[],last_failure_age_ms:100,last_success_age_ms:10000});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
   await until('document.querySelector("#telegram-body").dataset.state==="unavailable"','new WSS failure must replace stale connected state');
   await evaluate('window.__tgIncomingPathDraws=0');

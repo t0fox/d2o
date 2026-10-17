@@ -110,6 +110,7 @@ struct proxy_connection {
     int route_tcp_only;
     int route_session_tracked;
     int route_failure_recorded;
+    uint8_t route_failure_stage;
     tg_active_route_session route_session;
     size_t route_index;
     size_t route_dns_step_index;
@@ -271,7 +272,7 @@ static uint8_t route_session_transport_for(const proxy_connection *connection,
 
 static void route_session_append(tg_active_route_session *session,
                                  uint8_t branch, uint8_t transport,
-                                 uint8_t state) {
+                                 uint8_t state, uint8_t failure_stage) {
     if (session->event_count == TG_EPOLL_MAX_ROUTE_EVENTS) {
         memmove(&session->events[0], &session->events[1],
                 (TG_EPOLL_MAX_ROUTE_EVENTS - 1u) * sizeof(session->events[0]));
@@ -279,9 +280,11 @@ static void route_session_append(tg_active_route_session *session,
     }
     tg_route_session_event *event = &session->events[session->event_count++];
     event->sequence = session->next_event_sequence++;
+    event->timestamp_ms = monotonic_ms();
     event->branch = branch;
     event->transport = transport;
     event->state = state;
+    event->failure_stage = failure_stage;
 }
 
 static void route_session_event(proxy_connection *connection,
@@ -301,7 +304,8 @@ static void route_session_event(proxy_connection *connection,
         session->fallback_state = state;
         session->fallback_transport = transport;
     }
-    route_session_append(session, branch, transport, state);
+    route_session_append(session, branch, transport, state,
+        state == TG_ROUTE_SESSION_FAILED ? connection->route_failure_stage : 0);
 }
 
 static void route_session_selected(proxy_connection *connection,
@@ -320,7 +324,7 @@ static void route_session_selected(proxy_connection *connection,
     if (*losing_state == TG_ROUTE_SESSION_CONNECTED && losing_transport) {
         *losing_state = TG_ROUTE_SESSION_CANCELLED;
         route_session_append(session, branch ? 0u : 1u, losing_transport,
-                             TG_ROUTE_SESSION_CANCELLED);
+                                 TG_ROUTE_SESSION_CANCELLED, 0);
     }
     session->selected_transport = transport;
     session->telegram_response_seen = 0;
@@ -659,6 +663,7 @@ static int route_health_get(tg_epoll_proxy *server,
 static void route_failure_record(proxy_connection *connection,
                                  tg_route_kind kind, uint32_t stage) {
     if (!connection) return;
+    connection->route_failure_stage = (uint8_t)stage;
     uint64_t now = monotonic_ms();
     tg_epoll_proxy *server = connection->server;
     if (now >= server->last_failure_ms) {
@@ -1023,9 +1028,9 @@ static void clear_wss_state(proxy_connection *connection) {
 static void clear_route_attempt(proxy_connection *connection, int failed) {
     tg_epoll_proxy *server = connection->server;
     if (failed) {
+        route_health_failed(connection);
         route_session_event(connection, connection->route_kind,
                             TG_ROUTE_SESSION_FAILED);
-        route_health_failed(connection);
     } else if (connection->direct_wss) {
         proxy_connection *owner = route_session_owner(connection);
         if (!owner->route_session_tracked) goto route_attempt_cleared;
@@ -1160,9 +1165,9 @@ static int start_next_route(proxy_connection *connection) {
                                         TG_ROUTE_SESSION_CONNECTED);
                 return 0;
             }
+            route_failure_record(connection, step.kind, TG_EPOLL_FAILURE_TCP);
             route_session_event(connection, step.kind,
                                 TG_ROUTE_SESSION_FAILED);
-            route_failure_record(connection, step.kind, TG_EPOLL_FAILURE_TCP);
             continue;
         }
         if (!server->config.enable_direct_wss ||
@@ -1195,11 +1200,11 @@ static int start_next_route(proxy_connection *connection) {
             (server->config.enforce_self_dial &&
              tg_listener_is_self_dial_addr(&target, server->listen_ports,
                                            server->config.listen_port_count))) {
-            route_session_event(connection, step.kind,
-                                TG_ROUTE_SESSION_FAILED);
             route_failure_record(connection, step.kind,
                 step.kind == TG_ROUTE_DIRECT_WSS
                     ? TG_EPOLL_FAILURE_SETUP : TG_EPOLL_FAILURE_DNS);
+            route_session_event(connection, step.kind,
+                                TG_ROUTE_SESSION_FAILED);
             continue;
         }
         connection->route_data_seen = 0;
@@ -1296,7 +1301,8 @@ static int hedge_launch_next(proxy_connection *parent) {
              tg_listener_is_self_dial_addr(&candidate->upstream_target,
                                            server->listen_ports,
                                            server->config.listen_port_count))) {
-            route_session_event(parent, step.kind,
+            route_failure_record(candidate, step.kind, TG_EPOLL_FAILURE_SETUP);
+            route_session_event(candidate, step.kind,
                                 TG_ROUTE_SESSION_FAILED);
             free(candidate);
             continue;
@@ -1334,6 +1340,7 @@ static int hedge_launch_next(proxy_connection *parent) {
             return 1;
         }
         route_session_event(candidate, step.kind, TG_ROUTE_SESSION_CONNECTING);
+        route_failure_record(candidate, step.kind, TG_EPOLL_FAILURE_TCP);
         route_session_event(candidate, step.kind, TG_ROUTE_SESSION_FAILED);
         hedge_retire_candidate(candidate, 1);
     }
@@ -2287,13 +2294,13 @@ static void upstream_event(proxy_connection *connection, uint32_t events) {
                 connection_update(connection);
                 return;
             }
-            if (!connection->direct_wss)
-                route_session_event(connection, connection->route_kind,
-                                    TG_ROUTE_SESSION_FAILED);
             if (!connection->direct_wss &&
                 connection->route_kind == TG_ROUTE_DIRECT_TCP)
                 route_failure_record(connection, connection->route_kind,
                                      TG_EPOLL_FAILURE_TCP);
+            if (!connection->direct_wss)
+                route_session_event(connection, connection->route_kind,
+                                    TG_ROUTE_SESSION_FAILED);
             connection_close(connection);
             return;
         }
@@ -2360,19 +2367,22 @@ static void upstream_event(proxy_connection *connection, uint32_t events) {
         return;
     }
     if ((events & EPOLLERR) && socket_error(connection->upstream_fd)) {
-        route_session_event(connection, connection->route_kind,
-                            TG_ROUTE_SESSION_FAILED);
         if (connection->route_kind == TG_ROUTE_DIRECT_TCP)
             route_failure_record(connection, connection->route_kind,
                                  TG_EPOLL_FAILURE_TCP);
+        route_session_event(connection, connection->route_kind,
+                            TG_ROUTE_SESSION_FAILED);
         connection_close(connection);
         return;
     }
     if (!connection->connecting && (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP))) {
         if (receive_upstream(connection) != 0) {
-            if (connection->route_kind == TG_ROUTE_DIRECT_TCP)
+            if (connection->route_kind == TG_ROUTE_DIRECT_TCP) {
                 route_failure_record(connection, connection->route_kind,
                                      TG_EPOLL_FAILURE_TCP);
+                route_session_event(connection, connection->route_kind,
+                                    TG_ROUTE_SESSION_FAILED);
+            }
             connection_close(connection);
             return;
         }
@@ -2382,11 +2392,11 @@ static void upstream_event(proxy_connection *connection, uint32_t events) {
         queue_flush(connection->upstream_fd, &connection->to_upstream,
                     &connection->last_activity_ms,
                     connection) != 0) {
-        route_session_event(connection, connection->route_kind,
-                            TG_ROUTE_SESSION_FAILED);
         if (connection->route_kind == TG_ROUTE_DIRECT_TCP)
             route_failure_record(connection, connection->route_kind,
                                  TG_EPOLL_FAILURE_TCP);
+        route_session_event(connection, connection->route_kind,
+                            TG_ROUTE_SESSION_FAILED);
         connection_close(connection);
         return;
     }
@@ -2557,10 +2567,10 @@ static void expire_connections(tg_epoll_proxy *server) {
                 connection->route_dns_event_active = 0;
                 connection->route_index =
                     connection->route_dns_step_index + 1u;
-                route_session_event(connection, connection->route_kind,
-                                    TG_ROUTE_SESSION_FAILED);
                 route_failure_record(connection, connection->route_kind,
                                      TG_EPOLL_FAILURE_DNS);
+                route_session_event(connection, connection->route_kind,
+                                    TG_ROUTE_SESSION_FAILED);
             } else if (now >= connection->route_dns_retry_at_ms) {
                 connection->route_dns_pending = 0;
                 connection->route_dns_retry_at_ms = 0;
@@ -2582,6 +2592,8 @@ static void expire_connections(tg_epoll_proxy *server) {
             if (connection->direct_wss && advance_route(connection) == 0) {
                 connection_update(connection);
             } else if (!connection->direct_wss) {
+                route_failure_record(connection, connection->route_kind,
+                                     TG_EPOLL_FAILURE_TCP);
                 route_session_event(connection, connection->route_kind,
                                     TG_ROUTE_SESSION_FAILED);
                 connection_close(connection);
@@ -2749,6 +2761,9 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
         return -1;
     }
     memset(out, 0, sizeof(*out));
+    uint64_t now = monotonic_ms();
+    out->monotonic_time_ms = now;
+    out->route_cooldown_ms = TG_ROUTE_HEALTH_COOLDOWN_MS;
     out->active_connections = server->active_connections;
     out->process_started_at = server->process_started_at;
     out->accepted_connections = server->connections_started;
@@ -2785,7 +2800,6 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
     out->last_success_dc = server->last_success_dc;
     out->last_success_route = server->last_success_route;
     out->last_success_latency_ms = server->last_success_latency_ms;
-    uint64_t now = monotonic_ms();
     out->last_success_age_ms = server->last_success_ms &&
         now >= server->last_success_ms ? now - server->last_success_ms : 0;
     out->last_failure_dc = server->last_failure_dc;
@@ -2831,6 +2845,26 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
         add_u64(&out->wss_failures, health->failures);
         add_u64(&out->wss_responses, health->responses);
         add_u64(&out->cf_wss_responses, health->cf_responses);
+        if (health->cooldown_until_ms <= now) continue;
+        uint8_t transport = health->kind == TG_ROUTE_DIRECT_WSS
+            ? TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS
+            : health->kind == TG_ROUTE_CF_WORKER
+                ? TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_WORKER
+                : health->kind == TG_ROUTE_CF_PROXY
+                    ? TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_PROXY
+                    : TG_ROUTE_SESSION_TRANSPORT_NONE;
+        if (transport == TG_ROUTE_SESSION_TRANSPORT_NONE) continue;
+        if (out->route_cooldowns_count >= TG_EPOLL_MAX_ROUTE_COOLDOWNS) {
+            out->route_cooldowns_truncated = 1;
+            continue;
+        }
+        tg_route_cooldown *cooldown =
+            &out->route_cooldowns[out->route_cooldowns_count++];
+        cooldown->dc = health->dc_id;
+        cooldown->is_media = (uint8_t)(health->is_media != 0);
+        cooldown->transport = transport;
+        cooldown->failure_stage = (uint8_t)health->last_failure_stage;
+        cooldown->remaining_ms = health->cooldown_until_ms - now;
     }
     return 0;
 }

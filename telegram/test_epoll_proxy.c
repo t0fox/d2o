@@ -1118,6 +1118,9 @@ static void test_read_only_stats_socket(void) {
     assert(strstr(response, "\"accepted_connections\":0") != NULL);
     assert(strstr(response, "\"active_sessions\":[]") != NULL);
     assert(strstr(response, "\"route_sessions_truncated\":false") != NULL);
+    assert(strstr(response, "\"route_cooldown_ms\":1000") != NULL);
+    assert(strstr(response, "\"route_cooldowns\":[]") != NULL);
+    assert(strstr(response, "\"route_cooldowns_truncated\":false") != NULL);
     assert(strstr(response, "\"active_wss_connections\":0") != NULL);
     assert(strstr(response, "\"max_wss_connections\":") != NULL);
     assert(strstr(response, "\"buffer_bytes_current\":0") != NULL);
@@ -1740,6 +1743,11 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
            TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
     assert(session->events[session->event_count - 1u].sequence >
            session->events[session->event_count - 2u].sequence);
+    assert(session->events[session->event_count - 1u].timestamp_ms > 0);
+    assert(route_stats.monotonic_time_ms >=
+           session->events[session->event_count - 1u].timestamp_ms);
+    assert(session->events[session->event_count - 1u].failure_stage ==
+           TG_EPOLL_FAILURE_NONE);
     assert(shutdown(client, SHUT_WR) == 0);
     assert(pthread_join(wss_thread, NULL) == 0);
     assert(wss.accepted_count == 1 && atomic_load(&wss.complete) == 1);

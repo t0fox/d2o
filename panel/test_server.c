@@ -238,8 +238,14 @@ static void *serve_telegram_stats(void *opaque) {
               "\"stage\":\"upstream_ready\",\"direct_state\":\"selected\","
               "\"direct_transport\":\"direct_wss\",\"fallback_state\":\"idle\","
               "\"fallback_transport\":null,\"selected_transport\":\"direct_wss\","
-              "\"telegram_response_seen\":false,\"events\":[]}],"
-              "\"route_sessions_truncated\":false}\n");
+              "\"telegram_response_seen\":false,\"events\":[{"
+              "\"sequence\":3,\"age_ms\":125,\"failure_stage\":3,"
+              "\"branch\":\"fallback\",\"transport\":\"cloudflare_proxy\","
+              "\"state\":\"failed\"}]}],"
+              "\"route_sessions_truncated\":false,\"route_cooldown_ms\":30000,"
+              "\"route_cooldowns\":[{\"dc\":4,\"is_media\":true,"
+              "\"transport\":\"cloudflare_proxy\",\"remaining_ms\":28750,"
+              "\"failure_stage\":3}],\"route_cooldowns_truncated\":false}\n");
     close(client);
     close(fixture->listener);
     return NULL;
@@ -289,7 +295,12 @@ static void test_telegram_stats_socket_is_normalized_for_status_api(void) {
     assert(strstr(response,
                   "\"process_started_at\":100,\"accepted_connections\":9,"
                   "\"active_sessions\":[{\"id\":9,\"dc\":2,\"is_media\":false,") != NULL);
-    assert(strstr(response, "\"route_sessions_truncated\":false}") != NULL);
+    assert(strstr(response,
+                  "\"route_sessions_truncated\":false,\"route_cooldown_ms\":30000,") != NULL);
+    assert(strstr(response,
+                  "\"age_ms\":125,\"failure_stage\":3,\"branch\":\"fallback\"") != NULL);
+    assert(strstr(response,
+                  "\"route_cooldowns\":[{\"dc\":4,\"is_media\":true,") != NULL);
     assert(strstr(response,
                   "\"bytes_from_clients\":1234,\"bytes_from_upstreams\":5678,"
                   "\"wss_attempts\":8,\"wss_failures\":2,"

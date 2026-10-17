@@ -25,6 +25,7 @@ typedef enum {
 
 #define TG_EPOLL_MAX_ACTIVE_ROUTE_SESSIONS 64u
 #define TG_EPOLL_MAX_ROUTE_EVENTS 6u
+#define TG_EPOLL_MAX_ROUTE_COOLDOWNS 256u
 
 typedef enum {
     TG_ROUTE_SESSION_STAGE_ACCEPTED = 0,
@@ -56,9 +57,11 @@ typedef enum {
 
 typedef struct {
     uint64_t sequence;
+    uint64_t timestamp_ms;
     uint8_t branch; /* 0 — direct, 1 — fallback */
     uint8_t transport;
     uint8_t state;
+    uint8_t failure_stage;
 } tg_route_session_event;
 
 typedef struct {
@@ -80,12 +83,25 @@ typedef struct {
 } tg_active_route_session;
 
 typedef struct {
+    uint32_t dc;
+    uint64_t remaining_ms;
+    uint8_t is_media;
+    uint8_t transport;
+    uint8_t failure_stage;
+} tg_route_cooldown;
+
+typedef struct {
     size_t active_connections;
     uint64_t process_started_at;
     uint64_t accepted_connections;
     size_t active_sessions_count;
     int route_sessions_truncated;
     tg_active_route_session active_sessions[TG_EPOLL_MAX_ACTIVE_ROUTE_SESSIONS];
+    size_t route_cooldowns_count;
+    int route_cooldowns_truncated;
+    tg_route_cooldown route_cooldowns[TG_EPOLL_MAX_ROUTE_COOLDOWNS];
+    uint64_t monotonic_time_ms;
+    uint32_t route_cooldown_ms;
     size_t max_connections;
     size_t active_wss_connections;
     size_t max_wss_connections;

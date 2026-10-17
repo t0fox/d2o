@@ -90,6 +90,15 @@
       stage === 6 ? "настройка маршрута" : "неизвестный этап";
   }
   function telegramAge(ms) { return ms < 1000 ? "только что" : duration(ms); }
+  function telegramMilliseconds(ms) {
+    return Number.isFinite(Number(ms)) ? Math.max(0, Math.round(Number(ms))) + " мс" : "—";
+  }
+  function telegramBytes(bytes) {
+    var value = Math.max(0, Number(bytes) || 0), units = ["Б", "КБ", "МБ", "ГБ"];
+    var unit = 0;
+    while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+    return (unit ? new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 }).format(value) : String(value)) + " " + units[unit];
+  }
   function clock(ms) {
     var s = Math.max(0, Math.floor(ms / 1000));
     var m = Math.floor(s / 60), h = Math.floor(m / 60);
@@ -1890,6 +1899,8 @@
   function tunnelScene(doc) {
     var root = el(doc, "div", "tg-flow");
     var canvas = el(doc, "canvas", "tg-flow-canvas");
+    canvas.width = 900;
+    canvas.height = 420;
     canvas.setAttribute("role", "img");
     canvas.setAttribute("aria-label", "Схема активных маршрутов Telegram");
     var caption = el(doc, "p", "tg-flow-caption", "Активные маршруты появятся после подключения.");
@@ -1913,7 +1924,10 @@
     [
       ["Сессии сейчас", "tg-flow-metric-active", "data-tg-active-count"],
       ["Всего подключений", "tg-flow-metric-total", "data-tg-accepted-count"],
-      ["Ответы Telegram", "tg-flow-metric-confirmed", "data-tg-confirmed-count"]
+      ["Ответы Telegram", "tg-flow-metric-confirmed", "data-tg-confirmed-count"],
+      ["Отклик p50 / p95", "tg-flow-metric-latency", "data-tg-latency"],
+      ["WSS: отказы / попытки", "tg-flow-metric-wss", "data-tg-wss"],
+      ["К Telegram / от Telegram", "tg-flow-metric-traffic", "data-tg-traffic"]
     ].forEach(function (item) {
       var metric = el(doc, "div", "tg-flow-metric " + item[1]);
       metric.append(el(doc, "span", "", item[0]), el(doc, "b", "", "—"));
@@ -1943,7 +1957,6 @@
     return transport === "direct_wss" ? "Прямой WSS" :
       transport === "cloudflare_worker" ? "Cloudflare Worker" :
       transport === "cloudflare_proxy" ? "Прокси Cloudflare" :
-      transport === "tcp_fallback" ? "Резервный TCP" :
       transport === "tcp_passthrough" ? "Прямой TCP" : "Маршрут определяется";
   }
 
@@ -1984,12 +1997,14 @@
         row.__fields.forEach(function (field) { row.appendChild(field); });
         ui.scene.__sessionRows.set(id, row);
       }
-      var dc = session.dc == null ? "DC неизвестен" : "DC" + session.dc;
+      var dcNumber = Number(session.dc) === 203 ? 2 : Number(session.dc);
+      var dc = Number.isInteger(dcNumber) && dcNumber >= 1 && dcNumber <= 5 ? "DC" + dcNumber : "DC неизвестен";
       var kind = session.is_media === true ? "media" : session.is_media === false ? "основная" : "тип не определён";
       var confirmed = session.telegram_response_seen === true;
       var route = telegramTransportLabel(telegramSessionRoute(session));
       var status = confirmed ? "Ответ Telegram подтверждён" :
-        session.selected_transport ? "Маршрут выбран · ждём ответ Telegram" : "Соединение устанавливается";
+        session.stage === "upstream_ready" ? "Маршрут готов · ждём ответ Telegram" :
+          session.stage === "routing" ? "Подбирается маршрут" : "Соединение принято";
       var values = [dc + " · " + kind, "Маршрут: " + route, status];
       row.__fields.forEach(function (field, index) {
         if (field.textContent !== values[index]) field.textContent = values[index];
@@ -2006,15 +2021,28 @@
     var activeNode = scene.querySelector("[data-tg-active-count]");
     var totalNode = scene.querySelector("[data-tg-accepted-count]");
     var confirmedNode = scene.querySelector("[data-tg-confirmed-count]");
+    var latencyNode = scene.querySelector("[data-tg-latency]");
+    var wssNode = scene.querySelector("[data-tg-wss]");
+    var trafficNode = scene.querySelector("[data-tg-traffic]");
     if (activeNode && activeNode.textContent !== active) activeNode.textContent = active;
     if (totalNode && totalNode.textContent !== total) totalNode.textContent = total;
     if (confirmedNode && confirmedNode.textContent !== confirmed) confirmedNode.textContent = confirmed;
+    var latencySamples = Number(stats && stats.client_response_latency_samples) || 0;
+    var p50us = Number(stats && stats.client_response_latency_p50_us);
+    var p95us = Number(stats && stats.client_response_latency_p95_us);
+    var latency = latencySamples > 0 && Number.isFinite(p50us) && Number.isFinite(p95us)
+      ? "p50 " + telegramMilliseconds(p50us / 1000) + " · p95 " + telegramMilliseconds(p95us / 1000) : "—";
+    var wss = stats ? (Number(stats.wss_failures) || 0) + " / " + (Number(stats.wss_attempts) || 0) : "—";
+    var traffic = stats ? telegramBytes(stats.bytes_from_clients) + " / " + telegramBytes(stats.bytes_from_upstreams) : "—";
+    if (latencyNode && latencyNode.textContent !== latency) latencyNode.textContent = latency;
+    if (wssNode && wssNode.textContent !== wss) wssNode.textContent = wss;
+    if (trafficNode && trafficNode.textContent !== traffic) trafficNode.textContent = traffic;
     var last = scene.querySelector("[data-tg-last-success]");
     if (!last) return;
     var successCount = Number(stats && stats.wss_responses) || 0;
     var text = successCount && Number.isFinite(Number(stats.last_success_age_ms))
-      ? "Последний успешный ответ: " + (stats.last_success_dc ? "DC" + stats.last_success_dc + " · " : "") +
-        telegramRouteName(Number(stats.last_success_route)) + " · " + telegramAge(Number(stats.last_success_age_ms))
+      ? "Последний успешный ответ: " + (stats.last_success_dc ? "DC" + (Number(stats.last_success_dc) === 203 ? 2 : stats.last_success_dc) + " · " : "") +
+        telegramRouteName(Number(stats.last_success_route)) + " · " + telegramMilliseconds(Number(stats.last_success_age_ms)) + " назад"
       : successCount ? "Подтверждён ответ Telegram" : "Подтверждённых ответов пока нет";
     if (last.textContent !== text) last.textContent = text;
   }

@@ -1,39 +1,57 @@
 (function (global) {
 "use strict";
 
-const WIDTH = 760;
-const HEIGHT = 340;
+const PROTOTYPE_GEOMETRY = Object.freeze({
+  width: 900,
+  height: 420,
+  client: Object.freeze([70, 210]),
+  hub: Object.freeze([300, 210]),
+  collector: Object.freeze([720, 210]),
+  laneY: Object.freeze([62, 148, 272, 358]),
+  gateX: Object.freeze([465, 500, 535, 570, 605]),
+  dcPositions: Object.freeze([[802, 70], [816, 140], [830, 210], [816, 280], [802, 350]]
+    .map(position => Object.freeze(position))),
+});
+const WIDTH = PROTOTYPE_GEOMETRY.width;
+const HEIGHT = PROTOTYPE_GEOMETRY.height;
+const CLIENT = PROTOTYPE_GEOMETRY.client;
+const ROUTE_HUB = PROTOTYPE_GEOMETRY.hub;
+const TELEGRAM_HUB = PROTOTYPE_GEOMETRY.collector;
 const MOTION = Object.freeze({
   maxParticles: 12,
   maxSparks: 8,
   maxRipples: 6,
-  attemptDurationMs: 2200,
-  failureDurationMs: 1600,
-  responseDurationMs: 2600,
+  attemptDurationMs: 1100,
+  failureDurationMs: 1800,
+  responseDurationMs: 1100,
+  winnerDurationMs: 900,
+  upstreamDurationMs: 300,
   sparkDurationMs: 800,
-  fadeDurationMs: 650,
-  rippleDurationMs: 1100,
-  rippleIntervalMs: 1100,
+  fadeDurationMs: 600,
+  rippleDurationMs: 1200,
 });
-const LANE_Y = [32, 98, 170, 242, 308];
+const LANE_Y = PROTOTYPE_GEOMETRY.laneY;
+const GATE_NAMES = ["DNS", "TCP", "TLS", "WS", "MTP"];
+const GATE_ACCESSIBLE_NAMES = ["DNS", "TCP", "TLS", "WS", "MTProto"];
+const GATE_X = PROTOTYPE_GEOMETRY.gateX;
+const TELEGRAM_DCS = PROTOTYPE_GEOMETRY.dcPositions;
+const TELEGRAM_DC_PATHS = TELEGRAM_DCS.map(position => makePath([TELEGRAM_HUB, position]));
 const MAX_PARTICLES = MOTION.maxParticles;
 const MAX_SPARKS = MOTION.maxSparks;
 const MAX_RIPPLES = MOTION.maxRipples;
 
 const ROUTES = [
   { transport: "direct_wss", label: "Прямой WSS" },
-  { transport: "tcp_passthrough", label: "Прямой TCP passthrough" },
   { transport: "cloudflare_worker", label: "Cloudflare Worker" },
   { transport: "cloudflare_proxy", label: "Прокси Cloudflare" },
-  { transport: "tcp_fallback", label: "Резервный TCP" },
+  { transport: "tcp_passthrough", label: "Прямой TCP · диагностика" },
 ];
 
 const TRANSPORT_TO_LANE = new Map([
   ["direct_wss", 0],
-  ["tcp_passthrough", 1],
-  ["cloudflare_worker", 2],
-  ["cloudflare_proxy", 3],
-  ["tcp_fallback", 4],
+  ["cloudflare_worker", 1],
+  ["cloudflare_proxy", 2],
+  ["tcp_passthrough", 3],
 ]);
 
 const STATE_LABELS = {
@@ -49,7 +67,64 @@ const STATE_LABELS = {
 };
 
 const STATUS_ORDER = ["selected", "race", "connecting", "connected", "cooldown", "failed", "cancelled", "skipped"];
-const VISIBLE_ROUTE_STATES = new Set(["selected", "race", "connecting", "connected", "failed", "cancelled"]);
+const VISIBLE_ROUTE_STATES = new Set(["selected", "race", "connecting", "connected", "cooldown", "failed", "cancelled"]);
+
+function sessionOrbState(session) {
+  const stage = session?.stage;
+  return ["accepted", "routing", "upstream_ready", "first_wss_binary_response"].includes(stage)
+    ? stage : "unknown";
+}
+
+function telegramDcNumber(dc) {
+  const number = Number(dc);
+  if (number === 203) return 2;
+  return Number.isInteger(number) && number >= 1 && number <= 5 ? number : null;
+}
+
+function telegramDcActivity(sessions) {
+  const dcs = Array.from({ length: 5 }, () => ({ active: 0, media: 0, confirmed: 0 }));
+  (Array.isArray(sessions) ? sessions : []).forEach(session => {
+    const dc = telegramDcNumber(session?.dc);
+    if (!dc) return;
+    const current = dcs[dc - 1];
+    current.active += 1;
+    if (session.is_media === true) current.media += 1;
+    if (session.telegram_response_seen === true) current.confirmed += 1;
+  });
+  return dcs;
+}
+
+function failureGateIndex(stage) {
+  const value = Number(stage);
+  return Number.isInteger(value) && value >= 1 && value <= 5 ? value - 1 : null;
+}
+
+function normalizeCooldowns(snapshot) {
+  if (!Array.isArray(snapshot?.route_cooldowns)) return [];
+  return snapshot.route_cooldowns.flatMap(cooldown => {
+    const remainingMs = Number(cooldown?.remaining_ms);
+    const lane = transportLane(cooldown?.transport);
+    if (lane < 0 || !Number.isFinite(remainingMs) || remainingMs <= 0) return [];
+    const dc = telegramDcNumber(cooldown.dc);
+    return [{ dc, isMedia: cooldown.is_media === true,
+      transport: cooldown.transport, remainingMs,
+      failureStage: Number(cooldown.failure_stage) || 0 }];
+  });
+}
+
+function applyCooldowns(lanes, cooldowns) {
+  cooldowns.forEach(cooldown => {
+    const lane = lanes[transportLane(cooldown.transport)];
+    if (!lane) return;
+    const newestCooldown = cooldown.remainingMs >= (lane.cooldownRemainingMs || 0);
+    lane.cooldownCount = (lane.cooldownCount || 0) + 1;
+    lane.cooldownRemainingMs = Math.max(lane.cooldownRemainingMs || 0, cooldown.remainingMs);
+    lane.cooldownDcNumbers = [...new Set([...(lane.cooldownDcNumbers || []), cooldown.dc].filter(Number.isInteger))];
+    if (newestCooldown) lane.failureStage = cooldown.failureStage || lane.failureStage || 0;
+    if (lane.status === "idle") lane.status = "cooldown";
+  });
+  return lanes;
+}
 
 function bezier(start, control1, control2, end, progress) {
   const inverse = 1 - progress;
@@ -60,12 +135,12 @@ function bezier(start, control1, control2, end, progress) {
 
 function makeLanePath(y) {
   const points = [];
-  for (let index = 0; index <= 30; index += 1) {
-    points.push(bezier([230, 170], [290, 170], [280, y], [340, y], index / 30));
+  for (let index = 1; index <= 22; index += 1) {
+    points.push(bezier(ROUTE_HUB, [360, 210], [380, y], [440, y], index / 22));
   }
-  for (let index = 1; index <= 20; index += 1) points.push([340 + 230 * index / 20, y]);
-  for (let index = 1; index <= 30; index += 1) {
-    points.push(bezier([570, y], [630, y], [620, 170], [700, 170], index / 30));
+  points.push([620, y]);
+  for (let index = 1; index <= 22; index += 1) {
+    points.push(bezier([620, y], [680, y], [670, 210], TELEGRAM_HUB, index / 22));
   }
   return makePath(points);
 }
@@ -79,20 +154,23 @@ function makePath(points) {
   return { points, cumulative, length: cumulative[cumulative.length - 1] };
 }
 
+function fractionAtX(path, targetX) {
+  for (let index = 1; index < path.points.length; index += 1) {
+    const left = path.points[index - 1], right = path.points[index];
+    if (right[0] < targetX) continue;
+    const part = (targetX - left[0]) / (right[0] - left[0] || 1);
+    return (path.cumulative[index - 1]
+      + (path.cumulative[index] - path.cumulative[index - 1]) * part) / path.length;
+  }
+  return 1;
+}
+
 function composeFlowPoints(routePoints, clientToHubPoints, direction) {
   if (direction === "response") {
     return [...routePoints.slice().reverse(), ...clientToHubPoints.slice(0, -1).reverse()];
   }
   if (direction === "request") return [...clientToHubPoints, ...routePoints.slice(1)];
   return routePoints;
-}
-
-function connectionDotStates(view) {
-  const active = Math.min(3, Math.max(0, Number(view?.activeConnections) || 0));
-  const confirmed = Math.min(active, (Array.isArray(view?.sessions) ? view.sessions : [])
-    .filter(session => session.telegram_response_seen === true).length);
-  return Array.from({ length: 3 }, (_, index) => index < confirmed ? "confirmed"
-    : index < active ? "active" : "idle");
 }
 
 function pointAt(path, fraction) {
@@ -139,7 +217,8 @@ function routeState(value) {
 function visibleRouteLanes(view) {
   if (!Array.isArray(view?.lanes)) return [];
   return view.lanes.filter(lane => Object.entries(lane.counts || {})
-    .some(([state, count]) => VISIBLE_ROUTE_STATES.has(state) && Number(count) > 0));
+    .some(([state, count]) => VISIBLE_ROUTE_STATES.has(state) && Number(count) > 0)
+      || Number(lane.cooldownCount) > 0);
 }
 
 function eventState(value) {
@@ -149,7 +228,6 @@ function eventState(value) {
 
 function routeDescription(transport, lane) {
   if (transport === "tcp_passthrough") return "Прямой TCP passthrough";
-  if (transport === "tcp_fallback") return "Резервный TCP";
   return ROUTES[lane]?.label || "WSS-транспорт не определён";
 }
 
@@ -162,9 +240,9 @@ function latestRouteFailure(snapshot) {
       (successDc && Number.isFinite(successAge) && failureAge > successAge)) return null;
   const routes = {
     1: [0, "Прямой WSS"],
-    2: [2, "Cloudflare Worker"],
-    3: [3, "Прокси Cloudflare"],
-    4: [4, "Прямой TCP (диагностика)"],
+    2: [1, "Cloudflare Worker"],
+    3: [2, "Прокси Cloudflare"],
+    4: [3, "Прямой TCP (диагностика)"],
   };
   const stages = {
     1: "DNS",
@@ -228,20 +306,25 @@ function summarize(snapshot, error) {
       state: "unavailable", caption: "Статистика маршрутов недоступна", transportLabel: "Недоступно",
       dcLabel: "DC неизвестен", lanes: ROUTES.map(route => ({ ...route, status: "idle", counts: {} })),
       sessions: [], truncated: false, hedged: [], activeConnections: 0,
-      acceptedConnections: 0, mediaSessions: 0,
+      acceptedConnections: 0, mediaSessions: 0, cooldowns: [], cooldownDurationMs: 0,
+      dcActivity: telegramDcActivity([]),
     };
   }
 
   const activeConnections = Math.max(0, Number(snapshot?.active_connections) || 0);
   const sessions = Array.isArray(snapshot?.active_sessions) ? snapshot.active_sessions.slice(0, 64) : [];
+  const cooldowns = normalizeCooldowns(snapshot);
+  const cooldownDurationMs = Math.max(0, Number(snapshot?.route_cooldown_ms) || 0);
   const emptyLanes = ROUTES.map(route => ({ ...route, status: "idle", counts: {} }));
   if (activeConnections === 0) {
     const failure = latestRouteFailure(snapshot);
+    const lanes = applyCooldowns(emptyLanes, cooldowns);
     if (failure) {
-      const lanes = emptyLanes.map(lane => ({ ...lane, counts: {} }));
       if (failure.lane >= 0) {
         lanes[failure.lane].status = "failed";
-        lanes[failure.lane].counts = { failed: 1 };
+        lanes[failure.lane].counts.failed = (lanes[failure.lane].counts.failed || 0) + 1;
+        lanes[failure.lane].failureStage = Number(snapshot?.last_failure_stage) || 0;
+        lanes[failure.lane].failureAgeMs = Number(snapshot?.last_failure_age_ms) || 0;
       }
       return {
         state: "unavailable",
@@ -249,21 +332,27 @@ function summarize(snapshot, error) {
         transportLabel: "Недоступно", dcLabel: failure.dc, lanes, sessions: [],
         truncated: Boolean(snapshot?.route_sessions_truncated), hedged: [], activeConnections,
         acceptedConnections: Number(snapshot?.accepted_connections) || 0, mediaSessions: 0,
+        cooldowns, cooldownDurationMs, dcActivity: telegramDcActivity([]),
       };
     }
     return {
-      state: "idle", caption: "Нет активных соединений", transportLabel: "Нет подключений",
-      dcLabel: "DC неизвестен", lanes: emptyLanes, sessions: [],
+      state: cooldowns.length ? "cooling" : "idle",
+      caption: cooldowns.length ? "Нет активных сессий · часть маршрутов на паузе" : "Нет активных соединений",
+      transportLabel: cooldowns.length ? "Маршруты на паузе" : "Нет подключений",
+      dcLabel: "DC неизвестен", lanes, sessions: [],
       truncated: Boolean(snapshot?.route_sessions_truncated), hedged: [], activeConnections,
       acceptedConnections: Number(snapshot?.accepted_connections) || 0, mediaSessions: 0,
+      cooldowns, cooldownDurationMs, dcActivity: telegramDcActivity([]),
     };
   }
   if (!Array.isArray(snapshot?.active_sessions) || !sessions.length) {
+    applyCooldowns(emptyLanes, cooldowns);
     return {
       state: "unavailable", caption: "Активные соединения есть, маршрут пока не определён", transportLabel: "Определяется",
       dcLabel: "DC неизвестен", lanes: emptyLanes, sessions: [],
       truncated: Boolean(snapshot?.route_sessions_truncated), hedged: [], activeConnections,
       acceptedConnections: Number(snapshot?.accepted_connections) || 0, mediaSessions: 0,
+      cooldowns, cooldownDurationMs, dcActivity: telegramDcActivity([]),
     };
   }
 
@@ -284,11 +373,33 @@ function summarize(snapshot, error) {
     const label = transports.length === 1 ? routeDescription(transports[0], index) : route.label;
     return { ...route, label, status, counts: laneCounts };
   });
+  applyCooldowns(lanes, cooldowns);
+  lanes.forEach(lane => {
+    if (lane.cooldownCount) lane.failureAgeMs = Math.max(0, cooldownDurationMs - lane.cooldownRemainingMs);
+  });
+  sessionViews.forEach(({ session }) => {
+    (Array.isArray(session.events) ? session.events : []).forEach(event => {
+      if (event.state !== "failed") return;
+      const lane = lanes[transportLane(event.transport)];
+      const ageMs = Number(event.age_ms);
+      if (!lane || !Number.isFinite(ageMs)) return;
+      if (!Number.isFinite(lane.failureAgeMs) || ageMs <= lane.failureAgeMs) {
+        lane.failureAgeMs = ageMs;
+        lane.failureStage = Number(event.failure_stage) || 0;
+      }
+    });
+    const laneIndex = selectedLaneFor(session);
+    if (laneIndex < 0 || !session.selected_transport || session.selected_transport.startsWith("tcp_")) return;
+    const lane = lanes[laneIndex];
+    lane.passedGate = Math.max(lane.passedGate || 0,
+      session.stage === "first_wss_binary_response" ? 5
+        : session.stage === "upstream_ready" ? 4 : 0);
+  });
   const selectedLanes = lanes.filter(lane => lane.counts.selected);
   const connectingLanes = lanes.filter(lane => lane.counts.connecting || lane.counts.race);
   const failedLanes = lanes.filter(lane => lane.counts.failed || lane.counts.cooldown);
   const dcValues = new Set(sessions
-    .map(({ dc }) => dc == null ? null : Number(dc))
+    .map(({ dc }) => telegramDcNumber(dc))
     .filter(Number.isInteger));
   const mediaSessions = sessions.filter(session => session.is_media === true).length;
   const dcLabel = dcValues.size === 1 ? `DC${[...dcValues][0]}${mediaSessions ? ` · media ${mediaSessions}` : ""}`
@@ -331,6 +442,7 @@ function summarize(snapshot, error) {
     state, caption, transportLabel, dcLabel, lanes, sessions,
     truncated: Boolean(snapshot.route_sessions_truncated), hedged, activeConnections,
     acceptedConnections: Number(snapshot.accepted_connections) || 0, mediaSessions,
+    cooldowns, cooldownDurationMs, dcActivity: telegramDcActivity(sessions),
   };
 }
 
@@ -338,22 +450,31 @@ function mountTelegramFlow(canvas) {
   const context = canvas.getContext("2d", { alpha: false });
   if (!context) throw new Error("Canvas 2D недоступен для схемы Telegram");
   const root = canvas.closest(".tg-flow");
-  const incomingPath = makePath([[60, 170], [230, 170]]);
-  const lanes = ROUTES.map((route, index) => ({
-    ...route, index, path: makeLanePath(LANE_Y[index]), color: [100, 125, 128], targetColor: [100, 125, 128],
-    alpha: 0.22, targetAlpha: 0.22, glow: 0, targetGlow: 0, status: "idle", counts: {}, markerPulse: 0,
-  }));
+  const incomingPath = makePath([CLIENT, ROUTE_HUB]);
+  const responsePath = makePath(incomingPath.points.slice().reverse());
+  const lanes = ROUTES.map((route, index) => {
+    const path = makeLanePath(LANE_Y[index]);
+    return {
+      ...route, index, path, color: [100, 125, 128], targetColor: [100, 125, 128],
+      gateProgress: GATE_X.map(x => fractionAtX(path, x)),
+      gatePulses: Array(GATE_NAMES.length).fill(0),
+      alpha: 0.22, targetAlpha: 0.22, glow: 0, targetGlow: 0, status: "idle", counts: {}, markerPulse: 0,
+    };
+  });
   const hub = { angle: 0, pulse: 0, spin: 0 };
   const client = { pulse: 0 };
   const particles = [];
+  const trafficParticles = [];
   const sparks = [];
   const ripples = [];
+  const ecgBeats = [];
   const cursors = new Map();
-  const attemptedSessions = new Set();
   const activeParticles = new Map();
   let currentView = summarize(null, "");
   let processStartedAt = 0;
   let acceptedConnections = null;
+  let trafficProcessStartedAt = 0;
+  let previousTrafficBytes = null;
   let pixelRatio = 1;
   let scaleX = 1;
   let scaleY = 1;
@@ -361,7 +482,6 @@ function mountTelegramFlow(canvas) {
   let destroyed = false;
   let frameId = 0;
   let lastFrame = 0;
-  let lastRippleAt = 0;
   let paletteInitialized = false;
   const motionPreference = window.matchMedia?.("(prefers-reduced-motion: reduce)") || null;
   const darkPreference = window.matchMedia?.("(prefers-color-scheme: dark)") || null;
@@ -405,9 +525,10 @@ function mountTelegramFlow(canvas) {
     if (lane.status === "failed") return palette.failure;
     if (lane.status === "idle") return palette.line;
     if (lane.status === "cooldown" || lane.status === "cancelled" || lane.status === "skipped") return palette.muted;
-    if (lane.transport === "tcp_passthrough") return palette.direct;
-    if (lane.transport === "tcp_fallback") return palette.tcp;
-    if (lane.index === 0) return palette.direct;
+    if (lane.status === "selected" && currentView.sessions.some(session =>
+      session.selected_transport === lane.transport && session.telegram_response_seen === true))
+      return palette.direct;
+    if (lane.transport === "tcp_passthrough") return palette.tcp;
     return palette.cloudflare;
   }
 
@@ -415,10 +536,20 @@ function mountTelegramFlow(canvas) {
     const next = view.lanes[lane.index];
     const nextStatus = next?.status || "idle";
     const nextTransport = next?.transport || lane.transport;
-    if (lane.status === nextStatus && lane.transport === nextTransport) return;
+    const nextColor = laneColor({ ...lane, status: nextStatus, transport: nextTransport });
+    lane.counts = next?.counts || {};
+    lane.passedGate = Number(next?.passedGate) || 0;
+    lane.failureStage = Number(next?.failureStage) || 0;
+    lane.failureAgeMs = Number.isFinite(Number(next?.failureAgeMs)) ? Number(next.failureAgeMs) : null;
+    lane.cooldownCount = Number(next?.cooldownCount) || 0;
+    lane.cooldownRemainingMs = Number(next?.cooldownRemainingMs) || 0;
+    lane.cooldownUpdatedAt = performance.now();
+    lane.cooldownDcNumbers = next?.cooldownDcNumbers || [];
+    const colorUnchanged = lane.targetColor.every((channel, index) => channel === nextColor[index]);
+    if (lane.status === nextStatus && lane.transport === nextTransport && colorUnchanged) return;
     lane.status = nextStatus;
     lane.transport = nextTransport;
-    lane.targetColor = laneColor(lane);
+    lane.targetColor = nextColor;
     lane.targetAlpha = nextStatus === "idle" ? 0.22
       : nextStatus === "cancelled" || nextStatus === "skipped" ? 0.3 : nextStatus === "selected" ? 0.78 : 0.55;
     const routeActive = ["selected", "connected", "connecting", "race"].includes(nextStatus);
@@ -432,24 +563,37 @@ function mountTelegramFlow(canvas) {
     }
   }
 
-  function combinedPath(laneIndex, startsAtHub, direction) {
+function combinedPath(laneIndex, direction, dc) {
     const route = lanes[laneIndex].path.points;
-    return makePath(composeFlowPoints(route, incomingPath.points,
-      direction || (startsAtHub ? "route" : "request")));
+    const dcNumber = telegramDcNumber(dc);
+    const pathToDc = dcNumber ? [...route, TELEGRAM_DCS[dcNumber - 1]] : route;
+    return makePath(composeFlowPoints(pathToDc, incomingPath.points,
+      direction || "route"));
   }
 
   function addParticle(sessionId, laneIndex, now, options = {}) {
     if (motionPreference?.matches || laneIndex < 0 || particles.length >= MAX_PARTICLES) return null;
-    const path = combinedPath(laneIndex, options.startsAtHub !== false, options.direction);
+  const path = combinedPath(laneIndex, options.direction, options.dc);
+  const lane = lanes[laneIndex];
+  const dcNumber = telegramDcNumber(options.dc);
+  const routeLength = dcNumber
+    ? makePath([...lane.path.points, TELEGRAM_DCS[dcNumber - 1]]).length : lane.path.length;
+  const gateProgress = lane.gateProgress.map(progress => options.direction === "response"
+    ? (routeLength - lane.path.length * progress) / (routeLength + incomingPath.length)
+    : lane.path.length * progress / routeLength);
     const particle = {
       sessionId,
       laneIndex,
       path,
-      startedAt: now,
+      gateProgress,
+      fraction: 0,
+      startedAt: options.startedAt ?? now,
       duration: options.duration || MOTION.attemptDurationMs,
       stopAt: options.stopAt ?? null,
       kind: options.kind || "attempt",
       fadeAt: 0,
+      settleStartedAt: 0,
+      settleFrom: 0,
       x: path.points[0][0],
       y: path.points[0][1],
       opacity: 1,
@@ -462,16 +606,21 @@ function mountTelegramFlow(canvas) {
     return particle;
   }
 
-  function launchFailure(sessionId, laneIndex, now) {
-    const key = `${sessionId}:${laneIndex}`;
-    const existing = activeParticles.get(key);
-    if (existing && existing.startedAt + existing.duration > now && !existing.fadeAt) {
-      existing.kind = "failure";
-      existing.stopAt = 0.58;
-      existing.color = palette.failure;
-      return;
-    }
-    addParticle(sessionId, laneIndex, now, { startsAtHub: true, duration: MOTION.failureDurationMs, stopAt: 0.58, kind: "failure" });
+function launchFailure(sessionId, laneIndex, now, failureStage, dc) {
+  fadeAttempt(sessionId, laneIndex, now);
+  const lane = lanes[laneIndex];
+  lane.failureStage = Number(failureStage) || 0;
+  const gate = failureGateIndex(failureStage);
+  if (gate !== null) lane.gatePulses[gate] = Math.max(lane.gatePulses[gate], 1);
+  const routeProgress = gate === null ? 0.03 : lane.gateProgress[gate];
+  const dcNumber = telegramDcNumber(dc);
+  const routeLength = dcNumber
+    ? makePath([...lane.path.points, TELEGRAM_DCS[dcNumber - 1]]).length : lane.path.length;
+  const stopAt = lane.path.length * routeProgress / routeLength;
+  addParticle(sessionId, laneIndex, now, {
+    startedAt: now, duration: MOTION.failureDurationMs,
+    stopAt, kind: "failure", track: false, dc,
+  });
   }
 
   function fadeAttempt(sessionId, laneIndex, now) {
@@ -482,22 +631,38 @@ function mountTelegramFlow(canvas) {
   function processEvent(session, event, now) {
     const laneIndex = transportLane(event.transport);
     if (laneIndex < 0) return;
+  const eventAge = Number(event.age_ms);
+  const eventAt = Number.isFinite(eventAge) && eventAge >= 0 ? now - eventAge : now;
     const state = event.state;
     if (state === "connecting") {
-      const startsAtHub = attemptedSessions.has(session.id);
-      attemptedSessions.add(session.id);
-      addParticle(session.id, laneIndex, now, { startsAtHub, stopAt: 0.48 });
+      addParticle(session.id, laneIndex, eventAt, { startedAt: eventAt, dc: session.dc });
       hub.pulse = 0.42;
       hub.spin = 0.18;
-    } else if (state === "connected" || state === "selected") {
-      fadeAttempt(session.id, laneIndex, now);
+    } else if (state === "connected") {
+      const particle = activeParticles.get(`${session.id}:${laneIndex}`);
+      if (particle) {
+        particle.kind = "upstream";
+        particle.settleStartedAt = eventAt;
+        particle.settleFrom = particle.fraction;
+        particle.stopAt = particle.gateProgress[3];
+      }
+  } else if (state === "selected") {
+    fadeAttempt(session.id, laneIndex, eventAt);
+    addParticle(session.id, laneIndex, eventAt, { startedAt: eventAt,
+      duration: MOTION.winnerDurationMs, kind: "winner", track: false, dc: session.dc });
+    hub.pulse = 0.72;
+    hub.spin = 0.28;
     } else if (state === "failed") {
-      launchFailure(session.id, laneIndex, now);
+    launchFailure(session.id, laneIndex, eventAt, event.failure_stage, session.dc);
     } else if (state === "cancelled") {
-      fadeAttempt(session.id, laneIndex, now);
+    fadeAttempt(session.id, laneIndex, eventAt);
+  } else if (state === "cooldown") {
+    lanes[laneIndex].markerPulse = 0.7;
     } else if (state === "first_binary_response") {
-      addParticle(session.id, laneIndex, now, { direction: "response", kind: "response", duration: MOTION.responseDurationMs });
-      if (!motionPreference?.matches) client.pulse = 0.55;
+    addParticle(session.id, laneIndex, eventAt, { direction: "response", startedAt: eventAt,
+      kind: "response", duration: MOTION.responseDurationMs, track: false, dc: session.dc });
+    hub.pulse = 1;
+    hub.spin = 0.3;
     }
   }
 
@@ -508,10 +673,11 @@ function mountTelegramFlow(canvas) {
       || (acceptedConnections != null && accepted < acceptedConnections));
     if (restarted) {
       cursors.clear();
-      attemptedSessions.clear();
       activeParticles.clear();
       particles.length = 0;
+      trafficParticles.length = 0;
       ripples.length = 0;
+      ecgBeats.length = 0;
       sparks.length = 0;
     }
     if (processTime) processStartedAt = processTime;
@@ -520,7 +686,6 @@ function mountTelegramFlow(canvas) {
     for (const id of cursors.keys()) {
       if (!liveIds.has(id)) {
         cursors.delete(id);
-        attemptedSessions.delete(id);
         for (const [key, particle] of activeParticles) {
           if (particle.sessionId === id) {
             particle.fadeAt ||= now;
@@ -549,6 +714,33 @@ function mountTelegramFlow(canvas) {
     });
   }
 
+  function readTraffic(snapshot, now) {
+    if (!snapshot) return;
+    const processTime = Number(snapshot.process_started_at) || 0;
+    const fromClients = Number(snapshot.bytes_from_clients);
+    const fromUpstreams = Number(snapshot.bytes_from_upstreams);
+    if (!Number.isFinite(fromClients) || !Number.isFinite(fromUpstreams)) return;
+    const restarted = processTime && trafficProcessStartedAt && processTime !== trafficProcessStartedAt;
+    if (processTime) trafficProcessStartedAt = processTime;
+    if (restarted || previousTrafficBytes === null ||
+        fromClients < previousTrafficBytes.fromClients || fromUpstreams < previousTrafficBytes.fromUpstreams) {
+      previousTrafficBytes = { fromClients, fromUpstreams };
+      trafficParticles.length = 0;
+      return;
+    }
+    const deltas = [
+      ["request", fromClients - previousTrafficBytes.fromClients],
+      ["response", fromUpstreams - previousTrafficBytes.fromUpstreams],
+    ];
+    previousTrafficBytes = { fromClients, fromUpstreams };
+    deltas.forEach(([direction, bytes]) => {
+      if (bytes <= 0 || motionPreference?.matches) return;
+      trafficParticles.push({ direction, bytes, startedAt: now, duration: 1250,
+        size: 2.5 + Math.min(6, Math.log2(1 + bytes / 128)) });
+      if (trafficParticles.length > MAX_PARTICLES) trafficParticles.shift();
+    });
+  }
+
   function setLaneTargets(view) {
     lanes.forEach(lane => configureLane(lane, view));
   }
@@ -573,13 +765,14 @@ function mountTelegramFlow(canvas) {
     if (canAnimate) startLoop();
   }
 
-  function strokePath(path, color, alpha, width, dash = [], glow = 0) {
+  function strokePath(path, color, alpha, width, dash = [], glow = 0, dashOffset = 0) {
     context.beginPath();
     context.moveTo(path.points[0][0], path.points[0][1]);
     for (let index = 1; index < path.points.length; index += 1) {
       context.lineTo(path.points[index][0], path.points[index][1]);
     }
     context.setLineDash(dash);
+    context.lineDashOffset = dashOffset;
     context.lineWidth = width;
     context.lineCap = "round";
     context.lineJoin = "round";
@@ -591,6 +784,7 @@ function mountTelegramFlow(canvas) {
     context.shadowBlur = 0;
     context.globalAlpha = 1;
     context.setLineDash([]);
+    context.lineDashOffset = 0;
   }
 
   function rgb(color, alpha = 1) {
@@ -633,76 +827,208 @@ function mountTelegramFlow(canvas) {
     context.restore();
   }
 
+  function drawTelegramDcs(cssWidth, cssHeight) {
+    const dcs = currentView.dcActivity || telegramDcActivity([]);
+    TELEGRAM_DCS.forEach((position, index) => {
+      const activity = dcs[index] || { active: 0, media: 0, confirmed: 0 };
+      const active = activity.active > 0;
+      const confirmed = activity.confirmed > 0;
+      const color = confirmed ? palette.direct : active ? palette.cloudflare : palette.line;
+      strokePath(TELEGRAM_DC_PATHS[index], rgb(active ? color : palette.line), active ? 0.55 : 0.24, 1.2);
+      const activityLevel = Math.min(1, activity.active / 5);
+      drawNode(position[0], position[1], 9 + activityLevel * 3,
+        active ? 0.35 + 0.65 * activityLevel : 0);
+      context.save();
+      context.translate(position[0], position[1]);
+      context.scale(1, scaleX / scaleY);
+      context.beginPath();
+      context.arc(0, 0, 9 + activityLevel * 3, 0, Math.PI * 2);
+      context.fillStyle = rgb(color, active ? 0.12 + 0.5 * activityLevel : 0.08);
+      context.fill();
+      context.lineWidth = 2;
+      context.strokeStyle = rgb(color, active ? 0.55 + 0.3 * activityLevel : 0.34);
+      context.stroke();
+      if (activity.media) {
+        context.beginPath();
+        context.arc(0, 0, 15 + activityLevel * 3, 0, Math.PI * 2);
+        context.setLineDash([2, 3]);
+        context.lineWidth = 1.4;
+        context.strokeStyle = rgb(palette.accent, 0.85);
+        context.stroke();
+        context.setLineDash([]);
+      }
+      context.restore();
+      const compact = cssWidth < 600;
+      const labelX = compact ? position[0] : position[0] + 24;
+      const labelY = compact ? position[1] - 22 : position[1] + 4;
+      drawText(`DC${index + 1}`, labelX, labelY,
+        compact ? "600 10px system-ui, sans-serif" : "600 11px system-ui, sans-serif",
+        rgb(palette.text, active ? 0.9 : 0.55), cssWidth, cssHeight, compact ? "center" : "left");
+      if (cssWidth >= 600 && active) {
+        const count = activity.media ? `${activity.active} · media ${activity.media}` : String(activity.active);
+        drawText(count, position[0] + 24, position[1] + 18,
+          "10px system-ui, sans-serif", rgb(palette.muted, 0.88), cssWidth, cssHeight, "left");
+      }
+    });
+    drawNode(TELEGRAM_HUB[0], TELEGRAM_HUB[1], 6, 0.2);
+  }
+
+  function drawEcg(now) {
+    if (!(currentView.activeConnections > 0 || trafficParticles.length || ecgBeats.length)) return;
+    context.beginPath();
+    const baseY = ROUTE_HUB[1];
+    const startX = CLIENT[0] + 30;
+    const endX = ROUTE_HUB[0] - 34;
+    context.moveTo(startX, baseY);
+    for (let x = startX; x <= endX; x += 3) {
+      let offset = 0;
+      ecgBeats.forEach(beat => {
+        const distance = x - (endX - (now - beat) * 0.17);
+        offset += -distance * Math.exp(-distance * distance / 260) * 0.9;
+      });
+      context.lineTo(x, baseY + Math.max(-34, Math.min(34, offset)));
+    }
+    context.strokeStyle = rgb(ecgBeats.length ? palette.direct : palette.line,
+      ecgBeats.length ? 0.35 + Math.min(0.5, ecgBeats.length * 0.2) : 0.3);
+    context.lineWidth = 2.2;
+    context.lineJoin = "round";
+    context.stroke();
+  }
+
   function draw() {
     if (destroyed || !context || !canvas.width || !canvas.height) return;
     const cssWidth = canvas.width / pixelRatio;
     const cssHeight = canvas.height / pixelRatio;
-    const compact = cssWidth < 620;
+    const compact = cssWidth < 600;
     context.setTransform(scaleX, 0, 0, scaleY, 0, 0);
     context.globalCompositeOperation = "source-over";
     context.globalAlpha = 1;
     context.fillStyle = rgb(palette.background);
     context.fillRect(0, 0, WIDTH, HEIGHT);
 
-    if (currentView.activeConnections > 0) strokePath(incomingPath, rgb(palette.accent), 0.35, 3);
+    const now = performance.now();
+    if (currentView.activeConnections > 0 || trafficParticles.length)
+      strokePath(incomingPath, rgb(palette.line), 0.42, 2.2);
+    drawEcg(now);
     const visibleRouteIndices = new Set(visibleRouteLanes(currentView)
       .map(lane => transportLane(lane.transport)));
     lanes.forEach((lane, index) => {
       if (!visibleRouteIndices.has(lane.index)) return;
-      const dashed = ["cooldown", "failed", "cancelled", "skipped"].includes(lane.status) ? [3, 9] : [];
-      strokePath(lane.path, rgb(lane.color), lane.alpha, 3, dashed, lane.glow * 0.5);
-      const routeLabel = lane.transport === "tcp_passthrough" ? "Прямой TCP passthrough" : lane.label;
-      drawText(routeLabel, 455, LANE_Y[index] - 13,
-        compact ? "600 11px system-ui, sans-serif" : "600 14px system-ui, sans-serif",
+      const selectedCount = Number(lane.counts.selected) || 0;
+      const connectingCount = (Number(lane.counts.connecting) || 0) + (Number(lane.counts.race) || 0);
+      const upstreamCount = Number(lane.counts.connected) || 0;
+      const failedCount = Number(lane.counts.failed) || 0;
+      const selected = selectedCount > 0;
+      const connecting = connectingCount > 0;
+      const cooling = lane.cooldownCount > 0 && !selected;
+      const dash = cooling || failedCount || ["cancelled", "skipped"].includes(lane.status)
+        ? [3, 9] : connecting ? [6, 8] : [];
+      const color = lane.status === "failed" ? palette.failure : lane.color;
+      strokePath(lane.path, rgb(color), selected ? 0.86 : cooling ? 0.4 : connecting ? 0.58 : lane.alpha,
+        selected ? 3.4 : 2, dash, lane.glow);
+      if (selected && !motionPreference?.matches) {
+        const confirmed = currentView.sessions.some(session => session.selected_transport === lane.transport
+          && session.telegram_response_seen === true);
+        const motionColor = confirmed ? palette.direct : lane.color;
+        strokePath(lane.path, rgb(motionColor, 0.58), 1, 1.6, [3, 16], 0,
+          -(now / 1000) * (40 + selectedCount * 14));
+        if (confirmed) strokePath(lane.path, rgb(palette.direct, 0.36), 1, 1.2, [2, 20], 0,
+          (now / 1000) * (50 + selectedCount * 10));
+      }
+      const label = compact ? ({
+        cloudflare_worker: "Worker",
+        cloudflare_proxy: "CF proxy",
+        tcp_passthrough: "TCP · диагностика",
+      }[lane.transport] || lane.label) : lane.label;
+      const upper = LANE_Y[index] < ROUTE_HUB[1];
+      const labelY = compact ? LANE_Y[index] - 20 : LANE_Y[index] + (upper ? -26 : 36);
+      const statusY = compact ? LANE_Y[index] + 24 : LANE_Y[index] + (upper ? -39 : 49);
+      const remaining = Math.max(0, lane.cooldownRemainingMs
+        - (now - lane.cooldownUpdatedAt));
+      const stateLabel = selected ? `активен · ${selectedCount}`
+        : connecting ? `${lane.counts.race ? "гонка" : "подключение"} · ${connectingCount}`
+          : upstreamCount ? `upstream готов · ${upstreamCount}`
+            : lane.cooldownCount ? `пауза · ${Math.ceil(remaining)} мс`
+              : failedCount ? `отказ · ${lane.failureStage ? GATE_ACCESSIBLE_NAMES[failureGateIndex(lane.failureStage)] || "маршрут" : "маршрут"}`
+                : STATE_LABELS[lane.status] || STATE_LABELS.idle;
+      drawText(label, 540, labelY, compact ? "600 11px system-ui, sans-serif" : "600 12px system-ui, sans-serif",
         rgb(palette.text, 0.9), cssWidth, cssHeight);
-      if (cssWidth >= 620) {
-        const stateColor = lane.status === "failed" ? palette.failure
-          : lane.status === "idle" ? palette.muted : lane.color;
-        const countText = Object.entries(lane.counts).map(([state, count]) =>
-          `${STATE_LABELS[state] || state}: ${count}`).join(" · ");
-        drawText(countText || STATE_LABELS[lane.status] || STATE_LABELS.idle, 455, LANE_Y[index] + 17,
-          "11px system-ui, sans-serif", rgb(stateColor, 0.95), cssWidth, cssHeight);
+      drawText(stateLabel, 540, statusY, compact ? "10px system-ui, sans-serif" : "10px system-ui, sans-serif",
+        rgb(lane.failureStage ? palette.failure : lane.color, 0.88), cssWidth, cssHeight);
+      for (let gate = 0; gate < GATE_NAMES.length; gate += 1) {
+        const point = pointAt(lane.path, lane.gateProgress[gate]);
+        const failedGate = failureGateIndex(lane.failureStage) === gate;
+        const passing = particles.some(particle => particle.laneIndex === lane.index
+          && !particle.fadeAt && Math.abs(particle.fraction - particle.gateProgress[gate]) < 0.035);
+        const passed = lane.passedGate > gate;
+        const gateColor = failedGate ? palette.failure
+          : passed ? (lane.passedGate >= GATE_NAMES.length && gate === GATE_NAMES.length - 1
+            ? palette.direct : palette.cloudflare)
+          : passing ? lane.color : palette.line;
+        const pulse = Math.max(lane.gatePulses[gate], passing ? 0.8 : 0);
+        context.save();
+        context.translate(point[0], point[1]);
+        context.scale(1, scaleX / scaleY);
+        context.beginPath();
+        context.arc(0, 0, 3 + pulse * 2, 0, Math.PI * 2);
+        context.fillStyle = rgb(gateColor, failedGate || passed || passing ? 0.95 : 0.38);
+        context.shadowColor = rgb(gateColor);
+        context.shadowBlur = pulse * 7;
+        context.fill();
+        context.shadowBlur = 0;
+        context.restore();
+        if (!compact) drawText(GATE_NAMES[gate], GATE_X[gate], LANE_Y[index] + (upper ? -12 : 19),
+          "600 9px system-ui, sans-serif", rgb(palette.muted, 0.35 + pulse * 0.45), cssWidth, cssHeight);
       }
-      const marker = pointAt(lane.path, 0.5);
-      context.save();
-      context.translate(marker[0], marker[1]);
-      context.lineCap = "round";
-      context.lineWidth = 3;
-      if (lane.status === "failed") {
-        const markerScale = 1 + 0.3 * lane.markerPulse;
+      if (lane.status === "failed" || lane.cooldownCount) {
+        const gate = failureGateIndex(lane.failureStage);
+        const markerX = gate === null ? 540 : GATE_X[gate];
+        const point = pointAt(lane.path, gate === null
+          ? fractionAtX(lane.path, markerX) : lane.gateProgress[gate]);
+        const cooldownFraction = currentView.cooldownDurationMs > 0
+          ? Math.min(1, remaining / currentView.cooldownDurationMs) : 0;
+        context.save();
+        context.translate(point[0], point[1]);
+        context.scale(1, scaleX / scaleY);
+        const markerScale = 1 + 0.35 * lane.markerPulse;
         context.scale(markerScale, markerScale);
-        context.strokeStyle = rgb(palette.failure, Math.max(0.2, lane.alpha));
+        context.lineWidth = 2.5;
+        context.lineCap = "round";
+        context.strokeStyle = rgb(palette.failure, 0.95);
         context.beginPath();
-        context.moveTo(-6, -6); context.lineTo(6, 6);
-        context.moveTo(6, -6); context.lineTo(-6, 6);
+        context.moveTo(-4.5, -4.5); context.lineTo(4.5, 4.5);
+        context.moveTo(4.5, -4.5); context.lineTo(-4.5, 4.5);
         context.stroke();
+        if (lane.cooldownCount) {
+          context.beginPath();
+          context.arc(0, 0, 13, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * cooldownFraction);
+          context.strokeStyle = rgb(palette.failure, 0.88);
+          context.lineWidth = 1.8;
+          context.stroke();
+        }
+        context.restore();
       }
-      if (lane.status === "cooldown") {
-        context.strokeStyle = rgb(palette.muted, Math.max(0.4, lane.alpha));
-        context.beginPath();
-        context.moveTo(-3.5, -6); context.lineTo(-3.5, 6);
-        context.moveTo(3.5, -6); context.lineTo(3.5, 6);
-        context.stroke();
-      }
-      context.restore();
     });
 
-    drawNode(60, 170, 28, Math.min(1, client.pulse));
-    drawNode(700, 170, 28, 0);
+    drawTelegramDcs(cssWidth, cssHeight);
+    drawNode(CLIENT[0], CLIENT[1], 28, Math.min(1, client.pulse));
     context.strokeStyle = rgb(palette.text, 0.8);
     context.lineWidth = 2;
     context.lineCap = "round";
     context.lineJoin = "round";
-    context.strokeRect(52, 157, 16, 26);
-    context.beginPath(); context.moveTo(57, 178); context.lineTo(63, 178); context.stroke();
-    context.strokeRect(687, 157, 26, 10);
-    context.strokeRect(687, 173, 26, 10);
+    context.strokeRect(CLIENT[0] - 8, CLIENT[1] - 13, 16, 26);
+    context.beginPath(); context.moveTo(CLIENT[0] - 3, CLIENT[1] + 8);
+    context.lineTo(CLIENT[0] + 3, CLIENT[1] + 8); context.stroke();
 
     const hubScale = 1 + 0.06 * hub.pulse;
     context.save();
-    context.translate(230, 170);
+    context.translate(ROUTE_HUB[0], ROUTE_HUB[1]);
     context.scale(hubScale, hubScale * scaleX / scaleY);
-    drawHexagon(0, 0, 28, hub.angle);
+    context.beginPath();
+    context.arc(0, 0, 60, -Math.PI / 2,
+      -Math.PI / 2 + Math.PI * 2 * Math.min(1, currentView.activeConnections / 40));
+    context.strokeStyle = rgb(palette.accent, 0.28); context.lineWidth = 2; context.stroke();
+    drawHexagon(0, 0, 31, hub.angle);
     context.fillStyle = rgb(palette.background);
     context.fill();
     context.lineWidth = 2.5;
@@ -711,30 +1037,36 @@ function mountTelegramFlow(canvas) {
     context.shadowBlur = 4 + 3 * hub.pulse;
     context.stroke();
     context.shadowBlur = 0;
-    const dotStates = connectionDotStates(currentView);
-    const dotAlpha = 0.45 + 0.45 * Math.min(1, currentView.activeConnections / 12);
-    for (let index = 0; index < dotStates.length; index += 1) {
-      const angle = -hub.angle * 0.8 + index * 2.094;
+    const orbRadii = [45, 53];
+    currentView.sessions.forEach((session, index) => {
+      const id = Number(session.id) || index + 1;
+      const orbit = index % 2;
+      const angle = (id * 2.399963229728653 + now / 1000 * (orbit ? -0.68 : 0.5)) % (Math.PI * 2);
+      const state = sessionOrbState(session);
+      const color = state === "first_wss_binary_response" ? palette.direct
+        : state === "upstream_ready" ? palette.cloudflare
+          : state === "routing" ? palette.accent : palette.muted;
+      const blink = state === "routing" ? 0.42 + 0.58 * (0.5 + 0.5 * Math.sin(now / 520 + id)) : 1;
+      const radius = state === "first_wss_binary_response" ? 2.8 : 2.4;
+      const orbitRadius = orbRadii[orbit];
       context.beginPath();
-      context.arc(38 * Math.cos(angle), 38 * Math.sin(angle), 2.5, 0, Math.PI * 2);
-      const state = dotStates[index];
-      const color = state === "confirmed" ? palette.direct
-        : state === "active" ? palette.accent : palette.line;
-      context.fillStyle = rgb(color, state === "idle" ? 0.16 : dotAlpha);
+      context.arc(orbitRadius * Math.cos(angle), orbitRadius * Math.sin(angle), radius, 0, Math.PI * 2);
+      context.fillStyle = rgb(color, blink);
       context.shadowColor = rgb(color);
-      context.shadowBlur = state === "confirmed" ? 5 : state === "active" ? 2 : 0;
+      context.shadowBlur = state === "first_wss_binary_response" ? 5 : state === "routing" ? 3 * blink : 0;
       context.fill();
-    }
+    });
     context.shadowBlur = 0;
     context.beginPath(); context.arc(0, 0, 5, 0, Math.PI * 2);
     context.fillStyle = rgb(palette.text); context.fill();
     context.restore();
 
-    if (!compact) {
-      drawText("Клиент", 60, 218, "600 13px system-ui, sans-serif", rgb(palette.text, 0.72), cssWidth, cssHeight);
-      drawText("d2o", 230, 235, "13px system-ui, sans-serif", rgb(palette.text, 0.72), cssWidth, cssHeight);
-      drawText(currentView.dcLabel, 700, 220, "600 13px system-ui, sans-serif", rgb(palette.text, 0.72), cssWidth, cssHeight);
-    }
+    drawText("Клиент", CLIENT[0], CLIENT[1] + 52,
+      compact ? "600 10px system-ui, sans-serif" : "600 12px system-ui, sans-serif",
+      rgb(palette.text, 0.75), cssWidth, cssHeight);
+    drawText("d2o", ROUTE_HUB[0], ROUTE_HUB[1] + 86,
+      compact ? "10px system-ui, sans-serif" : "12px system-ui, sans-serif",
+      rgb(palette.text, 0.75), cssWidth, cssHeight);
 
     ripples.forEach(ripple => {
       const progress = ripple.elapsed / (MOTION.rippleDurationMs / 1000);
@@ -746,24 +1078,43 @@ function mountTelegramFlow(canvas) {
       context.stroke();
     });
     context.globalCompositeOperation = "lighter";
+    trafficParticles.forEach(particle => {
+      const progress = Math.min(1, Math.max(0, (now - particle.startedAt) / particle.duration));
+      const path = particle.direction === "request" ? incomingPath : responsePath;
+      const point = pointAt(path, ease(progress));
+      const color = particle.direction === "request" ? palette.accent : palette.direct;
+      context.beginPath();
+      context.moveTo(point[0] - particle.size, point[1]);
+      context.lineTo(point[0] + particle.size, point[1]);
+      context.strokeStyle = rgb(color, 0.72 * (1 - progress));
+      context.lineWidth = 1.4 + particle.size * 0.45;
+      context.lineCap = "round";
+      context.shadowColor = rgb(color);
+      context.shadowBlur = 4;
+      context.stroke();
+      context.shadowBlur = 0;
+    });
     particles.forEach(particle => {
       if (!visibleRouteIndices.has(particle.laneIndex)) return;
-      const count = particle.trail.length;
-      for (let index = 1; index < count; index += 1) {
-        const weight = index / count;
+      const color = particle.kind === "failure" ? palette.failure
+        : particle.kind === "response" ? palette.direct
+          : particle.kind === "upstream" || particle.kind === "upstream_ready"
+            ? palette.cloudflare : particle.color;
+      const count = particle.kind === "response" ? 8 : 7;
+      for (let index = 1; index <= count; index += 1) {
+        const fraction = particle.fraction - index * 0.012;
+        if (fraction < 0) continue;
+        const point = pointAt(particle.path, fraction);
         context.beginPath();
-        context.moveTo(particle.trail[index - 1][0], particle.trail[index - 1][1]);
-        context.lineTo(particle.trail[index][0], particle.trail[index][1]);
-        context.strokeStyle = rgb(particle.color, 0.22 * weight * particle.opacity);
-        context.lineWidth = 0.5 + 0.9 * weight;
-        context.lineCap = "round";
-        context.stroke();
+        context.arc(point[0], point[1], 4.2 * (1 - index / (count + 2)), 0, Math.PI * 2);
+        context.fillStyle = rgb(color, 0.55 * (1 - index / (count + 1)) * particle.opacity);
+        context.fill();
       }
       context.beginPath();
       context.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
-      context.fillStyle = rgb(particle.color, 0.9 * particle.opacity);
-      context.shadowColor = rgb(particle.color);
-      context.shadowBlur = 2.5;
+      context.fillStyle = rgb(color, 0.95 * particle.opacity);
+      context.shadowColor = rgb(color);
+      context.shadowBlur = 12;
       context.fill();
       context.shadowBlur = 0;
     });
@@ -778,9 +1129,9 @@ function mountTelegramFlow(canvas) {
   }
 
   function burst(x, y) {
-    for (let index = 0; index < 2 && sparks.length < MAX_SPARKS; index += 1) {
+    for (let index = 0; index < 7 && sparks.length < MAX_SPARKS; index += 1) {
       const angle = Math.random() * Math.PI * 2;
-      const speed = 12 + Math.random() * 16;
+      const speed = 20 + Math.random() * 40;
       sparks.push({ x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, elapsed: 0, duration: MOTION.sparkDurationMs / 1000 });
     }
   }
@@ -798,10 +1149,11 @@ function mountTelegramFlow(canvas) {
       lane.alpha += (lane.targetAlpha - lane.alpha) * smoothing;
       lane.glow += (lane.targetGlow - lane.glow) * smoothing;
       lane.markerPulse *= Math.exp(-delta * 2.8);
+      lane.gatePulses.forEach((value, index) => { lane.gatePulses[index] = value * Math.exp(-delta * 2.8); });
     });
     hub.pulse *= Math.exp(-delta * 2.2);
     hub.spin *= Math.exp(-delta * 1.6);
-    if (currentView.activeConnections > 0) hub.angle += delta * (0.08 + 0.3 * hub.spin);
+    if (currentView.activeConnections > 0) hub.angle += delta * (0.12 + 0.25 * hub.pulse);
     client.pulse *= Math.exp(-delta * 2.2);
     for (let index = particles.length - 1; index >= 0; index -= 1) {
       const particle = particles[index];
@@ -814,23 +1166,42 @@ function mountTelegramFlow(canvas) {
         particle.opacity = 1 - fade;
         particle.radius = 2 * (1 - 0.5 * fade);
       } else {
-        const progress = Math.min((now - particle.startedAt) / particle.duration, 1);
-        const fraction = particle.stopAt == null ? ease(progress) : Math.min(ease(progress), particle.stopAt);
+        const age = Math.max(0, now - particle.startedAt);
+        let progress = Math.min(age / particle.duration, 1);
+        let fraction;
+        if (particle.kind === "attempt") {
+          const start = particle.gateProgress[0] * 0.55;
+          const target = particle.gateProgress[3] * 0.92;
+          fraction = start + (target - start) * (1 - Math.exp(-age / particle.duration));
+          progress = 0;
+        } else if (particle.kind === "upstream") {
+          progress = Math.min(Math.max(0, now - particle.settleStartedAt) / MOTION.upstreamDurationMs, 1);
+          fraction = particle.settleFrom + (particle.stopAt - particle.settleFrom) * ease(progress);
+          if (progress >= 1) {
+            particle.kind = "upstream_ready";
+            fraction = particle.stopAt;
+          }
+        } else if (particle.kind === "upstream_ready") {
+          fraction = particle.stopAt;
+          progress = 0;
+        } else {
+          fraction = particle.stopAt == null ? ease(progress) : Math.min(ease(progress), particle.stopAt);
+        }
+        particle.fraction = fraction;
         const point = pointAt(particle.path, fraction);
         particle.x = point[0];
         particle.y = point[1];
         particle.opacity = 1;
-        particle.trail.push(point);
-        if (particle.trail.length > 4) particle.trail.shift();
         if (progress >= 1) {
           if (particle.kind === "failure") {
             burst(particle.x, particle.y);
             lanes[particle.laneIndex].markerPulse = 1;
-          } else if (particle.kind === "response" && now - lastRippleAt > MOTION.rippleIntervalMs) {
-            ripples.push({ x: 60, y: 170, elapsed: 0,
-              color: lanes[particle.laneIndex].targetColor });
+          } else if (particle.kind === "response") {
+            client.pulse = 1;
+            ecgBeats.push(now);
+            if (ecgBeats.length > MAX_RIPPLES) ecgBeats.shift();
+            ripples.push({ x: CLIENT[0], y: CLIENT[1], elapsed: 0, color: palette.direct });
             if (ripples.length > MAX_RIPPLES) ripples.shift();
-            lastRippleAt = now;
           }
           if (activeParticles.get(`${particle.sessionId}:${particle.laneIndex}`) === particle) {
             activeParticles.delete(`${particle.sessionId}:${particle.laneIndex}`);
@@ -838,6 +1209,13 @@ function mountTelegramFlow(canvas) {
           particles.splice(index, 1);
         }
       }
+    }
+    for (let index = ecgBeats.length - 1; index >= 0; index -= 1) {
+      if (now - ecgBeats[index] >= 1400) ecgBeats.splice(index, 1);
+    }
+    for (let index = trafficParticles.length - 1; index >= 0; index -= 1) {
+      if (now - trafficParticles[index].startedAt >= trafficParticles[index].duration)
+        trafficParticles.splice(index, 1);
     }
     for (let index = sparks.length - 1; index >= 0; index -= 1) {
       const spark = sparks[index];
@@ -870,8 +1248,14 @@ function mountTelegramFlow(canvas) {
   function updateAccessibility(view) {
     const visibleLanes = visibleRouteLanes(view);
     const routeText = visibleLanes.map(lane => {
-      const details = Object.entries(lane.counts).map(([state, count]) => `${STATE_LABELS[state] || state}: ${count}`).join(", ");
-      return `${lane.label} — ${details}`;
+      const details = Object.entries(lane.counts)
+        .map(([state, count]) => `${STATE_LABELS[state] || state}: ${count}`).join(", ")
+        || STATE_LABELS[lane.status] || "активный маршрут";
+      const gate = failureGateIndex(lane.failureStage);
+      const failure = gate === null ? "" : `, отказ на воротах ${GATE_ACCESSIBLE_NAMES[gate]}`;
+      const cooldown = lane.cooldownCount
+        ? `, пауза ${lane.cooldownCount} маршрута, ещё ${Math.ceil(lane.cooldownRemainingMs)} мс` : "";
+      return `${lane.label} — ${details}${failure}${cooldown}`;
     }).join("; ") || "Сейчас нет активных маршрутов";
     const confirmed = view.sessions.some(session => session.telegram_response_seen);
     const connectionText = confirmed
@@ -891,8 +1275,9 @@ function mountTelegramFlow(canvas) {
     const view = summarize(snapshot, error);
     const now = performance.now();
     readEvents(snapshot, view, now);
-    setLaneTargets(view);
+    readTraffic(snapshot, now);
     currentView = view;
+    setLaneTargets(view);
     updateAccessibility(view);
     if (motionPreference?.matches || !inView || document.hidden) draw();
     else startLoop();
@@ -903,6 +1288,7 @@ function mountTelegramFlow(canvas) {
     stopLoop();
     if (motionPreference?.matches) {
       particles.length = 0;
+      trafficParticles.length = 0;
       sparks.length = 0;
       ripples.length = 0;
       client.pulse = 0;
@@ -974,9 +1360,9 @@ function mountTelegramFlow(canvas) {
       motionPreference?.removeEventListener("change", motionListener);
       darkPreference?.removeEventListener("change", themeListener);
       cursors.clear();
-      attemptedSessions.clear();
       activeParticles.clear();
       particles.length = 0;
+      trafficParticles.length = 0;
       sparks.length = 0;
       ripples.length = 0;
     },
@@ -984,11 +1370,15 @@ function mountTelegramFlow(canvas) {
 }
 
 global.D2kTelegramFlow = {
+  prototypeGeometry: PROTOTYPE_GEOMETRY,
   motionProfile: MOTION,
   mountTelegramFlow,
   summarizeTelegramFlow: summarize,
   composeFlowPoints,
-  connectionDotStates,
+  sessionOrbState,
+  telegramDcNumber,
+  telegramDcActivity,
+  failureGateIndex,
   routeDescription,
   hasCurrentRouteFailure,
   visibleRouteLanes,

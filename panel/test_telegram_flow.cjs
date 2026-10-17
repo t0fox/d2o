@@ -25,24 +25,26 @@ const snapshot = (values = {}) => ({
   ...values,
 });
 
-{
-  const route = [[230, 170], [500, 100], [700, 170]];
-  const clientToHub = [[60, 170], [230, 170]];
-  assert.deepEqual(flow.composeFlowPoints(route, clientToHub, "request"),
-    [[60, 170], [230, 170], [500, 100], [700, 170]],
-    "исходная попытка идёт от клиента через d2o к Telegram");
-  assert.deepEqual(flow.composeFlowPoints(route, clientToHub, "response"),
-    [[700, 170], [500, 100], [230, 170], [60, 170]],
-    "подтверждённый ответ Telegram идёт от DC к клиенту");
-}
+assert.deepEqual(flow.prototypeGeometry, {
+  width: 900,
+  height: 420,
+  client: [70, 210],
+  hub: [300, 210],
+  collector: [720, 210],
+  laneY: [62, 148, 272, 358],
+  gateX: [465, 500, 535, 570, 605],
+  dcPositions: [[802, 70], [816, 140], [830, 210], [816, 280], [802, 350]],
+}, "сцена использует координаты исходного HTML-прототипа");
 
 {
-  assert.deepEqual(flow.connectionDotStates({ activeConnections: 0, sessions: [] }),
-    ["idle", "idle", "idle"], "при отсутствии сессий индикаторы d2o погашены");
-  assert.deepEqual(flow.connectionDotStates({ activeConnections: 5, sessions: [
-    { telegram_response_seen: true }, { telegram_response_seen: false },
-  ] }), ["confirmed", "active", "active"],
-  "индикаторы учитывают число активных соединений и подтверждённые ответы");
+  const route = [[300, 210], [500, 100], [720, 210]];
+  const clientToHub = [[70, 210], [300, 210]];
+  assert.deepEqual(flow.composeFlowPoints(route, clientToHub, "request"),
+    [[70, 210], [300, 210], [500, 100], [720, 210]],
+    "исходная попытка идёт от клиента через d2o к Telegram");
+  assert.deepEqual(flow.composeFlowPoints(route, clientToHub, "response"),
+    [[720, 210], [500, 100], [300, 210], [70, 210]],
+    "подтверждённый ответ Telegram идёт от DC к клиенту");
 }
 
 {
@@ -50,6 +52,46 @@ const snapshot = (values = {}) => ({
   assert.equal(view.state, "idle");
   assert.equal(view.activeConnections, 0);
   assert.equal(view.acceptedConnections, 0);
+}
+
+{
+  assert.equal(flow.sessionOrbState(session({ stage: "accepted" })), "accepted");
+  assert.equal(flow.sessionOrbState(session({ stage: "routing" })), "routing");
+  assert.equal(flow.sessionOrbState(session({ stage: "upstream_ready" })), "upstream_ready");
+  assert.equal(flow.sessionOrbState(session({ stage: "first_wss_binary_response" })),
+    "first_wss_binary_response");
+  assert.equal(flow.telegramDcNumber(203), 2, "DC203 располагается в узле DC2");
+  assert.equal(flow.telegramDcNumber(4), 4);
+  assert.equal(flow.telegramDcNumber(null), null);
+  assert.deepEqual(flow.telegramDcActivity([
+    session({ dc: 203, is_media: true, telegram_response_seen: true }),
+    session({ dc: 2, is_media: false, telegram_response_seen: false }),
+    session({ dc: 4, is_media: true, telegram_response_seen: false }),
+    session({ dc: 6, is_media: true, telegram_response_seen: true }),
+  ]), [
+    { active: 0, media: 0, confirmed: 0 },
+    { active: 2, media: 1, confirmed: 1 },
+    { active: 0, media: 0, confirmed: 0 },
+    { active: 1, media: 1, confirmed: 0 },
+    { active: 0, media: 0, confirmed: 0 },
+  ], "DC-узлы показывают только реальные сессии; DC203 учитывается в DC2");
+  assert.deepEqual([1, 2, 3, 4, 5].map(flow.failureGateIndex), [0, 1, 2, 3, 4],
+    "ошибки останавливаются на соответствующих воротах DNS/TCP/TLS/WS/MTProto");
+  assert.equal(flow.failureGateIndex(6), null, "подготовка маршрута не выдаётся за сетевые ворота");
+}
+
+{
+  const view = flow.summarizeTelegramFlow(snapshot({
+    active_connections: 1,
+    active_sessions: [session({ id: 42, dc: 4, is_media: true, stage: "routing" })],
+    route_cooldown_ms: 30000,
+    route_cooldowns: [{ dc: 4, is_media: true, transport: "cloudflare_proxy",
+      remaining_ms: 28750, failure_stage: 3 }],
+  }));
+  assert.deepEqual(view.cooldowns, [{ dc: 4, isMedia: true, transport: "cloudflare_proxy",
+    remainingMs: 28750, failureStage: 3 }]);
+  assert.equal(view.lanes[2].cooldownCount, 1);
+  assert.ok(flow.visibleRouteLanes(view).some(lane => lane.transport === "cloudflare_proxy"));
 }
 
 {
@@ -67,7 +109,7 @@ const snapshot = (values = {}) => ({
   assert.equal(view.state, "unavailable");
   assert.equal(view.transportLabel, "Недоступно");
   assert.match(view.caption, /TLS.*DC4.*Прокси Cloudflare/);
-  assert.equal(view.lanes[3].counts.failed, 1);
+  assert.equal(view.lanes[2].counts.failed, 1);
   assert.deepEqual(flow.visibleRouteLanes(view).map(lane => lane.transport), ["cloudflare_proxy"]);
 }
 
@@ -116,11 +158,14 @@ const snapshot = (values = {}) => ({
   assert.equal(view.mediaSessions, 2);
   assert.match(view.dcLabel, /Несколько DC · media 2/);
   assert.equal(view.lanes[0].counts.selected, 2);
-  assert.equal(view.lanes[1].label, "Прямой TCP passthrough");
-  assert.equal(view.lanes[1].counts.selected, 1);
-  assert.equal(view.lanes[2].counts.connecting, 1);
+  assert.equal(view.lanes[3].label, "Прямой TCP passthrough");
+  assert.equal(view.lanes[3].counts.selected, 1);
+  assert.equal(view.lanes[1].counts.connecting, 1);
+  assert.deepEqual(view.lanes.map(lane => lane.transport),
+    ["direct_wss", "cloudflare_worker", "cloudflare_proxy", "tcp_passthrough"],
+    "на схеме нет удалённого автоматического TCP fallback");
   assert.deepEqual(flow.visibleRouteLanes(view).map(lane => lane.transport),
-    ["direct_wss", "tcp_passthrough", "cloudflare_worker"]);
+    ["direct_wss", "cloudflare_worker", "tcp_passthrough"]);
 }
 
 {
@@ -161,12 +206,13 @@ assert.deepEqual(flow.motionProfile, {
   maxParticles: 12,
   maxSparks: 8,
   maxRipples: 6,
-  attemptDurationMs: 2200,
-  failureDurationMs: 1600,
-  responseDurationMs: 2600,
+  attemptDurationMs: 1100,
+  failureDurationMs: 1800,
+  responseDurationMs: 1100,
+  winnerDurationMs: 900,
+  upstreamDurationMs: 300,
   sparkDurationMs: 800,
-  fadeDurationMs: 650,
-  rippleDurationMs: 1100,
-  rippleIntervalMs: 1100,
+  fadeDurationMs: 600,
+  rippleDurationMs: 1200,
 }, "реальный поток движется спокойно и ограничивает визуальный шум");
 console.log("telegram flow: active sessions and route states match C11 snapshots");
