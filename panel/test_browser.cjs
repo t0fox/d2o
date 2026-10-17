@@ -70,6 +70,16 @@ async function main(){
  const wait=ms=>new Promise(r=>setTimeout(r,ms));
  const until=async(expr,msg)=>{for(let i=0;i<160;i++){if(await evaluate(expr))return;await wait(50)}throw Error(msg)};
  await call('Page.enable');await call('Runtime.enable');
+ await call('Page.addScriptToEvaluateOnNewDocument',{source:`(()=>{
+  const arc=CanvasRenderingContext2D.prototype.arc;
+  window.__tgStartupParticles=[];
+  CanvasRenderingContext2D.prototype.arc=function(x,y,r,...args){
+   if(this.canvas?.classList.contains('tg-flow-canvas')&&this.globalCompositeOperation==='lighter'
+      &&r>=1.8&&r<=2.2&&window.__tgStartupParticles.length<100)
+    window.__tgStartupParticles.push({x,y,at:performance.now()});
+   return arc.call(this,x,y,r,...args);
+  };
+ })()`});
  const out=process.env.D2K_CAPTURE_DIR;
  const panel=await require('./browser-c-fixture.cjs')(fixture);
  try{
@@ -78,6 +88,11 @@ async function main(){
   await until('document.querySelectorAll(".search").length===2','C API must populate the live searches');
   await evaluate('document.fonts.ready');
   assert.equal(await evaluate('document.fonts.check("700 24px Onest")'),true,'C CSP must load the bundled text face');
+  await until('document.querySelector("#telegram-body .tg-flow-canvas")','C11 route canvas mounts from live stats');
+  await evaluate('document.querySelector("#telegram").scrollIntoView({block:"center"})');
+  await until('window.__tgStartupParticles.length>0','fresh real C11 route events animate on the first panel view');
+  assert.ok(await evaluate('window.__tgStartupParticles.length>0'),
+   'recent C11 events present in the first stats snapshot are not silently skipped');
   async function checkLayout(){
   // Раскладка на ширинах содержимого.
   for(const [name,width,height] of [['narrow',320,740],['phone',390,844],['compact-boundary',640,1020],['overlap-regression',649,1020],['small-tablet',650,1020],['chrome-report',678,1020],['mid-tablet',700,1020],['tablet',768,1024],['tablet-boundary',820,1020],['full-label-boundary',821,1020],['status-regression',854,1020],['large-tablet',971,1020],['nav-boundary',1080,1020],['laptop',1280,800],['wide',1920,1080]]){

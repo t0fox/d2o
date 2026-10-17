@@ -30,6 +30,15 @@ const MOTION = Object.freeze({
   fadeDurationMs: 600,
   rippleDurationMs: 1200,
 });
+const EVENT_REPLAY_WINDOWS = Object.freeze({
+  connecting: MOTION.attemptDurationMs,
+  connected: MOTION.upstreamDurationMs,
+  selected: MOTION.winnerDurationMs,
+  failed: MOTION.failureDurationMs,
+  cancelled: MOTION.fadeDurationMs,
+  cooldown: 600,
+  first_binary_response: MOTION.responseDurationMs,
+});
 const LANE_Y = PROTOTYPE_GEOMETRY.laneY;
 const GATE_NAMES = ["DNS", "TCP", "TLS", "WS", "MTP"];
 const GATE_ACCESSIBLE_NAMES = ["DNS", "TCP", "TLS", "WS", "MTProto"];
@@ -669,7 +678,7 @@ function launchFailure(sessionId, laneIndex, now, failureStage, dc) {
   function readEvents(snapshot, view, now) {
     const processTime = Number(snapshot?.process_started_at || 0);
     const accepted = Number(snapshot?.accepted_connections || 0);
-    const restarted = processTime && (processStartedAt !== processTime
+    const restarted = processTime && ((processStartedAt && processStartedAt !== processTime)
       || (acceptedConnections != null && accepted < acceptedConnections));
     if (restarted) {
       cursors.clear();
@@ -700,6 +709,14 @@ function launchFailure(sessionId, laneIndex, now, failureStage, dc) {
       const previous = cursors.get(session.id);
       if (previous == null || restarted) {
         cursors.set(session.id, newest);
+        if (!restarted) {
+          events.filter(event => {
+            const age = Number(event.age_ms);
+            const windowMs = EVENT_REPLAY_WINDOWS[event.state] || 0;
+            return Number.isFinite(age) && age >= 0 && age <= windowMs;
+          }).sort((left, right) => left.sequence - right.sequence)
+            .forEach(event => processEvent(session, event, now));
+        }
         return;
       }
       const oldest = events.length ? Number(events[0].sequence) || newest : newest;
