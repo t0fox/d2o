@@ -1738,6 +1738,8 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     assert(session->direct_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
     assert(session->selected_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
     assert(session->telegram_response_seen);
+    assert(session->bytes_from_clients >= wss.expected_packet_len);
+    assert(session->bytes_from_upstreams >= wss.response_packet_len);
     assert(session->event_count >= 4);
     assert(session->events[session->event_count - 1u].state ==
            TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
@@ -1748,6 +1750,38 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
            session->events[session->event_count - 1u].timestamp_ms);
     assert(session->events[session->event_count - 1u].failure_stage ==
            TG_EPOLL_FAILURE_NONE);
+
+    char stats_path[256];
+    assert(snprintf(stats_path, sizeof(stats_path), "%s/stats.sock", directory) > 0);
+    tg_stats_socket stats_socket = {.fd = -1};
+    assert(tg_stats_socket_open(&stats_socket, stats_path) == 0);
+    int stats_client = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(stats_client >= 0);
+    struct sockaddr_un stats_address = {.sun_family = AF_UNIX};
+    memcpy(stats_address.sun_path, stats_path, strlen(stats_path) + 1u);
+    assert(connect(stats_client, (struct sockaddr *)&stats_address,
+                   sizeof(stats_address)) == 0);
+    assert(tg_stats_socket_serve(&stats_socket, proxy) == 0);
+    char stats_json[64u * 1024u];
+    size_t stats_json_len = 0;
+    for (;;) {
+        assert(stats_json_len < sizeof(stats_json) - 1u);
+        ssize_t n = recv(stats_client, stats_json + stats_json_len,
+                         sizeof(stats_json) - 1u - stats_json_len, 0);
+        if (n == 0) break;
+        assert(n > 0);
+        stats_json_len += (size_t)n;
+    }
+    stats_json[stats_json_len] = '\0';
+    char expected_session_bytes[128];
+    assert(snprintf(expected_session_bytes, sizeof(expected_session_bytes),
+        "\"telegram_response_seen\":true,\"bytes_from_clients\":%" PRIu64
+        ",\"bytes_from_upstreams\":%" PRIu64 ",\"events\":[",
+        session->bytes_from_clients, session->bytes_from_upstreams) > 0);
+    assert(strstr(stats_json, expected_session_bytes) != NULL);
+    close(stats_client);
+    tg_stats_socket_close(&stats_socket);
+
     assert(shutdown(client, SHUT_WR) == 0);
     assert(pthread_join(wss_thread, NULL) == 0);
     assert(wss.accepted_count == 1 && atomic_load(&wss.complete) == 1);

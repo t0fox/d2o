@@ -107,7 +107,8 @@ async function main() {
       'The installed panel must declare its local favicon');
     for (const [asset, mime] of [
       ['favicon.svg', 'image/svg+xml'], ['onest.woff2', 'font/woff2'],
-      ['gsap.js', 'application/javascript; charset=utf-8'], ['jbmono.woff2', 'font/woff2']
+      ['gsap.js', 'application/javascript; charset=utf-8'],
+      ['telegram-flow-prototype.js', 'application/javascript; charset=utf-8'], ['jbmono.woff2', 'font/woff2']
     ]) {
       const r = await fetch(`http://127.0.0.1:${port}/assets/${asset}`);
       assert.equal(r.status, 200, asset + ' must be served by the real C panel');

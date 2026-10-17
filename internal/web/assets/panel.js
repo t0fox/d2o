@@ -38,6 +38,10 @@
   function num(v) { return typeof v === "number" && isFinite(v) ? v : null; }
   function list(v) { return Array.isArray(v) ? v : []; }
   function str(v) { return v === undefined || v === null ? "" : String(v); }
+  function bodyAttribute(doc, name) {
+    var body = doc && doc.body;
+    return body && typeof body.getAttribute === "function" ? body.getAttribute(name) : null;
+  }
 
   function shapeLabel(shape, transport) {
     var s = SHAPES[shape];
@@ -428,7 +432,10 @@
       .catch(function () {
         self.catalogRevision = null;
         self.failed = true;
+        var staleBefore = bodyAttribute(self.doc, "data-stale");
         self.renderNotice();
+        var staleAfter = bodyAttribute(self.doc, "data-stale");
+        if (self.m && staleBefore !== staleAfter) self.renderTelegram(self.m);
       })
       .then(function () { self.win.clearTimeout(timer); self.inflight = false; });
   };
@@ -1356,7 +1363,10 @@
       if (rows[i].__parts) this.updateClock(rows[i]);
       else if (rows[i].__d2kKey === "queue") this.updateQueue(rows[i], this.m ? this.m.queued : []);
     }
+    var staleBefore = bodyAttribute(this.doc, "data-stale");
     this.renderNotice();
+    var staleAfter = bodyAttribute(this.doc, "data-stale");
+    if (this.m && staleBefore !== staleAfter) this.renderTelegram(this.m);
   };
 
   /* ─── Каталог: семейства и коробки ─── */
@@ -1898,122 +1908,49 @@
 
   function tunnelScene(doc) {
     var root = el(doc, "div", "tg-flow");
+    var top = el(doc, "div", "tg-flow-top");
+    var title = el(doc, "h1", "tg-flow-title");
+    var lamp = el(doc, "span", "tg-flow-lamp");
+    lamp.setAttribute("data-tg-state-lamp", "");
+    lamp.setAttribute("aria-hidden", "true");
+    var titleText = el(doc, "span", "", "Локальный прокси");
+    titleText.setAttribute("data-tg-state-title", "");
+    title.append(lamp, titleText);
+    var actions = el(doc, "div", "tg-flow-actions");
+    actions.setAttribute("data-tg-actions", "");
+    top.append(title, actions);
+
+    var stage = el(doc, "div", "tg-flow-stage");
     var canvas = el(doc, "canvas", "tg-flow-canvas");
     canvas.width = 900;
     canvas.height = 420;
     canvas.setAttribute("role", "img");
-    canvas.setAttribute("aria-label", "Схема активных маршрутов Telegram");
-    var caption = el(doc, "p", "tg-flow-caption", "Активные маршруты появятся после подключения.");
+    canvas.setAttribute("aria-label", "Схема: клиент, d2o, маршруты, дата-центры Telegram");
+    stage.appendChild(canvas);
+    var caption = el(doc, "p", "tg-flow-caption", "Прокси устанавливает соединение");
     caption.id = "tg-flow-caption";
-    var panels = el(doc, "div", "tg-flow-panels");
-    var active = el(doc, "section", "tg-flow-block");
-    active.setAttribute("data-tg-active-sessions", "");
-    var activeTitle = el(doc, "div", "tg-flow-block-head");
-    add(activeTitle, el(doc, "h3", "", "Активные сессии"),
-      el(doc, "span", "tg-flow-count", "0"));
-    activeTitle.lastChild.setAttribute("data-tg-session-count", "");
-    var sessionList = el(doc, "div", "tg-flow-session-list");
-    sessionList.setAttribute("data-tg-session-list", "");
-    sessionList.setAttribute("role", "list");
-    active.append(activeTitle, sessionList);
-
-    var summary = el(doc, "section", "tg-flow-block");
-    summary.setAttribute("data-tg-connection-summary", "");
-    summary.appendChild(el(doc, "h3", "", "Краткая сводка подключений"));
     var metrics = el(doc, "div", "tg-flow-metrics");
     [
-      ["Сессии сейчас", "tg-flow-metric-active", "data-tg-active-count"],
-      ["Всего подключений", "tg-flow-metric-total", "data-tg-accepted-count"],
-      ["Ответы Telegram", "tg-flow-metric-confirmed", "data-tg-confirmed-count"],
-      ["Отклик p50 / p95", "tg-flow-metric-latency", "data-tg-latency"],
-      ["WSS: отказы / попытки", "tg-flow-metric-wss", "data-tg-wss"],
-      ["К Telegram / от Telegram", "tg-flow-metric-traffic", "data-tg-traffic"]
+      ["Сессии сейчас", "data-tg-active-count"],
+      ["Всего подключений", "data-tg-accepted-count"],
+      ["Ответы Telegram", "data-tg-confirmed-count"],
+      ["Отклик p50 / p95", "data-tg-latency"],
+      ["WSS отказы / попытки", "data-tg-wss"],
+      ["Трафик ↑ / ↓", "data-tg-traffic"]
     ].forEach(function (item) {
-      var metric = el(doc, "div", "tg-flow-metric " + item[1]);
-      metric.append(el(doc, "span", "", item[0]), el(doc, "b", "", "—"));
-      metric.lastChild.setAttribute(item[2], "");
+      var metric = el(doc, "div", "tg-flow-metric");
+      metric.append(el(doc, "span", "", item[0]), el(doc, "b", "", "0"));
+      metric.lastChild.setAttribute(item[1], "");
       metrics.appendChild(metric);
     });
-    var lastSuccess = el(doc, "p", "tg-flow-last-success", "Подтверждённых ответов пока нет");
-    lastSuccess.setAttribute("data-tg-last-success", "");
-    summary.append(metrics, lastSuccess);
-    panels.append(active, summary);
-    root.append(canvas, caption, panels);
+    root.append(top, stage, caption, metrics);
     if (global.D2kTelegramFlow && global.D2kTelegramFlow.mountTelegramFlow) {
       root.__flow = global.D2kTelegramFlow.mountTelegramFlow(canvas);
     }
-    root.__sessionRows = new Map();
     return root;
   }
 
-  function telegramSessionRoute(session) {
-    if (session.selected_transport) return session.selected_transport;
-    if (session.fallback_transport && ["connecting", "connected", "first_binary_response"].indexOf(session.fallback_state) >= 0)
-      return session.fallback_transport;
-    return session.direct_transport || session.fallback_transport || null;
-  }
-
-  function telegramTransportLabel(transport) {
-    return transport === "direct_wss" ? "Прямой WSS" :
-      transport === "cloudflare_worker" ? "Cloudflare Worker" :
-      transport === "cloudflare_proxy" ? "Прокси Cloudflare" :
-      transport === "tcp_passthrough" ? "Прямой TCP" : "Маршрут определяется";
-  }
-
-  function updateTelegramSessions(ui, stats) {
-    var listNode = ui.scene.querySelector("[data-tg-session-list]");
-    var countNode = ui.scene.querySelector("[data-tg-session-count]");
-    if (!listNode || !countNode) return;
-    var sessions = stats && Array.isArray(stats.active_sessions) ? stats.active_sessions : [];
-    var activeCount = stats && Number.isFinite(Number(stats.active_connections))
-      ? Math.max(0, Number(stats.active_connections)) : null;
-    var countText = activeCount === null ? "—" : String(activeCount);
-    if (stats && stats.route_sessions_truncated) countText += "+";
-    if (countNode.textContent !== countText) countNode.textContent = countText;
-    var live = new Set(sessions.map(function (session) { return String(session.id); }));
-    ui.scene.__sessionRows.forEach(function (row, id) {
-      if (!live.has(id)) { row.remove(); ui.scene.__sessionRows.delete(id); }
-    });
-    if (!stats) {
-      ui.sessionEmpty = ui.sessionEmpty || el(ui.scene.ownerDocument, "p", "tg-flow-empty", "Статистика маршрутов пока недоступна");
-      if (ui.sessionEmpty.parentNode !== listNode) listNode.replaceChildren(ui.sessionEmpty);
-      return;
-    }
-    if (!sessions.length) {
-      ui.sessionEmpty = ui.sessionEmpty || el(ui.scene.ownerDocument, "p", "tg-flow-empty", activeCount
-        ? "Сессии есть, маршрут ещё определяется" : "Нет активных сессий");
-      ui.sessionEmpty.textContent = activeCount ? "Сессии есть, маршрут ещё определяется" : "Нет активных сессий";
-      if (ui.sessionEmpty.parentNode !== listNode) listNode.replaceChildren(ui.sessionEmpty);
-      return;
-    }
-    if (ui.sessionEmpty && ui.sessionEmpty.parentNode === listNode) ui.sessionEmpty.remove();
-    sessions.forEach(function (session) {
-      var id = String(session.id);
-      var row = ui.scene.__sessionRows.get(id);
-      if (!row) {
-        row = el(ui.scene.ownerDocument, "div", "tg-flow-session");
-        row.setAttribute("role", "listitem");
-        row.__fields = [el(ui.scene.ownerDocument, "b"), el(ui.scene.ownerDocument, "span"), el(ui.scene.ownerDocument, "span")];
-        row.__fields.forEach(function (field) { row.appendChild(field); });
-        ui.scene.__sessionRows.set(id, row);
-      }
-      var dcNumber = Number(session.dc) === 203 ? 2 : Number(session.dc);
-      var dc = Number.isInteger(dcNumber) && dcNumber >= 1 && dcNumber <= 5 ? "DC" + dcNumber : "DC неизвестен";
-      var kind = session.is_media === true ? "media" : session.is_media === false ? "основная" : "тип не определён";
-      var confirmed = session.telegram_response_seen === true;
-      var route = telegramTransportLabel(telegramSessionRoute(session));
-      var status = confirmed ? "Ответ Telegram подтверждён" :
-        session.stage === "upstream_ready" ? "Маршрут готов · ждём ответ Telegram" :
-          session.stage === "routing" ? "Подбирается маршрут" : "Соединение принято";
-      var values = [dc + " · " + kind, "Маршрут: " + route, status];
-      row.__fields.forEach(function (field, index) {
-        if (field.textContent !== values[index]) field.textContent = values[index];
-      });
-      if (row.parentNode !== listNode) listNode.appendChild(row);
-    });
-  }
-
-  function updateTelegramSummary(ui, stats) {
+  function updateTelegramMetrics(ui, stats) {
     var scene = ui.scene;
     var active = stats ? String(Math.max(0, Number(stats.active_connections) || 0)) : "—";
     var total = stats ? String(Math.max(0, Number(stats.accepted_connections) || 0)) : "—";
@@ -2031,20 +1968,13 @@
     var p50us = Number(stats && stats.client_response_latency_p50_us);
     var p95us = Number(stats && stats.client_response_latency_p95_us);
     var latency = latencySamples > 0 && Number.isFinite(p50us) && Number.isFinite(p95us)
-      ? "p50 " + telegramMilliseconds(p50us / 1000) + " · p95 " + telegramMilliseconds(p95us / 1000) : "—";
+      ? telegramMilliseconds(p50us / 1000).replace(/ мс$/, "") + " / " +
+        telegramMilliseconds(p95us / 1000) : "—";
     var wss = stats ? (Number(stats.wss_failures) || 0) + " / " + (Number(stats.wss_attempts) || 0) : "—";
     var traffic = stats ? telegramBytes(stats.bytes_from_clients) + " / " + telegramBytes(stats.bytes_from_upstreams) : "—";
     if (latencyNode && latencyNode.textContent !== latency) latencyNode.textContent = latency;
     if (wssNode && wssNode.textContent !== wss) wssNode.textContent = wss;
     if (trafficNode && trafficNode.textContent !== traffic) trafficNode.textContent = traffic;
-    var last = scene.querySelector("[data-tg-last-success]");
-    if (!last) return;
-    var successCount = Number(stats && stats.wss_responses) || 0;
-    var text = successCount && Number.isFinite(Number(stats.last_success_age_ms))
-      ? "Последний успешный ответ: " + (stats.last_success_dc ? "DC" + (Number(stats.last_success_dc) === 203 ? 2 : stats.last_success_dc) + " · " : "") +
-        telegramRouteName(Number(stats.last_success_route)) + " · " + telegramMilliseconds(Number(stats.last_success_age_ms)) + " назад"
-      : successCount ? "Подтверждён ответ Telegram" : "Подтверждённых ответов пока нет";
-    if (last.textContent !== text) last.textContent = text;
   }
 
   App.prototype.renderTelegram = function (m, force) {
@@ -2067,20 +1997,19 @@
     body.__d2kKey = key;
     var ui = body.__tgUi;
     if (!ui) {
+      var scene = tunnelScene(doc);
       ui = body.__tgUi = {
-        state: el(doc, "div", "tunnel-state"),
-        lamp: el(doc, "span", "lamp"),
-        word: el(doc, "span", "tunnel-word"),
-        actions: el(doc, "div", "tunnel-actions"),
-        scene: tunnelScene(doc),
-        note: el(doc, "p", "tunnel-note"),
+        scene: scene,
+        lamp: scene.querySelector("[data-tg-state-lamp]"),
+        word: scene.querySelector("[data-tg-state-title]"),
+        actions: scene.querySelector("[data-tg-actions]"),
       };
-      ui.state.append(ui.lamp, ui.word);
-      body.replaceChildren(ui.state, ui.actions, ui.scene, ui.note);
+      body.replaceChildren(scene);
       if (ui.scene.__flow) ui.scene.__flow.attach();
     }
     ui.lamp.setAttribute("data-tone", info.lamp);
-    if (ui.word.textContent !== info.word) ui.word.textContent = info.word;
+    ui.lamp.setAttribute("aria-label", info.word);
+    if (ui.word.textContent !== "Локальный прокси") ui.word.textContent = "Локальный прокси";
     var buttons = [];
     if (snap.controls_enabled) {
       if (snap.telegram_enabled) {
@@ -2091,14 +2020,9 @@
     }
     buttons.push(this.button("telegram-workers", "Мои Workers", null, null, busy));
     ui.actions.replaceChildren.apply(ui.actions, buttons);
-    var note = info.note;
-    if (routeFailure) note = "Последняя попытка Telegram завершилась ошибкой. Причина указана в схеме маршрутов.";
-    if (snap.telegram_enabled && st === "stopped") note = "Туннель включён в конфигурации, но служба не запущена.";
-    if (ui.note.textContent !== note) ui.note.textContent = note;
     body.setAttribute("data-state", st);
-    if (ui.scene.__flow) ui.scene.__flow.update(stats);
-    updateTelegramSessions(ui, stats);
-    updateTelegramSummary(ui, stats);
+    if (ui.scene.__flow) ui.scene.__flow.update(stats, stale);
+    updateTelegramMetrics(ui, stats);
     if (focused) {
       var again = body.querySelector("button");
       if (again) again.focus();

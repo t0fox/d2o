@@ -1422,6 +1422,9 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     if (strcmp(path, "/assets/telegram-flow.js") == 0) {
         return static_file(fd, cfg, req, "telegram-flow.js", "application/javascript; charset=utf-8");
     }
+    if (strcmp(path, "/assets/telegram-flow-prototype.js") == 0) {
+        return static_file(fd, cfg, req, "telegram-flow-prototype.js", "application/javascript; charset=utf-8");
+    }
     if (strcmp(path, "/assets/gsap.js") == 0) {
         return static_file(fd, cfg, req, "gsap.js", "application/javascript; charset=utf-8");
     }

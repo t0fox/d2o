@@ -79,6 +79,8 @@ typedef struct {
     uint8_t telegram_response_seen;
     uint8_t event_count;
     uint64_t next_event_sequence;
+    uint64_t bytes_from_clients;
+    uint64_t bytes_from_upstreams;
     tg_route_session_event events[TG_EPOLL_MAX_ROUTE_EVENTS];
 } tg_active_route_session;
 

@@ -255,6 +255,16 @@ static proxy_connection *route_session_owner(proxy_connection *connection) {
         ? connection->hedge_parent : connection;
 }
 
+static void route_session_add_bytes(proxy_connection *connection,
+                                    int from_client, size_t amount) {
+    proxy_connection *owner = route_session_owner(connection);
+    if (!owner || !owner->route_session_tracked) return;
+    uint64_t *total = from_client
+        ? &owner->route_session.bytes_from_clients
+        : &owner->route_session.bytes_from_upstreams;
+    add_bytes(total, amount);
+}
+
 static uint8_t route_session_transport_for(const proxy_connection *connection,
                                            tg_route_kind kind) {
     if (kind == TG_ROUTE_DIRECT_WSS)
@@ -1651,6 +1661,7 @@ static int receive_client(proxy_connection *connection) {
         ssize_t n = recv(connection->client_fd, buffer, capacity, 0);
         if (n > 0) {
             add_bytes(&connection->server->bytes_from_clients, (size_t)n);
+            route_session_add_bytes(connection, 1, (size_t)n);
             connection->last_activity_ms = monotonic_ms();
             if (!connection->handshake_done) {
                 memcpy(connection->handshake + connection->handshake_len,
@@ -1717,6 +1728,7 @@ static int receive_upstream(proxy_connection *connection) {
         ssize_t n = recv(connection->upstream_fd, buffer, capacity, 0);
         if (n > 0) {
             add_bytes(&connection->server->bytes_from_upstreams, (size_t)n);
+            route_session_add_bytes(connection, 0, (size_t)n);
             connection->last_activity_ms = monotonic_ms();
             if (queue_append_grow(connection, &connection->to_client,
                                   buffer, (size_t)n, queue_limit) != 0)
@@ -2034,6 +2046,7 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
                           TG_MTPROTO_MAX_PACKET) != 0)
         return -1;
     add_bytes(&connection->server->bytes_from_upstreams, payload_len);
+    route_session_add_bytes(connection, 0, payload_len);
     connection->last_activity_ms = monotonic_ms();
     return 0;
 }

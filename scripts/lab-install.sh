@@ -133,7 +133,7 @@ cp telegram/build-lab/d2ktg "$REL/builds/d2ktg-linux-$ARCH"
 make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
-cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/telegram-flow.js internal/web/assets/gsap.js "$REL/internal/web/assets/"
+cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/telegram-flow.js internal/web/assets/telegram-flow-prototype.js internal/web/assets/gsap.js "$REL/internal/web/assets/"
 cp internal/web/assets/favicon.svg "$REL/internal/web/assets/"
 mkdir -p "$REL/internal/web/assets/fonts"
 cp internal/web/assets/fonts/onest.woff2 internal/web/assets/fonts/OFL-onest.txt internal/web/assets/fonts/jbmono.woff2 internal/web/assets/fonts/OFL-jbmono.txt "$REL/internal/web/assets/fonts/"
@@ -264,7 +264,7 @@ done
 [ -e "$DIR/run/d2ktg.pid" ] || fail "Telegram не запущен установщиком"
 [ -x /opt/sbin/d2kpanel ] || fail "C-панель не установлена"
 [ ! -x /opt/sbin/d2k ] || fail "legacy Go-панель осталась установленной"
-[ -s "$DIR/panel/index.html" ] && [ -s "$DIR/panel/panel.css" ] && [ -s "$DIR/panel/panel.js" ] && [ -s "$DIR/panel/gsap.js" ] && [ -s "$DIR/panel/fonts/onest.woff2" ] && [ -s "$DIR/panel/fonts/jbmono.woff2" ] || fail "не установлены статические ресурсы панели"
+[ -s "$DIR/panel/index.html" ] && [ -s "$DIR/panel/panel.css" ] && [ -s "$DIR/panel/panel.js" ] && [ -s "$DIR/panel/telegram-flow-prototype.js" ] && [ -s "$DIR/panel/gsap.js" ] && [ -s "$DIR/panel/fonts/onest.woff2" ] && [ -s "$DIR/panel/fonts/jbmono.woff2" ] || fail "не установлены статические ресурсы панели"
 [ -x "$INIT" ]        || fail "init-скрипт не установлен"
 [ -f "$DIR/run/d2k-panel.pid" ] || fail "C-панель не получила pid-файл"
 PANEL_PID=$(cat "$DIR/run/d2k-panel.pid")
@@ -291,6 +291,7 @@ fi
 panel_curl -fsS http://127.0.0.1:8090/ | grep -q 'id="app"' || fail "C-панель не отдала главную страницу через LAN-привязку"
 panel_curl -fsS http://127.0.0.1:8090/assets/gsap.js -o /tmp/d2k-gsap.js || fail "C-панель не отдала библиотеку анимаций"
 panel_curl -fsS http://127.0.0.1:8090/assets/telegram-flow.js -o /tmp/d2k-telegram-flow.js || fail "C-панель не отдала анимацию Telegram"
+panel_curl -fsS http://127.0.0.1:8090/assets/telegram-flow-prototype.js -o /tmp/d2k-telegram-flow-prototype.js || fail "C-панель не отдала макет Telegram"
 panel_curl -fsS http://127.0.0.1:8090/assets/onest.woff2 -o /tmp/d2k-onest.woff2 || fail "C-панель не отдала шрифт"
 panel_post stop | grep -q '"ok":true' || fail "локальная панель не остановила движок"
 [ -d "/proc/$PANEL_PID" ] || fail "остановка движка погасила панель управления"

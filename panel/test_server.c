@@ -702,6 +702,19 @@ static void test_vendored_animation_library_is_served_same_origin(void) {
     assert(strstr(response, "Content-Type: application/javascript; charset=utf-8") != NULL);
 }
 
+static void test_telegram_prototype_animation_is_served_same_origin(void) {
+    d2k_panel_config cfg = {
+        .live_path = "/absent",
+        .asset_dir = "../internal/web/assets",
+    };
+    char response[8192];
+    (void)request(&cfg, "GET /assets/telegram-flow-prototype.js HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                  response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "Content-Type: application/javascript; charset=utf-8") != NULL);
+    assert(strstr(response, "function mountTelegramFlow(canvas)") != NULL);
+}
+
 static void test_static_assets_revalidate_with_etag(void) {
     d2k_panel_config cfg = {
         .live_path = "/absent",
@@ -771,6 +784,7 @@ int main(void) {
     test_retired_slidoscope_assets_are_not_served();
     test_offline_text_fonts_are_served_as_woff2();
     test_vendored_animation_library_is_served_same_origin();
+    test_telegram_prototype_animation_is_served_same_origin();
     test_static_assets_revalidate_with_etag();
     test_disconnected_client_cannot_sigpipe_server();
     puts("C panel HTTP contract: all checks passed");

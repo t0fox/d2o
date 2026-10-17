@@ -37,6 +37,31 @@ assert.deepEqual(flow.prototypeGeometry, {
 }, "сцена использует координаты исходного HTML-прототипа");
 
 {
+  const previous = new Map();
+  const media = session({ id: 91, dc: 4, is_media: true,
+    selected_transport: "cloudflare_worker", telegram_response_seen: true,
+    bytes_from_clients: 1200, bytes_from_upstreams: 800 });
+  assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [media]), [],
+    "первичный снимок только задаёт базу и не проигрывает накопленный трафик");
+  const next = { ...media, bytes_from_clients: 5320, bytes_from_upstreams: 4900 };
+  assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [next]), [
+    { id: 91, laneIndex: 1, dc: 4, direction: "request", bytes: 4120 },
+    { id: 91, laneIndex: 1, dc: 4, direction: "response", bytes: 4100 },
+  ], "пакеты идут по подтверждённому Cloudflare Worker маршруту DC4 media");
+  assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [next]), [],
+    "повторный poll без новых байтов не рисует пакеты");
+  assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [
+    { ...next, bytes_from_clients: 3, bytes_from_upstreams: 2 },
+  ]), [], "сброс счётчиков не выдаётся за новые пакеты");
+  const unconfirmed = session({ id: 92, dc: 2, selected_transport: "direct_wss",
+    bytes_from_clients: 0, bytes_from_upstreams: 0 });
+  flow.collectConfirmedTrafficDeltas(previous, [unconfirmed]);
+  assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [{ ...unconfirmed,
+    bytes_from_clients: 4096, bytes_from_upstreams: 4096 }]), [],
+  "неподтверждённая сессия не рисует успешный трафик");
+}
+
+{
   const route = [[300, 210], [500, 100], [720, 210]];
   const clientToHub = [[70, 210], [300, 210]];
   assert.deepEqual(flow.composeFlowPoints(route, clientToHub, "request"),
@@ -55,6 +80,21 @@ assert.deepEqual(flow.prototypeGeometry, {
 }
 
 {
+  const view = flow.summarizeTelegramFlow(null);
+  assert.equal(view.state, "unavailable");
+  assert.match(view.caption, /статистика.*недоступна/i,
+    "отсутствующие данные C11 не выглядят как ноль активных соединений");
+}
+
+{
+  const view = flow.summarizeTelegramFlow(snapshot({ active_connections: 1 }), "stale");
+  assert.equal(view.state, "stale");
+  assert.equal(view.activeConnections, 1,
+    "устаревший снимок сохраняет последнюю цифру и не выдаёт её за текущую");
+  assert.match(view.caption, /данные.*устарели/i);
+}
+
+{
   assert.equal(flow.sessionOrbState(session({ stage: "accepted" })), "accepted");
   assert.equal(flow.sessionOrbState(session({ stage: "routing" })), "routing");
   assert.equal(flow.sessionOrbState(session({ stage: "upstream_ready" })), "upstream_ready");
@@ -63,6 +103,12 @@ assert.deepEqual(flow.prototypeGeometry, {
   assert.equal(flow.telegramDcNumber(203), 2, "DC203 располагается в узле DC2");
   assert.equal(flow.telegramDcNumber(4), 4);
   assert.equal(flow.telegramDcNumber(null), null);
+  assert.deepEqual(flow.telegramDcPosition(203), [816, 140],
+    "маршрут DC203 заканчивается в узле DC2");
+  assert.deepEqual(flow.telegramDcPosition(4), [816, 280],
+    "media DC4 заканчивается в узле DC4");
+  assert.equal(flow.telegramDcPosition(null), null,
+    "маршрут без DC не приписывается узлу");
   assert.deepEqual(flow.telegramDcActivity([
     session({ dc: 203, is_media: true, telegram_response_seen: true }),
     session({ dc: 2, is_media: false, telegram_response_seen: false }),
@@ -158,6 +204,8 @@ assert.deepEqual(flow.prototypeGeometry, {
   assert.equal(view.mediaSessions, 2);
   assert.match(view.dcLabel, /Несколько DC · media 2/);
   assert.equal(view.lanes[0].counts.selected, 2);
+  assert.equal(view.lanes[0].confirmed, 1,
+    "маршрут считает только сессии с подтверждённым ответом Telegram");
   assert.equal(view.lanes[3].label, "Прямой TCP passthrough");
   assert.equal(view.lanes[3].counts.selected, 1);
   assert.equal(view.lanes[1].counts.connecting, 1);
