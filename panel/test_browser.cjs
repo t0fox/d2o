@@ -210,7 +210,7 @@ async function main(){
   panel.telegramStats({...fixture.telegramStats,active_connections:0,active_sessions:[],route_cooldowns:[]});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
   await until('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state==="idle"','expired route cooldown clears from C11 stats');
-  await wait(350);
+  await wait(await evaluate('Math.max(window.D2kTelegramFlow.motionProfile.responseDurationMs,1400)+50'));
   const sessionBeforeResponse={...fixture.telegramStats.active_sessions[0],telegram_response_seen:false,events:[]};
   panel.telegramStats({...fixture.telegramStats,active_connections:1,active_sessions:[sessionBeforeResponse]});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
