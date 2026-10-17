@@ -31,6 +31,7 @@ typedef struct {
     tg_ws_routing_policy ws_routing;
     uint32_t ws_hedge_delay_ms;
     uint32_t ws_hedge_limit;
+    int diagnostic_direct_tcp;
     int cf_balance;
     int default_domains;
     uint16_t listen_port;

@@ -10,11 +10,11 @@ uint32_t tg_route_websocket_dc(uint32_t dc_id) {
 int tg_route_cf_proxy_hostname(uint32_t dc_id, int media_variant,
                                const char *domain, char *hostname,
                                size_t hostname_size) {
-    uint32_t dc = tg_route_websocket_dc(dc_id);
-    if (dc < 1 || dc > 5 || (media_variant != 0 && media_variant != 1) ||
+    if (dc_id < 1 || dc_id > 999 ||
+        (media_variant != 0 && media_variant != 1) ||
         !domain || !*domain || !hostname || !hostname_size)
         return -1;
-    int n = snprintf(hostname, hostname_size, "kws%u%s.%s", dc,
+    int n = snprintf(hostname, hostname_size, "kws%u%s.%s", dc_id,
                      media_variant ? "-1" : "", domain);
     return n > 0 && (size_t)n < hostname_size ? 0 : -1;
 }
@@ -54,9 +54,11 @@ static int append_cloudflare(tg_route_plan *plan, size_t worker_count,
 int tg_route_plan_build(uint32_t dc_id, int is_media,
                         tg_ws_routing_policy policy, int prefer_cf,
                         size_t worker_count, size_t cf_domain_count,
+                        int diagnostic_direct_tcp,
                         tg_route_plan *out) {
     if (!out || dc_id > 999 || (is_media != 0 && is_media != 1) ||
         (prefer_cf != 0 && prefer_cf != 1) ||
+        (diagnostic_direct_tcp != 0 && diagnostic_direct_tcp != 1) ||
         worker_count > TG_CONFIG_MAX_CF_WORKER_DOMAINS ||
         cf_domain_count > TG_CF_POOL_MAX ||
         (policy != TG_WS_ROUTING_ADAPTIVE &&
@@ -76,5 +78,6 @@ int tg_route_plan_build(uint32_t dc_id, int is_media,
             append_cloudflare(out, worker_count, cf_domain_count, is_media) != 0)
             return -1;
     }
-    return append_step(out, TG_ROUTE_DIRECT_TCP, 0);
+    return diagnostic_direct_tcp
+        ? append_step(out, TG_ROUTE_DIRECT_TCP, 0) : 0;
 }

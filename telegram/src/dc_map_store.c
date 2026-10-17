@@ -43,11 +43,25 @@ static int same_address_port(const tg_dc_endpoint *left,
            memcmp(left->address, right->address, len) == 0;
 }
 
+static int same_address(const tg_dc_endpoint *left,
+                        const tg_dc_endpoint *right) {
+    size_t len = left->family == AF_INET ? 4 : 16;
+    return left->family == right->family &&
+           memcmp(left->address, right->address, len) == 0;
+}
+
+static int same_route(const tg_dc_endpoint *left,
+                      const tg_dc_endpoint *right) {
+    return left->id == right->id && left->media_only == right->media_only &&
+           left->tcpo_only == right->tcpo_only && left->cdn == right->cdn &&
+           left->this_port_only == right->this_port_only;
+}
+
 static int same_identity(const tg_dc_endpoint *left,
                          const tg_dc_endpoint *right) {
     return same_address_port(left, right) && left->id == right->id &&
            left->media_only == right->media_only && left->tcpo_only == right->tcpo_only &&
-           left->cdn == right->cdn && left->is_static == right->is_static &&
+           left->cdn == right->cdn &&
            left->this_port_only == right->this_port_only &&
            left->secret_len == right->secret_len &&
            memcmp(left->secret, right->secret, left->secret_len) == 0;
@@ -59,7 +73,8 @@ static int replaced_by_incoming(const tg_dc_endpoint *old,
         const tg_dc_endpoint *fresh = &incoming->endpoints[i];
         if (same_address_port(fresh, old) &&
             (fresh->id != old->id || fresh->media_only != old->media_only ||
-             fresh->cdn != old->cdn))
+             fresh->tcpo_only != old->tcpo_only || fresh->cdn != old->cdn ||
+             fresh->this_port_only != old->this_port_only))
             return 1;
     }
     return 0;
@@ -77,6 +92,32 @@ static int endpoint_order(const void *a, const void *b) {
     if (left->cdn != right->cdn) return left->cdn - right->cdn;
     if (left->this_port_only != right->this_port_only)
         return left->this_port_only - right->this_port_only;
+    return 0;
+}
+
+static int append_builtin_endpoints(tg_dc_snapshot *snapshot, int64_t now) {
+    tg_dc_endpoint *endpoints = (tg_dc_endpoint *)snapshot->endpoints;
+    for (size_t i = 0; i < tg_dc_builtin_endpoint_count(); ++i) {
+        tg_dc_endpoint builtin;
+        if (tg_dc_builtin_endpoint_at(i, now, &builtin) != 0) return -1;
+        int duplicate = 0, conflict = 0;
+        for (size_t j = 0; j < snapshot->endpoint_count; ++j) {
+            const tg_dc_endpoint *known = &endpoints[j];
+            if (!same_address(known, &builtin)) continue;
+            if (same_route(known, &builtin)) duplicate = 1;
+            else conflict = 1;
+        }
+        /* Свежие данные Telegram важнее алиаса при смене DC, media или
+         * ограничений TCP/порта. Не добавляем алиас поверх такой записи. */
+        if (duplicate || conflict) continue;
+        if (snapshot->endpoint_count == TG_DC_MAP_MAX_ENDPOINTS) return -1;
+        tg_dc_endpoint *grown = realloc(endpoints,
+            (snapshot->endpoint_count + 1) * sizeof(*endpoints));
+        if (!grown) return -1;
+        endpoints = grown;
+        endpoints[snapshot->endpoint_count++] = builtin;
+        snapshot->endpoints = endpoints;
+    }
     return 0;
 }
 
@@ -106,6 +147,7 @@ static int merge_snapshot(const tg_dc_snapshot *previous,
             out->endpoints = endpoints;
         }
     }
+    if (append_builtin_endpoints(out, now) != 0) goto fail;
     qsort((void *)out->endpoints, out->endpoint_count,
           sizeof(*out->endpoints), endpoint_order);
     if (tg_dc_snapshot_validate(out, now) != 0) goto fail;
@@ -240,6 +282,14 @@ int tg_dc_map_store_load(tg_dc_map_store *store, int64_t now) {
     if (read_snapshot_file(store->path, now, &loaded) != 0 &&
         read_snapshot_file(backup, now, &loaded) != 0)
         return 0;
+    size_t before = loaded.endpoint_count;
+    if (append_builtin_endpoints(&loaded, now) != 0 ||
+        tg_dc_snapshot_validate(&loaded, now) != 0) {
+        tg_dc_snapshot_destroy(&loaded);
+        return -1;
+    }
+    if (loaded.endpoint_count != before)
+        (void)save_snapshot(store->path, &loaded, now);
     if (store->has_snapshot) tg_dc_snapshot_destroy(&store->snapshot);
     store->snapshot = loaded;
     store->has_snapshot = 1;

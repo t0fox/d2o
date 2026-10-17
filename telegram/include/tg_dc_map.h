@@ -77,6 +77,9 @@ int tg_dc_map_store_refresh_due(const tg_dc_map_store *store, int64_t now,
                                 uint64_t refresh_secs);
 int tg_dc_map_store_install(tg_dc_map_store *store,
                             const tg_dc_snapshot *incoming, int64_t now);
+size_t tg_dc_builtin_endpoint_count(void);
+int tg_dc_builtin_endpoint_at(size_t index, int64_t now,
+                              tg_dc_endpoint *out);
 int tg_dc_map_store_resolve(const tg_dc_map_store *store, int64_t now,
                             const tg_listener_destination *destination,
                             int media_hint, uint32_t dc_hint, int allow_cdn,

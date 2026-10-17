@@ -35,6 +35,60 @@ static tg_dc_snapshot complete_snapshot(tg_dc_endpoint endpoints[6], int64_t now
     };
 }
 
+static int snapshot_has_route(const tg_dc_snapshot *snapshot, uint32_t dc,
+                              const char *ip, int media_only) {
+    uint8_t address[16] = {0};
+    if (!snapshot || inet_pton(AF_INET, ip, address) != 1) return 0;
+    for (size_t i = 0; i < snapshot->endpoint_count; ++i) {
+        const tg_dc_endpoint *endpoint = &snapshot->endpoints[i];
+        if (endpoint->id == dc && endpoint->family == AF_INET &&
+            endpoint->media_only == media_only &&
+            memcmp(endpoint->address, address, 4) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void assert_media_catalogue(const tg_dc_map_store *store, int64_t now) {
+    static const struct {
+        uint32_t dc;
+        const char *ip;
+    } media[] = {
+        {1, "149.154.175.52"},
+        {2, "149.154.167.151"}, {2, "149.154.167.222"},
+        {2, "149.154.167.223"}, {2, "149.154.162.123"},
+        {3, "149.154.175.102"},
+        {4, "149.154.167.43"}, {4, "149.154.164.250"},
+        {4, "149.154.166.120"}, {4, "149.154.166.121"},
+        {4, "149.154.167.118"}, {4, "149.154.165.111"},
+        {5, "91.108.56.102"}, {5, "91.108.56.128"},
+        {5, "91.108.56.151"}
+    };
+    const tg_dc_snapshot *snapshot = tg_dc_map_store_current(store);
+    assert(snapshot != NULL);
+    for (size_t i = 0; i < sizeof(media) / sizeof(media[0]); ++i) {
+        tg_listener_destination destination = {.family = AF_INET, .port = 443};
+        assert(inet_pton(AF_INET, media[i].ip, destination.address) == 1);
+        assert(snapshot_has_route(snapshot, media[i].dc, media[i].ip, 1));
+        tg_dc_endpoint route;
+        tg_dc_map_source source;
+        assert(tg_dc_map_store_resolve(store, now, &destination, 1,
+                                       media[i].dc, 1, &route, &source) ==
+               TG_DC_LOOKUP_OK);
+        assert(source == TG_DC_MAP_OFFICIAL && route.id == media[i].dc &&
+               route.media_only);
+        assert(tg_dc_map_store_resolve(store, now, &destination, 0,
+                                       media[i].dc, 1, &route, &source) ==
+               TG_DC_LOOKUP_MEDIA);
+    }
+    tg_listener_destination unknown = {.family = AF_INET, .port = 443};
+    assert(inet_pton(AF_INET, "149.154.167.250", unknown.address) == 1);
+    tg_dc_endpoint route;
+    tg_dc_map_source source;
+    assert(tg_dc_map_store_resolve(store, now, &unknown, 1, 4, 1,
+                                   &route, &source) == TG_DC_LOOKUP_NOT_LISTED);
+}
+
 static void make_paths(char dir[], char path[TG_DC_MAP_PATH_MAX]) {
     char *created = mkdtemp(dir);
     assert(created != NULL);
@@ -68,19 +122,22 @@ static void test_store_install_merge_and_last_known_good_recovery(void) {
     tg_dc_endpoint endpoints[6];
     tg_dc_snapshot first = complete_snapshot(endpoints, INT64_C(1800000000));
     assert(tg_dc_map_store_install(&store, &first, INT64_C(1800000000)) == 0);
-    assert(tg_dc_map_store_current(&store)->endpoint_count == 5);
+    size_t installed_count = tg_dc_map_store_current(&store)->endpoint_count;
+    assert(installed_count > 5);
+    assert(snapshot_has_route(tg_dc_map_store_current(&store), 4,
+                              "149.154.167.43", 1));
     assert(!tg_dc_map_store_refresh_due(&store, INT64_C(1800000000), 3600));
     assert(tg_dc_map_store_refresh_due(&store, INT64_C(1800003600), 3600));
 
     endpoints[5] = endpoints[1];
-    endpoint(&endpoints[5], 2, "149.154.167.220", INT64_C(1800000001));
+    endpoint(&endpoints[5], 2, "149.154.167.224", INT64_C(1800000001));
     first.endpoint_count = 6;
     first.fetched_at = INT64_C(1800000001);
     first.config_date = INT64_C(1800000001);
     first.config_expires = INT64_C(1800086401);
     first.endpoints = endpoints;
     assert(tg_dc_map_store_install(&store, &first, INT64_C(1800000001)) == 0);
-    assert(tg_dc_map_store_current(&store)->endpoint_count == 6);
+    assert(tg_dc_map_store_current(&store)->endpoint_count == installed_count + 1);
     assert(!tg_dc_map_store_refresh_due(&store, INT64_C(1800000001), 3600));
     tg_dc_map_store_destroy(&store);
 
@@ -90,7 +147,8 @@ static void test_store_install_merge_and_last_known_good_recovery(void) {
     assert(tg_dc_map_store_init(&recovered, path) == 0);
     assert(tg_dc_map_store_load(&recovered, INT64_C(1800000001)) == 0);
     const tg_dc_snapshot *snapshot = tg_dc_map_store_current(&recovered);
-    assert(snapshot != NULL && snapshot->endpoint_count == 5);
+    assert(snapshot != NULL && snapshot->endpoint_count == installed_count);
+    assert(snapshot_has_route(snapshot, 4, "149.154.167.43", 1));
     assert(snapshot->config_date == INT64_C(1800000000));
     tg_dc_map_store_destroy(&recovered);
     remove_paths(path);
@@ -105,12 +163,99 @@ static void test_rejected_update_does_not_replace_active_snapshot(void) {
     tg_dc_snapshot snapshot = complete_snapshot(endpoints, INT64_C(1800000000));
     assert(tg_dc_map_store_init(&store, path) == 0);
     assert(tg_dc_map_store_install(&store, &snapshot, INT64_C(1800000000)) == 0);
+    size_t installed_count = tg_dc_map_store_current(&store)->endpoint_count;
     snapshot.endpoint_count = 4;
     snapshot.config_date = INT64_C(1800000001);
     snapshot.fetched_at = INT64_C(1800000001);
     assert(tg_dc_map_store_install(&store, &snapshot, INT64_C(1800000001)) != 0);
-    assert(tg_dc_map_store_current(&store)->endpoint_count == 5);
+    assert(tg_dc_map_store_current(&store)->endpoint_count == installed_count);
     assert(tg_dc_map_store_current(&store)->config_date == INT64_C(1800000000));
+    tg_dc_map_store_destroy(&store);
+    remove_paths(path);
+}
+
+static void test_refresh_keeps_complete_media_route_catalogue(void) {
+    const int64_t now = INT64_C(1800000000);
+    char dir[] = "/tmp/d2k-dc-media-XXXXXX";
+    char path[TG_DC_MAP_PATH_MAX];
+    make_paths(dir, path);
+    tg_dc_map_store store = {0};
+    tg_dc_endpoint endpoints[6];
+    tg_dc_snapshot snapshot = complete_snapshot(endpoints, now);
+    assert(tg_dc_map_store_init(&store, path) == 0);
+    assert(tg_dc_map_store_install(&store, &snapshot, now) == 0);
+    assert_media_catalogue(&store, now);
+
+    /* help.getConfig не перечисляет алиасы: обновление сохраняет проверенный
+     * каталог media-маршрутов вместо удаления записей из карты. */
+    snapshot.fetched_at = now + 1;
+    snapshot.config_date = now + 1;
+    snapshot.config_expires = now + 86401;
+    for (size_t i = 0; i < snapshot.endpoint_count; ++i)
+        endpoints[i].last_seen = now + 1;
+    assert(tg_dc_map_store_install(&store, &snapshot, now + 1) == 0);
+    assert_media_catalogue(&store, now + 1);
+    tg_dc_map_store_destroy(&store);
+    remove_paths(path);
+}
+
+static void test_load_migrates_old_cache_with_builtin_media_routes(void) {
+    const int64_t now = INT64_C(1800000000);
+    char dir[] = "/tmp/d2k-dc-load-media-XXXXXX";
+    char path[TG_DC_MAP_PATH_MAX];
+    make_paths(dir, path);
+    tg_dc_endpoint endpoints[6];
+    tg_dc_snapshot old_snapshot = complete_snapshot(endpoints, now);
+    uint8_t *json = NULL;
+    size_t json_len = 0;
+    assert(tg_dc_snapshot_encode_json(&old_snapshot, now, &json,
+                                      &json_len) == 0);
+    FILE *file = fopen(path, "wb");
+    assert(file != NULL);
+    assert(fwrite(json, 1, json_len, file) == json_len);
+    assert(fclose(file) == 0);
+    free(json);
+
+    tg_dc_map_store store = {0};
+    assert(tg_dc_map_store_init(&store, path) == 0);
+    assert(tg_dc_map_store_load(&store, now) == 0);
+    assert_media_catalogue(&store, now);
+
+    file = fopen(path, "rb");
+    assert(file != NULL);
+    char persisted[65536];
+    size_t persisted_len = fread(persisted, 1, sizeof(persisted) - 1, file);
+    assert(!ferror(file) && fclose(file) == 0);
+    persisted[persisted_len] = '\0';
+    assert(strstr(persisted, "\"address\":\"149.154.167.43\"") != NULL);
+    tg_dc_map_store_destroy(&store);
+    remove_paths(path);
+}
+
+static void test_official_dc_option_overrides_builtin_alias_conflict(void) {
+    const int64_t now = INT64_C(1800000000);
+    char dir[] = "/tmp/d2k-dc-alias-conflict-XXXXXX";
+    char path[TG_DC_MAP_PATH_MAX];
+    make_paths(dir, path);
+    tg_dc_map_store store = {0};
+    tg_dc_endpoint endpoints[6];
+    tg_dc_snapshot snapshot = complete_snapshot(endpoints, now);
+    endpoint(&endpoints[5], 4, "149.154.167.43", now);
+    snapshot.endpoint_count = 6;
+    assert(tg_dc_map_store_init(&store, path) == 0);
+    assert(tg_dc_map_store_install(&store, &snapshot, now) == 0);
+    assert(snapshot_has_route(tg_dc_map_store_current(&store), 4,
+                              "149.154.167.43", 0));
+    assert(!snapshot_has_route(tg_dc_map_store_current(&store), 4,
+                               "149.154.167.43", 1));
+    tg_listener_destination destination = {.family = AF_INET, .port = 443};
+    assert(inet_pton(AF_INET, "149.154.167.43", destination.address) == 1);
+    tg_dc_endpoint route;
+    tg_dc_map_source source;
+    assert(tg_dc_map_store_resolve(&store, now, &destination, 1, 4, 1,
+                                   &route, &source) == TG_DC_LOOKUP_OK);
+    assert(source == TG_DC_MAP_OFFICIAL && route.id == 4 &&
+           !route.media_only);
     tg_dc_map_store_destroy(&store);
     remove_paths(path);
 }
@@ -182,6 +327,9 @@ static void test_endpoint_manifest_uses_only_allowed_exact_pairs(void) {
 int main(void) {
     test_store_install_merge_and_last_known_good_recovery();
     test_rejected_update_does_not_replace_active_snapshot();
+    test_refresh_keeps_complete_media_route_catalogue();
+    test_load_migrates_old_cache_with_builtin_media_routes();
+    test_official_dc_option_overrides_builtin_alias_conflict();
     test_store_resolve_uses_fresh_exact_map_and_scoped_secrets();
     test_endpoint_manifest_uses_only_allowed_exact_pairs();
     puts("Тесты хранилища карты Telegram DC: ок");

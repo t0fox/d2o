@@ -1411,11 +1411,14 @@ static int route_after_handshake(proxy_connection *connection) {
     int prefer_cf = policy == TG_WS_ROUTING_ADAPTIVE && have_preferred &&
         (preferred.kind == TG_ROUTE_CF_WORKER ||
          preferred.kind == TG_ROUTE_CF_PROXY);
+    int diagnostic_direct_tcp = server->config.routing_config &&
+        server->config.routing_config->diagnostic_direct_tcp;
     if (tg_route_plan_build(selection.tcp_only ? 0 : connection->route_dc_id,
                             connection->route_is_media, policy, prefer_cf,
-                            worker_count, cf_count,
+                            worker_count, cf_count, diagnostic_direct_tcp,
                             &connection->route_plan) != 0)
         return -1;
+    if (!connection->route_plan.count) return -1;
     if (policy == TG_WS_ROUTING_ADAPTIVE && have_preferred)
         route_plan_prioritize(&connection->route_plan, &preferred);
     uint32_t hedge_limit = server->config.routing_config

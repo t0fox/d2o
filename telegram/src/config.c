@@ -125,7 +125,8 @@ int tg_config_read(const char *path,tg_config *out) {
            K_STATE=1u<<4,K_MODE=1u<<5,K_DC_MAP=1u<<6,K_STATS_SOCKET=1u<<7,
            K_CF_WORKER=1u<<8,K_CF_PROXY=1u<<9,K_CF_BALANCE=1u<<10,
            K_WS_ROUTING=1u<<11,K_WS_HEDGE_DELAY=1u<<12,K_WS_HEDGE_LIMIT=1u<<13,
-           K_DEFAULT_DOMAINS=1u<<14,K_CF_CACHE=1u<<15 };
+           K_DEFAULT_DOMAINS=1u<<14,K_CF_CACHE=1u<<15,
+           K_DIAGNOSTIC_DIRECT_TCP=1u<<16 };
     FILE *f;char line[2048],state_dir[512]="/opt/d2k/state";unsigned seen=0;int rc=-1;
     int have_status=0,have_dc_map=0,have_stats_socket=0;
     int have_cf_cache=0;
@@ -161,6 +162,7 @@ int tg_config_read(const char *path,tg_config *out) {
         else if(strcmp(key,"TG_WS_HEDGE_DELAY_MS")==0)bit=K_WS_HEDGE_DELAY;
         else if(strcmp(key,"TG_WS_HEDGE_LIMIT")==0)bit=K_WS_HEDGE_LIMIT;
         else if(strcmp(key,"TG_DEFAULT_DOMAINS")==0)bit=K_DEFAULT_DOMAINS;
+        else if(strcmp(key,"TG_DIAGNOSTIC_DIRECT_TCP")==0)bit=K_DIAGNOSTIC_DIRECT_TCP;
         else if(strcmp(key,"TG_CF_DOMAIN_CACHE_PATH")==0){bit=K_CF_CACHE;dst=out->cf_domain_cache_path;cap=sizeof(out->cf_domain_cache_path);}
         else if(strcmp(key,"STATE_DIR")==0){bit=K_STATE;dst=state_dir;cap=sizeof(state_dir);}
         if(!bit)continue;
@@ -202,6 +204,8 @@ int tg_config_read(const char *path,tg_config *out) {
             if(parse_bounded_uint(value,32,&out->ws_hedge_limit)!=0)goto done;
         } else if(bit==K_DEFAULT_DOMAINS) {
             if(parse_boolean(value,&out->default_domains)!=0)goto done;
+        } else if(bit==K_DIAGNOSTIC_DIRECT_TCP) {
+            if(parse_boolean(value,&out->diagnostic_direct_tcp)!=0)goto done;
         } else if(!*value||copy_value(dst,cap,value)!=0)goto done;
         if(bit==K_STATUS)have_status=1;
         if(bit==K_DC_MAP)have_dc_map=1;

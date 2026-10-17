@@ -132,6 +132,28 @@ static void test_unmapped_direct_route_preserves_exact_original_target(void) {
     assert(selected.dc_id == 0 && selected.tcp_only);
 }
 
+static void test_dc4_media_alias_uses_dc4_wss_route(void) {
+    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN];
+    assert(unhex("0001020304050607000102030405060708090a0b0c0d0e0f"
+                 "101112131415161718191a1b1c1d1e1f0001020304050607"
+                 "08090a0b0c0d0e0f87aeb3fe059b4807",
+                 handshake, sizeof(handshake)) == sizeof(handshake));
+    const uint16_t ports[] = {443};
+    const char *cidrs[] = {"149.154.0.0/16"};
+    tg_transparent_policy policy = {
+        .allowed_ports = ports,
+        .allowed_port_count = 1,
+        .allowed_cidrs = cidrs,
+        .allowed_cidr_count = 1,
+    };
+    tg_listener_destination original;
+    destination(&original, "149.154.167.43", 443);
+    tg_epoll_route_selection selected = {0};
+    assert(tg_transparent_select_route(&policy, &original, handshake,
+                                       &selected) == 0);
+    assert(selected.dc_id == 4 && selected.is_media && !selected.tcp_only);
+}
+
 static void test_exact_tcpo_secret_is_used_for_original_destination_only(void) {
     uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN], secret[16];
     assert(unhex("0001020304050607000102030405060708090a0b0c0d0e0f"
@@ -194,6 +216,7 @@ int main(void) {
     test_known_dc_is_validated_and_target_is_preserved();
     test_policy_rejects_wrong_port_cidr_and_unlisted_dc();
     test_unmapped_direct_route_preserves_exact_original_target();
+    test_dc4_media_alias_uses_dc4_wss_route();
     test_exact_tcpo_secret_is_used_for_original_destination_only();
     puts("Тесты политики прозрачного Telegram-прокси: ок");
     return 0;

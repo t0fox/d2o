@@ -18,6 +18,7 @@ static void test_config_values_and_legacy_fields(void) {
           "TG_ENROLL_PORT=9443\n",f);assert(fclose(f)==0);
     tg_config cfg;assert(tg_config_read(path,&cfg)==0);unlink(path);
     assert(cfg.enabled==1&&cfg.local_mode&&cfg.listen_port==1443);
+    assert(!cfg.diagnostic_direct_tcp);
     assert(strcmp(cfg.ca_bundle,"/opt/d2k/files/tg-roots.pem")==0);
     assert(strcmp(cfg.status_path,"/opt/d2k/state/telegram.status")==0);
     assert(strcmp(cfg.stats_socket_path,"/opt/d2k/state/telegram.stats.sock")==0);
@@ -79,12 +80,13 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
           "TG_CF_DOMAIN=Edge.Example,edge2.example\n"
           "TG_CF_BALANCE=1\nTG_WS_ROUTING=cf-first\n"
           "TG_WS_HEDGE_DELAY_MS=250\nTG_WS_HEDGE_LIMIT=4\n"
-          "TG_DEFAULT_DOMAINS=1\n", file);
+          "TG_DEFAULT_DOMAINS=1\nTG_DIAGNOSTIC_DIRECT_TCP=yes\n", file);
     assert(fclose(file) == 0);
 
     tg_config config;
     assert(tg_config_read(path, &config) == 0);
-    assert(config.local_mode && config.cf_balance && config.default_domains);
+    assert(config.local_mode && config.cf_balance && config.default_domains &&
+           config.diagnostic_direct_tcp);
     assert(config.cf_worker_domain_count == 2);
     assert(strcmp(config.cf_worker_domains[0], "tunnel.example") == 0);
     assert(strcmp(config.cf_worker_domains[1], "backup.example") == 0);
@@ -103,6 +105,12 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
     file = fopen(path, "w");
     assert(file);
     fputs("TG_WS_ROUTING=unknown\n", file);
+    assert(fclose(file) == 0);
+    assert(tg_config_read(path, &config) != 0);
+
+    file = fopen(path, "w");
+    assert(file);
+    fputs("TG_DIAGNOSTIC_DIRECT_TCP=maybe\n", file);
     assert(fclose(file) == 0);
     assert(tg_config_read(path, &config) != 0);
     unlink(path);

@@ -23,6 +23,7 @@ static const builtin_endpoint builtin_endpoints[] = {
     {2, "149.154.167.223", 1}, {2, "149.154.162.123", 1},
     {3, "149.154.175.100", 0}, {3, "149.154.175.101", 0},
     {3, "149.154.175.102", 1}, {4, "149.154.167.91", 0},
+    {4, "149.154.167.43", 1},
     {4, "149.154.167.92", 0}, {4, "149.154.164.250", 1},
     {4, "149.154.166.120", 1}, {4, "149.154.166.121", 1},
     {4, "149.154.167.118", 1}, {4, "149.154.165.111", 1},
@@ -37,6 +38,25 @@ static const builtin_endpoint builtin_endpoints[] = {
     {4, "2001:67c:4e8:f004::a", 0},
     {5, "2001:b28:f23f:f005::a", 0}
 };
+
+size_t tg_dc_builtin_endpoint_count(void) {
+    return sizeof(builtin_endpoints) / sizeof(builtin_endpoints[0]);
+}
+
+int tg_dc_builtin_endpoint_at(size_t index, int64_t now,
+                              tg_dc_endpoint *out) {
+    if (!out || index >= tg_dc_builtin_endpoint_count() || now <= 0) return -1;
+    const builtin_endpoint *builtin = &builtin_endpoints[index];
+    memset(out, 0, sizeof(*out));
+    out->id = builtin->id;
+    out->family = strchr(builtin->address, ':') ? AF_INET6 : AF_INET;
+    if (inet_pton(out->family, builtin->address, out->address) != 1) return -1;
+    out->port = 443;
+    out->media_only = builtin->media_only;
+    out->is_static = 1;
+    out->last_seen = now;
+    return 0;
+}
 
 static int ipv4_non_global(const uint8_t ip[4]) {
     return ip[0] == 0 || ip[0] == 10 || ip[0] == 127 || ip[0] >= 224 ||

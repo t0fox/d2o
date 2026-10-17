@@ -32,6 +32,7 @@ int tg_route_cf_proxy_hostname(uint32_t dc_id, int media_variant,
 int tg_route_plan_build(uint32_t dc_id, int is_media,
                         tg_ws_routing_policy policy, int prefer_cf,
                         size_t worker_count, size_t cf_domain_count,
+                        int diagnostic_direct_tcp,
                         tg_route_plan *out);
 
 #endif

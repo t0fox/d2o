@@ -701,6 +701,7 @@ static void test_epoll_bridge_preserves_handshake_and_half_close(void) {
     proxy_fixture fixture = {0};
     set_ipv4(&fixture.original, "149.154.167.51", 443);
     set_ipv4(&fixture.upstream, "127.0.0.1", upstream_port);
+    tg_config routing = {.diagnostic_direct_tcp = 1};
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
@@ -708,6 +709,7 @@ static void test_epoll_bridge_preserves_handshake_and_half_close(void) {
         .configured_max_connections = 16,
         .handshake_timeout_ms = 1000,
         .idle_timeout_ms = 5000,
+        .routing_config = &routing,
         .original_destination = original_destination,
         .select_target = select_target,
         .context = &fixture,
@@ -767,6 +769,7 @@ static void test_epoll_many_concurrent_tcp_clients(void) {
     proxy_fixture fixture = {0};
     set_ipv4(&fixture.original, "149.154.167.51", 443);
     set_ipv4(&fixture.upstream, "127.0.0.1", upstream_port);
+    tg_config routing = {.diagnostic_direct_tcp = 1};
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
@@ -774,6 +777,7 @@ static void test_epoll_many_concurrent_tcp_clients(void) {
         .configured_max_connections = CLIENT_COUNT,
         .handshake_timeout_ms = 1000,
         .idle_timeout_ms = 5000,
+        .routing_config = &routing,
         .original_destination = original_destination,
         .select_target = select_target,
         .context = &fixture,
@@ -1069,6 +1073,7 @@ static void test_self_dial_target_is_rejected(void) {
     set_ipv4(&fixture.original, "149.154.167.51", 443);
     set_ipv4(&fixture.upstream, "127.0.0.1", 443);
     const uint16_t proxy_ports[] = {1443};
+    tg_config routing = {.diagnostic_direct_tcp = 1};
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
@@ -1079,6 +1084,7 @@ static void test_self_dial_target_is_rejected(void) {
         .enforce_self_dial = 1,
         .listen_ports = proxy_ports,
         .listen_port_count = 1,
+        .routing_config = &routing,
         .original_destination = original_destination,
         .select_target = select_target,
         .context = &fixture,
@@ -1718,7 +1724,7 @@ static void test_async_route_dns_waits_before_tcp_fallback(void) {
     set_ipv4(&fixture.worker_upstream, "127.0.0.1", ws_port);
     SSL_CTX *tls_context = tg_tls_client_context(cert_path);
     assert(tls_context);
-    tg_config routing = {0};
+    tg_config routing = {.diagnostic_direct_tcp = 1};
     routing.ws_routing = TG_WS_ROUTING_CF_FIRST;
     routing.cf_worker_domain_count = 1;
     memcpy(routing.cf_worker_domains[0], "worker.test", sizeof("worker.test"));
@@ -1945,6 +1951,7 @@ static void test_epoll_direct_wss_rejection_falls_back_to_tcp(void) {
     set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
     SSL_CTX *tls_context = tg_tls_client_context(cert_path);
     assert(tls_context);
+    tg_config routing = {.diagnostic_direct_tcp = 1};
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
@@ -1954,6 +1961,7 @@ static void test_epoll_direct_wss_rejection_falls_back_to_tcp(void) {
         .idle_timeout_ms = 5000,
         .enable_direct_wss = 1,
         .tls_context = tls_context,
+        .routing_config = &routing,
         .original_destination = original_destination,
         .select_target = select_target,
         .context = &fixture,
@@ -2051,6 +2059,7 @@ static void test_epoll_wss_certificate_rejection_falls_back_to_tcp(void) {
     set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
     SSL_CTX *tls_context = tg_tls_client_context(trust_path);
     assert(tls_context);
+    tg_config routing = {.diagnostic_direct_tcp = 1};
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
@@ -2060,6 +2069,7 @@ static void test_epoll_wss_certificate_rejection_falls_back_to_tcp(void) {
         .idle_timeout_ms = 5000,
         .enable_direct_wss = 1,
         .tls_context = tls_context,
+        .routing_config = &routing,
         .original_destination = original_destination,
         .select_target = select_target,
         .context = &fixture,
