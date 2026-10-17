@@ -26,6 +26,26 @@ const snapshot = (values = {}) => ({
 });
 
 {
+  const route = [[230, 170], [500, 100], [700, 170]];
+  const clientToHub = [[60, 170], [230, 170]];
+  assert.deepEqual(flow.composeFlowPoints(route, clientToHub, "request"),
+    [[60, 170], [230, 170], [500, 100], [700, 170]],
+    "исходная попытка идёт от клиента через d2o к Telegram");
+  assert.deepEqual(flow.composeFlowPoints(route, clientToHub, "response"),
+    [[700, 170], [500, 100], [230, 170], [60, 170]],
+    "подтверждённый ответ Telegram идёт от DC к клиенту");
+}
+
+{
+  assert.deepEqual(flow.connectionDotStates({ activeConnections: 0, sessions: [] }),
+    ["idle", "idle", "idle"], "при отсутствии сессий индикаторы d2o погашены");
+  assert.deepEqual(flow.connectionDotStates({ activeConnections: 5, sessions: [
+    { telegram_response_seen: true }, { telegram_response_seen: false },
+  ] }), ["confirmed", "active", "active"],
+  "индикаторы учитывают число активных соединений и подтверждённые ответы");
+}
+
+{
   const view = flow.summarizeTelegramFlow(snapshot());
   assert.equal(view.state, "idle");
   assert.equal(view.activeConnections, 0);

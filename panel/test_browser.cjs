@@ -154,12 +154,33 @@ async function main(){
   assert.equal(await evaluate('window.tgFlowCanvas===document.querySelector("#telegram-body .tg-flow-canvas")'),true,'route canvas is mounted once');
   await tunnelShot('1-connected');
 
+  // Подтверждённый ответ идёт от Telegram DC обратно к клиенту.
+  panel.telegramStats({...fixture.telegramStats,active_connections:0,active_sessions:[]});
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("#telegram-body").dataset.state==="idle"','empty C11 snapshot clears active route state');
+  await wait(350);
+  await evaluate('(()=>{const canvas=document.querySelector("#telegram-body .tg-flow-canvas");const proto=CanvasRenderingContext2D.prototype;const arc=proto.arc;window.__tgResponseXs=[];window.__tgOriginalArc=arc;proto.arc=function(x,y,r,...args){if(this.canvas===canvas&&this.globalCompositeOperation==="lighter"&&r>=2.4&&r<=2.6)window.__tgResponseXs.push(x);return arc.call(this,x,y,r,...args)};return true})()');
+  const confirmedSession={...fixture.telegramStats.active_sessions[0],telegram_response_seen:true,
+   events:[{sequence:1,branch:'direct',transport:'direct_wss',state:'first_binary_response'}]};
+  panel.telegramStats({...fixture.telegramStats,active_connections:1,active_sessions:[confirmedSession]});
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("#telegram-body").dataset.state==="active"','confirmed C11 response activates its route');
+  await wait(350);
+  const responseMovement=await evaluate('({first:window.__tgResponseXs[0],last:window.__tgResponseXs.at(-1),count:window.__tgResponseXs.length})');
+  assert.ok(responseMovement.count>3,'confirmed response is animated');
+  assert.ok(responseMovement.first>responseMovement.last+20,'подтверждённый ответ движется от DC к клиенту');
+  await evaluate('CanvasRenderingContext2D.prototype.arc=window.__tgOriginalArc;delete window.__tgOriginalArc');
+
   // Свежий отказ всех WSS-маршрутов не должен выглядеть как активное подключение из-за старого ответа.
+  await evaluate('(()=>{const canvas=document.querySelector("#telegram-body .tg-flow-canvas");const proto=CanvasRenderingContext2D.prototype;const moveTo=proto.moveTo;window.__tgIncomingPathDraws=0;window.__tgOriginalMoveTo=moveTo;proto.moveTo=function(x,y){if(this.canvas===canvas&&this.globalCompositeOperation==="source-over"&&x===60&&y===170)window.__tgIncomingPathDraws++;return moveTo.call(this,x,y)};return true})()');
   panel.telegram('local');
   panel.telegramStats({...fixture.telegramStats,active_connections:0,active_sessions:[],
    last_failure_age_ms:100,last_success_age_ms:10000});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
   await until('document.querySelector("#telegram-body").dataset.state==="unavailable"','new WSS failure must replace stale connected state');
+  await wait(50);
+  assert.equal(await evaluate('window.__tgIncomingPathDraws'),0,'при нуле активных соединений схема не рисует линию клиент → d2o');
+  await evaluate('CanvasRenderingContext2D.prototype.moveTo=window.__tgOriginalMoveTo;delete window.__tgOriginalMoveTo');
   assert.equal(await evaluate('document.querySelector(".tunnel-word").textContent'),'Маршрут недоступен');
   assert.match(await evaluate('document.querySelector(".tunnel-note").textContent'),/Последняя попытка Telegram завершилась ошибкой/);
   assert.match(await evaluate('document.querySelector("#tg-flow-caption").textContent'),/Последняя ошибка: WebSocket · DC4 · Прокси Cloudflare/);

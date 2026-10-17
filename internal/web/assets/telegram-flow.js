@@ -67,6 +67,22 @@ function makePath(points) {
   return { points, cumulative, length: cumulative[cumulative.length - 1] };
 }
 
+function composeFlowPoints(routePoints, clientToHubPoints, direction) {
+  if (direction === "response") {
+    return [...routePoints.slice().reverse(), ...clientToHubPoints.slice(0, -1).reverse()];
+  }
+  if (direction === "request") return [...clientToHubPoints, ...routePoints.slice(1)];
+  return routePoints;
+}
+
+function connectionDotStates(view) {
+  const active = Math.min(3, Math.max(0, Number(view?.activeConnections) || 0));
+  const confirmed = Math.min(active, (Array.isArray(view?.sessions) ? view.sessions : [])
+    .filter(session => session.telegram_response_seen === true).length);
+  return Array.from({ length: 3 }, (_, index) => index < confirmed ? "confirmed"
+    : index < active ? "active" : "idle");
+}
+
 function pointAt(path, fraction) {
   const distance = Math.max(0, Math.min(1, fraction)) * path.length;
   let low = 0;
@@ -316,7 +332,7 @@ function mountTelegramFlow(canvas) {
     alpha: 0.22, targetAlpha: 0.22, glow: 0, targetGlow: 0, status: "idle", counts: {}, markerPulse: 0,
   }));
   const hub = { angle: 0, pulse: 0, spin: 0 };
-  const destination = { pulse: 0 };
+  const client = { pulse: 0 };
   const particles = [];
   const sparks = [];
   const ripples = [];
@@ -403,14 +419,15 @@ function mountTelegramFlow(canvas) {
     }
   }
 
-  function combinedPath(laneIndex, startsAtHub) {
+  function combinedPath(laneIndex, startsAtHub, direction) {
     const route = lanes[laneIndex].path.points;
-    return makePath(startsAtHub ? route : [...incomingPath.points, ...route.slice(1)]);
+    return makePath(composeFlowPoints(route, incomingPath.points,
+      direction || (startsAtHub ? "route" : "request")));
   }
 
   function addParticle(sessionId, laneIndex, now, options = {}) {
     if (motionPreference?.matches || laneIndex < 0 || particles.length >= MAX_PARTICLES) return null;
-    const path = combinedPath(laneIndex, options.startsAtHub !== false);
+    const path = combinedPath(laneIndex, options.startsAtHub !== false, options.direction);
     const particle = {
       sessionId,
       laneIndex,
@@ -466,8 +483,8 @@ function mountTelegramFlow(canvas) {
     } else if (state === "cancelled") {
       fadeAttempt(session.id, laneIndex, now);
     } else if (state === "first_binary_response") {
-      addParticle(session.id, laneIndex, now, { startsAtHub: true, kind: "response" });
-      destination.pulse = 1;
+      addParticle(session.id, laneIndex, now, { direction: "response", kind: "response" });
+      if (!motionPreference?.matches) client.pulse = 1;
     }
   }
 
@@ -614,7 +631,7 @@ function mountTelegramFlow(canvas) {
     context.fillStyle = rgb(palette.background);
     context.fillRect(0, 0, WIDTH, HEIGHT);
 
-    strokePath(incomingPath, rgb(palette.accent), 0.35, 3);
+    if (currentView.activeConnections > 0) strokePath(incomingPath, rgb(palette.accent), 0.35, 3);
     const visibleRouteIndices = new Set(visibleRouteLanes(currentView)
       .map(lane => transportLane(lane.transport)));
     lanes.forEach((lane, index) => {
@@ -657,8 +674,8 @@ function mountTelegramFlow(canvas) {
       context.restore();
     });
 
-    drawNode(60, 170, 28, 0);
-    drawNode(700, 170, 28, Math.min(1, destination.pulse));
+    drawNode(60, 170, 28, Math.min(1, client.pulse));
+    drawNode(700, 170, 28, 0);
     context.strokeStyle = rgb(palette.text, 0.8);
     context.lineWidth = 2;
     context.lineCap = "round";
@@ -681,13 +698,21 @@ function mountTelegramFlow(canvas) {
     context.shadowBlur = 6 + 6 * hub.pulse;
     context.stroke();
     context.shadowBlur = 0;
-    for (let index = 0; index < 3; index += 1) {
+    const dotStates = connectionDotStates(currentView);
+    const dotAlpha = 0.45 + 0.45 * Math.min(1, currentView.activeConnections / 12);
+    for (let index = 0; index < dotStates.length; index += 1) {
       const angle = -hub.angle * 1.6 + index * 2.094;
       context.beginPath();
       context.arc(38 * Math.cos(angle), 38 * Math.sin(angle), 2.5, 0, Math.PI * 2);
-      context.fillStyle = rgb(palette.accent, 0.55);
+      const state = dotStates[index];
+      const color = state === "confirmed" ? palette.direct
+        : state === "active" ? palette.accent : palette.line;
+      context.fillStyle = rgb(color, state === "idle" ? 0.16 : dotAlpha);
+      context.shadowColor = rgb(color);
+      context.shadowBlur = state === "confirmed" ? 5 : state === "active" ? 2 : 0;
       context.fill();
     }
+    context.shadowBlur = 0;
     context.beginPath(); context.arc(0, 0, 5, 0, Math.PI * 2);
     context.fillStyle = rgb(palette.text); context.fill();
     context.restore();
@@ -763,8 +788,8 @@ function mountTelegramFlow(canvas) {
     });
     hub.pulse *= Math.exp(-delta * 5);
     hub.spin *= Math.exp(-delta * 3);
-    hub.angle += delta * (0.3 + 1.5 * hub.spin);
-    destination.pulse *= Math.exp(-delta * 4);
+    if (currentView.activeConnections > 0) hub.angle += delta * (0.3 + 1.5 * hub.spin);
+    client.pulse *= Math.exp(-delta * 4);
     for (let index = particles.length - 1; index >= 0; index -= 1) {
       const particle = particles[index];
       if (particle.fadeAt) {
@@ -789,7 +814,8 @@ function mountTelegramFlow(canvas) {
             burst(particle.x, particle.y);
             lanes[particle.laneIndex].markerPulse = 1;
           } else if (particle.kind === "response" && now - lastRippleAt > 400) {
-            ripples.push({ x: 700, y: 170, elapsed: 0, color: lanes[particle.laneIndex].targetColor });
+            ripples.push({ x: 60, y: 170, elapsed: 0,
+              color: lanes[particle.laneIndex].targetColor });
             if (ripples.length > MAX_RIPPLES) ripples.shift();
             lastRippleAt = now;
           }
@@ -866,6 +892,7 @@ function mountTelegramFlow(canvas) {
       particles.length = 0;
       sparks.length = 0;
       ripples.length = 0;
+      client.pulse = 0;
       activeParticles.clear();
       lanes.forEach(lane => {
         lane.color = [...lane.targetColor];
@@ -946,6 +973,8 @@ function mountTelegramFlow(canvas) {
 global.D2kTelegramFlow = {
   mountTelegramFlow,
   summarizeTelegramFlow: summarize,
+  composeFlowPoints,
+  connectionDotStates,
   routeDescription,
   hasCurrentRouteFailure,
   visibleRouteLanes,
