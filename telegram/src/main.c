@@ -12,12 +12,18 @@
 #include "tg_mtproto.h"
 #include "tg_mtproto_discovery.h"
 #include "tg_stats_socket.h"
+#include "tg_cf_domains.h"
+#include "tg_route_dns.h"
+#include "tg_route_plan.h"
+#include "tg_listener.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +34,10 @@
 #define TG_BUILD "d2k-tg-0.3"
 #define TG_DC_REFRESH_SECS (6u * 60u * 60u)
 #define TG_DC_REFRESH_RETRY_SECS (60u * 60u)
+#define TG_DC_DISCOVERY_TIMEOUT_MS 12000u
+#define TG_DC_DISCOVERY_TOTAL_MS 90000u
+#define TG_DC_DISCOVERY_DNS_WAIT_MS 20000u
+#define TG_DC_DISCOVERY_WORKER_LIMIT 3u
 
 static const char *health_path = "/tmp/d2k/d2ktg.health";
 static volatile sig_atomic_t stop_requested;
@@ -87,25 +97,215 @@ static int create_local_listener(uint16_t port) {
     return fd;
 }
 
-static int refresh_local_dc_map(tg_dc_map_store *store, int64_t now) {
-    static const struct {
-        const char *address;
-        uint32_t dc_id;
-    } bootstrap[] = {
-        {"149.154.175.50", 1},
-        {"2001:b28:f23d:f001::a", 1}
-    };
-    for (size_t i = 0; i < sizeof(bootstrap) / sizeof(bootstrap[0]); ++i) {
-        tg_dc_snapshot snapshot = {0};
-        if (tg_mtproto_discover_config(bootstrap[i].address, 443,
-                                       bootstrap[i].dc_id, 4000, 0x31, now,
-                                       &snapshot) == 0) {
-            int installed = tg_dc_map_store_install(store, &snapshot, now);
-            tg_dc_snapshot_destroy(&snapshot);
-            if (installed == 0) return 0;
+typedef struct {
+    uint32_t dc_id;
+    const char *address;
+} dc_bootstrap;
+
+static const dc_bootstrap dc_bootstraps[] = {
+    {1, "149.154.175.50"},
+    {1, "2001:b28:f23d:f001::a"},
+    {2, "149.154.167.51"},
+    {2, "2001:67c:4e8:f002::a"},
+    {3, "149.154.175.100"},
+    {3, "2001:b28:f23d:f003::a"},
+    {4, "149.154.167.91"},
+    {4, "2001:67c:4e8:f004::a"},
+    {5, "149.154.171.5"},
+    {5, "2001:b28:f23f:f005::a"},
+    {203, "91.105.192.100"}
+};
+
+typedef struct {
+    pthread_t thread;
+    atomic_int done;
+    atomic_int cancelled;
+    int started;
+    int result;
+    int64_t now;
+    const tg_config *config;
+    tg_cf_domain_pool *cf_domains;
+    tg_route_dns *route_dns;
+    SSL_CTX *tls_context;
+    tg_dc_snapshot snapshot;
+} dc_refresh_job;
+
+static uint64_t monotonic_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static int discovery_cancelled(const atomic_int *cancelled,
+                               uint64_t deadline) {
+    uint64_t now = monotonic_ms();
+    return atomic_load_explicit(cancelled, memory_order_relaxed) || !now ||
+           now >= deadline;
+}
+
+static int discover_wss_host(SSL_CTX *tls_context, tg_route_dns *route_dns,
+                             const char *hostname, const char *path,
+                             uint32_t dc_id, int64_t now,
+                             const atomic_int *cancelled, uint64_t deadline,
+                             tg_dc_snapshot *snapshot) {
+    if (!route_dns || discovery_cancelled(cancelled, deadline) ||
+        tg_route_dns_prefetch(route_dns, hostname) != 0)
+        return -1;
+    uint64_t now_ms = monotonic_ms();
+    if (!now_ms) return -1;
+    uint64_t dns_deadline = now_ms + TG_DC_DISCOVERY_DNS_WAIT_MS;
+    if (dns_deadline > deadline) dns_deadline = deadline;
+    tg_listener_destination seen[TG_ROUTE_DNS_ADDRESS_MAX] = {{0}};
+    size_t seen_count = 0;
+    while (!discovery_cancelled(cancelled, dns_deadline)) {
+        tg_listener_destination target = {0};
+        if (tg_route_dns_resolve(route_dns, hostname, &target) != 0) {
+            struct timespec pause = {.tv_sec = 0, .tv_nsec = 50000000L};
+            (void)nanosleep(&pause, NULL);
+            continue;
+        }
+        int duplicate = 0;
+        for (size_t i = 0; i < seen_count; ++i) {
+            size_t bytes = target.family == AF_INET ? 4u : 16u;
+            if (seen[i].family == target.family &&
+                memcmp(seen[i].address, target.address, bytes) == 0) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate || seen_count == TG_ROUTE_DNS_ADDRESS_MAX) break;
+        seen[seen_count++] = target;
+        char numeric_address[INET6_ADDRSTRLEN];
+        const void *address = target.address;
+        int family = target.family;
+        if ((family != AF_INET && family != AF_INET6) ||
+            !inet_ntop(family, address, numeric_address,
+                       sizeof(numeric_address)))
+            continue;
+        if (discovery_cancelled(cancelled, deadline)) return -1;
+        if (tg_mtproto_discover_config_wss(
+                tls_context, numeric_address, hostname, path, 443, dc_id,
+                TG_DC_DISCOVERY_TIMEOUT_MS, TG_OUTBOUND_SOCKET_MARK, now,
+                snapshot) == 0)
+            return 0;
+    }
+    return -1;
+}
+
+static int refresh_local_dc_map(const tg_config *config,
+                                tg_cf_domain_pool *cf_domains,
+                                tg_route_dns *route_dns,
+                                SSL_CTX *tls_context, int64_t now,
+                                const atomic_int *cancelled,
+                                tg_dc_snapshot *snapshot) {
+    if (!config || !cf_domains || !tls_context || !snapshot)
+        return -1;
+    memset(snapshot, 0, sizeof(*snapshot));
+    uint64_t started = monotonic_ms();
+    if (!started) return -1;
+    uint64_t deadline = started + TG_DC_DISCOVERY_TOTAL_MS;
+    for (size_t i = 0; i < 3; ++i) {
+        if (discovery_cancelled(cancelled, deadline)) return -1;
+        if (tg_mtproto_discover_config(dc_bootstraps[i].address, 443,
+                dc_bootstraps[i].dc_id, TG_DC_DISCOVERY_TIMEOUT_MS,
+                TG_OUTBOUND_SOCKET_MARK, now, snapshot) == 0)
+            return 0;
+    }
+
+    for (size_t i = 0; i < sizeof(dc_bootstraps) / sizeof(dc_bootstraps[0]);
+         ++i) {
+        uint32_t dc_id = dc_bootstraps[i].dc_id;
+        int first_for_dc = 1;
+        for (size_t earlier = 0; earlier < i; ++earlier) {
+            if (dc_bootstraps[earlier].dc_id == dc_id) {
+                first_for_dc = 0;
+                break;
+            }
+        }
+        if (!first_for_dc) continue;
+        if (discovery_cancelled(cancelled, deadline)) return -1;
+        const char *bootstrap_address = dc_bootstraps[i].address;
+        if (!route_dns) continue;
+        size_t worker_count = config->cf_worker_domain_count;
+        if (worker_count > TG_DC_DISCOVERY_WORKER_LIMIT)
+            worker_count = TG_DC_DISCOVERY_WORKER_LIMIT;
+        for (size_t worker = 0; worker < worker_count; ++worker) {
+            char path[1024];
+            int n = snprintf(path, sizeof(path),
+                "/apiws?dst=%s&dc=%u&media=0", bootstrap_address, dc_id);
+            if (n <= 0 || (size_t)n >= sizeof(path)) continue;
+            if (discover_wss_host(tls_context, route_dns,
+                    config->cf_worker_domains[worker], path, dc_id, now,
+                    cancelled, deadline, snapshot) == 0)
+                return 0;
+        }
+
+        size_t domain_count = tg_cf_domain_pool_count(cf_domains);
+        for (size_t domain_index = 0; domain_index < domain_count;
+             ++domain_index) {
+            char domain[TG_CF_DOMAIN_LEN] = {0};
+            char hostname[TG_CF_DOMAIN_LEN + 16u];
+            if (tg_cf_domain_pool_copy_at(cf_domains, domain_index, domain) != 0)
+                continue;
+            int n = snprintf(hostname, sizeof(hostname), "kws%u.%s", dc_id,
+                             domain);
+            if (n <= 0 || (size_t)n >= sizeof(hostname)) continue;
+            if (discover_wss_host(tls_context, route_dns, hostname, "/apiws",
+                    dc_id, now, cancelled, deadline, snapshot) == 0)
+                return 0;
         }
     }
     return -1;
+}
+
+static void *dc_refresh_worker(void *opaque) {
+    dc_refresh_job *job = opaque;
+    job->result = refresh_local_dc_map(job->config, job->cf_domains,
+        job->route_dns, job->tls_context, job->now, &job->cancelled,
+        &job->snapshot);
+    atomic_store_explicit(&job->done, 1, memory_order_release);
+    return NULL;
+}
+
+static int start_dc_refresh(dc_refresh_job *job, const tg_config *config,
+                            tg_cf_domain_pool *cf_domains,
+                            tg_route_dns *route_dns, SSL_CTX *tls_context,
+                            int64_t now) {
+    if (!job || job->started) return -1;
+    job->config = config;
+    job->cf_domains = cf_domains;
+    job->route_dns = route_dns;
+    job->tls_context = tls_context;
+    job->now = now;
+    job->result = -1;
+    memset(&job->snapshot, 0, sizeof(job->snapshot));
+    atomic_store_explicit(&job->done, 0, memory_order_relaxed);
+    atomic_store_explicit(&job->cancelled, 0, memory_order_relaxed);
+    if (pthread_create(&job->thread, NULL, dc_refresh_worker, job) != 0)
+        return -1;
+    job->started = 1;
+    return 0;
+}
+
+static int finish_dc_refresh(dc_refresh_job *job, tg_dc_map_store *store,
+                             int64_t now) {
+    if (!job || !job->started ||
+        !atomic_load_explicit(&job->done, memory_order_acquire))
+        return 0;
+    (void)pthread_join(job->thread, NULL);
+    int ok = job->result == 0 &&
+             tg_dc_map_store_install(store, &job->snapshot, now) == 0;
+    tg_dc_snapshot_destroy(&job->snapshot);
+    job->started = 0;
+    return ok ? 1 : -1;
+}
+
+static void stop_dc_refresh(dc_refresh_job *job) {
+    if (!job || !job->started) return;
+    atomic_store_explicit(&job->cancelled, 1, memory_order_relaxed);
+    (void)pthread_join(job->thread, NULL);
+    tg_dc_snapshot_destroy(&job->snapshot);
+    job->started = 0;
 }
 
 static int run_local_daemon(const char *config_path) {
@@ -121,11 +321,15 @@ static int run_local_daemon(const char *config_path) {
     tg_config cfg;
     tg_dc_map_store map_store = {0};
     tg_cf_domain_pool cf_domain_pool = {0};
+    tg_route_dns *discovery_dns = NULL;
     tg_epoll_proxy *proxy = NULL;
     SSL_CTX *tls_context = NULL;
+    dc_refresh_job refresh_job = {0};
     tg_stats_socket stats_socket = {.fd = -1};
     int listener = -1, rc = 1;
     int64_t next_dc_refresh_at = 0;
+    atomic_init(&refresh_job.done, 0);
+    atomic_init(&refresh_job.cancelled, 0);
     if (tg_config_read(config_path, &cfg) != 0) {
         log_msg("не удалось прочитать конфигурацию локального прокси");
         return 1;
@@ -149,21 +353,16 @@ static int run_local_daemon(const char *config_path) {
     }
     int initial_refresh_due = tg_dc_map_store_refresh_due(
         &map_store, now, TG_DC_REFRESH_SECS);
-    if (initial_refresh_due) {
-        if (refresh_local_dc_map(&map_store, now) == 0) {
-            next_dc_refresh_at = now + TG_DC_REFRESH_SECS;
-        } else {
-            log_msg("не удалось обновить карту через Telegram; используется last-known-good или встроенная карта");
-            next_dc_refresh_at = now + TG_DC_REFRESH_RETRY_SECS;
-        }
-    } else {
-        next_dc_refresh_at = now + TG_DC_REFRESH_SECS;
-    }
+    next_dc_refresh_at = initial_refresh_due ? now : now + TG_DC_REFRESH_SECS;
     tls_context = tg_tls_client_context(cfg.ca_bundle);
     if (!tls_context) {
         log_msg("не удалось загрузить доверенные сертификаты для direct WSS");
         goto done;
     }
+    discovery_dns = tg_route_dns_create(tls_context,
+        TG_OUTBOUND_SOCKET_MARK, NULL, NULL, NULL);
+    if (!discovery_dns)
+        log_msg("не удалось создать DoH-резолвер обновления карты; останется проверка прямых DC");
     listener = create_local_listener(cfg.listen_port);
     if (listener < 0) {
         log_msg("не удалось открыть IPv4/IPv6 listener локального прокси");
@@ -227,13 +426,23 @@ static int run_local_daemon(const char *config_path) {
             tg_stats_socket_serve(&stats_socket, proxy) != 0)
             log_msg("ошибка обслуживания локального socket статистики Telegram");
         int64_t refresh_now = (int64_t)time(NULL);
-        if (refresh_now >= next_dc_refresh_at &&
+        int refresh_result = finish_dc_refresh(&refresh_job, &map_store,
+                                                refresh_now);
+        if (refresh_result > 0) {
+            next_dc_refresh_at = refresh_now + TG_DC_REFRESH_SECS;
+            log_msg("карта Telegram обновлена по подтверждённому help.getConfig");
+        } else if (refresh_result < 0) {
+            next_dc_refresh_at = refresh_now + TG_DC_REFRESH_RETRY_SECS;
+            log_msg("обновление карты Telegram не подтвердилось; сохранена last-known-good карта");
+        }
+        if (!refresh_job.started && refresh_now >= next_dc_refresh_at &&
             tg_dc_map_store_refresh_due(&map_store, refresh_now,
                                        TG_DC_REFRESH_SECS)) {
-            if (refresh_local_dc_map(&map_store, refresh_now) == 0) {
-                next_dc_refresh_at = refresh_now + TG_DC_REFRESH_SECS;
+            if (start_dc_refresh(&refresh_job, &cfg, &cf_domain_pool,
+                    discovery_dns, tls_context, refresh_now) == 0) {
+                log_msg("запущено фоновое обновление DC через direct, Worker и Cloudflare WSS");
             } else {
-                log_msg("не удалось периодически обновить карту Telegram; используется last-known-good или встроенная карта");
+                log_msg("не удалось запустить фоновое обновление карты Telegram");
                 next_dc_refresh_at = refresh_now + TG_DC_REFRESH_RETRY_SECS;
             }
         }
@@ -242,8 +451,10 @@ static int run_local_daemon(const char *config_path) {
     }
     (void)write_status(cfg.status_path, rc == 0 ? "stopped\n" : "error\n");
 done:
+    stop_dc_refresh(&refresh_job);
     tg_stats_socket_close(&stats_socket);
     tg_epoll_proxy_destroy(proxy);
+    tg_route_dns_destroy(discovery_dns);
     SSL_CTX_free(tls_context);
     if (listener >= 0) close(listener);
     tg_cf_domain_pool_destroy(&cf_domain_pool);

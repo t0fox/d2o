@@ -22,6 +22,20 @@
 
 #define TG_PROBE_MAX_PACKET (1024u * 1024u)
 #define TG_PROBE_MAX_FINGERPRINTS 64u
+#define TG_DISCOVERY_WSS_BUFFER_MAX (TG_WS_MAX_MESSAGE + TG_PROBE_MAX_PACKET + 4u)
+
+typedef struct {
+    int fd;
+    SSL *ssl;
+    tg_ws_pump pump;
+    int websocket;
+    int pump_ready;
+    uint64_t deadline;
+    uint8_t *rx;
+    size_t rx_len;
+    size_t rx_offset;
+    size_t rx_cap;
+} discovery_io;
 
 static uint64_t monotonic_ms(void) {
     struct timespec now;
@@ -85,6 +99,110 @@ static int transfer_all(int fd, uint8_t *data, size_t len, int writing,
             continue;
         }
         return -1;
+    }
+    return 0;
+}
+
+static int collect_discovery_wss_bytes(void *opaque, const uint8_t *payload,
+                                       size_t payload_len) {
+    discovery_io *io = opaque;
+    if (!io || (payload_len && !payload)) return -1;
+    size_t unread = io->rx_len - io->rx_offset;
+    if (io->rx_offset && unread) {
+        memmove(io->rx, io->rx + io->rx_offset, unread);
+    }
+    io->rx_len = unread;
+    io->rx_offset = 0;
+    if (payload_len > TG_DISCOVERY_WSS_BUFFER_MAX - unread) return -1;
+    size_t needed = unread + payload_len;
+    if (needed > io->rx_cap) {
+        size_t cap = io->rx_cap ? io->rx_cap : 65536u;
+        while (cap < needed) {
+            if (cap > TG_DISCOVERY_WSS_BUFFER_MAX / 2u) {
+                cap = TG_DISCOVERY_WSS_BUFFER_MAX;
+                break;
+            }
+            cap *= 2u;
+        }
+        if (cap < needed) return -1;
+        uint8_t *grown = OPENSSL_realloc(io->rx, cap);
+        if (!grown) return -1;
+        io->rx = grown;
+        io->rx_cap = cap;
+    }
+    if (payload_len) memcpy(io->rx + io->rx_len, payload, payload_len);
+    io->rx_len += payload_len;
+    return 0;
+}
+
+static int discovery_wss_pump(discovery_io *io, uint64_t deadline,
+                              int writing) {
+    while (writing ? io->pump.tx_head != NULL
+                   : io->rx_len - io->rx_offset == 0) {
+        uint64_t now = monotonic_ms();
+        if (now >= deadline) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        short revents = 0;
+        short events = tg_ws_pump_events(&io->pump);
+        if (SSL_pending(io->ssl) > 0) {
+            revents = POLLIN;
+        } else {
+            uint64_t left = deadline - now;
+            int timeout = left > (uint64_t)INT_MAX ? INT_MAX : (int)left;
+            struct pollfd descriptor = {
+                .fd = io->fd,
+                .events = events
+            };
+            int rc = poll(&descriptor, 1, timeout);
+            if (rc == 0) {
+                errno = ETIMEDOUT;
+                return -1;
+            }
+            if (rc < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            revents = descriptor.revents;
+        }
+        if (tg_ws_pump_process(&io->pump, revents,
+                               collect_discovery_wss_bytes, io) != 0)
+            return -1;
+        if (io->pump.closed) {
+            errno = ECONNRESET;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int discovery_transfer_all(discovery_io *io, uint8_t *data,
+                                  size_t len, int writing,
+                                  uint64_t deadline) {
+    if (!io || (!data && len)) return -1;
+    if (!io->websocket)
+        return transfer_all(io->fd, data, len, writing, deadline);
+    if (writing) {
+        if (len > TG_WS_MAX_MESSAGE ||
+            tg_ws_pump_queue_binary(&io->pump, data, len) != 0)
+            return -1;
+        return discovery_wss_pump(io, deadline, 1);
+    }
+    size_t used = 0;
+    while (used < len) {
+        size_t available = io->rx_len - io->rx_offset;
+        if (!available && discovery_wss_pump(io, deadline, 0) != 0)
+            return -1;
+        available = io->rx_len - io->rx_offset;
+        size_t amount = len - used < available ? len - used : available;
+        memcpy(data + used, io->rx + io->rx_offset, amount);
+        io->rx_offset += amount;
+        used += amount;
+        if (io->rx_offset == io->rx_len) {
+            io->rx_offset = 0;
+            io->rx_len = 0;
+        }
     }
     return 0;
 }
@@ -235,6 +353,43 @@ static int make_address(const char *text, uint16_t port,
         return AF_INET6;
     }
     return -1;
+}
+
+static int connect_numeric_until(const char *numeric_address, uint16_t port,
+                                 uint32_t socket_mark, uint64_t deadline) {
+    struct sockaddr_storage address;
+    socklen_t address_len = 0;
+    int family = make_address(numeric_address, port, &address, &address_len);
+    if (family < 0) return -1;
+    int fd = socket(family, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0 ||
+        fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 ||
+        set_probe_socket_mark(fd, socket_mark) != 0) {
+        close(fd);
+        return -1;
+    }
+    int connect_rc = connect(fd, (struct sockaddr *)&address, address_len);
+    if (connect_rc != 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    if (connect_rc != 0) {
+        if (wait_fd(fd, POLLOUT, deadline) != 0) {
+            close(fd);
+            return -1;
+        }
+        int error = 0;
+        socklen_t error_len = sizeof(error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_len) != 0 ||
+            error != 0) {
+            if (error) errno = error;
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
 }
 
 tg_mtproto_probe_status tg_mtproto_probe_res_pq(
@@ -477,9 +632,9 @@ static int ssl_transfer_until(SSL *ssl, int fd, uint8_t *data, size_t len,
 }
 
 static int wss_upgrade_until(SSL *ssl, int fd, const char *hostname,
-                             uint64_t deadline) {
+                             const char *path, uint64_t deadline) {
     tg_ws_upgrade_state state = {0};
-    if (tg_ws_upgrade_start_ex(&state, hostname, "/apiws", "binary",
+    if (tg_ws_upgrade_start_ex(&state, hostname, path, "binary",
                                "https://web.telegram.org",
                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -649,7 +804,7 @@ tg_mtproto_probe_status tg_mtproto_probe_res_pq_wss(
         goto done;
     }
     out->stage = TG_MTPROTO_PROBE_STAGE_WS;
-    if (wss_upgrade_until(ssl, fd, hostname, deadline) != 0) {
+    if (wss_upgrade_until(ssl, fd, hostname, "/apiws", deadline) != 0) {
         error = errno == ETIMEDOUT ? TG_MTPROTO_PROBE_ERROR_TIMEOUT
                                    : TG_MTPROTO_PROBE_ERROR_WS_UPGRADE;
         status = errno == ETIMEDOUT ? TG_MTPROTO_PROBE_TIMEOUT
@@ -780,7 +935,7 @@ static int discovery_write_string(discovery_writer *writer,
                  : -1;
 }
 
-static int send_frame(int fd, tg_mtproto_ctr *to_server,
+static int send_frame(discovery_io *io, tg_mtproto_ctr *to_server,
                       const uint8_t *payload, size_t payload_len,
                       uint64_t deadline) {
     uint8_t length_bytes[4];
@@ -795,8 +950,9 @@ static int send_frame(int fd, tg_mtproto_ctr *to_server,
     write_le32(length_bytes, (uint32_t)payload_len);
     if (tg_mtproto_ctr_xor(to_server, length_bytes, sizeof(length_bytes)) == 0 &&
         tg_mtproto_ctr_xor(to_server, copy, payload_len) == 0 &&
-        transfer_all(fd, length_bytes, sizeof(length_bytes), 1, deadline) == 0 &&
-        transfer_all(fd, copy, payload_len, 1, deadline) == 0)
+        discovery_transfer_all(io, length_bytes, sizeof(length_bytes), 1,
+                               deadline) == 0 &&
+        discovery_transfer_all(io, copy, payload_len, 1, deadline) == 0)
         rc = 0;
     OPENSSL_cleanse(length_bytes, sizeof(length_bytes));
     OPENSSL_cleanse(copy, payload_len);
@@ -804,7 +960,7 @@ static int send_frame(int fd, tg_mtproto_ctr *to_server,
     return rc;
 }
 
-static int read_frame(int fd, tg_mtproto_ctr *from_server,
+static int read_frame(discovery_io *io, tg_mtproto_ctr *from_server,
                       uint64_t deadline, uint8_t **payload,
                       size_t *payload_len) {
     uint8_t length_bytes[4];
@@ -813,13 +969,14 @@ static int read_frame(int fd, tg_mtproto_ctr *from_server,
     if (!from_server || !payload || !payload_len) return -1;
     *payload = NULL;
     *payload_len = 0;
-    if (transfer_all(fd, length_bytes, sizeof(length_bytes), 0, deadline) != 0 ||
+    if (discovery_transfer_all(io, length_bytes, sizeof(length_bytes), 0,
+                               deadline) != 0 ||
         tg_mtproto_ctr_xor(from_server, length_bytes, sizeof(length_bytes)) != 0)
         goto done;
     uint32_t len = read_le32(length_bytes);
     if (len < 20 || len > TG_PROBE_MAX_PACKET) goto done;
     packet = malloc(len);
-    if (!packet || transfer_all(fd, packet, len, 0, deadline) != 0 ||
+    if (!packet || discovery_transfer_all(io, packet, len, 0, deadline) != 0 ||
         tg_mtproto_ctr_xor(from_server, packet, len) != 0)
         goto done;
     *payload = packet;
@@ -835,7 +992,7 @@ done:
     return rc;
 }
 
-static int exchange_plain(int fd, tg_mtproto_ctr *to_server,
+static int exchange_plain(discovery_io *io, tg_mtproto_ctr *to_server,
                           tg_mtproto_ctr *from_server, const uint8_t *body,
                           size_t body_len, uint64_t deadline,
                           uint64_t *last_message_id,
@@ -854,8 +1011,8 @@ static int exchange_plain(int fd, tg_mtproto_ctr *to_server,
     *request_message_id = read_le64(request + 8);
     write_le32(request + 16, (uint32_t)body_len);
     memcpy(request + 20, body, body_len);
-    if (send_frame(fd, to_server, request, 20 + body_len, deadline) != 0 ||
-        read_frame(fd, from_server, deadline, &packet, &packet_len) != 0 ||
+    if (send_frame(io, to_server, request, 20 + body_len, deadline) != 0 ||
+        read_frame(io, from_server, deadline, &packet, &packet_len) != 0 ||
         parse_plain_response(packet, packet_len, &response_body,
                              &response_body_len) != 0 ||
         response_body_len > response_cap)
@@ -945,12 +1102,9 @@ int tg_mtproto_parse_rpc_result(const uint8_t *body, size_t body_len,
     return found ? 0 : 1;
 }
 
-int tg_mtproto_discover_config(const char *numeric_address, uint16_t port,
-                               uint32_t dc_id, uint32_t timeout_ms,
-                               uint32_t socket_mark, int64_t now,
-                               tg_dc_snapshot *out) {
-    struct sockaddr_storage address;
-    socklen_t address_len = 0;
+static int discover_config_common(discovery_io *io, uint32_t dc_id,
+                                  uint32_t timeout_ms, int64_t now,
+                                  tg_dc_snapshot *out) {
     tg_mtproto_auth_state auth = {0};
     tg_mtproto_ctr to_server = {0}, from_server = {0};
     tg_dc_snapshot fetched = {0};
@@ -966,64 +1120,38 @@ int tg_mtproto_discover_config(const char *numeric_address, uint16_t port,
     const uint8_t *rpc_value = NULL;
     size_t rpc_value_len = 0;
     uint64_t message_id = 0;
-    int fd = -1, family, rc = -1;
+    int rc = -1;
     uint64_t started = monotonic_ms(), deadline = 0;
     uint64_t last_plain_message_id = 0;
     if (out) memset(out, 0, sizeof(*out));
-    if (!out || !numeric_address || !port || dc_id < 1 || dc_id > 999 ||
+    if (!io || !out || dc_id < 1 || dc_id > 999 ||
         timeout_ms == 0 || timeout_ms > 60000 || now <= 0)
         goto done;
-    family = make_address(numeric_address, port, &address, &address_len);
-    if (family < 0) goto done;
-    deadline = started + timeout_ms;
-    fd = socket(family, SOCK_STREAM, 0);
-    if (fd < 0) goto done;
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0 ||
-        fcntl(fd, F_SETFD, FD_CLOEXEC) != 0)
-        goto done;
-    if (socket_mark) {
-#ifdef SO_MARK
-        if (setsockopt(fd, SOL_SOCKET, SO_MARK, &socket_mark,
-                       sizeof(socket_mark)) != 0)
-            goto done;
-#else
-        goto done;
-#endif
-    }
-    int connect_rc = connect(fd, (struct sockaddr *)&address, address_len);
-    if (connect_rc != 0 && errno != EINPROGRESS) goto done;
-    if (connect_rc != 0) {
-        if (wait_fd(fd, POLLOUT, deadline) != 0) goto done;
-        int error = 0;
-        socklen_t error_len = sizeof(error);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_len) != 0 ||
-            error != 0)
-            goto done;
-    }
+    deadline = io->deadline ? io->deadline : started + timeout_ms;
     if (RAND_bytes(auth.nonce, sizeof(auth.nonce)) != 1 ||
         tg_mtproto_make_obfuscated2_init(TG_MTPROTO_INTERMEDIATE, dc_id, 0,
                                          handshake, &to_server,
                                          &from_server) != 0 ||
-        transfer_all(fd, handshake, sizeof(handshake), 1, deadline) != 0)
+        discovery_transfer_all(io, handshake, sizeof(handshake), 1,
+                               deadline) != 0)
         goto done;
 
     memcpy(req_pq, "\xf1\x8e\x7e\xbe", 4);
     memcpy(req_pq + 4, auth.nonce, sizeof(auth.nonce));
-    if (exchange_plain(fd, &to_server, &from_server, req_pq, sizeof(req_pq),
+    if (exchange_plain(io, &to_server, &from_server, req_pq, sizeof(req_pq),
                        deadline, &last_plain_message_id, &message_id, response, sizeof(response),
                        &response_len) != 0 ||
         RAND_bytes(random2, sizeof(random2)) != 1 ||
         tg_mtproto_auth_step2(&auth, response, response_len, random2,
                               request2, sizeof(request2), &request2_len) != 0 ||
-        exchange_plain(fd, &to_server, &from_server, request2, request2_len,
+        exchange_plain(io, &to_server, &from_server, request2, request2_len,
                        deadline, &last_plain_message_id, &message_id, response, sizeof(response),
                        &response_len) != 0 ||
         RAND_bytes(random3, sizeof(random3)) != 1 ||
         tg_mtproto_auth_step3(&auth, response, response_len, random3,
                               (int32_t)now, request3, sizeof(request3),
                               &request3_len) != 0 ||
-        exchange_plain(fd, &to_server, &from_server, request3, request3_len,
+        exchange_plain(io, &to_server, &from_server, request3, request3_len,
                        deadline, &last_plain_message_id, &message_id, response, sizeof(response),
                        &response_len) != 0 ||
         tg_mtproto_auth_step4(&auth, response, response_len) != 0 ||
@@ -1048,12 +1176,12 @@ int tg_mtproto_discover_config(const char *numeric_address, uint16_t port,
                               padding_len, encrypted_request,
                               sizeof(encrypted_request),
                               &encrypted_request_len) != 0 ||
-        send_frame(fd, &to_server, encrypted_request,
+        send_frame(io, &to_server, encrypted_request,
                    encrypted_request_len, deadline) != 0)
         goto done;
     int got_config = 0;
     for (unsigned frame = 0; frame < 16; ++frame) {
-        if (read_frame(fd, &from_server, deadline, &encrypted_response,
+        if (read_frame(io, &from_server, deadline, &encrypted_response,
                        &encrypted_response_len) != 0 ||
             encrypted_response_len < 40 ||
             (plain = malloc(encrypted_response_len - 24)) == NULL ||
@@ -1097,7 +1225,6 @@ int tg_mtproto_discover_config(const char *numeric_address, uint16_t port,
     memset(&fetched, 0, sizeof(fetched));
     rc = 0;
 done:
-    if (fd >= 0) close(fd);
     if (encrypted_response) {
         OPENSSL_cleanse(encrypted_response, encrypted_response_len);
         free(encrypted_response);
@@ -1123,5 +1250,66 @@ done:
     OPENSSL_cleanse(session_id, sizeof(session_id));
     OPENSSL_cleanse(encrypted_request, sizeof(encrypted_request));
     OPENSSL_cleanse(id_bytes, sizeof(id_bytes));
+    return rc;
+}
+
+int tg_mtproto_discover_config(const char *numeric_address, uint16_t port,
+                               uint32_t dc_id, uint32_t timeout_ms,
+                               uint32_t socket_mark, int64_t now,
+                               tg_dc_snapshot *out) {
+    discovery_io io = {.fd = -1};
+    uint64_t started = monotonic_ms();
+    if (out) memset(out, 0, sizeof(*out));
+    if (!out || !numeric_address || !port || dc_id < 1 || dc_id > 999 ||
+        timeout_ms == 0 || timeout_ms > 60000 || now <= 0 || !started)
+        return -1;
+    uint64_t deadline = started + timeout_ms;
+    io.deadline = deadline;
+    io.fd = connect_numeric_until(numeric_address, port, socket_mark,
+                                  deadline);
+    if (io.fd < 0) return -1;
+    int rc = discover_config_common(&io, dc_id, timeout_ms, now, out);
+    close(io.fd);
+    return rc;
+}
+
+int tg_mtproto_discover_config_wss(SSL_CTX *tls_context,
+                                   const char *numeric_address,
+                                   const char *hostname, const char *path,
+                                   uint16_t port, uint32_t dc_id,
+                                   uint32_t timeout_ms,
+                                   uint32_t socket_mark, int64_t now,
+                                   tg_dc_snapshot *out) {
+    discovery_io io = {.fd = -1};
+    SSL *ssl = NULL;
+    uint64_t started = monotonic_ms();
+    int rc = -1;
+    if (out) memset(out, 0, sizeof(*out));
+    if (!out || !tls_context || !numeric_address || !hostname || !*hostname ||
+        strlen(hostname) >= TG_CONFIG_DOMAIN_SIZE || !path || path[0] != '/' ||
+        strpbrk(hostname, "\r\n/ ") || strpbrk(path, "\r\n ") ||
+        strlen(path) >= 1024u || !port || dc_id < 1 || dc_id > 999 ||
+        timeout_ms == 0 || timeout_ms > 60000 || now <= 0 || !started)
+        goto done;
+    uint64_t deadline = started + timeout_ms;
+    io.deadline = deadline;
+    io.fd = connect_numeric_until(numeric_address, port, socket_mark,
+                                  deadline);
+    if (io.fd < 0) goto done;
+    ssl = tg_tls_prepare_client_fd(tls_context, io.fd, hostname, hostname);
+    if (!ssl || ssl_handshake_until(ssl, io.fd, deadline) != 0 ||
+        SSL_get_verify_result(ssl) != X509_V_OK ||
+        wss_upgrade_until(ssl, io.fd, hostname, path, deadline) != 0)
+        goto done;
+    io.ssl = ssl;
+    io.websocket = 1;
+    if (tg_ws_pump_init(&io.pump, ssl) != 0) goto done;
+    io.pump_ready = 1;
+    rc = discover_config_common(&io, dc_id, timeout_ms, now, out);
+done:
+    if (io.pump_ready) tg_ws_pump_destroy(&io.pump);
+    if (io.rx) OPENSSL_clear_free(io.rx, io.rx_cap);
+    if (ssl) SSL_free(ssl);
+    if (io.fd >= 0) close(io.fd);
     return rc;
 }

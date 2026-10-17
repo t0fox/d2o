@@ -5,6 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <openssl/ssl.h>
 
 /* После успеха endpoints принадлежат snapshot; освобождаются destroy-функцией. */
 int tg_mtproto_config_parse(const uint8_t *data, size_t len, int64_t now,
@@ -19,5 +20,14 @@ int tg_mtproto_discover_config(const char *numeric_address, uint16_t port,
                                uint32_t dc_id, uint32_t timeout_ms,
                                uint32_t socket_mark, int64_t now,
                                tg_dc_snapshot *out);
+/* Получить проверенный help.getConfig через WSS с заданными SNI, Host и path.
+ * numeric_address — числовой IP назначения; TLS всегда проверяет hostname. */
+int tg_mtproto_discover_config_wss(SSL_CTX *tls_context,
+                                   const char *numeric_address,
+                                   const char *hostname, const char *path,
+                                   uint16_t port, uint32_t dc_id,
+                                   uint32_t timeout_ms,
+                                   uint32_t socket_mark, int64_t now,
+                                   tg_dc_snapshot *out);
 
 #endif

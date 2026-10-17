@@ -5,17 +5,26 @@
 #include <assert.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
+#include <openssl/evp.h>
+#include <openssl/x509v3.h>
 
 typedef struct {
     int listener;
     int wrong_nonce;
     int invalid_plain_header;
 } fake_telegram;
+
+typedef struct {
+    int listener;
+    SSL_CTX *context;
+} fake_wss;
 
 static void read_all(int fd, uint8_t *data, size_t len) {
     size_t used = 0;
@@ -35,6 +44,162 @@ static void write_all(int fd, const uint8_t *data, size_t len) {
         assert(n > 0);
         used += (size_t)n;
     }
+}
+
+static void ssl_read_all(SSL *ssl, uint8_t *data, size_t len) {
+    size_t used = 0;
+    while (used < len) {
+        int n = SSL_read(ssl, data + used,
+                         len - used > INT_MAX ? INT_MAX : (int)(len - used));
+        assert(n > 0);
+        used += (size_t)n;
+    }
+}
+
+static void ssl_write_all(SSL *ssl, const uint8_t *data, size_t len) {
+    size_t used = 0;
+    while (used < len) {
+        int n = SSL_write(ssl, data + used,
+                          len - used > INT_MAX ? INT_MAX : (int)(len - used));
+        assert(n > 0);
+        used += (size_t)n;
+    }
+}
+
+static EVP_PKEY *make_wss_test_key(void) {
+    EVP_PKEY_CTX *context = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    EVP_PKEY *key = NULL;
+    assert(context && EVP_PKEY_keygen_init(context) == 1 &&
+           EVP_PKEY_CTX_set_rsa_keygen_bits(context, 2048) == 1 &&
+           EVP_PKEY_keygen(context, &key) == 1);
+    EVP_PKEY_CTX_free(context);
+    return key;
+}
+
+static X509 *make_wss_test_cert(EVP_PKEY *key) {
+    X509 *cert = X509_new();
+    assert(cert && X509_set_version(cert, 2) == 1 &&
+           ASN1_INTEGER_set(X509_get_serialNumber(cert), 11) == 1 &&
+           X509_gmtime_adj(X509_getm_notBefore(cert), -60) != NULL &&
+           X509_gmtime_adj(X509_getm_notAfter(cert), 3600) != NULL &&
+           X509_set_pubkey(cert, key) == 1);
+    X509_NAME *name = X509_get_subject_name(cert);
+    assert(name && X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+        (const unsigned char *)"worker.example", -1, -1, 0) == 1 &&
+        X509_set_issuer_name(cert, name) == 1);
+    X509_EXTENSION *extension = X509V3_EXT_conf_nid(
+        NULL, NULL, NID_basic_constraints, "critical,CA:TRUE");
+    assert(extension && X509_add_ext(cert, extension, -1) == 1);
+    X509_EXTENSION_free(extension);
+    extension = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name,
+                                    "DNS:worker.example");
+    assert(extension && X509_add_ext(cert, extension, -1) == 1);
+    X509_EXTENSION_free(extension);
+    assert(X509_sign(cert, key, EVP_sha256()) > 0);
+    return cert;
+}
+
+static int create_wss_listener(uint16_t *port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK)
+    };
+    assert(bind(fd, (struct sockaddr *)&address, sizeof(address)) == 0 &&
+           listen(fd, 1) == 0);
+    socklen_t length = sizeof(address);
+    assert(getsockname(fd, (struct sockaddr *)&address, &length) == 0);
+    *port = ntohs(address.sin_port);
+    return fd;
+}
+
+static size_t read_client_ws_binary(SSL *ssl, uint8_t *payload, size_t cap) {
+    uint8_t header[2];
+    ssl_read_all(ssl, header, sizeof(header));
+    assert((header[0] & 0x8fu) == 0x82u && (header[1] & 0x80u) != 0);
+    uint64_t length = header[1] & 0x7fu;
+    if (length == 126) {
+        uint8_t extended[2];
+        ssl_read_all(ssl, extended, sizeof(extended));
+        length = ((uint64_t)extended[0] << 8) | extended[1];
+    } else if (length == 127) {
+        uint8_t extended[8];
+        ssl_read_all(ssl, extended, sizeof(extended));
+        length = 0;
+        for (size_t i = 0; i < sizeof(extended); ++i)
+            length = (length << 8) | extended[i];
+    }
+    assert(length <= cap);
+    uint8_t mask[4];
+    ssl_read_all(ssl, mask, sizeof(mask));
+    ssl_read_all(ssl, payload, (size_t)length);
+    for (size_t i = 0; i < (size_t)length; ++i) payload[i] ^= mask[i & 3u];
+    return (size_t)length;
+}
+
+static void *serve_wss_discovery_request(void *opaque) {
+    fake_wss *fake = opaque;
+    int fd = accept(fake->listener, NULL, NULL);
+    assert(fd >= 0);
+    SSL *ssl = SSL_new(fake->context);
+    assert(ssl && SSL_set_fd(ssl, fd) == 1 && SSL_accept(ssl) == 1);
+    const char *sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    assert(sni && strcmp(sni, "worker.example") == 0);
+
+    char request[2048] = {0};
+    size_t used = 0;
+    while (used + 1 < sizeof(request) &&
+           (!used || strstr(request, "\r\n\r\n") == NULL)) {
+        ssl_read_all(ssl, (uint8_t *)request + used, 1);
+        ++used;
+        request[used] = '\0';
+    }
+    assert(strstr(request,
+        "GET /apiws?dst=149.154.175.50&dc=1&media=0 HTTP/1.1\r\n") != NULL);
+    assert(strstr(request, "Host: worker.example\r\n") != NULL);
+    assert(strstr(request, "Sec-WebSocket-Protocol: binary\r\n") != NULL);
+    const char *key_line = strstr(request, "Sec-WebSocket-Key: ");
+    assert(key_line);
+    key_line += strlen("Sec-WebSocket-Key: ");
+    const char *key_end = strstr(key_line, "\r\n");
+    assert(key_end && (size_t)(key_end - key_line) < 64);
+    char key[64] = {0};
+    memcpy(key, key_line, (size_t)(key_end - key_line));
+    char material[128];
+    int material_len = snprintf(material, sizeof(material),
+        "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
+    assert(material_len > 0 && (size_t)material_len < sizeof(material));
+    uint8_t digest[EVP_MAX_MD_SIZE];
+    unsigned digest_len = 0;
+    assert(EVP_Digest(material, (size_t)material_len, digest, &digest_len,
+                      EVP_sha1(), NULL) == 1);
+    char accept_key[EVP_ENCODE_LENGTH(EVP_MAX_MD_SIZE)] = {0};
+    assert(EVP_EncodeBlock((unsigned char *)accept_key, digest,
+                           (int)digest_len) > 0);
+    char response[512];
+    int response_len = snprintf(response, sizeof(response),
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %s\r\n"
+        "Sec-WebSocket-Protocol: binary\r\n\r\n", accept_key);
+    assert(response_len > 0 && (size_t)response_len < sizeof(response));
+    ssl_write_all(ssl, (const uint8_t *)response, (size_t)response_len);
+
+    uint8_t frame[TG_MTPROTO_HANDSHAKE_LEN + 1024];
+    size_t frame_len = read_client_ws_binary(ssl, frame, sizeof(frame));
+    assert(frame_len == TG_MTPROTO_HANDSHAKE_LEN);
+    tg_mtproto_init init;
+    assert(tg_mtproto_parse_obfuscated2(frame, &init) == 0 && init.dc_id == 1);
+    frame_len = read_client_ws_binary(ssl, frame, sizeof(frame));
+    assert(frame_len == 4);
+    frame_len = read_client_ws_binary(ssl, frame, sizeof(frame));
+    assert(frame_len == 40);
+    static const uint8_t close_frame[] = {0x88, 0x00};
+    ssl_write_all(ssl, close_frame, sizeof(close_frame));
+    SSL_free(ssl);
+    close(fd);
+    return NULL;
 }
 
 static uint32_t read_le32(const uint8_t bytes[4]) {
@@ -191,6 +356,47 @@ static void test_config_discovery_rejects_invalid_arguments(void) {
                                       &snapshot) != 0);
     assert(tg_mtproto_discover_config("127.0.0.1", 443, 1, 1000, 0, 0,
                                       &snapshot) != 0);
+    snapshot.this_dc = 77;
+    assert(tg_mtproto_discover_config_wss(NULL, "127.0.0.1",
+                                          "worker.example", "/apiws", 443, 1,
+                                          1000, 0, 1, &snapshot) != 0);
+    assert(snapshot.this_dc == 0 && snapshot.endpoint_count == 0);
+    snapshot.this_dc = 77;
+    assert(tg_mtproto_discover_config_wss(NULL, NULL, "worker.example",
+                                          "/apiws", 443, 1, 1000, 0, 1,
+                                          &snapshot) != 0);
+    assert(snapshot.this_dc == 0 && snapshot.endpoint_count == 0);
+}
+
+static void test_wss_discovery_authenticates_host_and_forwards_binary_stream(void) {
+    uint16_t port = 0;
+    EVP_PKEY *key = make_wss_test_key();
+    X509 *cert = make_wss_test_cert(key);
+    SSL_CTX *server_context = SSL_CTX_new(TLS_server_method());
+    SSL_CTX *client_context = SSL_CTX_new(TLS_client_method());
+    assert(server_context && client_context &&
+           SSL_CTX_use_certificate(server_context, cert) == 1 &&
+           SSL_CTX_use_PrivateKey(server_context, key) == 1 &&
+           X509_STORE_add_cert(SSL_CTX_get_cert_store(client_context), cert) == 1);
+    SSL_CTX_set_verify(client_context, SSL_VERIFY_PEER, NULL);
+    fake_wss fake = {
+        .listener = create_wss_listener(&port),
+        .context = server_context
+    };
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, serve_wss_discovery_request, &fake) == 0);
+    tg_dc_snapshot snapshot = {.this_dc = 77};
+    assert(tg_mtproto_discover_config_wss(
+        client_context, "127.0.0.1", "worker.example",
+        "/apiws?dst=149.154.175.50&dc=1&media=0", port, 1, 5000, 0,
+        (int64_t)time(NULL), &snapshot) != 0);
+    assert(snapshot.this_dc == 0 && snapshot.endpoint_count == 0);
+    assert(pthread_join(thread, NULL) == 0);
+    close(fake.listener);
+    SSL_CTX_free(client_context);
+    SSL_CTX_free(server_context);
+    X509_free(cert);
+    EVP_PKEY_free(key);
 }
 
 static void test_encrypted_response_ignores_control_messages_before_rpc_result(void) {
@@ -298,6 +504,7 @@ int main(void) {
     test_response_with_wrong_nonce_is_not_healthy();
     test_non_plain_response_is_not_healthy();
     test_config_discovery_rejects_invalid_arguments();
+    test_wss_discovery_authenticates_host_and_forwards_binary_stream();
     test_encrypted_response_ignores_control_messages_before_rpc_result();
     puts("Тесты MTProto probe и response parser: ок");
     return 0;
