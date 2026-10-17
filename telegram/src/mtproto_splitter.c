@@ -1,7 +1,10 @@
 #include "tg_mtproto_splitter.h"
 
+#include <openssl/crypto.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define TG_MTPROTO_SPLITTER_RETAIN (64u * 1024u)
 
 static int grow_packet(tg_mtproto_splitter *splitter, size_t extra) {
     if (extra > TG_MTPROTO_MAX_PACKET - splitter->packet_len)
@@ -16,8 +19,15 @@ static int grow_packet(tg_mtproto_splitter *splitter, size_t extra) {
         }
         cap *= 2;
     }
+    if (splitter->memory_budget &&
+        tg_memory_budget_reserve(splitter->memory_budget, cap) != 0)
+        return TG_MTPROTO_SPLIT_NO_MEMORY;
     uint8_t *packet = realloc(splitter->packet, cap);
-    if (!packet) return TG_MTPROTO_SPLIT_NO_MEMORY;
+    if (!packet) {
+        tg_memory_budget_release(splitter->memory_budget, cap);
+        return TG_MTPROTO_SPLIT_NO_MEMORY;
+    }
+    tg_memory_budget_release(splitter->memory_budget, splitter->packet_cap);
     splitter->packet = packet;
     splitter->packet_cap = cap;
     return TG_MTPROTO_SPLIT_OK;
@@ -77,17 +87,25 @@ static int parse_total_length(const tg_mtproto_splitter *splitter,
 
 int tg_mtproto_splitter_init(tg_mtproto_splitter *splitter,
                              tg_mtproto_proto proto) {
+    return tg_mtproto_splitter_init_accounted(splitter, proto, NULL);
+}
+
+int tg_mtproto_splitter_init_accounted(tg_mtproto_splitter *splitter,
+                                       tg_mtproto_proto proto,
+                                       tg_memory_budget *memory_budget) {
     if (!splitter || proto < TG_MTPROTO_ABRIDGED ||
         proto > TG_MTPROTO_PADDED_INTERMEDIATE)
         return TG_MTPROTO_SPLIT_INVALID;
     memset(splitter, 0, sizeof(*splitter));
     splitter->proto = proto;
+    splitter->memory_budget = memory_budget;
     return TG_MTPROTO_SPLIT_OK;
 }
 
 void tg_mtproto_splitter_destroy(tg_mtproto_splitter *splitter) {
     if (!splitter) return;
-    free(splitter->packet);
+    OPENSSL_clear_free(splitter->packet, splitter->packet_cap);
+    tg_memory_budget_release(splitter->memory_budget, splitter->packet_cap);
     memset(splitter, 0, sizeof(*splitter));
 }
 
@@ -98,6 +116,13 @@ static int emit_packet(tg_mtproto_splitter *splitter,
         return splitter->error;
     }
     splitter->packet_len = 0;
+    if (splitter->packet_cap > TG_MTPROTO_SPLITTER_RETAIN) {
+        size_t old_cap = splitter->packet_cap;
+        OPENSSL_clear_free(splitter->packet, old_cap);
+        splitter->packet = NULL;
+        splitter->packet_cap = 0;
+        tg_memory_budget_release(splitter->memory_budget, old_cap);
+    }
     return TG_MTPROTO_SPLIT_OK;
 }
 

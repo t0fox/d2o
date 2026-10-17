@@ -52,6 +52,51 @@ static void test_partial_intermediate_packet_becomes_one_frame(void) {
     tg_mtproto_ctr_destroy(&reference);
 }
 
+static void test_large_accounted_packet_releases_its_storage(void) {
+    const size_t payload_len = 128u * 1024u;
+    const size_t packet_len = payload_len + 4u;
+    uint8_t *packet = malloc(packet_len);
+    uint8_t *expected = malloc(packet_len);
+    assert(packet && expected);
+    packet[0] = (uint8_t)payload_len;
+    packet[1] = (uint8_t)(payload_len >> 8);
+    packet[2] = (uint8_t)(payload_len >> 16);
+    packet[3] = (uint8_t)(payload_len >> 24);
+    for (size_t i = 4; i < packet_len; ++i)
+        packet[i] = (uint8_t)(i * 17u);
+    memcpy(expected, packet, packet_len);
+
+    uint8_t key[32] = {9}, iv[16] = {7};
+    tg_mtproto_ctr encrypt = {0}, reference = {0};
+    tg_mtproto_splitter splitter;
+    tg_memory_budget budget = {.limit = 512u * 1024u};
+    capture out = {0};
+    assert(tg_mtproto_ctr_init(&encrypt, key, iv) == 0);
+    assert(tg_mtproto_ctr_init(&reference, key, iv) == 0);
+    assert(tg_mtproto_ctr_xor(&reference, expected, packet_len) == 0);
+    assert(tg_mtproto_splitter_init_accounted(
+               &splitter, TG_MTPROTO_INTERMEDIATE, &budget) ==
+           TG_MTPROTO_SPLIT_OK);
+    assert(tg_mtproto_splitter_feed(&splitter, &encrypt, packet, 64u * 1024u,
+                                    collect, &out) == TG_MTPROTO_SPLIT_OK);
+    assert(out.count == 0 && budget.used > 0);
+    assert(tg_mtproto_splitter_feed(&splitter, &encrypt,
+                                    packet + 64u * 1024u,
+                                    packet_len - 64u * 1024u,
+                                    collect, &out) == TG_MTPROTO_SPLIT_OK);
+    assert(out.count == 1 && out.len[0] == packet_len);
+    assert(memcmp(out.bytes[0], expected, packet_len) == 0);
+    assert(budget.peak >= packet_len && budget.used == 0);
+
+    clear(&out);
+    tg_mtproto_splitter_destroy(&splitter);
+    tg_mtproto_ctr_destroy(&encrypt);
+    tg_mtproto_ctr_destroy(&reference);
+    free(packet);
+    free(expected);
+    assert(budget.used == 0);
+}
+
 static void test_abridged_packets_keep_individual_boundaries(void) {
     uint8_t stream[] = {2, 'a','b','c','d','e','f','g','h', 2, 'i','j','k','l','m','n','o','p'};
     uint8_t expected[sizeof(stream)];
@@ -148,6 +193,7 @@ static void test_oversized_intermediate_packet_is_rejected(void) {
 
 int main(void) {
     test_partial_intermediate_packet_becomes_one_frame();
+    test_large_accounted_packet_releases_its_storage();
     test_abridged_packets_keep_individual_boundaries();
     test_abridged_extended_length_header_can_arrive_in_parts();
     test_zero_abridged_length_switches_to_raw_stream();

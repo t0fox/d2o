@@ -9,26 +9,96 @@
 
 struct tg_ws_tx_frame { struct tg_ws_tx_frame *next; uint8_t *bytes; size_t len,offset,allocated; };
 #define TG_WS_PUMP_TX_LIMIT (TG_WS_MAX_MESSAGE + 14u + sizeof(struct tg_ws_tx_frame))
+#define TG_WS_PUMP_RX_RETAIN (64u * 1024u)
+#define TG_WS_PUMP_RX_LIMIT (TG_WS_MAX_MESSAGE + 10u)
 
 static void release_frames(tg_ws_pump *p,tg_ws_tx_frame *frame) {
-    while(frame){tg_ws_tx_frame *next=frame->next;p->tx_memory_bytes-=frame->allocated+sizeof(*frame);
-        OPENSSL_clear_free(frame->bytes,frame->allocated);free(frame);frame=next;}
+    while(frame){tg_ws_tx_frame *next=frame->next;
+        size_t charged=frame->allocated+sizeof(*frame);
+        p->tx_memory_bytes-=charged;
+        OPENSSL_clear_free(frame->bytes,frame->allocated);free(frame);
+        tg_memory_budget_release(p->memory_budget,charged);
+        frame=next;}
 }
 
 int tg_ws_pump_init(tg_ws_pump *p,SSL *ssl) {
+    return tg_ws_pump_init_accounted(p, ssl, NULL);
+}
+
+int tg_ws_pump_init_accounted(tg_ws_pump *p, SSL *ssl,
+                              tg_memory_budget *memory_budget) {
     if(!p||!ssl)return -1;
     memset(p,0,sizeof(*p));p->ssl=ssl;p->fd=SSL_get_fd(ssl);
+    p->memory_budget = memory_budget;
+    p->reassembly.memory_budget = memory_budget;
     if(p->fd<0)return -1;
-    p->rx_cap=TG_WS_MAX_MESSAGE+10;p->rx=malloc(p->rx_cap);if(!p->rx)return -1;
+    if (memory_budget &&
+        tg_memory_budget_reserve(memory_budget, TG_WS_PUMP_RX_INITIAL) != 0)
+        return -1;
+    p->rx=malloc(TG_WS_PUMP_RX_INITIAL);
+    if(!p->rx){tg_memory_budget_release(memory_budget,
+                                         TG_WS_PUMP_RX_INITIAL);return -1;}
+    p->rx_cap=TG_WS_PUMP_RX_INITIAL;
     int flags=fcntl(p->fd,F_GETFL,0);
-    if(flags<0||fcntl(p->fd,F_SETFL,flags|O_NONBLOCK)<0){free(p->rx);memset(p,0,sizeof(*p));return -1;}
+    if(flags<0||fcntl(p->fd,F_SETFL,flags|O_NONBLOCK)<0){free(p->rx);
+        tg_memory_budget_release(memory_budget, p->rx_cap);
+        memset(p,0,sizeof(*p));return -1;}
     return 0;
+}
+
+static int reserve_rx(tg_ws_pump *p,size_t needed) {
+    if(needed>TG_WS_PUMP_RX_LIMIT)return -1;
+    if(needed<=p->rx_cap)return 0;
+    size_t cap=p->rx_cap?p->rx_cap:TG_WS_PUMP_RX_INITIAL;
+    while(cap<needed){
+        if(cap>TG_WS_PUMP_RX_LIMIT/2u){cap=TG_WS_PUMP_RX_LIMIT;break;}
+        cap*=2u;
+    }
+    if(cap<needed)return -1;
+    if(p->memory_budget&&tg_memory_budget_reserve(p->memory_budget,cap)!=0)
+        return -1;
+    uint8_t *grown=realloc(p->rx,cap);
+    if(!grown){tg_memory_budget_release(p->memory_budget,cap);return -1;}
+    tg_memory_budget_release(p->memory_budget,p->rx_cap);
+    p->rx=grown;p->rx_cap=cap;
+    return 0;
+}
+
+static void trim_idle_buffers(tg_ws_pump *p) {
+    if(p->rx_len==0&&p->rx_cap>TG_WS_PUMP_RX_RETAIN){
+        uint8_t *small=realloc(p->rx,TG_WS_PUMP_RX_INITIAL);
+        if(small){
+            tg_memory_budget_release(p->memory_budget,
+                p->rx_cap-TG_WS_PUMP_RX_INITIAL);
+            p->rx=small;p->rx_cap=TG_WS_PUMP_RX_INITIAL;
+        }
+    }
+    if(!p->reassembly.fragmented&&p->reassembly.len==0&&
+       p->reassembly.cap>TG_WS_PUMP_RX_RETAIN){
+        size_t old_cap=p->reassembly.cap;
+        OPENSSL_clear_free(p->reassembly.data,old_cap);
+        p->reassembly.data=NULL;
+        p->reassembly.cap=0;
+        tg_memory_budget_release(p->memory_budget,old_cap);
+        if(!p->memory_budget||tg_memory_budget_reserve(p->memory_budget,
+                TG_WS_PUMP_RX_INITIAL)==0){
+            uint8_t *small=OPENSSL_malloc(TG_WS_PUMP_RX_INITIAL);
+            if(small){
+                p->reassembly.data=small;
+                p->reassembly.cap=TG_WS_PUMP_RX_INITIAL;
+            }else{
+                tg_memory_budget_release(p->memory_budget,
+                    TG_WS_PUMP_RX_INITIAL);
+            }
+        }
+    }
 }
 
 void tg_ws_pump_destroy(tg_ws_pump *p) {
     if(!p) { return; }
     release_frames(p,p->tx_head);tg_ws_reassembly_destroy(&p->reassembly);
-    free(p->rx);memset(p,0,sizeof(*p));p->fd=-1;
+    free(p->rx);tg_memory_budget_release(p->memory_budget,p->rx_cap);
+    memset(p,0,sizeof(*p));p->fd=-1;
 }
 
 static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,size_t len) {
@@ -36,9 +106,16 @@ static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,size_t 
     size_t alloc=len+14,written=0;
     if(p->tx_memory_bytes>TG_WS_PUMP_TX_LIMIT||
        alloc+sizeof(tg_ws_tx_frame)>TG_WS_PUMP_TX_LIMIT-p->tx_memory_bytes)return -1;
-    tg_ws_tx_frame *f=calloc(1,sizeof(*f));if(!f)return -1;
-    f->bytes=OPENSSL_malloc(alloc);if(!f->bytes){free(f);return -1;}
-    if(tg_ws_encode_client_frame(f->bytes,alloc,opcode,data,len,&written)!=0){OPENSSL_clear_free(f->bytes,alloc);free(f);return -1;}
+    size_t charge=alloc+sizeof(tg_ws_tx_frame);
+    if(p->memory_budget&&tg_memory_budget_reserve(p->memory_budget,charge)!=0)
+        return -1;
+    tg_ws_tx_frame *f=calloc(1,sizeof(*f));if(!f){
+        tg_memory_budget_release(p->memory_budget,charge);return -1;}
+    f->bytes=OPENSSL_malloc(alloc);if(!f->bytes){free(f);
+        tg_memory_budget_release(p->memory_budget,charge);return -1;}
+    if(tg_ws_encode_client_frame(f->bytes,alloc,opcode,data,len,&written)!=0){
+        OPENSSL_clear_free(f->bytes,alloc);free(f);
+        tg_memory_budget_release(p->memory_budget,charge);return -1;}
     f->len=written;f->allocated=alloc;
     if(p->tx_tail) { p->tx_tail->next=f; }
     else { p->tx_head=f; }
@@ -69,10 +146,16 @@ static int append_fragment(tg_ws_reassembly *state, const uint8_t *data,
             cap *= 2u;
         }
         if (cap < needed) return -1;
+        if(state->memory_budget&&
+           tg_memory_budget_reserve(state->memory_budget,cap)!=0)return -1;
         uint8_t *buffer = OPENSSL_malloc(cap);
-        if (!buffer) return -1;
+        if (!buffer) {
+            tg_memory_budget_release(state->memory_budget,cap);
+            return -1;
+        }
         if (state->len) memcpy(buffer, state->data, state->len);
         OPENSSL_clear_free(state->data, state->cap);
+        tg_memory_budget_release(state->memory_budget,state->cap);
         state->data = buffer;
         state->cap = cap;
     }
@@ -84,6 +167,7 @@ static int append_fragment(tg_ws_reassembly *state, const uint8_t *data,
 void tg_ws_reassembly_destroy(tg_ws_reassembly *state) {
     if (!state) return;
     OPENSSL_clear_free(state->data, state->cap);
+    tg_memory_budget_release(state->memory_budget,state->cap);
     memset(state, 0, sizeof(*state));
 }
 
@@ -216,6 +300,7 @@ static int dispatch_frames(tg_ws_pump *p,tg_ws_message_cb callback,void *ctx) {
             else if(op==TG_WS_TEXT)return -1;
             else if(op==TG_WS_BINARY&&callback&&
                     callback(ctx,data,len)!=0)return -1;
+            trim_idle_buffers(p);
         }
         memmove(p->rx,p->rx+used,p->rx_len-used);p->rx_len-=used;
     }
@@ -244,19 +329,20 @@ int tg_ws_pump_process(tg_ws_pump *p,short revents,tg_ws_message_cb callback,voi
     if((revents&POLLIN)||p->read_wants_write||SSL_pending(p->ssl)>0){
         p->read_wants_write=0;
         for(;;){
-            if(p->rx_len==p->rx_cap){p->failed=1;return -1;}
+            if(p->rx_len==p->rx_cap&&reserve_rx(p,p->rx_len+1u)!=0){p->failed=1;return -1;}
             size_t n=0;int rc=SSL_read_ex(p->ssl,p->rx+p->rx_len,p->rx_cap-p->rx_len,&n);
             if(rc!=1){int error=SSL_get_error(p->ssl,rc);
                 if(error==SSL_ERROR_WANT_READ)break;
                 if(error==SSL_ERROR_WANT_WRITE){p->read_wants_write=1;break;}
-                if(error==SSL_ERROR_ZERO_RETURN){p->closed=1;return 0;}
+                if(error==SSL_ERROR_ZERO_RETURN){p->closed=1;trim_idle_buffers(p);return 0;}
                 p->failed=1;return -1;
             }
             if(!n){p->failed=1;return -1;}p->rx_len+=n;
             if(dispatch_frames(p,callback,ctx)!=0){p->failed=1;return -1;}
-            if(p->closed)return 0;
+            if(p->closed){trim_idle_buffers(p);return 0;}
         }
     }
     if(revents&POLLHUP)p->closed=1;
+    trim_idle_buffers(p);
     return p->failed?-1:0;
 }

@@ -4,7 +4,7 @@
 #undef main
 #include <assert.h>
 
-static int parse(const char *text) {
+static int parse_with_unknown(const char *text, size_t *unknown_count) {
     char path[] = "/tmp/d2k-config-XXXXXX";
     int fd = mkstemp(path); assert(fd >= 0);
     assert(write(fd, text, strlen(text)) == (ssize_t)strlen(text)); close(fd);
@@ -13,11 +13,20 @@ static int parse(const char *text) {
     int queue = 0, exists = 0;
     int rc = read_config(path, mode, sizeof mode, listen, sizeof listen,
                          state, sizeof state, &queue, 0, 0, 0, 0, unknown, &count, &exists);
-    unlink(path); return rc;
+    unlink(path);
+    if (unknown_count) *unknown_count = count;
+    return rc;
+}
+static int parse(const char *text) {
+    return parse_with_unknown(text, NULL);
 }
 int main(void) {
     assert(known_key("TG_MODE") && known_key("TG_DC_MAP_PATH"));
     assert(known_key("TG_CF_WORKER_DOMAIN"));
+    size_t unknown_count = 0;
+    assert(parse_with_unknown("TG_DIAGNOSTIC_DIRECT_TCP=1\n",
+                              &unknown_count) == 0);
+    assert(unknown_count == 0);
     assert(parse("SCHEMA='1'\nMODE='apply'\nSTATE_DIR='/opt/d2k/state'\nQUEUE_NUM=\"2000\"\nPANEL_LISTEN='0.0.0.0:8080'\n") == 0);
     assert(parse("SCHEMA=1\nMODE=apply\nSTATE_DIR=/opt/d2k/state\nQUEUE_NUM=2000\n") == 0);
     assert(parse("QUEUE_NUM=\n") == -1);

@@ -235,7 +235,12 @@ int tg_stats_socket_serve(tg_stats_socket *server,
             if (append_active_sessions(response, sizeof(response), &used,
                                        &stats) == 0 &&
                 stats_append(response, sizeof(response), &used,
-                    "\"max_connections\":%zu,\"connections_started\":%" PRIu64
+                    "\"max_connections\":%zu,\"active_wss_connections\":%zu"
+                    ",\"max_wss_connections\":%zu"
+                    ",\"buffer_bytes_current\":%zu"
+                    ",\"buffer_bytes_peak\":%zu"
+                    ",\"buffer_bytes_limit\":%zu"
+                    ",\"connections_started\":%" PRIu64
                     ",\"bytes_from_clients\":%" PRIu64
                     ",\"bytes_from_upstreams\":%" PRIu64
                     ",\"wss_attempts\":%" PRIu64 ",\"wss_failures\":%" PRIu64
@@ -247,7 +252,10 @@ int tg_stats_socket_serve(tg_stats_socket *server,
                     ",\"last_failure_dc\":%u,\"last_failure_route\":%u"
                     ",\"last_failure_stage\":%u,\"last_failure_age_ms\":%" PRIu64
                     "}\n",
-                    stats.max_connections, stats.connections_started,
+                    stats.max_connections, stats.active_wss_connections,
+                    stats.max_wss_connections, stats.buffer_bytes_current,
+                    stats.buffer_bytes_peak, stats.buffer_bytes_limit,
+                    stats.connections_started,
                     stats.bytes_from_clients, stats.bytes_from_upstreams,
                     stats.wss_attempts, stats.wss_failures, stats.wss_responses,
                     stats.cf_wss_responses, stats.last_success_dc,

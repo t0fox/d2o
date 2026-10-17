@@ -19,7 +19,8 @@ typedef enum {
     TG_EPOLL_FAILURE_TLS = 3,
     TG_EPOLL_FAILURE_WEBSOCKET = 4,
     TG_EPOLL_FAILURE_MTPROTO = 5,
-    TG_EPOLL_FAILURE_SETUP = 6
+    TG_EPOLL_FAILURE_SETUP = 6,
+    TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE = 7
 } tg_epoll_failure_stage;
 
 #define TG_EPOLL_MAX_ACTIVE_ROUTE_SESSIONS 64u
@@ -86,6 +87,11 @@ typedef struct {
     int route_sessions_truncated;
     tg_active_route_session active_sessions[TG_EPOLL_MAX_ACTIVE_ROUTE_SESSIONS];
     size_t max_connections;
+    size_t active_wss_connections;
+    size_t max_wss_connections;
+    size_t buffer_bytes_current;
+    size_t buffer_bytes_peak;
+    size_t buffer_bytes_limit;
     uint64_t connections_started;
     uint64_t bytes_from_clients;
     uint64_t bytes_from_upstreams;

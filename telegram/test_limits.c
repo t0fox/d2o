@@ -29,10 +29,22 @@ static void test_reserved_resources_and_invalid_inputs_fail_closed(void) {
                                           SIZE_MAX, 512) == 0);
 }
 
+static void test_runtime_memory_budget_tracks_router_ram(void) {
+    const size_t mib = 1024u * 1024u;
+    assert(tg_limits_runtime_memory_budget(512u * mib, 348u * mib) ==
+           192u * mib);
+    assert(tg_limits_runtime_memory_budget(64u * mib, 40u * mib) ==
+           24u * mib);
+    assert(tg_limits_runtime_memory_budget(2048u * mib, 1024u * mib) ==
+           192u * mib);
+    assert(tg_limits_runtime_memory_budget(512u * mib, 0) == 0);
+}
+
 int main(void) {
     test_connection_budget_respects_file_descriptors();
     test_connection_budget_respects_memory_and_configured_cap();
     test_reserved_resources_and_invalid_inputs_fail_closed();
+    test_runtime_memory_budget_tracks_router_ram();
     puts("Тесты лимитов Telegram runtime: ок");
     return 0;
 }

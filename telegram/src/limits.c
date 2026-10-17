@@ -8,6 +8,7 @@
 #define TG_LIMITS_UNLIMITED_MAX 512u
 #define TG_LIMITS_RESERVED_FDS 33u
 #define TG_LIMITS_FDS_PER_CONNECTION 2u
+#define TG_LIMITS_MEMORY_BUDGET_MAX (192u * 1024u * 1024u)
 
 size_t tg_limits_soft_nofile(void) {
     struct rlimit limit;
@@ -35,4 +36,16 @@ size_t tg_limits_auto_max_connections(size_t fd_limit, size_t memory_budget,
     if (cap > configured_max) cap = configured_max;
     if (cap > TG_LIMITS_UNLIMITED_MAX) cap = TG_LIMITS_UNLIMITED_MAX;
     return cap;
+}
+
+size_t tg_limits_runtime_memory_budget(size_t total_bytes,
+                                      size_t available_bytes) {
+    if (!total_bytes || !available_bytes) return 0;
+    /* Оставляем системе большую часть RAM и ограничиваем худший случай WSS. */
+    size_t total_cap = (total_bytes / 5u) * 2u;
+    size_t available_cap = (available_bytes / 5u) * 3u;
+    size_t budget = total_cap < available_cap ? total_cap : available_cap;
+    return budget < TG_LIMITS_MEMORY_BUDGET_MAX
+        ? budget
+        : TG_LIMITS_MEMORY_BUDGET_MAX;
 }

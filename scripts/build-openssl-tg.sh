@@ -117,6 +117,7 @@ file "$ROOT/build/telegram/openssl-link-smoke-$ARCH"
     "$ROOT/telegram/src/tls.c" \
     "$ROOT/telegram/src/ws.c" \
     "$ROOT/telegram/src/ws_pump.c" \
+    "$ROOT/telegram/src/memory_budget.c" \
     "$ROOT/telegram/src/net.c" \
     "$ROOT/telegram/src/listener.c" \
     "$ROOT/telegram/src/mtproto_crypto.c" \

@@ -8,5 +8,7 @@ size_t tg_limits_auto_max_connections(size_t fd_limit, size_t memory_budget,
                                      size_t bytes_per_connection,
                                      size_t hedge_limit,
                                      size_t configured_max);
+size_t tg_limits_runtime_memory_budget(size_t total_bytes,
+                                      size_t available_bytes);
 
 #endif

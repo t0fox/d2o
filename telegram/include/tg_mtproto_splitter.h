@@ -2,6 +2,7 @@
 #define D2K_TG_MTPROTO_SPLITTER_H
 
 #include "tg_mtproto.h"
+#include "tg_memory_budget.h"
 
 #define TG_MTPROTO_MAX_PACKET (4u * 1024u * 1024u)
 
@@ -27,10 +28,14 @@ typedef struct {
     size_t packet_cap;
     int disabled;
     int error;
+    tg_memory_budget *memory_budget;
 } tg_mtproto_splitter;
 
 int tg_mtproto_splitter_init(tg_mtproto_splitter *splitter,
                              tg_mtproto_proto proto);
+int tg_mtproto_splitter_init_accounted(tg_mtproto_splitter *splitter,
+                                       tg_mtproto_proto proto,
+                                       tg_memory_budget *memory_budget);
 void tg_mtproto_splitter_destroy(tg_mtproto_splitter *splitter);
 int tg_mtproto_splitter_feed(tg_mtproto_splitter *splitter,
                              tg_mtproto_ctr *encrypt, uint8_t *plaintext,

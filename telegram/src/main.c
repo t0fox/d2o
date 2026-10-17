@@ -1,6 +1,9 @@
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE
 #endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 #include "../../runtime/d2k_runtime.h"
 #include "tg_config.h"
@@ -16,6 +19,7 @@
 #include "tg_route_dns.h"
 #include "tg_route_plan.h"
 #include "tg_listener.h"
+#include "tg_limits.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -25,9 +29,13 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#if defined(__linux__)
+#include <sys/sysinfo.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -41,6 +49,32 @@
 
 static const char *health_path = "/tmp/d2k/d2ktg.health";
 static volatile sig_atomic_t stop_requested;
+
+#if defined(__linux__)
+static size_t memory_bytes_from_sysinfo(uint64_t units,
+                                        unsigned int unit) {
+    if (!unit || units > UINT64_MAX / unit) return SIZE_MAX;
+    uint64_t bytes = units * unit;
+    return bytes > SIZE_MAX ? SIZE_MAX : (size_t)bytes;
+}
+#endif
+
+static size_t proxy_memory_budget(void) {
+#if defined(__linux__)
+    struct sysinfo info;
+    if (sysinfo(&info) == 0 && info.mem_unit) {
+        uint64_t available_pages = (uint64_t)info.freeram + info.bufferram;
+        size_t total_bytes = memory_bytes_from_sysinfo(info.totalram,
+                                                      info.mem_unit);
+        size_t available_bytes = memory_bytes_from_sysinfo(available_pages,
+                                                           info.mem_unit);
+        size_t budget = tg_limits_runtime_memory_budget(total_bytes,
+                                                        available_bytes);
+        if (budget) return budget;
+    }
+#endif
+    return 32u * 1024u * 1024u;
+}
 
 static void on_signal(int signo) { (void)signo;stop_requested=1; }
 
@@ -378,7 +412,7 @@ static int run_local_daemon(const char *config_path) {
     tg_epoll_proxy_config proxy_config = {
         .listener_fd = listener,
         .queue_bytes = 64u * 1024u,
-        .memory_budget_bytes = 32u * 1024u * 1024u,
+        .memory_budget_bytes = proxy_memory_budget(),
         .configured_max_connections = 64,
         .handshake_timeout_ms = 5000,
         .idle_timeout_ms = 300000,

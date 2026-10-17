@@ -2,10 +2,13 @@
 #include "tg_route_dns.h"
 
 #include <assert.h>
+#include <errno.h>
+#include <netdb.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 
 extern size_t tg_route_dns_test_doh_endpoint_count(void);
@@ -16,6 +19,29 @@ extern int tg_route_dns_test_h2_encode_headers(
     size_t headers_cap, size_t *headers_len);
 extern int tg_route_dns_test_h2_response_is_ok(const uint8_t *block,
                                                size_t block_len);
+
+static atomic_int mock_getaddrinfo_error = EAI_NONAME;
+static atomic_int mock_getaddrinfo_calls;
+static atomic_int mock_socket_calls;
+
+int __wrap_getaddrinfo(const char *node, const char *service,
+                       const struct addrinfo *hints, struct addrinfo **results) {
+    (void)node;
+    (void)service;
+    (void)hints;
+    if (results) *results = NULL;
+    atomic_fetch_add(&mock_getaddrinfo_calls, 1);
+    return atomic_load(&mock_getaddrinfo_error);
+}
+
+int __wrap_socket(int domain, int type, int protocol) {
+    (void)domain;
+    (void)type;
+    (void)protocol;
+    atomic_fetch_add(&mock_socket_calls, 1);
+    errno = ECONNREFUSED;
+    return -1;
+}
 
 typedef struct {
     pthread_mutex_t mutex;
@@ -159,6 +185,32 @@ static void test_doh_endpoint_order_and_fallbacks(void) {
     }
 }
 
+static void test_negative_system_dns_skips_doh_fallback(void) {
+    SSL_CTX *tls = SSL_CTX_new(TLS_client_method());
+    assert(tls);
+    tg_route_dns *cache = tg_route_dns_create(tls, 0, NULL, NULL, NULL);
+    assert(cache);
+    tg_listener_destination addresses[TG_ROUTE_DNS_ADDRESS_MAX] = {{0}};
+    size_t count = 0;
+
+    atomic_store(&mock_getaddrinfo_error, EAI_NONAME);
+    atomic_store(&mock_getaddrinfo_calls, 0);
+    atomic_store(&mock_socket_calls, 0);
+    assert(tg_route_dns_lookup_now(cache, "missing.example", addresses,
+                                  &count) != 0);
+    assert(atomic_load(&mock_getaddrinfo_calls) == 1);
+    assert(atomic_load(&mock_socket_calls) == 0);
+
+    atomic_store(&mock_getaddrinfo_error, EAI_AGAIN);
+    assert(tg_route_dns_lookup_now(cache, "offline.example", addresses,
+                                  &count) != 0);
+    assert(atomic_load(&mock_getaddrinfo_calls) == 2);
+    assert(atomic_load(&mock_socket_calls) > 0);
+
+    tg_route_dns_destroy(cache);
+    SSL_CTX_free(tls);
+}
+
 static void test_http2_doh_headers_and_status(void) {
     uint8_t headers[512] = {0};
     size_t headers_len = 0;
@@ -266,6 +318,7 @@ int main(void) {
     test_http_body_parser_accepts_bounded_chunked_response();
     test_http_body_parser_accepts_content_length_response();
     test_doh_endpoint_order_and_fallbacks();
+    test_negative_system_dns_skips_doh_fallback();
     test_http2_doh_headers_and_status();
     test_cache_returns_bounded_public_addresses();
     test_private_and_invalid_results_are_rejected();

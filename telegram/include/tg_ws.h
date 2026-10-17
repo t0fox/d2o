@@ -5,8 +5,10 @@
 #include <stdint.h>
 #include <openssl/ssl.h>
 #include <poll.h>
+#include "tg_memory_budget.h"
 
 #define TG_WS_MAX_MESSAGE (4u * 1024u * 1024u)
+#define TG_WS_PUMP_RX_INITIAL (16u * 1024u)
 #define TG_WS_CONTINUATION 0x0u
 #define TG_WS_TEXT 0x1u
 #define TG_WS_BINARY 0x2u
@@ -50,6 +52,7 @@ typedef struct {
     size_t len, cap;
     uint8_t opcode;
     int fragmented;
+    tg_memory_budget *memory_budget;
 } tg_ws_reassembly;
 
 /* Состояние перед первым вызовом должно быть нулевым.
@@ -73,10 +76,13 @@ typedef struct {
      * buffer and node charges until free, excluding allocator metadata. */
     SSL *ssl; int fd; uint8_t *rx; size_t rx_len,rx_cap,tx_bytes,tx_memory_bytes;
     tg_ws_tx_frame *tx_head,*tx_tail; tg_ws_reassembly reassembly;
+    tg_memory_budget *memory_budget;
     int failed,closed,read_wants_write,write_wants_read;
 } tg_ws_pump;
 typedef int (*tg_ws_message_cb)(void *ctx,const uint8_t *payload,size_t payload_len);
 int tg_ws_pump_init(tg_ws_pump *pump,SSL *ssl);
+int tg_ws_pump_init_accounted(tg_ws_pump *pump, SSL *ssl,
+                              tg_memory_budget *memory_budget);
 void tg_ws_pump_destroy(tg_ws_pump *pump);
 int tg_ws_pump_queue_binary(tg_ws_pump *pump,const uint8_t *payload,size_t payload_len);
 int tg_ws_pump_queue_ping(tg_ws_pump *pump,const uint8_t *payload,size_t payload_len);

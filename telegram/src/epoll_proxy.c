@@ -8,6 +8,7 @@
 #include "tg_mtproto_splitter.h"
 #include "tg_tls.h"
 #include "tg_ws.h"
+#include "tg_memory_budget.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -31,6 +32,7 @@
 #define TG_HEDGE_DELAY_DEFAULT_MS 125u
 #define TG_ROUTE_DNS_WAIT_TIMEOUT_MS 20000u
 #define TG_ROUTE_DNS_RETRY_MS 50u
+#define TG_EPOLL_RUNTIME_RESERVE_PER_CONNECTION (256u * 1024u)
 #ifndef TG_ROUTE_HEALTH_COOLDOWN_MS
 #define TG_ROUTE_HEALTH_COOLDOWN_MS 30000u
 #endif
@@ -42,6 +44,7 @@ typedef struct {
     size_t cap;
     size_t head;
     size_t len;
+    size_t dynamic_bytes;
 } byte_queue;
 
 typedef struct proxy_connection proxy_connection;
@@ -104,6 +107,7 @@ struct proxy_connection {
     int route_is_media;
     int route_tcp_only;
     int route_session_tracked;
+    int route_failure_recorded;
     tg_active_route_session route_session;
     size_t route_index;
     size_t route_dns_step_index;
@@ -113,7 +117,12 @@ struct proxy_connection {
     int route_dns_peer_fin;
     int route_dns_event_active;
     int route_health_index;
+    int route_data_seen;
     int route_response_seen;
+    int response_observer_disabled;
+    int wss_replay_disabled;
+    int wss_client_payload_started;
+    size_t wss_forwarded_offset;
     uint8_t response_header[4];
     size_t response_header_len;
     size_t response_header_needed;
@@ -141,6 +150,7 @@ struct proxy_connection {
     size_t handshake_len;
     uint64_t handshake_deadline_ms;
     uint64_t last_activity_ms;
+    uint64_t upstream_connect_deadline_ms;
     tg_listener_destination original;
     tg_listener_destination upstream_target;
     byte_queue to_upstream;
@@ -159,6 +169,7 @@ struct tg_epoll_proxy {
     size_t tracked_sessions;
     size_t max_wss_connections;
     size_t active_wss_connections;
+    tg_memory_budget buffer_budget;
     uint64_t connections_started;
     uint64_t process_started_at;
     uint64_t bytes_from_clients;
@@ -180,7 +191,10 @@ static int queue_wss_packet(void *opaque, const uint8_t *packet,
                             size_t packet_len);
 static int process_client_payload(proxy_connection *connection,
                                   uint8_t *buffer, size_t length);
-static int hedge_flush_buffered_payload(proxy_connection *connection);
+static int queue_wss_replay_payload(proxy_connection *connection,
+                                    uint8_t *buffer, size_t length);
+static void clear_wss_replay(proxy_connection *connection);
+static int flush_wss_replay(proxy_connection *connection);
 static int hedge_candidate_flush_buffered_payload(
     proxy_connection *candidate);
 static void hedge_cancel_candidates(proxy_connection *connection);
@@ -317,18 +331,8 @@ static int default_original_destination(void *context, int fd,
     return tg_listener_get_original_dst_any(fd, out);
 }
 
-static int queue_append(byte_queue *queue, const uint8_t *data, size_t len) {
-    if (len > queue->cap - queue->len) return -1;
-    if (queue->head + queue->len + len > queue->cap && queue->head) {
-        memmove(queue->data, queue->data + queue->head, queue->len);
-        queue->head = 0;
-    }
-    memcpy(queue->data + queue->head + queue->len, data, len);
-    queue->len += len;
-    return 0;
-}
-
-static int queue_append_grow(byte_queue *queue, const uint8_t *data, size_t len,
+static int queue_append_grow(proxy_connection *connection, byte_queue *queue,
+                             const uint8_t *data, size_t len,
                              size_t max_capacity) {
     if (queue->len > max_capacity || len > max_capacity - queue->len)
         return -1;
@@ -347,24 +351,81 @@ static int queue_append_grow(byte_queue *queue, const uint8_t *data, size_t len,
             cap *= 2u;
         }
         if (cap < need) return -1;
+        size_t growth = cap - queue->cap;
+        tg_memory_budget *budget = connection && connection->server
+            ? &connection->server->buffer_budget : NULL;
+        if (budget && tg_memory_budget_reserve(budget, growth) != 0)
+            return -1;
         uint8_t *grown = realloc(queue->data, cap);
-        if (!grown) return -1;
+        if (!grown) {
+            tg_memory_budget_release(budget, growth);
+            return -1;
+        }
         queue->data = grown;
         queue->cap = cap;
+        queue->dynamic_bytes += growth;
     }
     if (len) memcpy(queue->data + queue->head + queue->len, data, len);
     queue->len += len;
     return 0;
 }
 
-static int queue_flush(int fd, byte_queue *queue, uint64_t *last_activity) {
+static int queue_prepend(byte_queue *queue, const uint8_t *data, size_t len,
+                         size_t max_capacity, tg_memory_budget *budget) {
+    if (!queue || (len && !data) || len > SIZE_MAX - queue->len)
+        return -1;
+    size_t needed = queue->len + len;
+    if (needed > max_capacity) return -1;
+    if (needed > queue->cap) {
+        size_t growth = needed - queue->cap;
+        if (budget && tg_memory_budget_reserve(budget, growth) != 0)
+            return -1;
+        uint8_t *grown = realloc(queue->data, needed);
+        if (!grown) {
+            tg_memory_budget_release(budget, growth);
+            return -1;
+        }
+        queue->data = grown;
+        queue->cap = needed;
+        queue->dynamic_bytes += growth;
+    }
+    if (queue->head >= len) {
+        queue->head -= len;
+        if (len) memcpy(queue->data + queue->head, data, len);
+    } else {
+        memmove(queue->data + len, queue->data + queue->head, queue->len);
+        queue->head = 0;
+        if (len) memcpy(queue->data, data, len);
+    }
+    queue->len = needed;
+    return 0;
+}
+
+static void queue_release(proxy_connection *connection, byte_queue *queue) {
+    if (!queue) return;
+    tg_memory_budget *budget = connection && connection->server
+        ? &connection->server->buffer_budget : NULL;
+    free(queue->data);
+    tg_memory_budget_release(budget, queue->dynamic_bytes);
+    queue->data = NULL;
+    queue->cap = 0;
+    queue->head = 0;
+    queue->len = 0;
+    queue->dynamic_bytes = 0;
+}
+
+static int queue_flush(int fd, byte_queue *queue, uint64_t *last_activity,
+                       proxy_connection *connection) {
     while (queue->len) {
         ssize_t n = send(fd, queue->data + queue->head, queue->len,
                          MSG_NOSIGNAL);
         if (n > 0) {
             queue->head += (size_t)n;
             queue->len -= (size_t)n;
-            if (!queue->len) queue->head = 0;
+            if (!queue->len) {
+                queue->head = 0;
+                queue_release(connection, queue);
+            }
             *last_activity = monotonic_ms();
             continue;
         }
@@ -382,7 +443,7 @@ static uint32_t client_events(const proxy_connection *connection) {
     int wss_backpressure = connection->ws_pump_ready &&
                            connection->ws_pump.tx_memory_bytes != 0;
     int queue_has_room = connection->to_upstream.len <
-                         connection->to_upstream.cap;
+                         connection->server->config.queue_bytes;
     if ((!connection->route_dns_pending || !connection->route_dns_peer_fin) &&
         (!connection->route_racing || queue_has_room)) events |= EPOLLRDHUP;
     if (!connection->client_eof && upstream_ready && !wss_backpressure &&
@@ -408,7 +469,7 @@ static uint32_t upstream_events(const proxy_connection *connection) {
         return events;
     }
     if (!connection->upstream_eof &&
-        connection->to_client.len < connection->to_client.cap)
+        connection->to_client.len < connection->server->config.queue_bytes)
         events |= EPOLLIN;
     if (connection->to_upstream.len) events |= EPOLLOUT;
     return events;
@@ -459,6 +520,7 @@ static void connection_close(proxy_connection *connection) {
     tg_mtproto_ctr_destroy(&connection->client_encrypt);
     tg_mtproto_ctr_destroy(&connection->server_decrypt);
     connection->client_fd = connection->upstream_fd = -1;
+    connection->upstream_connect_deadline_ms = 0;
     proxy_connection **link = &server->connections;
     while (*link && *link != connection) link = &(*link)->next;
     if (*link == connection) *link = connection->next;
@@ -473,6 +535,10 @@ static void collect_retired(tg_epoll_proxy *server) {
     while (server->retired) {
         proxy_connection *connection = server->retired;
         server->retired = connection->retired_next;
+        tg_memory_budget_release(&server->buffer_budget,
+                                connection->to_upstream.dynamic_bytes);
+        tg_memory_budget_release(&server->buffer_budget,
+                                connection->to_client.dynamic_bytes);
         free(connection->to_upstream.data);
         free(connection->to_client.data);
         free(connection);
@@ -537,34 +603,47 @@ static int route_health_get(tg_epoll_proxy *server,
     return (int)index;
 }
 
-static void route_health_failed(proxy_connection *connection) {
-    if (!connection || connection->route_health_index < 0) return;
-    route_health *health = &connection->server->route_health[
-        (size_t)connection->route_health_index];
-    if (!health->used) return;
-    if (health->failures != UINT64_MAX) ++health->failures;
+static void route_failure_record(proxy_connection *connection,
+                                 tg_route_kind kind, uint32_t stage) {
+    if (!connection) return;
     uint64_t now = monotonic_ms();
-    health->cooldown_until_ms = now + TG_ROUTE_HEALTH_COOLDOWN_MS;
-    health->last_failure_ms = now;
-    if (connection->connecting || connection->wss_phase == WSS_NONE) {
-        health->last_failure_stage = TG_EPOLL_FAILURE_TCP;
-    } else if (connection->wss_phase == WSS_TLS) {
-        health->last_failure_stage = TG_EPOLL_FAILURE_TLS;
-    } else if (connection->wss_phase == WSS_UPGRADE_WRITE ||
-               connection->wss_phase == WSS_UPGRADE_READ) {
-        health->last_failure_stage = TG_EPOLL_FAILURE_WEBSOCKET;
-    } else if (connection->wss_phase == WSS_READY) {
-        health->last_failure_stage = TG_EPOLL_FAILURE_MTPROTO;
-    } else {
-        health->last_failure_stage = TG_EPOLL_FAILURE_SETUP;
-    }
     tg_epoll_proxy *server = connection->server;
     if (now >= server->last_failure_ms) {
         server->last_failure_ms = now;
-        server->last_failure_dc = health->dc_id;
-        server->last_failure_route = (uint32_t)health->kind;
-        server->last_failure_stage = health->last_failure_stage;
+        server->last_failure_dc = connection->route_dc_id;
+        server->last_failure_route = (uint32_t)kind;
+        server->last_failure_stage = stage;
     }
+    connection->route_failure_recorded = 1;
+}
+
+static void route_health_failed(proxy_connection *connection) {
+    if (!connection) return;
+    uint32_t stage;
+    if (connection->connecting || connection->wss_phase == WSS_NONE) {
+        stage = TG_EPOLL_FAILURE_TCP;
+    } else if (connection->wss_phase == WSS_TLS) {
+        stage = TG_EPOLL_FAILURE_TLS;
+    } else if (connection->wss_phase == WSS_UPGRADE_WRITE ||
+               connection->wss_phase == WSS_UPGRADE_READ) {
+        stage = TG_EPOLL_FAILURE_WEBSOCKET;
+    } else if (connection->wss_phase == WSS_READY) {
+        stage = TG_EPOLL_FAILURE_MTPROTO;
+    } else {
+        stage = TG_EPOLL_FAILURE_SETUP;
+    }
+    if (connection->route_health_index >= 0) {
+        route_health *health = &connection->server->route_health[
+            (size_t)connection->route_health_index];
+        if (health->used) {
+            if (health->failures != UINT64_MAX) ++health->failures;
+            uint64_t now = monotonic_ms();
+            health->cooldown_until_ms = now + TG_ROUTE_HEALTH_COOLDOWN_MS;
+            health->last_failure_ms = now;
+            health->last_failure_stage = stage;
+        }
+    }
+    route_failure_record(connection, connection->route_kind, stage);
 }
 
 static size_t route_worker_count(const tg_epoll_proxy *server);
@@ -829,6 +908,9 @@ static int begin_upstream(proxy_connection *connection,
         return -1;
     }
     connection->connecting = rc != 0;
+    connection->upstream_connect_deadline_ms = connection->connecting
+        ? monotonic_ms() + server->config.handshake_timeout_ms
+        : 0;
     if (!connection->connecting && connection->direct_wss &&
         prepare_wss_tls(connection) != 0) {
         close(fd);
@@ -907,9 +989,15 @@ route_attempt_cleared:
     if (connection->upstream_fd >= 0) close(connection->upstream_fd);
     connection->upstream_fd = -1;
     connection->connecting = 0;
+    connection->upstream_eof = 0;
+    connection->upstream_shutdown = 0;
+    connection->upstream_connect_deadline_ms = 0;
     connection->direct_wss = 0;
     connection->route_health_index = -1;
+    connection->route_data_seen = 0;
     connection->route_response_seen = 0;
+    connection->response_observer_disabled = 0;
+    connection->wss_forwarded_offset = 0;
     connection->route_started_ms = 0;
 }
 
@@ -997,10 +1085,15 @@ static int start_next_route(proxy_connection *connection) {
         if (step.kind == TG_ROUTE_DIRECT_TCP) {
             connection->route_dns_event_active = 0;
             connection->route_dns_pending = 0;
-            if (connection->to_upstream.len != 0 ||
-                queue_append(&connection->to_upstream, connection->handshake,
-                             sizeof(connection->handshake)) != 0)
+            if ((connection->wss_replay_disabled &&
+                 connection->wss_client_payload_started) ||
+                queue_prepend(&connection->to_upstream,
+                              connection->handshake,
+                              sizeof(connection->handshake),
+                              server->config.queue_bytes,
+                              &server->buffer_budget) != 0)
                 return -1;
+            connection->wss_replay_disabled = 1;
             if (begin_upstream(connection,
                                &connection->upstream_target) == 0) {
                 if (!connection->connecting)
@@ -1010,6 +1103,7 @@ static int start_next_route(proxy_connection *connection) {
             }
             route_session_event(connection, step.kind,
                                 TG_ROUTE_SESSION_FAILED);
+            route_failure_record(connection, step.kind, TG_EPOLL_FAILURE_TCP);
             continue;
         }
         if (!server->config.enable_direct_wss ||
@@ -1044,8 +1138,14 @@ static int start_next_route(proxy_connection *connection) {
                                            server->config.listen_port_count))) {
             route_session_event(connection, step.kind,
                                 TG_ROUTE_SESSION_FAILED);
+            route_failure_record(connection, step.kind,
+                step.kind == TG_ROUTE_DIRECT_WSS
+                    ? TG_EPOLL_FAILURE_SETUP : TG_EPOLL_FAILURE_DNS);
             continue;
         }
+        connection->route_data_seen = 0;
+        connection->route_response_seen = 0;
+        connection->response_observer_disabled = 0;
         int health_index = route_health_get(server, connection, 1);
         if (health_index >= 0) {
             route_health *health = &server->route_health[health_index];
@@ -1072,12 +1172,17 @@ static int start_next_route(proxy_connection *connection) {
         }
         clear_route_attempt(connection, 1);
     }
+    if (!connection->route_failure_recorded)
+        route_failure_record(connection, TG_ROUTE_DIRECT_WSS,
+                             TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE);
     return -1;
 }
 
 static int advance_route(proxy_connection *connection) {
     if (!connection || connection->closed || !connection->direct_wss ||
-        connection->wss_phase == WSS_READY) return -1;
+        connection->route_data_seen ||
+        (connection->wss_replay_disabled &&
+         connection->wss_client_payload_started)) return -1;
     clear_route_attempt(connection, 1);
     return start_next_route(connection);
 }
@@ -1220,10 +1325,13 @@ static void connection_update(proxy_connection *connection) {
         connection_close(connection);
         return;
     }
-    if (connection->upstream_fd >= 0 &&
-        watch_update(server, &connection->upstream_watch,
-                     upstream_events(connection)) != 0) {
-        connection_close(connection);
+    if (connection->upstream_fd >= 0) {
+        if (connection->upstream_eof) {
+            watch_remove(server, &connection->upstream_watch);
+        } else if (watch_update(server, &connection->upstream_watch,
+                                upstream_events(connection)) != 0) {
+            connection_close(connection);
+        }
     }
 }
 
@@ -1235,7 +1343,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
         return -1;
     }
     if (candidate->to_client.len &&
-        queue_append_grow(&parent->to_client,
+        queue_append_grow(parent, &parent->to_client,
                           candidate->to_client.data + candidate->to_client.head,
                           candidate->to_client.len,
                           TG_MTPROTO_MAX_PACKET) != 0) {
@@ -1263,6 +1371,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
     parent->packet_framing = candidate->packet_framing;
     parent->wss_subprotocol = candidate->wss_subprotocol;
     parent->route_health_index = candidate->route_health_index;
+    parent->route_data_seen = candidate->route_data_seen;
     parent->route_response_seen = candidate->route_response_seen;
     memcpy(parent->response_header, candidate->response_header,
            sizeof(parent->response_header));
@@ -1286,8 +1395,9 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
         .kind = 2, .connection = parent, .side = 1,
         .fd = parent->upstream_fd
     };
-    parent->to_upstream.head = 0;
-    parent->to_upstream.len = 0;
+    queue_release(parent, &parent->to_upstream);
+    parent->wss_forwarded_offset = 0;
+    parent->wss_replay_disabled = 1;
     parent->route_racing = 0;
     parent->hedge_due_ms = 0;
 
@@ -1390,6 +1500,7 @@ static int route_after_handshake(proxy_connection *connection) {
     connection->route_dc_id = selection.dc_id;
     connection->route_is_media = selection.is_media;
     connection->route_tcp_only = selection.tcp_only;
+    connection->route_failure_recorded = 0;
     connection->wss_proto = selection.proto;
     if (connection->route_session_tracked) {
         connection->route_session.stage = TG_ROUTE_SESSION_STAGE_ROUTING;
@@ -1418,7 +1529,11 @@ static int route_after_handshake(proxy_connection *connection) {
                             worker_count, cf_count, diagnostic_direct_tcp,
                             &connection->route_plan) != 0)
         return -1;
-    if (!connection->route_plan.count) return -1;
+    if (!connection->route_plan.count) {
+        route_failure_record(connection, TG_ROUTE_DIRECT_WSS,
+                             TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE);
+        return -1;
+    }
     if (policy == TG_WS_ROUTING_ADAPTIVE && have_preferred)
         route_plan_prioritize(&connection->route_plan, &preferred);
     uint32_t hedge_limit = server->config.routing_config
@@ -1447,8 +1562,17 @@ static int receive_client(proxy_connection *connection) {
             capacity = sizeof(connection->handshake) - connection->handshake_len;
             if (!capacity) return -1;
         } else {
-            size_t free_bytes = connection->to_upstream.cap -
-                                connection->to_upstream.len;
+            size_t queue_limit = connection->server->config.queue_bytes;
+            size_t free_bytes = connection->to_upstream.len < queue_limit
+                ? queue_limit - connection->to_upstream.len : 0;
+            if (!free_bytes && connection->direct_wss &&
+                !connection->route_racing &&
+                !connection->route_data_seen &&
+                !connection->wss_replay_disabled) {
+                connection->wss_replay_disabled = 1;
+                clear_wss_replay(connection);
+                free_bytes = queue_limit;
+            }
             if (!free_bytes) return 0;
             if (capacity > free_bytes) capacity = free_bytes;
         }
@@ -1461,13 +1585,19 @@ static int receive_client(proxy_connection *connection) {
                        buffer, (size_t)n);
                 connection->handshake_len += (size_t)n;
                 if (connection->handshake_len == sizeof(connection->handshake) &&
-                    route_after_handshake(connection) != 0)
+                    route_after_handshake(connection) != 0) {
+                    if (!connection->route_failure_recorded)
+                        route_failure_record(connection, connection->route_kind,
+                                             TG_EPOLL_FAILURE_SETUP);
                     return -1;
+                }
                 if (connection->route_dns_pending) return 0;
             } else if (connection->route_racing) {
-                if (queue_append(&connection->to_upstream, buffer,
-                                 (size_t)n) != 0)
+                if (queue_append_grow(connection, &connection->to_upstream,
+                                     buffer, (size_t)n,
+                                     connection->server->config.queue_bytes) != 0)
                     return -1;
+                connection->wss_client_payload_started = 1;
                 for (size_t i = 0; i < 2; ++i) {
                     proxy_connection *candidate = connection->hedges[i];
                     if (!candidate || candidate->wss_phase != WSS_READY)
@@ -1482,8 +1612,11 @@ static int receive_client(proxy_connection *connection) {
                         if (connection->closed) return -1;
                     }
                 }
-            } else if (process_client_payload(connection, buffer,
-                                              (size_t)n) != 0) {
+            } else if (connection->direct_wss
+                           ? queue_wss_replay_payload(connection, buffer,
+                                                      (size_t)n) != 0
+                           : process_client_payload(connection, buffer,
+                                                    (size_t)n) != 0) {
                 return -1;
             }
             continue;
@@ -1508,14 +1641,17 @@ static int receive_client(proxy_connection *connection) {
 static int receive_upstream(proxy_connection *connection) {
     uint8_t buffer[TG_EPOLL_IO_CHUNK];
     for (;;) {
-        size_t free_bytes = connection->to_client.cap - connection->to_client.len;
+        size_t queue_limit = connection->server->config.queue_bytes;
+        size_t free_bytes = connection->to_client.len < queue_limit
+            ? queue_limit - connection->to_client.len : 0;
         if (!free_bytes) return 0;
         size_t capacity = free_bytes < sizeof(buffer) ? free_bytes : sizeof(buffer);
         ssize_t n = recv(connection->upstream_fd, buffer, capacity, 0);
         if (n > 0) {
             add_bytes(&connection->server->bytes_from_upstreams, (size_t)n);
             connection->last_activity_ms = monotonic_ms();
-            if (queue_append(&connection->to_client, buffer, (size_t)n) != 0)
+            if (queue_append_grow(connection, &connection->to_client,
+                                  buffer, (size_t)n, queue_limit) != 0)
                 return -1;
             continue;
         }
@@ -1558,20 +1694,51 @@ static int process_client_payload(proxy_connection *connection,
         }
         return tg_ws_pump_queue_binary(&connection->ws_pump, buffer, length);
     }
-    return queue_append(&connection->to_upstream, buffer, length);
+    return queue_append_grow(connection, &connection->to_upstream, buffer,
+                             length,
+                             connection->server->config.queue_bytes);
 }
 
-static int hedge_flush_buffered_payload(proxy_connection *connection) {
+static void clear_wss_replay(proxy_connection *connection) {
+    queue_release(connection, &connection->to_upstream);
+    connection->wss_forwarded_offset = 0;
+}
+
+static int queue_wss_replay_payload(proxy_connection *connection,
+                                    uint8_t *buffer, size_t length) {
+    connection->wss_client_payload_started = 1;
+    if (!connection->wss_replay_disabled &&
+        !connection->route_data_seen) {
+        if (queue_append_grow(connection, &connection->to_upstream, buffer,
+                              length,
+                              connection->server->config.queue_bytes) == 0) {
+            if (process_client_payload(connection, buffer, length) != 0)
+                return -1;
+            connection->wss_forwarded_offset += length;
+            return 0;
+        }
+        connection->wss_replay_disabled = 1;
+        clear_wss_replay(connection);
+    }
+    return process_client_payload(connection, buffer, length);
+}
+
+static int flush_wss_replay(proxy_connection *connection) {
+    if (!connection || !connection->direct_wss ||
+        connection->wss_phase != WSS_READY ||
+        connection->wss_replay_disabled || connection->route_data_seen)
+        return 0;
     uint8_t buffer[TG_EPOLL_IO_CHUNK];
-    while (connection->to_upstream.len) {
-        size_t length = connection->to_upstream.len;
+    while (connection->wss_forwarded_offset < connection->to_upstream.len) {
+        size_t length = connection->to_upstream.len -
+                        connection->wss_forwarded_offset;
         if (length > sizeof(buffer)) length = sizeof(buffer);
         memcpy(buffer, connection->to_upstream.data +
-                        connection->to_upstream.head, length);
-        connection->to_upstream.head += length;
-        connection->to_upstream.len -= length;
-        if (!connection->to_upstream.len) connection->to_upstream.head = 0;
-        if (process_client_payload(connection, buffer, length) != 0) return -1;
+                        connection->to_upstream.head +
+                        connection->wss_forwarded_offset, length);
+        if (process_client_payload(connection, buffer, length) != 0)
+            return -1;
+        connection->wss_forwarded_offset += length;
     }
     return 0;
 }
@@ -1745,8 +1912,16 @@ cleanup:
 static int queue_wss_response(void *opaque, const uint8_t *payload,
                               size_t payload_len) {
     proxy_connection *connection = opaque;
-    int response = observe_mtproto_response(connection, payload, payload_len);
-    if (response < 0) return -1;
+    int response = 0;
+    if (payload_len && !connection->route_data_seen) {
+        connection->route_data_seen = 1;
+        connection->wss_replay_disabled = 1;
+        clear_wss_replay(connection);
+    }
+    if (!connection->response_observer_disabled) {
+        response = observe_mtproto_response(connection, payload, payload_len);
+        if (response < 0) connection->response_observer_disabled = 1;
+    }
     if (response > 0 && !connection->route_response_seen) {
         connection->route_response_seen = 1;
         route_session_first_response(connection);
@@ -1773,7 +1948,8 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
                 ++health->cf_responses;
         }
     }
-    if (queue_append_grow(&connection->to_client, payload, payload_len,
+    if (queue_append_grow(connection, &connection->to_client,
+                          payload, payload_len,
                           TG_MTPROTO_MAX_PACKET) != 0)
         return -1;
     add_bytes(&connection->server->bytes_from_upstreams, payload_len);
@@ -1789,7 +1965,9 @@ static int establish_wss_stream(proxy_connection *connection) {
         return -1;
     connection->response_header_needed =
         connection->wss_proto == TG_MTPROTO_ABRIDGED ? 0u : 4u;
-    if (tg_ws_pump_init(&connection->ws_pump, connection->upstream_ssl) != 0)
+    if (tg_ws_pump_init_accounted(&connection->ws_pump,
+                                 connection->upstream_ssl,
+                                 &connection->server->buffer_budget) != 0)
         return -1;
     connection->ws_pump_ready = 1;
     if (connection->packet_framing) {
@@ -1797,8 +1975,9 @@ static int establish_wss_stream(proxy_connection *connection) {
                                              &connection->client_decrypt,
                                              &connection->client_encrypt) != 0)
             return -1;
-        if (tg_mtproto_splitter_init(&connection->splitter,
-                                     connection->wss_proto) !=
+        if (tg_mtproto_splitter_init_accounted(&connection->splitter,
+                                     connection->wss_proto,
+                                     &connection->server->buffer_budget) !=
             TG_MTPROTO_SPLIT_OK)
             return -1;
         connection->splitter_ready = 1;
@@ -1812,8 +1991,10 @@ static int establish_wss_stream(proxy_connection *connection) {
                         TG_ROUTE_SESSION_CONNECTED);
     if (!connection->hedge_parent)
         route_session_selected(connection, connection->route_kind);
-    connection->wss_deadline_ms = 0;
+    connection->wss_deadline_ms = monotonic_ms() +
+        connection->server->config.handshake_timeout_ms;
     connection->last_activity_ms = monotonic_ms();
+    if (flush_wss_replay(connection) != 0) return -1;
     return 0;
 }
 
@@ -1892,7 +2073,7 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
                     if (hedge_candidate_flush_buffered_payload(connection) != 0) {
                         return -1;
                     }
-                } else if (hedge_flush_buffered_payload(connection) != 0) {
+                } else if (flush_wss_replay(connection) != 0) {
                     return -1;
                 }
                 continue;
@@ -1905,16 +2086,29 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
         }
         if (connection->wss_phase == WSS_READY) {
             short revents = 0;
-            if (events & EPOLLIN) revents |= POLLIN;
+            if (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP))
+                revents |= POLLIN;
             if (events & EPOLLOUT) revents |= POLLOUT;
-            if (events & EPOLLERR) revents |= POLLERR;
+            if ((events & EPOLLERR) && !(events & (EPOLLIN | EPOLLRDHUP |
+                                                    EPOLLHUP)))
+                revents |= POLLERR;
             if (events & (EPOLLHUP | EPOLLRDHUP)) revents |= POLLHUP;
             int pump_rc = tg_ws_pump_process(&connection->ws_pump, revents,
                                              queue_wss_response, connection);
             if (pump_rc != 0) {
+                if (connection->route_data_seen) {
+                    if (!connection->route_response_seen)
+                        route_health_failed(connection);
+                    connection->upstream_eof = 1;
+                    advance_half_closes(connection);
+                    return 0;
+                }
+                if (!connection->hedge_parent &&
+                    advance_route(connection) == 0)
+                    return 0;
                 return -1;
             }
-            if (connection->hedge_parent && connection->route_response_seen) {
+            if (connection->hedge_parent && connection->route_data_seen) {
                 if (connection->ws_pump.closed)
                     connection->upstream_eof = 1;
                 return hedge_promote_candidate(connection);
@@ -1924,6 +2118,10 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
                     hedge_fail_candidate(connection);
                     return 0;
                 }
+                if (!connection->route_data_seen &&
+                    advance_route(connection) == 0)
+                    return 0;
+                if (!connection->route_data_seen) return -1;
                 if (!connection->route_response_seen)
                     route_health_failed(connection);
                 connection->upstream_eof = 1;
@@ -1985,7 +2183,8 @@ static void client_event(proxy_connection *connection, uint32_t events) {
     }
     if ((events & EPOLLOUT) &&
         queue_flush(connection->client_fd, &connection->to_client,
-                    &connection->last_activity_ms) != 0) {
+                    &connection->last_activity_ms,
+                    connection) != 0) {
         connection_close(connection);
         return;
     }
@@ -2011,10 +2210,15 @@ static void upstream_event(proxy_connection *connection, uint32_t events) {
             if (!connection->direct_wss)
                 route_session_event(connection, connection->route_kind,
                                     TG_ROUTE_SESSION_FAILED);
+            if (!connection->direct_wss &&
+                connection->route_kind == TG_ROUTE_DIRECT_TCP)
+                route_failure_record(connection, connection->route_kind,
+                                     TG_EPOLL_FAILURE_TCP);
             connection_close(connection);
             return;
         }
         connection->connecting = 0;
+        connection->upstream_connect_deadline_ms = 0;
         if (!connection->direct_wss)
             route_session_event(connection, connection->route_kind,
                                 TG_ROUTE_SESSION_CONNECTED);
@@ -2032,24 +2236,40 @@ static void upstream_event(proxy_connection *connection, uint32_t events) {
         }
     }
     if (connection->direct_wss) {
-        int failed = (events & EPOLLERR) &&
+        int wss_may_have_buffered_data =
+            connection->wss_phase == WSS_READY &&
+            (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP));
+        int failed = (events & EPOLLERR) && !wss_may_have_buffered_data &&
                      socket_error(connection->upstream_fd) != 0;
         if ((events & (EPOLLHUP | EPOLLRDHUP)) &&
             connection->wss_phase != WSS_READY)
             failed = 1;
         if (!failed && progress_wss(connection, events) != 0) failed = 1;
+        if (!failed && wss_may_have_buffered_data &&
+            (events & EPOLLERR) && !connection->closed &&
+            connection->wss_phase == WSS_READY &&
+            socket_error(connection->upstream_fd) != 0)
+            failed = 1;
         if (failed) {
             if (connection->hedge_parent) {
                 hedge_fail_candidate(connection);
                 return;
             }
-            if (connection->wss_phase != WSS_READY &&
+            if (!connection->route_data_seen &&
                 advance_route(connection) == 0) {
                 connection_update(connection);
                 return;
             }
-            if (connection->wss_phase == WSS_READY &&
-                !connection->route_response_seen)
+            if (connection->route_data_seen) {
+                if (!connection->route_response_seen)
+                    route_health_failed(connection);
+                connection->upstream_eof = 1;
+                advance_half_closes(connection);
+                if (connection->closed) return;
+                connection_update(connection);
+                return;
+            }
+            if (connection->wss_phase == WSS_READY)
                 route_health_failed(connection);
             connection_close(connection);
             return;
@@ -2062,11 +2282,17 @@ static void upstream_event(proxy_connection *connection, uint32_t events) {
     if ((events & EPOLLERR) && socket_error(connection->upstream_fd)) {
         route_session_event(connection, connection->route_kind,
                             TG_ROUTE_SESSION_FAILED);
+        if (connection->route_kind == TG_ROUTE_DIRECT_TCP)
+            route_failure_record(connection, connection->route_kind,
+                                 TG_EPOLL_FAILURE_TCP);
         connection_close(connection);
         return;
     }
     if (!connection->connecting && (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP))) {
         if (receive_upstream(connection) != 0) {
+            if (connection->route_kind == TG_ROUTE_DIRECT_TCP)
+                route_failure_record(connection, connection->route_kind,
+                                     TG_EPOLL_FAILURE_TCP);
             connection_close(connection);
             return;
         }
@@ -2074,9 +2300,13 @@ static void upstream_event(proxy_connection *connection, uint32_t events) {
     if (connection->closed) return;
     if (!connection->connecting && (events & EPOLLOUT) &&
         queue_flush(connection->upstream_fd, &connection->to_upstream,
-                    &connection->last_activity_ms) != 0) {
+                    &connection->last_activity_ms,
+                    connection) != 0) {
         route_session_event(connection, connection->route_kind,
                             TG_ROUTE_SESSION_FAILED);
+        if (connection->route_kind == TG_ROUTE_DIRECT_TCP)
+            route_failure_record(connection, connection->route_kind,
+                                 TG_EPOLL_FAILURE_TCP);
         connection_close(connection);
         return;
     }
@@ -2126,22 +2356,11 @@ static void accept_clients(tg_epoll_proxy *server) {
             close(fd);
             continue;
         }
-        connection->to_upstream.data = malloc(server->config.queue_bytes);
-        connection->to_client.data = malloc(server->config.queue_bytes);
-        if (!connection->to_upstream.data || !connection->to_client.data) {
-            close(fd);
-            free(connection->to_upstream.data);
-            free(connection->to_client.data);
-            free(connection);
-            continue;
-        }
         connection->server = server;
         connection->client_fd = fd;
         connection->upstream_fd = -1;
         connection->route_health_index = -1;
         connection->original = original;
-        connection->to_upstream.cap = server->config.queue_bytes;
-        connection->to_client.cap = server->config.queue_bytes;
         connection->handshake_deadline_ms = monotonic_ms() +
                                             server->config.handshake_timeout_ms;
         connection->last_activity_ms = monotonic_ms();
@@ -2168,13 +2387,18 @@ static void accept_clients(tg_epoll_proxy *server) {
     }
 }
 
+static int wss_waiting_for_first_response(const proxy_connection *connection) {
+    return connection && connection->direct_wss &&
+           !connection->route_data_seen;
+}
+
 static int timeout_until_expiry(tg_epoll_proxy *server, int timeout_ms) {
     uint64_t now = monotonic_ms(), nearest = UINT64_MAX;
     for (proxy_connection *connection = server->connections; connection;
          connection = connection->next) {
         uint64_t expires = connection->route_dns_pending
             ? connection->route_dns_retry_at_ms
-            : connection->direct_wss && connection->wss_phase != WSS_READY
+            : wss_waiting_for_first_response(connection)
                 ? connection->wss_deadline_ms
                 : connection->handshake_done
                     ? connection->last_activity_ms +
@@ -2183,16 +2407,24 @@ static int timeout_until_expiry(tg_epoll_proxy *server, int timeout_ms) {
         if (connection->route_dns_pending &&
             connection->route_dns_deadline_ms < expires)
             expires = connection->route_dns_deadline_ms;
+        if (connection->connecting &&
+            connection->upstream_connect_deadline_ms &&
+            connection->upstream_connect_deadline_ms < expires)
+            expires = connection->upstream_connect_deadline_ms;
         if (expires < nearest) nearest = expires;
         if (connection->hedge_due_ms && connection->hedge_due_ms < nearest)
             nearest = connection->hedge_due_ms;
         for (size_t i = 0; i < 2; ++i) {
             const proxy_connection *candidate = connection->hedges[i];
             if (candidate) {
-                uint64_t expires = candidate->wss_phase != WSS_READY
+                uint64_t expires = wss_waiting_for_first_response(candidate)
                     ? candidate->wss_deadline_ms
                     : candidate->last_activity_ms +
                       server->config.idle_timeout_ms;
+                if (candidate->connecting &&
+                    candidate->upstream_connect_deadline_ms &&
+                    candidate->upstream_connect_deadline_ms < expires)
+                    expires = candidate->upstream_connect_deadline_ms;
                 if (expires < nearest) nearest = expires;
             }
         }
@@ -2212,10 +2444,14 @@ static void expire_connections(tg_epoll_proxy *server) {
         for (size_t i = 0; i < 2 && !connection->closed; ++i) {
             proxy_connection *candidate = connection->hedges[i];
             if (candidate) {
-                uint64_t expires = candidate->wss_phase != WSS_READY
+                uint64_t expires = wss_waiting_for_first_response(candidate)
                     ? candidate->wss_deadline_ms
                     : candidate->last_activity_ms +
                       server->config.idle_timeout_ms;
+                if (candidate->connecting &&
+                    candidate->upstream_connect_deadline_ms &&
+                    candidate->upstream_connect_deadline_ms < expires)
+                    expires = candidate->upstream_connect_deadline_ms;
                 if (now >= expires) {
                     hedge_fail_candidate(candidate);
                     break;
@@ -2241,6 +2477,8 @@ static void expire_connections(tg_epoll_proxy *server) {
                     connection->route_dns_step_index + 1u;
                 route_session_event(connection, connection->route_kind,
                                     TG_ROUTE_SESSION_FAILED);
+                route_failure_record(connection, connection->route_kind,
+                                     TG_EPOLL_FAILURE_DNS);
             } else if (now >= connection->route_dns_retry_at_ms) {
                 connection->route_dns_pending = 0;
                 connection->route_dns_retry_at_ms = 0;
@@ -2256,18 +2494,34 @@ static void expire_connections(tg_epoll_proxy *server) {
             connection = next;
             continue;
         }
-        int expired = connection->direct_wss &&
-                      connection->wss_phase != WSS_READY
+        if (connection->connecting &&
+            connection->upstream_connect_deadline_ms &&
+            now >= connection->upstream_connect_deadline_ms) {
+            if (connection->direct_wss && advance_route(connection) == 0) {
+                connection_update(connection);
+            } else if (!connection->direct_wss) {
+                route_session_event(connection, connection->route_kind,
+                                    TG_ROUTE_SESSION_FAILED);
+                connection_close(connection);
+            } else {
+                connection_close(connection);
+            }
+            connection = next;
+            continue;
+        }
+        int awaiting_first_response = connection->direct_wss &&
+            (connection->wss_phase != WSS_READY ||
+             !connection->route_data_seen);
+        int expired = awaiting_first_response
             ? now >= connection->wss_deadline_ms
             : connection->handshake_done
                 ? now >= connection->last_activity_ms + server->config.idle_timeout_ms
                 : now >= connection->handshake_deadline_ms;
-        if (expired && connection->direct_wss &&
-            connection->wss_phase != WSS_READY &&
+        if (expired && awaiting_first_response &&
             advance_route(connection) == 0) {
             connection_update(connection);
         } else if (expired) {
-            if (connection->direct_wss && !connection->route_response_seen)
+            if (connection->direct_wss && !connection->route_data_seen)
                 route_health_failed(connection);
             connection_close(connection);
         }
@@ -2288,17 +2542,30 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config) {
         errno = EINVAL;
         return NULL;
     }
-    size_t per_connection = sizeof(proxy_connection);
-    if (config->queue_bytes > (SIZE_MAX - per_connection) / 2) {
+    size_t connection_reserve = sizeof(proxy_connection);
+    if (connection_reserve > SIZE_MAX -
+                             TG_EPOLL_RUNTIME_RESERVE_PER_CONNECTION) {
         errno = EOVERFLOW;
         return NULL;
     }
-    per_connection += config->queue_bytes * 2;
+    connection_reserve += TG_EPOLL_RUNTIME_RESERVE_PER_CONNECTION;
+    size_t memory_per_connection = connection_reserve;
+    if (config->enable_direct_wss) {
+        if (memory_per_connection > SIZE_MAX - TG_WS_PUMP_RX_INITIAL) {
+            errno = EOVERFLOW;
+            return NULL;
+        }
+        memory_per_connection += TG_WS_PUMP_RX_INITIAL;
+    }
     size_t max_connections = tg_limits_auto_max_connections(
-        tg_limits_soft_nofile(), config->memory_budget_bytes, per_connection,
-        0, config->configured_max_connections);
+        tg_limits_soft_nofile(), config->memory_budget_bytes,
+        memory_per_connection, 0, config->configured_max_connections);
     if (!max_connections) {
         errno = ENOMEM;
+        return NULL;
+    }
+    if (max_connections > SIZE_MAX / connection_reserve) {
+        errno = EOVERFLOW;
         return NULL;
     }
     tg_epoll_proxy *server = calloc(1, sizeof(*server));
@@ -2307,26 +2574,13 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config) {
     server->listener_fd = config->listener_fd;
     server->config = *config;
     server->max_connections = max_connections;
+    size_t base_reservation = max_connections * connection_reserve;
+    server->buffer_budget.limit =
+        config->memory_budget_bytes - base_reservation;
+    server->max_wss_connections = config->enable_direct_wss
+        ? max_connections : 0;
     time_t started = time(NULL);
     server->process_started_at = started > 0 ? (uint64_t)started : 0;
-    if (config->enable_direct_wss) {
-        size_t base_reservation;
-        /* Буфер сборки фрагментированного WebSocket-сообщения. */
-        size_t wss_extra = 4u * (size_t)TG_MTPROTO_MAX_PACKET +
-                          TG_WS_MAX_MESSAGE;
-        if (max_connections > SIZE_MAX / per_connection) {
-            free(server);
-            errno = EOVERFLOW;
-            return NULL;
-        }
-        base_reservation = max_connections * per_connection;
-        if (base_reservation < config->memory_budget_bytes && wss_extra) {
-            server->max_wss_connections =
-                (config->memory_budget_bytes - base_reservation) / wss_extra;
-            if (server->max_wss_connections > max_connections)
-                server->max_wss_connections = max_connections;
-        }
-    }
     if (config->listen_port_count)
         memcpy(server->listen_ports, config->listen_ports,
                config->listen_port_count * sizeof(server->listen_ports[0]));
@@ -2436,6 +2690,11 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
     out->route_sessions_truncated =
         server->active_connections > out->active_sessions_count;
     out->max_connections = server->max_connections;
+    out->active_wss_connections = server->active_wss_connections;
+    out->max_wss_connections = server->max_wss_connections;
+    out->buffer_bytes_current = server->buffer_budget.used;
+    out->buffer_bytes_peak = server->buffer_budget.peak;
+    out->buffer_bytes_limit = server->buffer_budget.limit;
     out->connections_started = server->connections_started;
     out->bytes_from_clients = server->bytes_from_clients;
     out->bytes_from_upstreams = server->bytes_from_upstreams;

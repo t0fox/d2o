@@ -127,6 +127,19 @@ static int public_target(const tg_listener_destination *target) {
              target->address[2] == 0x0du && target->address[3] == 0xb8u);
 }
 
+enum {
+    SYSTEM_LOOKUP_FAILED = -1,
+    SYSTEM_LOOKUP_NOT_FOUND = -2
+};
+
+static int system_dns_error_is_negative(int error) {
+    if (error == EAI_NONAME) return 1;
+#ifdef EAI_NODATA
+    if (error == EAI_NODATA) return 1;
+#endif
+    return 0;
+}
+
 static int system_lookup(void *context, const char *domain,
                          tg_listener_destination addresses[TG_ROUTE_DNS_ADDRESS_MAX],
                          size_t *count) {
@@ -135,8 +148,11 @@ static int system_lookup(void *context, const char *domain,
                              .ai_socktype = SOCK_STREAM,
                              .ai_protocol = IPPROTO_TCP};
     struct addrinfo *results = NULL;
-    if (!domain || !count || getaddrinfo(domain, "443", &hints, &results) != 0)
-        return -1;
+    if (!domain || !count) return SYSTEM_LOOKUP_FAILED;
+    int lookup_error = getaddrinfo(domain, "443", &hints, &results);
+    if (lookup_error != 0)
+        return system_dns_error_is_negative(lookup_error)
+            ? SYSTEM_LOOKUP_NOT_FOUND : SYSTEM_LOOKUP_FAILED;
     *count = 0;
     for (struct addrinfo *item = results; item &&
          *count < TG_ROUTE_DNS_ADDRESS_MAX; item = item->ai_next) {
@@ -1049,7 +1065,9 @@ static int system_then_doh_lookup(void *opaque, const char *domain,
                                       TG_ROUTE_DNS_ADDRESS_MAX],
                                   size_t *count) {
     tg_route_dns *cache = opaque;
-    if (system_lookup(NULL, domain, addresses, count) == 0) return 0;
+    int status = system_lookup(NULL, domain, addresses, count);
+    if (status == 0) return 0;
+    if (status == SYSTEM_LOOKUP_NOT_FOUND) return -1;
     return doh_lookup(cache, domain, addresses, count);
 }
 

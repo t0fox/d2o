@@ -18,7 +18,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-typedef struct { int listener; const char *cert; const char *key; char sni[128]; int status; } server_args;
+typedef struct { int listener; const char *cert; const char *key; char sni[128]; int status; size_t payload_len; } server_args;
 
 typedef struct { uint8_t data[16]; size_t len; int received; } pump_capture;
 static int capture_message(void *ctx,const uint8_t *data,size_t len) {
@@ -165,6 +165,58 @@ static int connect_loopback(int listener) {
     assert(fd >= 0 && getsockname(listener, (struct sockaddr *)&addr, &len) == 0);
     assert(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
     return fd;
+}
+
+static void write_large_fragment(SSL *ssl, uint8_t opcode, size_t len) {
+    uint8_t header[10] = {opcode, 127, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (size_t i = 0; i < 8; ++i)
+        header[2 + i] = (uint8_t)((uint64_t)len >> (56u - (unsigned)i * 8u));
+    assert(ssl_write_exact(ssl, header, sizeof(header)) == 0);
+    uint8_t payload[16u * 1024u];
+    memset(payload, 0x5a, sizeof(payload));
+    while (len) {
+        size_t chunk = len < sizeof(payload) ? len : sizeof(payload);
+        assert(ssl_write_exact(ssl, payload, chunk) == 0);
+        len -= chunk;
+    }
+}
+
+static void *serve_large_ws( void *opaque) {
+    server_args *args = opaque;
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    int fd = accept(args->listener, NULL, NULL);
+    assert(ctx && fd >= 0);
+    assert(SSL_CTX_use_certificate_file(ctx, args->cert, SSL_FILETYPE_PEM) == 1);
+    assert(SSL_CTX_use_PrivateKey_file(ctx, args->key, SSL_FILETYPE_PEM) == 1);
+    SSL *ssl = SSL_new(ctx);
+    assert(ssl && SSL_set_fd(ssl, fd) == 1 && SSL_accept(ssl) == 1);
+    assert(args->payload_len > 0 && args->payload_len % 2u == 0);
+    write_large_fragment(ssl, TG_WS_BINARY, args->payload_len / 2u);
+    write_large_fragment(ssl, 0x80u, args->payload_len / 2u);
+    (void)SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(fd);
+    SSL_CTX_free(ctx);
+    return NULL;
+}
+
+typedef struct {
+    tg_ws_pump *pump;
+    size_t expected_len;
+    size_t rx_cap_at_callback;
+    size_t reassembly_cap_at_callback;
+    int received;
+} large_pump_capture;
+
+static int capture_large_message(void *opaque, const uint8_t *data, size_t len) {
+    large_pump_capture *capture = opaque;
+    if (!data || len != capture->expected_len || data[0] != 0x5a ||
+        data[len - 1u] != 0x5a)
+        return -1;
+    capture->rx_cap_at_callback = capture->pump->rx_cap;
+    capture->reassembly_cap_at_callback = capture->pump->reassembly.cap;
+    capture->received = 1;
+    return 0;
 }
 
 static void test_sni_and_certificate_validation(void) {
@@ -375,6 +427,7 @@ static void test_websocket_upgrade_fragmentation_and_text_rejection(void) {
     ssl=tg_tls_connect_fd(client_ctx,connect_loopback(args.listener),"relay.test"); assert(ssl);
     assert(tg_ws_upgrade(ssl,"relay.test:443","/ws")==0);
     assert(tg_ws_pump_init(&pump,ssl)==0);
+    assert(pump.rx_cap <= 16u * 1024u);
     assert(tg_ws_pump_queue_binary(&pump,(const uint8_t *)"hello",5)==0);
     int process_result=0;
     for(unsigned i=0;i<50&&process_result==0;i++) {
@@ -389,6 +442,63 @@ static void test_websocket_upgrade_fragmentation_and_text_rejection(void) {
     tg_ws_pump_destroy(&pump);
     SSL_free(ssl); SSL_CTX_free(client_ctx); pthread_join(thread,NULL); close(args.listener);
     unlink(key_path); unlink(cert_path); rmdir(dir);
+}
+
+static void test_websocket_pump_grows_and_releases_large_receive_buffers(void) {
+    const size_t payload_len = 1024u * 1024u;
+    char dir[] = "/tmp/d2k-tg-ws-large-XXXXXX", cert_path[256], key_path[256];
+    assert(mkdtemp(dir) != NULL);
+    snprintf(cert_path, sizeof(cert_path), "%s/cert.pem", dir);
+    snprintf(key_path, sizeof(key_path), "%s/key.pem", dir);
+    EVP_PKEY *key = make_key();
+    X509 *cert = make_cert(key);
+    FILE *file = fopen(cert_path, "w");
+    assert(file && PEM_write_X509(file, cert) == 1);
+    fclose(file);
+    file = fopen(key_path, "w");
+    assert(file && PEM_write_PrivateKey(file, key, NULL, NULL, 0, NULL, NULL) == 1);
+    fclose(file);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+
+    server_args args = {.listener = listen_loopback(), .cert = cert_path,
+                        .key = key_path, .payload_len = payload_len};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, serve_large_ws, &args) == 0);
+    SSL_CTX *client_ctx = tg_tls_client_context(cert_path);
+    assert(client_ctx != NULL);
+    SSL *ssl = tg_tls_connect_fd(client_ctx, connect_loopback(args.listener),
+                                 "relay.test");
+    assert(ssl != NULL);
+    tg_ws_pump pump;
+    tg_memory_budget budget = {.limit = 8u * 1024u * 1024u};
+    assert(tg_ws_pump_init_accounted(&pump, ssl, &budget) == 0);
+    assert(pump.rx_cap <= 16u * 1024u);
+    assert(budget.used == pump.rx_cap);
+    large_pump_capture capture = {.pump = &pump, .expected_len = payload_len};
+    for (unsigned i = 0; i < 100 && !pump.closed; ++i) {
+        struct pollfd pfd = {.fd = tg_ws_pump_fd(&pump),
+                             .events = tg_ws_pump_events(&pump)};
+        int ready = poll(&pfd, 1, 10000);
+        assert(ready > 0);
+        assert(tg_ws_pump_process(&pump, pfd.revents,
+                                  capture_large_message, &capture) == 0);
+    }
+    assert(capture.received);
+    assert(capture.rx_cap_at_callback >= payload_len / 2u);
+    assert(capture.reassembly_cap_at_callback >= payload_len);
+    assert(budget.peak > payload_len);
+    assert(pump.rx_cap <= 64u * 1024u);
+    assert(pump.reassembly.cap <= 64u * 1024u);
+    tg_ws_pump_destroy(&pump);
+    assert(budget.used == 0);
+    SSL_free(ssl);
+    SSL_CTX_free(client_ctx);
+    pthread_join(thread, NULL);
+    close(args.listener);
+    unlink(key_path);
+    unlink(cert_path);
+    assert(rmdir(dir) == 0);
 }
 
 static void test_websocket_tiny_frames_charge_allocations(void) {
@@ -468,6 +578,7 @@ int main(void) {
     test_sni_and_certificate_validation();
     test_shipped_relay_trust_bundle_loads();
     test_websocket_upgrade_fragmentation_and_text_rejection();
+    test_websocket_pump_grows_and_releases_large_receive_buffers();
     puts("TLS verification tests: ok");
     return 0;
 }
