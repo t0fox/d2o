@@ -103,7 +103,7 @@ exit 0`));
   fixture('files/d2k-openwrt-init', fs.readFileSync(path.join(root, 'files/d2k-openwrt-init'), 'utf8').replace(/\r\n/g, '\n')
     .replaceAll('/etc/rc.common', path.join(tmp, 'etc/rc.common')));
   for (const name of ['meta-ranges.txt', 'tg-roots.pem', 'fake/stun.bin', 'fake/quic_initial_dbankcloud_ru.bin']) fixture(`files/${name}`, 'fixture\n');
-  for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'gsap.js', 'fonts/onest.woff2',
+  for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'telegram-flow.js', 'gsap.js', 'fonts/onest.woff2',
     'fonts/OFL-onest.txt', 'fonts/jbmono.woff2', 'fonts/OFL-jbmono.txt']) fixture(`internal/web/assets/${name}`, 'fixture\n');
 
   // Система: чистый образ 25.12 с nfnetlink_queue и без iptables.
