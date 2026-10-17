@@ -1,5 +1,5 @@
 #!/bin/sh
-# D2K-owned TCP-only Telegram redirect and IPv6 fast-fail rules.
+# Правила перенаправления TCP-трафика Telegram для IPv4 и IPv6.
 set -eu
 
 SET4=d2k_tg_dc
@@ -30,11 +30,12 @@ nft_list() { printf '%s' "$1" | sed 's/ /, /g'; }
 nft_redirects() {
     for port in $TCP_PORTS; do
         printf '\t\tip daddr @tg4 tcp dport %s redirect to :%s\n' "$port" "$PORT"
+        printf '\t\tip6 daddr @tg6 tcp dport %s redirect to :%s\n' "$port" "$PORT"
     done
 }
 
-# Перехват (LAN — prerouting, сам роутер — output) раньше dstnat fw4; IPv6 —
-# быстрый отказ, как REJECT tcp-reset выше. Таблица целиком, одной транзакцией.
+# Перехват (LAN — prerouting, сам роутер — output) раньше dstnat fw4.
+# Таблица целиком, одной транзакцией.
 nft_ruleset() {
     cat <<EOF2
 table inet $NFT_TABLE {
@@ -49,26 +50,18 @@ table inet $NFT_TABLE {
 		meta mark $OUTBOUND_MARK return
 		$(nft_redirects)
 	}
-	chain fwd6 {
-		type filter hook forward priority filter - 1; policy accept;
-		ip6 daddr @tg6 meta l4proto tcp reject with tcp reset
-	}
-	chain out6 {
-		type filter hook output priority filter - 1; policy accept;
-		ip6 daddr @tg6 meta l4proto tcp reject with tcp reset
-	}
 }
 EOF2
 }
 
 nft_installed() {
     listed=$(nft list table inet "$NFT_TABLE" 2>/dev/null) || return 1
-    [ "$(printf '%s\n' "$listed" | grep -c "redirect to :$PORT")" -eq 4 ] || return 1
+    [ "$(printf '%s\n' "$listed" | grep -c "redirect to :$PORT")" -eq 8 ] || return 1
     for port in $TCP_PORTS; do
-        [ "$(printf '%s\n' "$listed" | grep -cF "tcp dport $port redirect to :$PORT")" -eq 2 ] || return 1
+        [ "$(printf '%s\n' "$listed" | grep -cF "tcp dport $port redirect to :$PORT")" -eq 4 ] || return 1
     done
     [ "$(printf '%s\n' "$listed" | grep -c "meta mark $OUTBOUND_MARK return")" -eq 1 ] &&
-        [ "$(printf '%s\n' "$listed" | grep -c 'reject with tcp reset')" -eq 2 ]
+        [ "$(printf '%s\n' "$listed" | grep -c 'reject with tcp reset')" -eq 0 ]
 }
 
 nft_up() {
@@ -106,12 +99,26 @@ ensure4() {
 
 ensure6() {
     command -v ip6tables >/dev/null 2>&1 || return 0
+    # Удаляем отказы старой версии до установки новых правил, чтобы IPv6 не
+    # оставался заблокированным, если на устройстве нет модуля ip6table_nat.
+    for chain in FORWARD OUTPUT; do
+        while ip6t -C "$chain" -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset; do
+            ip6t -D "$chain" -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset || break
+        done
+    done
+    command -v ipset >/dev/null 2>&1 || return 0
     ipset create "$SET6" hash:net family inet6 -exist 2>/dev/null || return 0
     for c in $CIDRS6; do ipset add "$SET6" "$c" -exist 2>/dev/null || return 0; done
-    for chain in FORWARD OUTPUT; do
-        ip6t -C "$chain" -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset ||
-            ip6t -I "$chain" 1 -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset || continue
+    for port in $TCP_PORTS; do
+        for chain in PREROUTING OUTPUT; do
+            ip6t -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET6" dst -j REDIRECT --to-port "$PORT" ||
+                ip6t -t nat -I "$chain" 1 -p tcp --dport "$port" -m set --match-set "$SET6" dst -j REDIRECT --to-port "$PORT" || return 1
+            ip6t -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET6" dst -j REDIRECT --to-port "$PORT" || return 1
+        done
     done
+    ip6t -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN ||
+        ip6t -t nat -I OUTPUT 1 -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || return 1
+    ip6t -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || return 1
     return 0
 }
 
@@ -125,6 +132,7 @@ start() {
     fi
     if command -v conntrack >/dev/null 2>&1; then
         for c in $CIDRS4; do conntrack -D -d "$c" >/dev/null 2>&1 || true; done
+        for c in $CIDRS6; do conntrack -D -f ipv6 -d "$c" >/dev/null 2>&1 || true; done
     fi
 }
 
@@ -151,6 +159,16 @@ ipt_stop() {
         ipt -t nat -D OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || break
     done
     if command -v ip6tables >/dev/null 2>&1; then
+        for port in $TCP_PORTS; do
+            for chain in PREROUTING OUTPUT; do
+                while ip6t -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET6" dst -j REDIRECT --to-port "$PORT"; do
+                    ip6t -t nat -D "$chain" -p tcp --dport "$port" -m set --match-set "$SET6" dst -j REDIRECT --to-port "$PORT" || break
+                done
+            done
+        done
+        while ip6t -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN; do
+            ip6t -t nat -D OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || break
+        done
         for chain in FORWARD OUTPUT; do
             while ip6t -C "$chain" -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset; do
                 ip6t -D "$chain" -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset || break

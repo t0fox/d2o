@@ -332,8 +332,17 @@ iptables -t nat -C PREROUTING -p tcp --dport 5222 -m set --match-set d2k_tg_dc d
 iptables -t nat -C OUTPUT -p tcp --dport 5222 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "нет Telegram OUTPUT redirect для 5222"
 if ipset test d2k_tg_dc6 2001:67c:4e8::1 >/dev/null 2>&1; then
     echo "IPv6 Telegram set and rules are available"
-    ip6tables -C FORWARD -p tcp -m set --match-set d2k_tg_dc6 dst -j REJECT --reject-with tcp-reset || fail "нет IPv6 Telegram fast-reject в FORWARD"
-    ip6tables -C OUTPUT -p tcp -m set --match-set d2k_tg_dc6 dst -j REJECT --reject-with tcp-reset || fail "нет IPv6 Telegram fast-reject в OUTPUT"
+    if ip6tables -t nat -S >/dev/null 2>&1; then
+        for port in 443 5222; do
+            ip6tables -t nat -C PREROUTING -p tcp --dport "$port" -m set --match-set d2k_tg_dc6 dst -j REDIRECT --to-port 1443 || fail "нет IPv6 PREROUTING redirect для порта $port"
+            ip6tables -t nat -C OUTPUT -p tcp --dport "$port" -m set --match-set d2k_tg_dc6 dst -j REDIRECT --to-port 1443 || fail "нет IPv6 OUTPUT redirect для порта $port"
+        done
+        ip6tables -t nat -C OUTPUT -m mark --mark 0x31 -m comment --comment d2k-tg-outbound -j RETURN || fail "нет исключения помеченных IPv6-подключений C11"
+        ! ip6tables -C FORWARD -p tcp -m set --match-set d2k_tg_dc6 dst -j REJECT --reject-with tcp-reset || fail "IPv6 Telegram трафик всё ещё отклоняется"
+        ! ip6tables -C OUTPUT -p tcp -m set --match-set d2k_tg_dc6 dst -j REJECT --reject-with tcp-reset || fail "IPv6 Telegram исходящие подключения всё ещё отклоняются"
+    else
+        echo "В ядре контейнера недоступен IPv6 NAT (на роутере используется nftables)"
+    fi
 else
     echo "IPv6 Telegram rules unavailable in this container kernel (donor behavior is best-effort)"
 fi
