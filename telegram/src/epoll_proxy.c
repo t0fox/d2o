@@ -24,6 +24,7 @@
 #if defined(__linux__)
 #include <sys/epoll.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #define TG_EPOLL_MAX_EVENTS 128
 #define TG_EPOLL_IO_CHUNK 16384u
@@ -354,6 +355,20 @@ static uint64_t read_le64(const uint8_t *data) {
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 ? 0 : -1;
+}
+
+static void set_tcp_nodelay(int fd) {
+    int enabled = 1;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+}
+
+static void set_tcp_quickack(int fd) {
+#ifdef TCP_QUICKACK
+    int enabled = 1;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &enabled, sizeof(enabled));
+#else
+    (void)fd;
+#endif
 }
 
 static int default_original_destination(void *context, int fd,
@@ -930,6 +945,7 @@ static int begin_upstream(proxy_connection *connection,
 
     int fd = socket(target->family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
+    set_tcp_nodelay(fd);
     if (server->config.require_socket_mark) {
 #ifdef SO_MARK
         uint32_t mark = server->config.socket_mark;
@@ -1623,6 +1639,8 @@ static int receive_client(proxy_connection *connection) {
             if (!free_bytes) return 0;
             if (capacity > free_bytes) capacity = free_bytes;
         }
+        if (connection->direct_wss && !connection->route_response_seen)
+            set_tcp_quickack(connection->client_fd);
         ssize_t n = recv(connection->client_fd, buffer, capacity, 0);
         if (n > 0) {
             add_bytes(&connection->server->bytes_from_clients, (size_t)n);
@@ -2110,6 +2128,8 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
             if (!(events & connection->tls_want)) return 0;
             uint8_t byte;
             size_t received = 0, consumed = 0;
+            if (!connection->route_response_seen)
+                set_tcp_quickack(connection->upstream_fd);
             int rc = SSL_read_ex(connection->upstream_ssl, &byte, 1, &received);
             if (rc != 1) {
                 if (SSL_get_error(connection->upstream_ssl, rc) ==
@@ -2150,6 +2170,8 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
                                                     EPOLLHUP)))
                 revents |= POLLERR;
             if (events & (EPOLLHUP | EPOLLRDHUP)) revents |= POLLHUP;
+            if (!connection->route_response_seen)
+                set_tcp_quickack(connection->upstream_fd);
             int pump_rc = tg_ws_pump_process(&connection->ws_pump, revents,
                                              queue_wss_response, connection);
             disable_wss_replay_after_payload_write(connection);
@@ -2394,6 +2416,7 @@ static void accept_clients(tg_epoll_proxy *server) {
             if (errno == EINTR) continue;
             return;
         }
+        set_tcp_nodelay(fd);
         if (server->active_connections >= server->max_connections) {
             close(fd);
             continue;

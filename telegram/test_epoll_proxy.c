@@ -2458,6 +2458,7 @@ static void test_epoll_reuses_confirmed_media_route_across_ips(void) {
     size_t reconnect_p95 =
         ((LATENCY_REUSE_SAMPLES - 1u) * 95u + 99u) / 100u - 1u;
     assert(client_latency_us[0] > reconnect_samples[reconnect_p95] + 50000u);
+    assert(reconnect_samples[reconnect_p95] < 20000u);
     printf("Лабораторная задержка Telegram: первая=%" PRIu64
            " мкс, переподключение p50=%" PRIu64 " мкс p95=%" PRIu64
            " мкс; подтверждено ответов=%zu\n",
