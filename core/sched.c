@@ -131,7 +131,10 @@
 #define SCHED_DP_TRIAL_SLOTS 2048
 #define SCHED_MEASURE_SLOTS \
     (SCHED_MAX_TASKS < SCHED_DP_TRIAL_SLOTS ? SCHED_MAX_TASKS : SCHED_DP_TRIAL_SLOTS)
-#define SCHED_MAX_QUEUED_MEASUREMENTS 16
+/* Очередь использует те же конечные ячейки, что и задачи; ранний предел 16
+   отбрасывал уже принятое подозрение, хотя оставались свободные ячейки.
+   Одновременные сетевые замеры по-прежнему ограничивает AIMD-предел ниже. */
+#define SCHED_MAX_QUEUED_MEASUREMENTS SCHED_MAX_TASKS
 /* Темп запуска (задача 38): не больше одного нового замера за 250 мс —
    и из очереди, и по свежему подозрению при уже идущем замере, — чтобы
    подъём предела не давал всплесков SYN/Initial. Прежняя секунда (задача
@@ -143,6 +146,9 @@
 /* Жизнь задачи. Дольше — и задача занимает место, давно перестав быть про
    актуальное состояние линии. */
 #define SCHED_TASK_LIFE_MS (10 * 60 * 1000)
+/* При чередовании relay сохраняем следующую точку, но не держим её дольше
+   двух минут за непроверенным голосовым опытом. */
+#define SCHED_VOICE_PENDING_GRACE_MS (2 * 60 * 1000)
 
 /* Отдых цели после неудачи: не долбить одну и ту же цель подряд. */
 #define SCHED_REST_MS (2 * 60 * 1000)
@@ -644,6 +650,7 @@ typedef struct {
     int        report_closed;
     int64_t    report_admitted_ms; /* -1 until scheduler time is known */
     int64_t    report_queue_ms;
+    int        local_error; /* запуск рабочего потока не удался */
 
     /* ГОЛОС/АДРЕСНЫЙ UDP: поток, к которому применился приём, и наблюдения.
        Обратная датаграмма не доказывает протокольный или прикладной успех.
@@ -1125,13 +1132,14 @@ typedef struct {
     int64_t observed_ms;
 } seen_name;
 
-/* Negative observations never enter the strategy catalog. This bounded,
-   process-local cache only debounces active measurements for an exact
-   hostname+transport; normal CLEAR backoff may be bypassed by a different
-   signal, while an explicit challenge or exhausted search remains quiet for
-   the full backoff regardless of signal changes. */
+/* Отрицательные наблюдения не попадают в каталог стратегий. Ограниченный
+   кэш отдельно удерживает обычную отсрочку для IP:порта, а антибот-ответ —
+   для всего имени; новый endpoint не наследует старый CLEAR, но не обходит
+   защитную паузу после челленджа. */
 typedef struct {
     char       name[256];
+    char       ip[INET6_ADDRSTRLEN];
+    uint16_t   port;
     uint8_t    transport;
     uint8_t    family;
     uint8_t    signal_code;
@@ -1223,8 +1231,18 @@ struct d2k_sched {
        секунду, а сроки здесь считаются секундами. */
     int64_t      now_ms;
     uint64_t     event_sequence;
+    uint64_t     suspect_events;
+    int64_t      last_suspect_ms;
+    uint8_t      last_suspect_transport, last_suspect_family, last_suspect_code;
+    char         last_suspect_name[256];
+    char         last_suspect_ip[INET6_ADDRSTRLEN];
+    uint16_t     last_suspect_port;
+    uint64_t     last_local_error_suspect;
+    char         last_local_error_target[256];
 
     task         tasks[SCHED_MAX_TASKS];
+    d2k_ev       pending_voice_suspect;
+    int          pending_voice_suspect_valid;
     seen_name    seen[SCHED_SEEN];
     size_t       seen_next;   /* кольцо: старое вытесняется, а не отказывает */
     /* Ответы HTTPS RR по именам-кандидатам в ECH-свидетели; под s->mu. */
@@ -1756,12 +1774,27 @@ static const char *recall(const d2k_sched *s, const d2k_ev *ev) {
     return NULL;
 }
 
-static target_cooldown *cooldown_find(d2k_sched *s, const char *name,
-                                     uint8_t transport, uint8_t family) {
+static target_cooldown *cooldown_find_endpoint(d2k_sched *s, const char *name,
+                                               uint8_t transport, uint8_t family,
+                                               const char *ip, uint16_t port) {
+    if (!s || !name || !name[0] || !ip || !ip[0]) { return NULL; }
+    for (size_t i = 0; i < SCHED_COOLDOWN_SLOTS; i++) {
+        target_cooldown *c = &s->cooldowns[i];
+        if (c->used && !c->challenge && c->transport == transport &&
+            c->family == (family ? family : 4) && c->port == port &&
+            strcmp(c->name, name) == 0 && strcmp(c->ip, ip) == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+static target_cooldown *cooldown_find_challenge(d2k_sched *s, const char *name,
+                                                 uint8_t transport, uint8_t family) {
     if (!s || !name || !name[0]) { return NULL; }
     for (size_t i = 0; i < SCHED_COOLDOWN_SLOTS; i++) {
         target_cooldown *c = &s->cooldowns[i];
-        if (c->used && c->transport == transport &&
+        if (c->used && c->challenge && c->transport == transport &&
             c->family == (family ? family : 4) && strcmp(c->name, name) == 0) {
             return c;
         }
@@ -1813,8 +1846,14 @@ static void dead_clear(d2k_sched *s, const task *t) {
 }
 
 static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
-                           uint8_t family, uint8_t signal_code, int64_t *remaining_ms) {
-    target_cooldown *c = cooldown_find(s, name, transport, family);
+                           uint8_t family, const char *ip, uint16_t port,
+                           uint8_t signal_code, int64_t *remaining_ms,
+                           target_cooldown **matched) {
+    if (matched) { *matched = NULL; }
+    target_cooldown *c = cooldown_find_challenge(s, name, transport, family);
+    if (!c || s->now_ms >= c->until_ms) {
+        c = cooldown_find_endpoint(s, name, transport, family, ip, port);
+    }
     if (!c) { return 0; }
     if (s->now_ms >= c->until_ms) { return 0; }
     /* Неубедительная пара поздних RST (вид 3) говорит только о позднем
@@ -1825,17 +1864,37 @@ static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
         signal_code != D2K_SUSPECT_TCP_STALL) {
         return 0;
     }
-    /* A changed symptom after a direct CLEAR is fresh evidence. Do not let a
-       stale negative suppress it. A bot challenge is different: stay quiet
-       for this exact origin even if the datapath reports another symptom. */
+    /* Новый симптом после прямого CLEAR — новое свидетельство. Антибот-ответ
+       остаётся общим для имени и не обходится другим симптомом или IP. */
     if (!c->challenge && !c->exhausted && c->signal_code != signal_code) { return 0; }
     if (remaining_ms) { *remaining_ms = c->until_ms - s->now_ms; }
+    if (matched) { *matched = c; }
     return 1;
 }
 
-static void cooldown_clear(d2k_sched *s, const char *name, uint8_t transport, uint8_t family) {
-    target_cooldown *c = cooldown_find(s, name, transport, family);
+static void cooldown_clear_endpoint(d2k_sched *s, const char *name,
+                                    uint8_t transport, uint8_t family,
+                                    const char *ip, uint16_t port) {
+    target_cooldown *c = cooldown_find_endpoint(s, name, transport, family, ip, port);
     if (c) { memset(c, 0, sizeof *c); }
+}
+
+static size_t cooldown_clear_nonchallenge(d2k_sched *s, const char *name,
+                                         uint8_t transport, uint8_t family,
+                                         int exhausted_only, int preserve_ech) {
+    if (!s || !name || !name[0]) { return 0; }
+    size_t cleared = 0;
+    for (size_t i = 0; i < SCHED_COOLDOWN_SLOTS; i++) {
+        target_cooldown *c = &s->cooldowns[i];
+        if (!c->used || c->challenge || c->transport != transport ||
+            c->family != (family ? family : 4) || strcmp(c->name, name) != 0 ||
+            (exhausted_only && !c->exhausted) || (preserve_ech && c->ech_input)) {
+            continue;
+        }
+        memset(c, 0, sizeof *c);
+        cleared++;
+    }
+    return cleared;
 }
 
 static int64_t clear_backoff_ms(unsigned streak) {
@@ -1872,11 +1931,20 @@ static target_cooldown *cooldown_victim(d2k_sched *s) {
    A dead address (task 54) is not a name cooldown: see dead_address. */
 static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     if (!s || !t || !t->name[0]) { return; }
-    target_cooldown *c = cooldown_find(s, t->name, t->transport, t->family);
+    target_cooldown *c = kind == 1
+        ? cooldown_find_challenge(s, t->name, t->transport, t->family)
+        : cooldown_find_endpoint(s, t->name, t->transport, t->family, t->ip, t->port);
+    target_cooldown *challenge = kind == 1 ? NULL
+        : cooldown_find_challenge(s, t->name, t->transport, t->family);
+    if (challenge && s->now_ms < challenge->until_ms) { return; }
     if (!c) {
         c = cooldown_victim(s);
         memset(c, 0, sizeof *c);
         snprintf(c->name, sizeof c->name, "%s", t->name);
+        if (kind != 1) {
+            snprintf(c->ip, sizeof c->ip, "%s", t->ip);
+            c->port = t->port;
+        }
         c->transport = t->transport;
         c->family = t->family;
         c->used = 1;
@@ -3011,9 +3079,16 @@ static unsigned task_budget(const d2k_sched *s, task *t) {
     return t->budget_pk = D2K_BUDGET_FIELD_PACKETS;
 }
 
+static void note_worker_start_failure(d2k_sched *s, task *t) {
+    t->local_error = 1;
+    s->last_local_error_suspect = s->suspect_events;
+    snprintf(s->last_local_error_target, sizeof s->last_local_error_target,
+             "%s", t->name);
+}
+
 static int start_worker(d2k_sched *s, task *t, task_job job) {
     worker_arg *a = malloc(sizeof *a);
-    if (!a) { return -1; }
+    if (!a) { note_worker_start_failure(s, t); return -1; }
     a->s = s; a->t = t;
     a->trig_len = t->trig_len; a->ctrl_len = t->ctrl_len;
     a->split_unfit = quic_split_unfit(s, t);
@@ -3055,6 +3130,7 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     if (!created) {
         if (a->use_fd >= 0) { close(a->use_fd); }
         free(a);
+        note_worker_start_failure(s, t);
         return -1;
     }
     t->th_live = 1;
@@ -5248,6 +5324,108 @@ static const char *task_phase(const task *t) {
     }
 }
 
+static const d2k_cat_binding *live_binding_for(const d2k_sched *s, const char *name,
+                                               uint8_t transport, uint8_t family) {
+    if (!name || !name[0]) { return NULL; }
+    for (size_t i = 0; i < s->cat->n_boxes; i++) {
+        const d2k_cat_box *b = &s->cat->boxes[i];
+        for (size_t j = 0; j < b->n_binds; j++) {
+            const d2k_cat_binding *bd = &b->binds[j];
+            if (bd->enabled && !bd->recheck_since &&
+                (bd->transport ? bd->transport : 6) == transport &&
+                (bd->family ? bd->family : 4) == family &&
+                !strcmp(bd->target, name)) return bd;
+        }
+    }
+    return NULL;
+}
+
+static void live_autopick_status(d2k_sched *s, char reason[128], char target[256],
+                                 char plan_id[40], int64_t *remaining_ms) {
+    snprintf(target, 256, "%s", s->last_suspect_name);
+    plan_id[0] = '\0';
+    *remaining_ms = 0;
+
+    if (!s->event_sequence) {
+        snprintf(reason, 128, "нет событий от datapath");
+        return;
+    }
+    if (!s->suspect_events) {
+        snprintf(reason, 128, "нет событий отказа от datapath");
+        return;
+    }
+    if (!target[0]) {
+        snprintf(reason, 128, "нет имени цели для нового замера");
+        return;
+    }
+    if (s->last_local_error_suspect == s->suspect_events &&
+        s->last_local_error_target[0] &&
+        !strcmp(s->last_local_error_target, target)) {
+        snprintf(reason, 128, "локальная ошибка: рабочий поток не запустился");
+        return;
+    }
+
+    uint8_t transport = s->last_suspect_transport;
+    uint8_t family = s->last_suspect_family ? s->last_suspect_family : 4;
+    task *t = task_of(s, target, transport, family);
+    target_cooldown *cool = NULL;
+    int64_t left = 0;
+    if (cooldown_blocks(s, target, transport, family,
+                        s->last_suspect_ip, s->last_suspect_port,
+                        s->last_suspect_code, &left, &cool)) {
+        *remaining_ms = left;
+        snprintf(reason, 128, cool && cool->exhausted
+                 ? "поиск исчерпан; действует cooldown"
+                 : "ожидание cooldown");
+        return;
+    }
+    if (t) {
+        switch (t->state) {
+        case T_QUEUED:
+            snprintf(reason, 128,
+                     measurements_in_flight(s) >= s->meas_limit
+                     ? "нет свободных рабочих потоков или ресурсов"
+                     : "задача в очереди");
+            return;
+        case T_WATCHING: {
+            const d2k_cat_binding *bd = live_binding_for(s, target, transport, family);
+            snprintf(reason, 128, "используется ранее подтверждённый Plan");
+            if (bd) snprintf(plan_id, 40, "%s", bd->plan_id);
+            return;
+        }
+        case T_RESTING:
+            *remaining_ms = t->rest_until_ms > s->now_ms
+                          ? t->rest_until_ms - s->now_ms : 0;
+            snprintf(reason, 128, t->local_error
+                     ? "локальная ошибка: рабочий поток не запустился"
+                     : "поиск исчерпан; задача отдыхает");
+            return;
+        case T_VOICE_WATCH:
+            snprintf(reason, 128, s->pending_voice_suspect_valid
+                     ? "Discovery проверяется; новый голосовой endpoint сохранён следом"
+                     : "Discovery подтверждён; качество аудио не измеряется");
+            return;
+        case T_VOICE_TRIAL:
+            snprintf(reason, 128, s->pending_voice_suspect_valid
+                     ? "опыт ждёт следующий поток; новый голосовой endpoint сохранён следом"
+                     : "опыт ждёт следующий голосовой поток");
+            return;
+        default:
+            snprintf(reason, 128, "%s", t->th_live
+                     ? "выполняется замер" : task_phase(t));
+            return;
+        }
+    }
+
+    const d2k_cat_binding *bd = live_binding_for(s, target, transport, family);
+    if (bd) {
+        snprintf(reason, 128, "используется ранее подтверждённый Plan");
+        snprintf(plan_id, 40, "%s", bd->plan_id);
+        return;
+    }
+    snprintf(reason, 128, "поиск не активен; ожидается новый сигнал datapath");
+}
+
 static void write_live_groups(FILE *f, const d2k_sched *s);
 
 int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_path) {
@@ -5393,6 +5571,25 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         fprintf(f, "\"limited_by\": \"%s\"},\n", why);
     } else {
         fputs("\"limited_by\": null},\n", f);
+    }
+    {
+        char reason[128], target[256], plan_id[40];
+        int64_t remaining_ms = 0;
+        live_autopick_status(s, reason, target, plan_id, &remaining_ms);
+        fputs("  \"autopick\": {\"reason\": ", f); json_str(f, reason);
+        fputs(", \"target\": ", f); json_str(f, target);
+        fputs(", \"plan_id\": ", f); json_str(f, plan_id);
+        fprintf(f, ", \"datapath_events\": %llu, \"suspect_events\": %llu, ",
+                (unsigned long long)s->event_sequence,
+                (unsigned long long)s->suspect_events);
+        fprintf(f, "\"transport\": %u, \"family\": %u, ",
+                (unsigned)s->last_suspect_transport,
+                (unsigned)(s->last_suspect_family ? s->last_suspect_family : 4));
+        if (remaining_ms > 0)
+            fprintf(f, "\"cooldown_seconds_left\": %lld},\n",
+                    (long long)((remaining_ms + 999) / 1000));
+        else
+            fputs("\"cooldown_seconds_left\": null},\n", f);
     }
     fprintf(f, "  \"targets\": %zu,\n  \"confirms\": %d,\n  \"probes_used\": %d,\n"
                "  \"client_unfit\": %u\n}\n",
@@ -6491,7 +6688,8 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
             r.verdict == D2K_VOICE_CLEAR
                 ? (t->voice_known_prefix_valid ? "unknown" : "direct") : "none");
         if (t->voice_known_prefix_valid && r.verdict == D2K_VOICE_CLEAR) {
-            say(s, "по %s (голос) сохраняю подтверждённый приём: %s", t->name, r.reason);
+            say(s, "по %s (голос) замер дал CLEAR; прежний подтверждённый приём сохранён, "
+                   "качество передачи аудио не измерено: %s", t->name, r.reason);
         } else say(s, "по %s (голос) временный Plan не ставлю: измерение не подтвердило "
                "блокировку (%s)", t->name, r.reason[0] ? r.reason : "нет причины");
         task_fail(s, t, now_ms);
@@ -7057,7 +7255,8 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     t->state = T_WATCHING;
     s->confirms++;
     s->sync_pending = 1;
-    say(s, "по %s (%s) ПОДТВЕРЖДЕНО протокольным ответом: %s",
+    say(s, "по %s (%s) подтверждён ответ Discord Discovery; качество передачи аудио "
+           "не измерено: %s",
         t->name, is_stun ? "STUN" : "голос", plan_id);
     search_report(s, t, now_ms, is_stun ? "stun-confirmed" : "discovery-confirmed", NULL);
 }
@@ -7091,7 +7290,16 @@ static int is_telegram_tunnel_domain(const char *name) {
 
 static int clean_handshake_recent(d2k_sched *s, const char *name, uint8_t transport,
                                   uint8_t family);
-static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
+static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
+    if (!replayed && s->suspect_events < UINT64_MAX) { s->suspect_events++; }
+    s->last_suspect_ms = s->now_ms;
+    s->last_suspect_transport = ev->transport;
+    s->last_suspect_family = ev->family ? ev->family : 4;
+    s->last_suspect_code = ev->code;
+    s->last_suspect_port = 0;
+    server_of(ev, s->last_suspect_ip, sizeof s->last_suspect_ip,
+              &s->last_suspect_port);
+    s->last_suspect_name[0] = '\0';
     /* Имя копируется СРАЗУ, а не держится указателем в кольцо имён: и потому
        что кольцо переживает вытеснение (следующее приветствие может занять
        ту же ячейку), и потому что источник с приёмником лежат внутри одного
@@ -7135,6 +7343,9 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         /* Дальше — общий жизненный цикл. Ранний return при найденной
            адресной задаче терял и молчание опыта, и деградацию WATCHING. */
     }
+    if (name[0]) {
+        snprintf(s->last_suspect_name, sizeof s->last_suspect_name, "%s", name);
+    }
     if (name[0] == '\0') {
         /* Имени нет — искать не по чему. Это не отказ: датапат подозревает
            поток, а не имя, и поток без приветствия (или с приветствием, уже
@@ -7173,23 +7384,25 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         return 0;
     }
     int64_t cooldown_left_ms = 0;
+    char endpoint_ip[INET6_ADDRSTRLEN];
+    uint16_t endpoint_port = 0;
+    server_of(ev, endpoint_ip, sizeof endpoint_ip, &endpoint_port);
     if (ev->transport == 6) {
         /* Мёртвый адрес мёртв для любого симптома; другие адреса имени — своё
            наблюдение (задача 54). */
-        char srv[INET6_ADDRSTRLEN];
-        uint16_t srv_port = 0;
-        server_of(ev, srv, sizeof srv, &srv_port);
-        dead_address *d = dead_find(s, name, ev->transport, ev->family, srv);
+        dead_address *d = dead_find(s, name, ev->transport, ev->family, endpoint_ip);
         if (d && s->now_ms < d->until_ms) {
             char quiet_key[300];
-            snprintf(quiet_key, sizeof quiet_key, "dead %s %s", name, srv);
+            snprintf(quiet_key, sizeof quiet_key, "dead %s %s", name, endpoint_ip);
             say_quiet(s, quiet_key, "по %s (TCP) замер отложен после блока адреса %s ещё примерно %lld мин",
-                name, srv, (long long)((d->until_ms - s->now_ms + 59999) / 60000));
+                name, endpoint_ip, (long long)((d->until_ms - s->now_ms + 59999) / 60000));
             return 0;
         }
     }
-    if (cooldown_blocks(s, name, ev->transport, ev->family, ev->code, &cooldown_left_ms)) {
-        target_cooldown *cool = cooldown_find(s, name, ev->transport, ev->family);
+    target_cooldown *cool = NULL;
+    if (cooldown_blocks(s, name, ev->transport, ev->family,
+                        endpoint_ip, endpoint_port, ev->code,
+                        &cooldown_left_ms, &cool)) {
         const char *reason = cool && cool->challenge ? "антибот-ответа" :
                              cool && cool->exhausted ? "неподтверждённого прошлого замера" :
                              "повторного CLEAR";
@@ -7204,24 +7417,50 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         return 0;
     }
     task *t = task_of(s, name, ev->transport, ev->family);
+    if (t && t->state == T_RESTING) {
+        int same_endpoint = t->ip[0] && endpoint_ip[0] &&
+            t->port == endpoint_port && strcmp(t->ip, endpoint_ip) == 0;
+        if (!same_endpoint) {
+            say(s, "по %s снимаю отдых старого endpoint %s:%u: пришло новое подозрение к %s:%u",
+                name, t->ip, (unsigned)t->port, endpoint_ip, (unsigned)endpoint_port);
+        } else {
+            say(s, "по %s снимаю завершённый отдых: новое подозрение снова допускает замер",
+                name);
+        }
+        task_done(s, t);
+        t = NULL;
+    }
     int ordinary_tcp_rst = ev->transport == 6 && ev->code == D2K_SUSPECT_RST;
     const int late_app_rst = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
         ev->code == D2K_SUSPECT_FIN_RETRY || ev->code == D2K_SUSPECT_TCP_STALL;
-    if (t && t->state == T_VOICE_TRIAL && voice_trial_owned(t) &&
-        is_voice_class(t->name, t->transport) && !voice_trial_same_context(t, ev)) {
-        /* ОПЫТ ЖДЁТ РАЗГОВОРА К ДРУГОЙ ТОЧКЕ (финальное ревью, п.1). Задача
-           голоса одна на класс, и раньше подозрение к новой точке сервера
-           молча терялось на всё время ожидания (до 10 мин) — голос замирал.
-           Ждущий опыт снимается точно (свой trial ID, кандидат не судим), и
-           новая точка получает свой замер. Подозрение к той же точке и тому
-           же клиенту ниже по-прежнему не дублирует замер. */
+    if (t && (t->state == T_VOICE_TRIAL || t->state == T_VOICE_WATCH) &&
+        voice_trial_owned(t) && is_voice_class(t->name, t->transport) &&
+        !voice_trial_same_context(t, ev)) {
+        /* Голосовые relay могут чередоваться в одной сессии. Не снимаем
+           непроверенный опыт при каждом переключении: держим один последний
+           endpoint и запускаем его после исхода или таймаута текущего опыта. */
+        s->pending_voice_suspect = *ev;
+        s->pending_voice_suspect_valid = 1;
         char srv[INET6_ADDRSTRLEN];
         uint16_t sport = 0;
         server_of(ev, srv, sizeof srv, &sport);
-        say(s, "по %s (голос) подозрение к другой точке %s:%u, пока опыт ждал "
-               "разговора — снимаю ждущий опыт (не проверено, кандидат не судим) "
-               "и меряю новую точку", t->name, srv, (unsigned)sport);
-        trial_retire(s, t);
+        say_quiet(s, "voice pending endpoint",
+            "по %s (голос) сохраняю опыт к %s:%u; подозрение к новой точке %s:%u "
+            "поставлено следом", t->name, t->ip, (unsigned)t->port,
+            srv, (unsigned)sport);
+        return 0;
+    }
+    if (t && t->state == T_WATCHING && voice_trial_owned(t) &&
+        is_voice_class(t->name, t->transport) && !voice_trial_same_context(t, ev)) {
+        if (s->pending_voice_suspect_valid) {
+            s->pending_voice_suspect = *ev;
+            return 0;
+        }
+        char srv[INET6_ADDRSTRLEN];
+        uint16_t sport = 0;
+        server_of(ev, srv, sizeof srv, &sport);
+        say(s, "по %s (голос) endpoint сменился на %s:%u — снимаю только наблюдатель "
+               "старой точки и проверяю новую", t->name, srv, (unsigned)sport);
         task_done(s, t);
         t = NULL;
     }
@@ -7283,8 +7522,8 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         }
         if (late_app_rst) {
             if (t->state != T_WATCHING) { return 0; }
-            /* Keep the confirmed catalog binding, but replace its passive
-               watcher with a targeted measurement task. */
+            /* Сохраняем подтверждённую привязку и заменяем наблюдателя
+               адресным замером. */
             say(s, "по %s позднее закрытие после app-data — проверяю повторяемость обрыва ответа",
                 t->name);
             task_done(s, t);
@@ -7312,9 +7551,9 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
            подряд, и наблюдение снималось зря. Ноль в поле — «не сказано»
            (старая служба), и по нему поведение остаётся прежним. */
         if (ev->planned == D2K_LINK_PLANNED_NO) {
-            /* No application is not necessarily an old flow: a different
-               TLS version deliberately does not match the confirmed plan.
-               Ask for bytes, not another network measurement. */
+            /* План мог не примениться к новому потоку из-за другой версии
+               TLS. Сначала просим датапат снять его байты, а не запускаем
+               сетевой замер вслепую. */
             if (t->transport == 6 && !t->watch_shape_pending) {
                 char err[128];
                 if (d2k_link_arm_shape_family(s->link_fd, t->name, 6,
@@ -7343,10 +7582,20 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
                    "плана не считаю, наблюдение продолжаю", t->name);
             return 0;
         }
-        say(s, "по %s подозрение при подтверждённом плане — наблюдение прекращаю",
-            t->name);
-        task_done(s, t);
-        return 0;
+        if (ev->planned == D2K_LINK_PLANNED_YES) {
+            /* Новый отказ на потоке с подтверждённым планом проверяем сразу.
+               Привязку в каталоге сохраняем до результата повторного замера. */
+            say(s, "по %s отказ потока с подтверждённым планом — запускаю повторную проверку",
+                t->name);
+            task_done(s, t);
+            t = NULL;
+        } else {
+            /* Для UNKNOWN нет доказательства, что план был на этом потоке. */
+            say(s, "по %s подозрение без подтверждения исполнения плана — наблюдение прекращаю",
+                t->name);
+            task_done(s, t);
+            return 0;
+        }
     }
     t = task_free_slot(s);
     if (!t) {
@@ -7606,8 +7855,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
                 /* Прежний «напрямую проходит» по этому имени мерился без ECH —
                    заготовкой. Он не говорит ничего о полёте клиента; отсрочку
                    снимаем один раз на допуск пачки, не на каждый повтор. */
-                if (cooldown_find(s, name, 17, fam)) {
-                    cooldown_clear(s, name, 17, fam);
+                if (cooldown_clear_nonchallenge(s, name, 17, fam, 0, 0) > 0) {
                     say(s, "по %s клиент шлёт QUIC с ECH — прежний «напрямую проходит» "
                            "мерился без ECH; отсрочку снимаю, мерю пачкой клиента", name);
                 }
@@ -7653,9 +7901,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
             slot = s->ech_input_next++ % 8;
             /* New protocol evidence supersedes an inconclusive ordinary
              * profile measurement, once per cache admission, not per retry. */
-            target_cooldown *cool = cooldown_find(s, name, 6, family);
-            if (cool && cool->exhausted && !cool->challenge && !cool->ech_input)
-                cooldown_clear(s, name, 6, family);
+            (void)cooldown_clear_nonchallenge(s, name, 6, family, 1, 1);
         }
         snprintf(s->ech_inputs[slot].name, 256, "%s", name);
         memcpy(s->ech_inputs[slot].bytes, ev->shape, ev->shape_len);
@@ -8732,7 +8978,8 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
                 if (!own && d2k_group_learn(s->cat->groups, &failed) > 0) {
                     s->cat->revision++; s->sync_pending = 1;
                 }
-                if (!task_of(s, name, ev->transport, ev->family)) (void)on_suspect(s, &suspicion);
+                if (!task_of(s, name, ev->transport, ev->family))
+                    (void)on_suspect(s, &suspicion, 0);
                 break; /* refusal is execution evidence, not a DPI verdict */
             }
         }
@@ -8980,7 +9227,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         }
         return 0;
     case D2K_EV_SUSPECT:
-        return on_suspect(s, ev);
+        return on_suspect(s, ev, 0);
     case D2K_EV_STATS:
         s->dropped_seen = ev->dropped;
         return 0;
@@ -9295,6 +9542,34 @@ static int queued_release(d2k_sched *s, int64_t now_ms) {
     (void)launch_task(s, t);
     measure_started(s);
     return 1;
+}
+
+static void voice_pending_dispatch(d2k_sched *s) {
+    if (!s || !s->pending_voice_suspect_valid) { return; }
+    task *t = task_of(s, D2K_LINK_VOICE_CLASS, 17, 4);
+    if (t && (t->state == T_VOICE_TRIAL || t->state == T_VOICE_WATCH) &&
+        voice_trial_owned(t)) {
+        if (t->started_ms == 0 ||
+            s->now_ms - t->started_ms < SCHED_VOICE_PENDING_GRACE_MS) { return; }
+        say(s, "по %s (голос) опыт к %s:%u не проверено за две минуты — снимаю его, "
+               "кандидат не судим", t->name, t->ip, (unsigned)t->port);
+        trial_retire(s, t);
+    } else if (t && t->state != T_WATCHING && t->state != T_RESTING) {
+        return;
+    }
+
+    d2k_ev ev = s->pending_voice_suspect;
+    s->pending_voice_suspect_valid = 0;
+    memset(&s->pending_voice_suspect, 0, sizeof s->pending_voice_suspect);
+    if (t) { task_done(s, t); }
+    s->last_local_error_target[0] = '\0';
+    if (s->event_sequence < UINT64_MAX) { s->event_sequence++; }
+    char ip[INET6_ADDRSTRLEN];
+    uint16_t port = 0;
+    server_of(&ev, ip, sizeof ip, &port);
+    say(s, "по %s (голос) завершается текущий опыт — запускаю сохранённую проверку %s:%u",
+        D2K_LINK_VOICE_CLASS, ip, (unsigned)port);
+    (void)on_suspect(s, &ev, 1);
 }
 
 int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
@@ -9857,7 +10132,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     }
                     forget_clear_target_bindings(s, t, now_ms);
                     cooldown_record(s, t, 0);
-                    target_cooldown *cool = cooldown_find(s, t->name, t->transport, t->family);
+                    target_cooldown *cool = cooldown_find_endpoint(s, t->name, t->transport,
+                                                                   t->family, t->ip, t->port);
                     int64_t delay_ms = cool
                                            ? clear_backoff_ms(cool->negative_streak)
                                            : SCHED_CLEAR_BACKOFF_1_MS;
@@ -9874,7 +10150,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 moved++;
                 continue;
             }
-            cooldown_clear(s, t->name, t->transport, t->family);
+            cooldown_clear_endpoint(s, t->name, t->transport, t->family, t->ip, t->port);
             t->group_block_proven = verdict_proves_block(r.verdict) || volume_proven;
             {
                 /* Volume fingerprint is installed by make_plans before its
@@ -10757,6 +11033,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         }
     }
     quic_yield_tick(s,now_ms);
+    voice_pending_dispatch(s);
     moved += queued_release(s, now_ms);
     return moved;
 }
