@@ -33,6 +33,40 @@ const snapshot = (values = {}) => ({
 }
 
 {
+  const sample = snapshot({
+    last_failure_dc: 4,
+    last_failure_route: 3,
+    last_failure_stage: 3,
+    last_failure_age_ms: 100,
+    last_success_dc: 2,
+    last_success_route: 1,
+    last_success_age_ms: 1000,
+  });
+  const view = flow.summarizeTelegramFlow(sample);
+  assert.equal(flow.hasCurrentRouteFailure(sample), true);
+  assert.equal(view.state, "unavailable");
+  assert.equal(view.transportLabel, "Недоступно");
+  assert.match(view.caption, /TLS.*DC4.*Прокси Cloudflare/);
+  assert.equal(view.lanes[3].counts.failed, 1);
+  assert.deepEqual(flow.visibleRouteLanes(view).map(lane => lane.transport), ["cloudflare_proxy"]);
+}
+
+{
+  const sample = snapshot({
+    last_failure_dc: 4,
+    last_failure_route: 3,
+    last_failure_stage: 3,
+    last_failure_age_ms: 1000,
+    last_success_dc: 2,
+    last_success_route: 1,
+    last_success_age_ms: 100,
+  });
+  const view = flow.summarizeTelegramFlow(sample);
+  assert.equal(flow.hasCurrentRouteFailure(sample), false);
+  assert.equal(view.state, "idle");
+}
+
+{
   const view = flow.summarizeTelegramFlow(snapshot({
     active_connections: 4,
     accepted_connections: 27,
@@ -65,6 +99,8 @@ const snapshot = (values = {}) => ({
   assert.equal(view.lanes[1].label, "Прямой TCP passthrough");
   assert.equal(view.lanes[1].counts.selected, 1);
   assert.equal(view.lanes[2].counts.connecting, 1);
+  assert.deepEqual(flow.visibleRouteLanes(view).map(lane => lane.transport),
+    ["direct_wss", "tcp_passthrough", "cloudflare_worker"]);
 }
 
 {

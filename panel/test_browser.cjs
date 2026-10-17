@@ -146,11 +146,30 @@ async function main(){
   assert.equal(await evaluate('document.querySelector("[data-tg-confirmed-count]").textContent'),'5');
   assert.match(await evaluate('document.querySelector("[data-tg-last-success]").textContent'),/DC2 · прямой WSS/);
   assert.doesNotMatch(await evaluate('document.querySelector("[data-tg-active-sessions]").textContent'),/sequence|first_binary_response|fallback_state/);
-  assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Клиент → d2o → Telegram/);
+  assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Клиент → d2o.*Ответ Telegram не подтверждён/);
+  assert.doesNotMatch(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Прокси Cloudflare|Резервный TCP/,
+    'unused routes are omitted from the diagram');
   assert.doesNotMatch(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/d2ktg C11/);
   assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Прямой TCP passthrough/);
   assert.equal(await evaluate('window.tgFlowCanvas===document.querySelector("#telegram-body .tg-flow-canvas")'),true,'route canvas is mounted once');
   await tunnelShot('1-connected');
+
+  // Свежий отказ всех WSS-маршрутов не должен выглядеть как активное подключение из-за старого ответа.
+  panel.telegram('local');
+  panel.telegramStats({...fixture.telegramStats,active_connections:0,active_sessions:[],
+   last_failure_age_ms:100,last_success_age_ms:10000});
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("#telegram-body").dataset.state==="unavailable"','new WSS failure must replace stale connected state');
+  assert.equal(await evaluate('document.querySelector(".tunnel-word").textContent'),'Маршрут недоступен');
+  assert.match(await evaluate('document.querySelector(".tunnel-note").textContent'),/Последняя попытка Telegram завершилась ошибкой/);
+  assert.match(await evaluate('document.querySelector("#tg-flow-caption").textContent'),/Последняя ошибка: WebSocket · DC4 · Прокси Cloudflare/);
+  assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Прокси Cloudflare — отказ: 1/);
+  assert.doesNotMatch(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Прямой WSS|Cloudflare Worker|Резервный TCP/,
+    'failure view names only the route that actually failed');
+  panel.telegram('connected');
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("#telegram-body").dataset.state==="connected"','new confirmed C11 snapshot restores connected state');
+
   // Worker-ы редактируются в тематическом диалоге и перезапускают только C11.
   await evaluate('document.querySelector("[data-control=telegram-workers]").click()');
   await until('document.querySelector(".tg-worker-dialog").open','Worker list opens in its own dialog');

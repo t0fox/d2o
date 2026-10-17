@@ -37,6 +37,7 @@ const STATE_LABELS = {
 };
 
 const STATUS_ORDER = ["selected", "race", "connecting", "connected", "cooldown", "failed", "cancelled", "skipped"];
+const VISIBLE_ROUTE_STATES = new Set(["selected", "race", "connecting", "connected", "failed", "cancelled"]);
 
 function bezier(start, control1, control2, end, progress) {
   const inverse = 1 - progress;
@@ -107,6 +108,12 @@ function routeState(value) {
   return Object.hasOwn(STATE_LABELS, value) ? value : "idle";
 }
 
+function visibleRouteLanes(view) {
+  if (!Array.isArray(view?.lanes)) return [];
+  return view.lanes.filter(lane => Object.entries(lane.counts || {})
+    .some(([state, count]) => VISIBLE_ROUTE_STATES.has(state) && Number(count) > 0));
+}
+
 function eventState(value) {
   if (value === "first_binary_response") return "selected";
   return routeState(value);
@@ -116,6 +123,41 @@ function routeDescription(transport, lane) {
   if (transport === "tcp_passthrough") return "Прямой TCP passthrough";
   if (transport === "tcp_fallback") return "Резервный TCP";
   return ROUTES[lane]?.label || "WSS-транспорт не определён";
+}
+
+function latestRouteFailure(snapshot) {
+  const stage = Number(snapshot?.last_failure_stage) || 0;
+  const successDc = Number(snapshot?.last_success_dc) || 0;
+  const failureAge = Number(snapshot?.last_failure_age_ms);
+  const successAge = Number(snapshot?.last_success_age_ms);
+  if (!stage || !Number.isFinite(failureAge) ||
+      (successDc && Number.isFinite(successAge) && failureAge > successAge)) return null;
+  const routes = {
+    1: [0, "Прямой WSS"],
+    2: [2, "Cloudflare Worker"],
+    3: [3, "Прокси Cloudflare"],
+    4: [4, "Прямой TCP (диагностика)"],
+  };
+  const stages = {
+    1: "DNS",
+    2: "TCP",
+    3: "TLS",
+    4: "WebSocket",
+    5: "MTProto",
+    6: "Настройка маршрута",
+    7: "WSS-маршрут недоступен",
+  };
+  const route = routes[Number(snapshot?.last_failure_route)] || [-1, "WSS-маршрут"];
+  const dc = Number(snapshot?.last_failure_dc) || 0;
+  return {
+    lane: route[0], route: route[1], stage: stages[stage] || "Ошибка соединения",
+    dc: dc ? `DC${dc}` : "DC неизвестен",
+  };
+}
+
+function hasCurrentRouteFailure(snapshot) {
+  return Math.max(0, Number(snapshot?.active_connections) || 0) === 0
+    && latestRouteFailure(snapshot) !== null;
 }
 
 function selectedLaneFor(session) {
@@ -166,6 +208,21 @@ function summarize(snapshot, error) {
   const sessions = Array.isArray(snapshot?.active_sessions) ? snapshot.active_sessions.slice(0, 64) : [];
   const emptyLanes = ROUTES.map(route => ({ ...route, status: "idle", counts: {} }));
   if (activeConnections === 0) {
+    const failure = latestRouteFailure(snapshot);
+    if (failure) {
+      const lanes = emptyLanes.map(lane => ({ ...lane, counts: {} }));
+      if (failure.lane >= 0) {
+        lanes[failure.lane].status = "failed";
+        lanes[failure.lane].counts = { failed: 1 };
+      }
+      return {
+        state: "unavailable",
+        caption: `Последняя ошибка: ${failure.stage} · ${failure.dc} · ${failure.route}`,
+        transportLabel: "Недоступно", dcLabel: failure.dc, lanes, sessions: [],
+        truncated: Boolean(snapshot?.route_sessions_truncated), hedged: [], activeConnections,
+        acceptedConnections: Number(snapshot?.accepted_connections) || 0, mediaSessions: 0,
+      };
+    }
     return {
       state: "idle", caption: "Нет активных соединений", transportLabel: "Нет подключений",
       dcLabel: "DC неизвестен", lanes: emptyLanes, sessions: [],
@@ -558,7 +615,10 @@ function mountTelegramFlow(canvas) {
     context.fillRect(0, 0, WIDTH, HEIGHT);
 
     strokePath(incomingPath, rgb(palette.accent), 0.35, 3);
+    const visibleRouteIndices = new Set(visibleRouteLanes(currentView)
+      .map(lane => transportLane(lane.transport)));
     lanes.forEach((lane, index) => {
+      if (!visibleRouteIndices.has(lane.index)) return;
       const dashed = ["cooldown", "failed", "cancelled", "skipped"].includes(lane.status) ? [3, 9] : [];
       strokePath(lane.path, rgb(lane.color), lane.alpha, 3, dashed, lane.glow * 0.5);
       const routeLabel = lane.transport === "tcp_passthrough" ? "Прямой TCP passthrough" : lane.label;
@@ -649,6 +709,7 @@ function mountTelegramFlow(canvas) {
     });
     context.globalCompositeOperation = "lighter";
     particles.forEach(particle => {
+      if (!visibleRouteIndices.has(particle.laneIndex)) return;
       const count = particle.trail.length;
       for (let index = 1; index < count; index += 1) {
         const weight = index / count;
@@ -768,14 +829,18 @@ function mountTelegramFlow(canvas) {
   }
 
   function updateAccessibility(view) {
-    const routeText = view.lanes.map(lane => {
+    const visibleLanes = visibleRouteLanes(view);
+    const routeText = visibleLanes.map(lane => {
       const details = Object.entries(lane.counts).map(([state, count]) => `${STATE_LABELS[state] || state}: ${count}`).join(", ");
-      return `${lane.label} — ${details || STATE_LABELS.idle}`;
-    }).join("; ");
+      return `${lane.label} — ${details}`;
+    }).join("; ") || "Сейчас нет активных маршрутов";
+    const confirmed = view.sessions.some(session => session.telegram_response_seen);
+    const connectionText = confirmed
+      ? "Ответ Telegram подтверждён" : "Ответ Telegram не подтверждён";
     const raceText = view.hedged.length
       ? ` Параллельная гонка: победитель ${view.hedged[0].winner}; отменены ${view.hedged[0].losers.join(", ")}.` : "";
     const truncationText = view.truncated ? " Показана ограниченная выборка активных сессий." : "";
-    canvas.setAttribute("aria-label", `Поток соединений: Клиент → d2o → Telegram. ${routeText}. ${view.caption}.${raceText}${truncationText}`);
+    canvas.setAttribute("aria-label", `Схема соединений: Клиент → d2o. ${connectionText}. ${routeText}. ${view.caption}.${raceText}${truncationText}`);
     canvas.dataset.state = view.state;
     if (root) root.dataset.state = view.state;
     const caption = root?.querySelector("#tg-flow-caption");
@@ -882,6 +947,8 @@ global.D2kTelegramFlow = {
   mountTelegramFlow,
   summarizeTelegramFlow: summarize,
   routeDescription,
+  hasCurrentRouteFailure,
+  visibleRouteLanes,
 };
 if (typeof module === "object" && module.exports) module.exports = global.D2kTelegramFlow;
 })(typeof window !== "undefined" ? window : globalThis);

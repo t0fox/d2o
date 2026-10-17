@@ -1882,6 +1882,7 @@
     connected: { word: "Подключён", lamp: "ok", note: "Получен подтверждённый ответ Telegram." },
     connecting: { word: "Подключается", lamp: "warn", note: "Служба запущена и проверяет доступные маршруты." },
     local: { word: "Локальный прокси", lamp: "warn", note: "Прокси запущен. Ответ Telegram появится после подтверждённого обмена." },
+    unavailable: { word: "Маршрут недоступен", lamp: "bad", note: "Нет активного маршрута Telegram." },
     stopped: { word: "Остановлен", lamp: "idle", note: "Служба не запущена." },
     not_configured: { word: "Не настроен", lamp: "idle", note: "Для C11 укажите TG_MODE=local в конфигурации." }
   };
@@ -2012,7 +2013,7 @@
     if (!last) return;
     var successCount = Number(stats && stats.wss_responses) || 0;
     var text = successCount && Number.isFinite(Number(stats.last_success_age_ms))
-      ? "Последний ответ: " + (stats.last_success_dc ? "DC" + stats.last_success_dc + " · " : "") +
+      ? "Последний успешный ответ: " + (stats.last_success_dc ? "DC" + stats.last_success_dc + " · " : "") +
         telegramRouteName(Number(stats.last_success_route)) + " · " + telegramAge(Number(stats.last_success_age_ms))
       : successCount ? "Подтверждён ответ Telegram" : "Подтверждённых ответов пока нет";
     if (last.textContent !== text) last.textContent = text;
@@ -2021,12 +2022,15 @@
   App.prototype.renderTelegram = function (m, force) {
     if (!m) return;
     var doc = this.doc, snap = m.snap;
+    var stats = snap.telegram_stats;
     var st = TG[snap.telegram_status] ? snap.telegram_status : (snap.telegram_configured ? "stopped" : "not_configured");
+    var routeFailure = (st === "connected" || st === "local") && stats && global.D2kTelegramFlow &&
+      global.D2kTelegramFlow.hasCurrentRouteFailure(stats);
+    if (routeFailure) st = "unavailable";
     var info = TG[st];
     var busy = snap.control_state === "running" || !!this.pending;
     var body = this.$("telegram-body");
     var stale = doc.body.getAttribute("data-stale") === "true";
-    var stats = snap.telegram_stats;
     var key = JSON.stringify([st, snap.telegram_enabled, snap.telegram_configured, stats,
       snap.controls_enabled, busy, this.pending, stale]);
     if (!force && body.__d2kKey === key) return;
@@ -2060,6 +2064,7 @@
     buttons.push(this.button("telegram-workers", "Мои Workers", null, null, busy));
     ui.actions.replaceChildren.apply(ui.actions, buttons);
     var note = info.note;
+    if (routeFailure) note = "Последняя попытка Telegram завершилась ошибкой. Причина указана в схеме маршрутов.";
     if (snap.telegram_enabled && st === "stopped") note = "Туннель включён в конфигурации, но служба не запущена.";
     if (ui.note.textContent !== note) ui.note.textContent = note;
     body.setAttribute("data-state", st);
