@@ -141,7 +141,7 @@ static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
 #define STUB_BLOCK_MS 5000
 static int tcp_block_until_stop;
 static int tcp_wait_until_stop;
-static int tcp_release_waiters;
+static volatile sig_atomic_t tcp_release_waiters;
 static int tcp_saw_stop;
 static int tcp_stop_count;
 static uint8_t tcp_last_trig[2048];
@@ -941,6 +941,26 @@ static const char *live_task_entry(d2k_sched *s, const char *target) {
     return entry;
 }
 
+static int live_autopick_reason_is(d2k_sched *s, const char *expected) {
+    char path[] = "/tmp/d2k-autopick-reason-XXXXXX";
+    int fd = mkstemp(path), ok = 0;
+    if (fd < 0) return 0;
+    close(fd);
+    if (d2k_sched_write_live(s, path, "catalog.json") == 0) {
+        FILE *f = fopen(path, "r");
+        char body[32768] = {0};
+        if (f) { (void)!fread(body, 1, sizeof body - 1, f); fclose(f); }
+        const char *a = strstr(body, "\"autopick\": {");
+        const char *r = a ? strstr(a, "\"reason\": ") : NULL;
+        const char *end = a ? strchr(a, '}') : NULL;
+        char want[192];
+        snprintf(want, sizeof want, "\"reason\": \"%s\"", expected);
+        ok = r && end && r < end && !strncmp(r, want, strlen(want));
+    }
+    unlink(path);
+    return ok;
+}
+
 /* "since" активного поиска цели — из блока "searches", а не первой
    встречной записи с этим именем (у подтверждённой цели раньше идёт её
    привязка в каталоге). Пусто — поиска нет. */
@@ -1192,6 +1212,28 @@ static size_t collect_addr_probes(uint8_t dst[][4], uint8_t trial[][D2K_TRIAL_ID
             if (src_port_be) { memcpy(&src_port_be[found], body + 33, 2); }
             memcpy(trial[found], body + 38, D2K_TRIAL_ID_LEN);
             found++;
+        }
+        off += 4 + n;
+    }
+    return found;
+}
+
+/* Последняя адресная проба после жизненного цикла может идти вместе с
+ * продлением старого lease; проверяем именно конечную цель и trial ID. */
+static int last_addr_probe_target(uint16_t *dst_port_be,
+                                  uint8_t trial[D2K_TRIAL_ID_LEN]) {
+    int found = 0;
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3];
+        if (n < 2 || n > sent_len - off - 4) { break; }
+        uint16_t type = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
+        if (type == D2K_CMD_SET_ADDR_PROBE && n >= 2 + 38 + D2K_TRIAL_ID_LEN + 4) {
+            const uint8_t *body = p + 6;
+            if (dst_port_be) { memcpy(dst_port_be, body + 35, 2); }
+            memcpy(trial, body + 38, D2K_TRIAL_ID_LEN);
+            found = 1;
         }
         off += 4 + n;
     }
@@ -1771,6 +1813,8 @@ static void confirm_transport(d2k_catalog *cat, int link_fd, const char *target,
     d2k_sched *s = d2k_sched_new(cat, link_fd, 0x2d);
     if (!s) { CHECK(0, "планировщик не завёлся"); return; }
     d2k_sched_set_say(s, collect_say, NULL);
+    CHECK(live_autopick_reason_is(s, "нет событий от datapath"),
+          "живой статус не объясняет отсутствие событий от datapath");
     ver_answer_port = cport;
     ver_calls = 0;
     forget_sent();
@@ -1792,6 +1836,10 @@ static void confirm_transport(d2k_catalog *cat, int link_fd, const char *target,
         if (live) { (void)!fread(body, 1, sizeof body - 1, live); fclose(live); }
         CHECK(!strstr(body, "подтверждено, смотрим живой трафик"),
               "confirmed passive watcher must not be exported as an ongoing search");
+        CHECK(live_autopick_reason_is(s, "используется ранее подтверждённый Plan") &&
+              strstr(body, "\"target\": \"") && strstr(body, target) &&
+              strstr(body, "\"plan_id\": \"plan-"),
+              "живой статус не называет подтверждённый Plan, из-за которого поиск ждёт");
         unlink(live_path);
     }
     d2k_sched_free(s);
@@ -4680,22 +4728,23 @@ admission_only_run:
         tcp_answer = D2K_V_OPAQUE;
     }
     /* Bound network work during a burst of distinct targets. Two measurements
-       may run at once; the third stays queued, and starts only after the
-       minimum spacing. The stub blocks until cancellation, so this verifies
-       the bound without touching any external host. */
+       may run at once; the rest stay queued, including events beyond the old
+       16-entry queue cap. Releasing the workers starts queued work without a
+       new datapath event. The stub never touches an external host. */
     {
         d2k_catalog c = {0};
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         tcp_calls = 0;
-        tcp_block_until_stop = 1;
-        tcp_saw_stop = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        tcp_wait_until_stop = 1;
+        tcp_release_waiters = 0;
         CHECK(s != NULL, "планировщик ограничения нагрузки не завёлся");
         if (s) {
             spin(s, 1); /* Establish the monotonic/wall clock before admission. */
-            for (uint16_t i = 0; i < 3; i++) {
+            for (uint16_t i = 0; i < 20; i++) {
                 char name[48];
                 uint16_t port = (uint16_t)(41030 + i);
-                snprintf(name, sizeof name, "burst-%u.example", (unsigned)i);
+                snprintf(name, sizeof name, "burst-%02u.example", (unsigned)i);
                 d2k_ev h = ev_hello(6, port, name);
                 d2k_sched_event(s, &h);
                 d2k_ev su = ev_suspect(6, port);
@@ -4704,8 +4753,8 @@ admission_only_run:
             settle(s);
             CHECK(tcp_calls == 2,
                   "всплеск запустил больше двух сетевых замеров одновременно");
-            CHECK(d2k_sched_active(s) == 3,
-                  "третий сигнал потерян, а не сохранён в ограниченной очереди");
+            CHECK(d2k_sched_active(s) == 20,
+                  "часть подозрений потерялась после заполнения очереди");
             char live_path[] = "/tmp/d2k-queue-time-XXXXXX";
             int live_fd = mkstemp(live_path);
             CHECK(live_fd >= 0, "queue time fixture");
@@ -4714,7 +4763,7 @@ admission_only_run:
                 CHECK(!d2k_sched_write_live(s, live_path, "catalog.json"), "queue live write");
                 char body[16384] = {0}; FILE *live = fopen(live_path, "r");
                 if (live) { (void)!fread(body, 1, sizeof body - 1, live); fclose(live); }
-                const char *row = strstr(body, "burst-2.example");
+                const char *row = strstr(body, "burst-19.example");
                 const char *since = row ? strstr(row, "\"since\": \"") : NULL;
                 struct tm tm = {0}; time_t queued_at = 0;
                 if (since && strptime(since + strlen("\"since\": \""),
@@ -4728,17 +4777,28 @@ admission_only_run:
                       !strncmp(src, "\"source\": \"\"", strlen("\"source\": \"\"")),
                       "queued task claims a plan source");
                 CHECK(strstr(body, "\"measurements\": {\"active\": 2, \"limit\": 2, "
-                                   "\"queued\": 1, \"cores\": null, \"free_pct\": null, "
+                                   "\"queued\": 18, \"cores\": null, \"free_pct\": null, "
                                    "\"mem_avail_mb\": null, \"mem_total_mb\": null, "
                                    "\"conntrack_pct\": null, \"limited_by\": null}") != NULL,
                       "без данных о процессоре live JSON не показывает прежний предел 2");
+                CHECK(strstr(body, "\"reason\": \"нет свободных рабочих потоков или ресурсов\"") != NULL,
+                      "живой статус не объясняет, почему задача в очереди не запускается");
                 unlink(live_path);
             }
-            tcp_block_until_stop = 0;
+            tcp_release_waiters = 1;
+            usleep(10000); /* Дать worker увидеть межпоточный сигнал. */
+            for (int i = 0; i < 50 && tcp_calls <= 2; i++) {
+                usleep(10000);
+                spin(s, 50);
+            }
+            CHECK(tcp_calls > 2,
+                  "очередь не продолжилась без нового сигнала datapath");
             d2k_sched_free(s);
         }
-        tcp_block_until_stop = 0;
+        tcp_wait_until_stop = 0;
+        tcp_release_waiters = 0;
         d2k_catalog_free(&c);
+        tcp_answer = D2K_V_OPAQUE;
     }
     {
         /* Задача 38: темп запуска — не больше одного нового замера за
@@ -7571,6 +7631,8 @@ lifecycle_test:
         CHECK(spawn_refused > 0, "lifecycle/restart: отказ запуска потока не случился");
         CHECK(d2k_sched_active(s) == 0,
               "lifecycle/restart: после провала запуска осталась задача-зомби");
+        CHECK(live_autopick_reason_is(s, "локальная ошибка: рабочий поток не запустился"),
+              "живой статус не объясняет отказ запуска рабочего потока");
         spawn_fail = 0;
         settle(s);
         /* Пустое имя в трассе («по  ...») — та самая задача-зомби: сброшенная
@@ -10155,6 +10217,36 @@ rx_volume_tests:
         tcp_answer = D2K_V_OPAQUE;
     }
 
+    /* Новый IP того же имени — отдельная цель: CLEAR старого endpoint и
+       оставшаяся после него задача отдыха не должны глушить новое соединение. */
+    {
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        tcp_answer = D2K_V_CLEAR;
+        tcp_calls = 0;
+        CHECK(s != NULL, "планировщик проверки смены endpoint не завёлся");
+        if (s) {
+            d2k_ev h1 = ev_hello(6, 40261, "меняющийся-endpoint.example");
+            d2k_sched_event(s, &h1);
+            d2k_ev su1 = ev_suspect(6, 40261);
+            d2k_sched_event(s, &su1);
+            settle(s);
+            CHECK(tcp_calls == 1, "первый endpoint не получил прямую проверку");
+
+            d2k_ev h2 = ev_hello(6, 40262, "меняющийся-endpoint.example");
+            h2.low_ip[3] = 2;
+            d2k_sched_event(s, &h2);
+            d2k_ev su2 = ev_suspect(6, 40262);
+            su2.low_ip[3] = 2;
+            d2k_sched_event(s, &su2);
+            settle(s);
+            CHECK(tcp_calls == 2,
+                  "CLEAR и отдых старого IP подавили поиск по новому endpoint того же имени");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&c);
+    }
+
     /* An anti-bot challenge gets a longer target-local cooldown than an
        ordinary CLEAR, and must not be treated as a failed strategy to retry. */
     {
@@ -10178,8 +10270,10 @@ rx_volume_tests:
 
             skip_ahead(s, 3 * 60 * 1000);
             d2k_ev h2 = ev_hello(6, 40211, "challenge-backoff.example");
+            h2.low_ip[3] = 2;
             d2k_sched_event(s, &h2);
             d2k_ev su2 = ev_suspect(6, 40211);
+            su2.low_ip[3] = 2;
             su2.code = D2K_SUSPECT_SILENT;
             d2k_sched_event(s, &su2);
             settle(s);
@@ -10641,14 +10735,12 @@ rx_volume_tests:
         d2k_catalog_free(&cC);
     }
 
-    /* --- ПОДОЗРЕНИЕ БЕЗ ПРИМЕНЁННОГО ПЛАНА — НЕ ДЕГРАДАЦИЯ ---------------
+    /* --- ОТКАЗ ПОДТВЕРЖДЁННОГО ПЛАНА СРАЗУ ЗАПУСКАЕТ ПЕРЕПРОВЕРКУ ----------
      *
-     * Поле 18.09.2026: через две секунды после «ПОДТВЕРЖДЕНО» приходило
-     * «подозрение при подтверждённом плане — наблюдение прекращаю», хотя
-     * клиент тут же получал 200 четыре раза подряд. Тот поток был начат ДО
-     * того, как план доехал до датапата: он шёл без обхода и про план не
-     * говорит ничего. Различить их может только датапат — он один знает,
-     * применялся ли план к ЭТОМУ потоку (ev->planned). */
+     * Поток, начатый ДО установки плана, не доказывает его отказ. Но когда
+     * свежий поток шёл с уже применённым подтверждённым планом, его первый
+     * достоверный отказ должен запустить проверку этим же событием. Иначе
+     * каждое новое подозрение только закрывает наблюдение. */
     {
         d2k_catalog cG;
         memset(&cG, 0, sizeof cG);
@@ -10690,9 +10782,18 @@ rx_volume_tests:
 
             d2k_ev sy = ev_suspect(6, 40311);
             sy.planned = D2K_LINK_PLANNED_YES;
+            int verifies_before = ver_calls;
             d2k_sched_event(s, &sy);
-            CHECK(said("наблюдение прекращаю"),
-                  "подозрение о потоке С применённым планом не признано деградацией");
+            CHECK(said("запускаю повторную проверку"),
+                  "первый отказ подтверждённого плана потерян вместо перепроверки");
+            CHECK(said("источник нового замера"),
+                  "отказ подтверждённого плана не создал задачу замера");
+            CHECK(binding_of(&cG, "деградация.цель", 6) != NULL,
+                  "запуск перепроверки удалил подтверждённую привязку заранее");
+            spin(s, 800);
+            CHECK(ver_calls > verifies_before,
+                  "новый замер не дошёл до проверки ранее подтверждённого Plan");
+            drain(); /* Не оставляем команды этого поиска соседним фикстурам. */
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cG);
@@ -11622,7 +11723,8 @@ voice_only_run:
             d2k_sched_event(s, &ex);
             spin(s, 20);
             const d2k_cat_binding *bd = binding_of(&cD, D2K_LINK_VOICE_CLASS, 17);
-            CHECK(bd != NULL && strcmp(bd->kind, "name") == 0 && said("ПОДТВЕРЖДЕНО"),
+            CHECK(bd != NULL && strcmp(bd->kind, "name") == 0 &&
+                  said("подтверждён ответ Discord Discovery"),
                   "IP Discovery response после APPLIED опыта не подтвердил голос");
             CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1 &&
                   sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0,
@@ -11650,12 +11752,9 @@ voice_only_run:
         }
         d2k_catalog_free(&cD);
 
-        /* Финальное ревью, п.1: пока единственная задача @discord-voice ждёт
-           следующего разговора (T_VOICE_TRIAL) к точке A, подозрение голоса
-           к ДРУГОЙ точке B не теряется: опыт A снимается точно (свой trial
-           ID), и B получает свой замер в том же окне тиков. Истечение опыта
-           «не проверено» не ставит общий 10-минутный запрет: новое
-           подозрение после него снова мерится. */
+        /* При чередовании двух Discord relay новый endpoint сохраняется в
+           ограниченном слоте: он не должен снимать каждый опыт до следующего
+           разговора. После срока опыта A запускается сохранённая проверка B. */
         d2k_catalog cR;
         memset(&cR, 0, sizeof cR);
         saidbuf[0] = '\0';
@@ -11675,41 +11774,64 @@ voice_only_run:
             CHECK(voice_calls == 1 &&
                   collect_addr_probes(adst, atrial, NULL, 2) == 1,
                   "голосовой опыт к точке A не поставлен");
-            forget_sent();
             g_server_port = 50008;              /* другая точка сервера B */
             h = ev_hello(17, 52041, D2K_LINK_VOICE_CLASS);
             d2k_sched_event(s, &h);
             su = ev_suspect(17, 52041);
             d2k_sched_event(s, &su);
-            /* Общий интервал запуска замеров (250 мс) может поставить B в
-               очередь — это и есть начало работы, не потеря. */
             spin(s, 400);
             drain();
-            uint8_t bdst[2][4], btrial[2][D2K_TRIAL_ID_LEN];
-            uint16_t bsport[2] = {1, 1};
-            size_t nb = collect_addr_probes(bdst, btrial, bsport, 2);
-            CHECK(voice_calls == 2,
-                  "подозрение голоса к другой точке сервера потеряно, пока опыт ждал разговора");
-            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1,
-                  "опыт точки A не снят при переходе к точке B");
-            CHECK(nb == 1 && bsport[0] == 0 &&
-                  memcmp(btrial[0], atrial[0], D2K_TRIAL_ID_LEN) != 0,
-                  "точка B не получила собственного опыта с новым trial ID");
-            /* Та же точка B, пока её опыт ждёт: подозрение не дублирует замер. */
+            CHECK(voice_calls == 1,
+                  "чередование endpoint сняло опыт A до следующего разговора");
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 0,
+                  "ждущий опыт A снят раньше срока после сигнала B");
+
+            /* Повторное подозрение к B обновляет один ограниченный слот, а
+               не создаёт бесконечную очередь голосовых задач. */
             h = ev_hello(17, 52042, D2K_LINK_VOICE_CLASS);
             d2k_sched_event(s, &h);
             su = ev_suspect(17, 52042);
             d2k_sched_event(s, &su);
             spin(s, 20);
-            CHECK(voice_calls == 2,
-                  "подозрение к той же точке сбросило ждущий опыт");
-            /* Опыт истёк «не проверено» — общий запрет не ставится. */
-            skip_ahead(s, 10 * 60 * 1000 + 1);
-            CHECK(said("не проверено"), "истечение голосового опыта не названо");
+            CHECK(voice_calls == 1,
+                  "повторный endpoint B отменил или продублировал опыт A");
+
+            /* A ждёт достаточно долго, чтобы примениться к следующему
+               разговору, но не блокирует новую точку дольше двух минут. */
             forget_sent();
+            skip_ahead(s, 2 * 60 * 1000 + 1);
+            spin(s, 20);
+            drain();
+            uint16_t target_port_be = 0;
+            uint8_t btrial[D2K_TRIAL_ID_LEN] = {0};
+            int have_b = last_addr_probe_target(&target_port_be, btrial);
+            CHECK(said("не проверено"), "истечение голосового опыта A не названо");
+            CHECK(voice_calls == 2,
+                  "сохранённое подозрение B не запустилось после срока опыта A");
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1,
+                  "по истечении срока не снят ровно опыт A");
+            CHECK(have_b && ntohs(target_port_be) == 50008,
+                  "сохранённое подозрение B не поставило Plan на порт B");
+            CHECK(have_b && memcmp(btrial, atrial[0], D2K_TRIAL_ID_LEN) != 0,
+                  "адресная проба B повторно использовала trial ID точки A");
+
+            /* Та же точка B, пока её опыт ждёт: подозрение не дублирует замер. */
             h = ev_hello(17, 52043, D2K_LINK_VOICE_CLASS);
             d2k_sched_event(s, &h);
             su = ev_suspect(17, 52043);
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            CHECK(voice_calls == 2,
+                  "подозрение к той же точке сбросило ждущий опыт B");
+
+            /* Истечение без применения не вводит общий cooldown; новый
+               datapath-сигнал после этого снова запускает безопасный замер. */
+            skip_ahead(s, 10 * 60 * 1000 + 1);
+            CHECK(said("не проверено"), "истечение голосового опыта B не названо");
+            forget_sent();
+            h = ev_hello(17, 52044, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            su = ev_suspect(17, 52044);
             d2k_sched_event(s, &su);
             spin(s, 20);
             drain();
