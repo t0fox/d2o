@@ -251,6 +251,11 @@ int tg_stats_socket_serve(tg_stats_socket *server,
                     ",\"last_success_age_ms\":%" PRIu64
                     ",\"last_failure_dc\":%u,\"last_failure_route\":%u"
                     ",\"last_failure_stage\":%u,\"last_failure_age_ms\":%" PRIu64
+                    ",\"client_response_latency_total\":%" PRIu64
+                    ",\"client_response_latency_samples\":%zu"
+                    ",\"client_response_latency_last_us\":%" PRIu64
+                    ",\"client_response_latency_p50_us\":%" PRIu64
+                    ",\"client_response_latency_p95_us\":%" PRIu64
                     "}\n",
                     stats.max_connections, stats.active_wss_connections,
                     stats.max_wss_connections, stats.buffer_bytes_current,
@@ -262,7 +267,12 @@ int tg_stats_socket_serve(tg_stats_socket *server,
                     stats.last_success_route, stats.last_success_latency_ms,
                     stats.last_success_age_ms, stats.last_failure_dc,
                     stats.last_failure_route, stats.last_failure_stage,
-                    stats.last_failure_age_ms) == 0)
+                    stats.last_failure_age_ms,
+                    stats.client_response_latency_total,
+                    stats.client_response_latency_samples,
+                    stats.client_response_latency_last_us,
+                    stats.client_response_latency_p50_us,
+                    stats.client_response_latency_p95_us) == 0)
                 length = (int)used;
             else
                 length = -1;

@@ -78,6 +78,7 @@ typedef struct {
     tg_ws_tx_frame *tx_head,*tx_tail; tg_ws_reassembly reassembly;
     tg_memory_budget *memory_budget;
     int failed,closed,read_wants_write,write_wants_read;
+    int mtproto_payload_write_attempted;
 } tg_ws_pump;
 typedef int (*tg_ws_message_cb)(void *ctx,const uint8_t *payload,size_t payload_len);
 int tg_ws_pump_init(tg_ws_pump *pump,SSL *ssl);
@@ -85,6 +86,9 @@ int tg_ws_pump_init_accounted(tg_ws_pump *pump, SSL *ssl,
                               tg_memory_budget *memory_budget);
 void tg_ws_pump_destroy(tg_ws_pump *pump);
 int tg_ws_pump_queue_binary(tg_ws_pump *pump,const uint8_t *payload,size_t payload_len);
+int tg_ws_pump_queue_mtproto_payload(tg_ws_pump *pump,
+                                     const uint8_t *payload,
+                                     size_t payload_len);
 int tg_ws_pump_queue_ping(tg_ws_pump *pump,const uint8_t *payload,size_t payload_len);
 int tg_ws_pump_queue_close(tg_ws_pump *pump);
 int tg_ws_pump_fd(const tg_ws_pump *pump);

@@ -7,7 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 
-struct tg_ws_tx_frame { struct tg_ws_tx_frame *next; uint8_t *bytes; size_t len,offset,allocated; };
+struct tg_ws_tx_frame { struct tg_ws_tx_frame *next; uint8_t *bytes; size_t len,offset,allocated; int mtproto_payload; };
 #define TG_WS_PUMP_TX_LIMIT (TG_WS_MAX_MESSAGE + 14u + sizeof(struct tg_ws_tx_frame))
 #define TG_WS_PUMP_RX_RETAIN (64u * 1024u)
 #define TG_WS_PUMP_RX_LIMIT (TG_WS_MAX_MESSAGE + 10u)
@@ -101,7 +101,8 @@ void tg_ws_pump_destroy(tg_ws_pump *p) {
     memset(p,0,sizeof(*p));p->fd=-1;
 }
 
-static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,size_t len) {
+static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,
+                        size_t len,int mtproto_payload) {
     if(!p||p->failed||p->closed||(!data&&len)||len>TG_WS_MAX_MESSAGE)return -1;
     size_t alloc=len+14,written=0;
     if(p->tx_memory_bytes>TG_WS_PUMP_TX_LIMIT||
@@ -116,7 +117,7 @@ static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,size_t 
     if(tg_ws_encode_client_frame(f->bytes,alloc,opcode,data,len,&written)!=0){
         OPENSSL_clear_free(f->bytes,alloc);free(f);
         tg_memory_budget_release(p->memory_budget,charge);return -1;}
-    f->len=written;f->allocated=alloc;
+    f->len=written;f->allocated=alloc;f->mtproto_payload=mtproto_payload;
     if(p->tx_tail) { p->tx_tail->next=f; }
     else { p->tx_head=f; }
     p->tx_tail=f;p->tx_bytes+=written;
@@ -124,9 +125,11 @@ static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,size_t 
     return 0;
 }
 
-int tg_ws_pump_queue_binary(tg_ws_pump *p,const uint8_t *data,size_t len){return queue_opcode(p,TG_WS_BINARY,data,len);}
-int tg_ws_pump_queue_ping(tg_ws_pump *p,const uint8_t *data,size_t len){return queue_opcode(p,TG_WS_PING,data,len);}
-int tg_ws_pump_queue_close(tg_ws_pump *p){return queue_opcode(p,TG_WS_CLOSE,NULL,0);}
+int tg_ws_pump_queue_binary(tg_ws_pump *p,const uint8_t *data,size_t len){return queue_opcode(p,TG_WS_BINARY,data,len,0);}
+int tg_ws_pump_queue_mtproto_payload(tg_ws_pump *p,const uint8_t *data,
+                                     size_t len){return queue_opcode(p,TG_WS_BINARY,data,len,1);}
+int tg_ws_pump_queue_ping(tg_ws_pump *p,const uint8_t *data,size_t len){return queue_opcode(p,TG_WS_PING,data,len,0);}
+int tg_ws_pump_queue_close(tg_ws_pump *p){return queue_opcode(p,TG_WS_CLOSE,NULL,0,0);}
 int tg_ws_pump_fd(const tg_ws_pump *p){return p?p->fd:-1;}
 short tg_ws_pump_events(const tg_ws_pump *p){
     if(!p||p->failed||p->closed)return 0;
@@ -295,7 +298,7 @@ static int dispatch_frames(tg_ws_pump *p,tg_ws_message_cb callback,void *ctx) {
         if(ready<0)return -1;
         if(ready==0)return 0;
         if(ready==1){
-            if(op==TG_WS_PING){if(queue_opcode(p,TG_WS_PONG,data,len)!=0)return -1;}
+            if(op==TG_WS_PING){if(queue_opcode(p,TG_WS_PONG,data,len,0)!=0)return -1;}
             else if(op==TG_WS_CLOSE){p->closed=1;return 0;}
             else if(op==TG_WS_TEXT)return -1;
             else if(op==TG_WS_BINARY&&callback&&
@@ -310,6 +313,7 @@ static int dispatch_frames(tg_ws_pump *p,tg_ws_message_cb callback,void *ctx) {
 static int flush_tx(tg_ws_pump *p) {
     p->write_wants_read=0;
     while(p->tx_head){tg_ws_tx_frame *f=p->tx_head;size_t n=0;
+        if(f->mtproto_payload)p->mtproto_payload_write_attempted=1;
         int rc=SSL_write_ex(p->ssl,f->bytes+f->offset,f->len-f->offset,&n);
         if(rc!=1){int error=SSL_get_error(p->ssl,rc);
             if(error==SSL_ERROR_WANT_READ){p->write_wants_read=1;return 0;}

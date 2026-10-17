@@ -107,6 +107,12 @@ typedef struct {
     uint32_t last_failure_route;
     uint32_t last_failure_stage;
     uint64_t last_failure_age_ms;
+    /* Перцентили последних 128 успешных WSS-сессий: accept TCP → MTProto. */
+    uint64_t client_response_latency_total;
+    size_t client_response_latency_samples;
+    uint64_t client_response_latency_last_us;
+    uint64_t client_response_latency_p50_us;
+    uint64_t client_response_latency_p95_us;
 } tg_epoll_proxy_stats;
 
 typedef int (*tg_epoll_original_destination_fn)(

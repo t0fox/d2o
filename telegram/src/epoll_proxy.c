@@ -29,6 +29,7 @@
 #define TG_EPOLL_IO_CHUNK 16384u
 #define TG_EPOLL_MAX_LISTEN_PORTS 16u
 #define TG_ROUTE_HEALTH_MAX 256u
+#define TG_CLIENT_LATENCY_SAMPLE_COUNT 128u
 #define TG_HEDGE_DELAY_DEFAULT_MS 125u
 #define TG_ROUTE_DNS_WAIT_TIMEOUT_MS 20000u
 #define TG_ROUTE_DNS_RETRY_MS 50u
@@ -133,6 +134,7 @@ struct proxy_connection {
     size_t response_prefix_len;
     int response_packet_padded;
     uint64_t route_started_ms;
+    uint64_t accepted_at_us;
     uint64_t hedge_due_ms;
     size_t hedge_payload_offset;
     uint32_t tls_want;
@@ -182,6 +184,10 @@ struct tg_epoll_proxy {
     uint32_t last_failure_dc;
     uint32_t last_failure_route;
     uint32_t last_failure_stage;
+    uint64_t client_response_latency[TG_CLIENT_LATENCY_SAMPLE_COUNT];
+    size_t client_response_latency_count;
+    size_t client_response_latency_next;
+    uint64_t client_response_latency_total;
     route_health route_health[TG_ROUTE_HEALTH_MAX];
     proxy_connection *connections;
     proxy_connection *retired;
@@ -200,11 +206,36 @@ static int hedge_candidate_flush_buffered_payload(
 static void hedge_cancel_candidates(proxy_connection *connection);
 static int hedge_promote_candidate(proxy_connection *candidate);
 static void advance_half_closes(proxy_connection *connection);
+static int progress_wss(proxy_connection *connection, uint32_t events);
 
 static uint64_t monotonic_ms(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
     return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static uint64_t monotonic_us(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000) +
+           (uint64_t)now.tv_nsec / 1000u;
+}
+
+static void record_client_response_latency(tg_epoll_proxy *server,
+                                          const proxy_connection *connection) {
+    if (!server || !connection || !connection->accepted_at_us) return;
+    uint64_t now = monotonic_us();
+    if (now < connection->accepted_at_us) return;
+    server->client_response_latency[server->client_response_latency_next] =
+        now - connection->accepted_at_us;
+    server->client_response_latency_next =
+        (server->client_response_latency_next + 1u) %
+        TG_CLIENT_LATENCY_SAMPLE_COUNT;
+    if (server->client_response_latency_count <
+        TG_CLIENT_LATENCY_SAMPLE_COUNT)
+        ++server->client_response_latency_count;
+    if (server->client_response_latency_total != UINT64_MAX)
+        ++server->client_response_latency_total;
 }
 
 static void add_bytes(uint64_t *total, size_t amount) {
@@ -549,14 +580,21 @@ static int route_health_key_matches(const route_health *health,
                                     const proxy_connection *connection) {
     const tg_listener_destination *a = &health->original;
     const tg_listener_destination *b = &connection->original;
-    size_t address_len = a->family == AF_INET ? 4u : 16u;
-    return health->used && health->kind == connection->route_kind &&
-        health->dc_id == connection->route_dc_id &&
-        health->is_media == connection->route_is_media &&
-        strcmp(health->hostname, connection->tls_hostname) == 0 &&
-        a->family == b->family && a->port == b->port &&
-        (a->family == AF_INET || a->family == AF_INET6) &&
-        memcmp(a->address, b->address, address_len) == 0;
+    if (!health->used || health->kind != connection->route_kind ||
+        health->dc_id != connection->route_dc_id ||
+        health->is_media != connection->route_is_media ||
+        strcmp(health->hostname, connection->tls_hostname) != 0 ||
+        a->port != b->port ||
+        (a->family != AF_INET && a->family != AF_INET6) ||
+        (b->family != AF_INET && b->family != AF_INET6))
+        return 0;
+    if (health->kind == TG_ROUTE_CF_WORKER) {
+        /* Worker URL содержит исходный IP, поэтому его успех переносить нельзя. */
+        if (a->family != b->family) return 0;
+        size_t address_len = a->family == AF_INET ? 4u : 16u;
+        return memcmp(a->address, b->address, address_len) == 0;
+    }
+    return 1;
 }
 
 static int route_health_in_use(const tg_epoll_proxy *server, size_t index) {
@@ -658,6 +696,7 @@ static int route_health_preferred_step(const tg_epoll_proxy *server,
                                        tg_route_step *out) {
     uint64_t now = monotonic_ms();
     const tg_listener_destination *target = &connection->original;
+    if (target->family != AF_INET && target->family != AF_INET6) return 0;
     size_t address_len = target->family == AF_INET ? 4u : 16u;
     const route_health *best = NULL;
     for (size_t i = 0; i < TG_ROUTE_HEALTH_MAX; ++i) {
@@ -668,9 +707,13 @@ static int route_health_preferred_step(const tg_epoll_proxy *server,
             health->is_media != connection->route_is_media ||
             !health->last_success_ms || now < health->last_success_ms ||
             now - health->last_success_ms > 120000u ||
-            health->original.family != target->family ||
             health->original.port != target->port ||
-            memcmp(health->original.address, target->address, address_len) != 0)
+            health->cooldown_until_ms > now ||
+            health->last_failure_ms > health->last_success_ms ||
+            (health->kind == TG_ROUTE_CF_WORKER &&
+             (health->original.family != target->family ||
+              memcmp(health->original.address, target->address,
+                     address_len) != 0)))
             continue;
         if (!best || health->latency_ms < best->latency_ms) best = health;
     }
@@ -1338,7 +1381,8 @@ static void connection_update(proxy_connection *connection) {
 static int hedge_promote_candidate(proxy_connection *candidate) {
     proxy_connection *parent = candidate->hedge_parent;
     if (!parent || parent->closed) return -1;
-    if (hedge_candidate_flush_buffered_payload(candidate) != 0 ||
+    int flush_rc = hedge_candidate_flush_buffered_payload(candidate);
+    if (flush_rc != 0 ||
         candidate->hedge_payload_offset != parent->to_upstream.len) {
         return -1;
     }
@@ -1387,7 +1431,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
     parent->route_started_ms = candidate->route_started_ms;
     parent->tls_want = candidate->tls_want;
     parent->upstream_eof = candidate->upstream_eof;
-    parent->wss_deadline_ms = 0;
+    parent->wss_deadline_ms = candidate->wss_deadline_ms;
     memcpy(parent->tls_hostname, candidate->tls_hostname,
            sizeof(parent->tls_hostname));
     memcpy(parent->wss_path, candidate->wss_path, sizeof(parent->wss_path));
@@ -1395,9 +1439,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
         .kind = 2, .connection = parent, .side = 1,
         .fd = parent->upstream_fd
     };
-    queue_release(parent, &parent->to_upstream);
-    parent->wss_forwarded_offset = 0;
-    parent->wss_replay_disabled = 1;
+    parent->wss_forwarded_offset = candidate->hedge_payload_offset;
     parent->route_racing = 0;
     parent->hedge_due_ms = 0;
 
@@ -1420,6 +1462,11 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
     hedge_cancel_candidates(parent);
     if (watch_update(server, &parent->upstream_watch,
                      upstream_events(parent)) != 0) {
+        connection_close(parent);
+        return 0;
+    }
+    int progress_rc = progress_wss(parent, EPOLLOUT);
+    if (progress_rc != 0) {
         connection_close(parent);
         return 0;
     }
@@ -1602,15 +1649,11 @@ static int receive_client(proxy_connection *connection) {
                     proxy_connection *candidate = connection->hedges[i];
                     if (!candidate || candidate->wss_phase != WSS_READY)
                         continue;
-                    int flush_rc = hedge_candidate_flush_buffered_payload(candidate);
-                    int watch_rc = flush_rc == 0
-                        ? watch_update(connection->server,
-                                       &candidate->upstream_watch,
-                                       upstream_events(candidate)) : 0;
-                    if (flush_rc != 0 || watch_rc != 0) {
+                    if (hedge_promote_candidate(candidate) != 0) {
                         hedge_fail_candidate(candidate);
                         if (connection->closed) return -1;
                     }
+                    break;
                 }
             } else if (connection->direct_wss
                            ? queue_wss_replay_payload(connection, buffer,
@@ -1676,7 +1719,8 @@ static int socket_error(int fd) {
 static int queue_wss_packet(void *opaque, const uint8_t *packet,
                             size_t packet_len) {
     proxy_connection *connection = opaque;
-    return tg_ws_pump_queue_binary(&connection->ws_pump, packet, packet_len);
+    return tg_ws_pump_queue_mtproto_payload(&connection->ws_pump, packet,
+                                            packet_len);
 }
 
 static int process_client_payload(proxy_connection *connection,
@@ -1692,7 +1736,8 @@ static int process_client_payload(proxy_connection *connection,
                 return -1;
             return 0;
         }
-        return tg_ws_pump_queue_binary(&connection->ws_pump, buffer, length);
+        return tg_ws_pump_queue_mtproto_payload(&connection->ws_pump, buffer,
+                                                length);
     }
     return queue_append_grow(connection, &connection->to_upstream, buffer,
                              length,
@@ -1702,6 +1747,16 @@ static int process_client_payload(proxy_connection *connection,
 static void clear_wss_replay(proxy_connection *connection) {
     queue_release(connection, &connection->to_upstream);
     connection->wss_forwarded_offset = 0;
+}
+
+static void disable_wss_replay_after_payload_write(
+    proxy_connection *connection) {
+    if (!connection || !connection->direct_wss ||
+        !connection->ws_pump.mtproto_payload_write_attempted ||
+        connection->wss_replay_disabled)
+        return;
+    connection->wss_replay_disabled = 1;
+    clear_wss_replay(connection);
 }
 
 static int queue_wss_replay_payload(proxy_connection *connection,
@@ -1924,6 +1979,7 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
     }
     if (response > 0 && !connection->route_response_seen) {
         connection->route_response_seen = 1;
+        record_client_response_latency(connection->server, connection);
         route_session_first_response(connection);
         if (connection->route_health_index >= 0) {
             route_health *health = &connection->server->route_health[
@@ -2070,9 +2126,10 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
             if (rc == 1) {
                 if (establish_wss_stream(connection) != 0) return -1;
                 if (connection->hedge_parent) {
-                    if (hedge_candidate_flush_buffered_payload(connection) != 0) {
-                        return -1;
-                    }
+                    proxy_connection *parent = connection->hedge_parent;
+                    if (parent->to_upstream.len >
+                        connection->hedge_payload_offset)
+                        return hedge_promote_candidate(connection);
                 } else if (flush_wss_replay(connection) != 0) {
                     return -1;
                 }
@@ -2095,6 +2152,7 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
             if (events & (EPOLLHUP | EPOLLRDHUP)) revents |= POLLHUP;
             int pump_rc = tg_ws_pump_process(&connection->ws_pump, revents,
                                              queue_wss_response, connection);
+            disable_wss_replay_after_payload_write(connection);
             if (pump_rc != 0) {
                 if (connection->route_data_seen) {
                     if (!connection->route_response_seen)
@@ -2361,6 +2419,7 @@ static void accept_clients(tg_epoll_proxy *server) {
         connection->upstream_fd = -1;
         connection->route_health_index = -1;
         connection->original = original;
+        connection->accepted_at_us = monotonic_us();
         connection->handshake_deadline_ms = monotonic_ms() +
                                             server->config.handshake_timeout_ms;
         connection->last_activity_ms = monotonic_ms();
@@ -2711,6 +2770,37 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
     out->last_failure_stage = server->last_failure_stage;
     out->last_failure_age_ms = server->last_failure_ms &&
         now >= server->last_failure_ms ? now - server->last_failure_ms : 0;
+    out->client_response_latency_total =
+        server->client_response_latency_total;
+    out->client_response_latency_samples =
+        server->client_response_latency_count;
+    if (server->client_response_latency_count) {
+        uint64_t samples[TG_CLIENT_LATENCY_SAMPLE_COUNT];
+        size_t count = server->client_response_latency_count;
+        size_t oldest = server->client_response_latency_count <
+            TG_CLIENT_LATENCY_SAMPLE_COUNT ? 0 :
+            server->client_response_latency_next;
+        for (size_t i = 0; i < count; ++i)
+            samples[i] = server->client_response_latency[
+                (oldest + i) % TG_CLIENT_LATENCY_SAMPLE_COUNT];
+        for (size_t i = 1; i < count; ++i) {
+            uint64_t value = samples[i];
+            size_t j = i;
+            while (j && samples[j - 1u] > value) {
+                samples[j] = samples[j - 1u];
+                --j;
+            }
+            samples[j] = value;
+        }
+        size_t p50 = (count * 50u + 99u) / 100u - 1u;
+        size_t p95 = (count * 95u + 99u) / 100u - 1u;
+        out->client_response_latency_p50_us = samples[p50];
+        out->client_response_latency_p95_us = samples[p95];
+        out->client_response_latency_last_us = server->client_response_latency[
+            (server->client_response_latency_next +
+             TG_CLIENT_LATENCY_SAMPLE_COUNT - 1u) %
+            TG_CLIENT_LATENCY_SAMPLE_COUNT];
+    }
     for (size_t i = 0; i < TG_ROUTE_HEALTH_MAX; ++i) {
         const route_health *health = &server->route_health[i];
         if (!health->used) continue;
