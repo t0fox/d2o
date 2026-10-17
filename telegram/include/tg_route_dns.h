@@ -31,6 +31,9 @@ void tg_route_dns_prefetch_cf_pool(tg_route_dns *cache,
                                    tg_cf_domain_pool *pool);
 int tg_route_dns_resolve(tg_route_dns *cache, const char *domain,
                          tg_listener_destination *out);
+/* 0 — адрес готов, 1 — асинхронный поиск выполняется, -1 — ошибка поиска. */
+int tg_route_dns_resolve_status(tg_route_dns *cache, const char *domain,
+                                tg_listener_destination *out);
 int tg_route_dns_parse_response(const uint8_t *response, size_t length,
                                 uint16_t expected_id,
                                 tg_listener_destination addresses[

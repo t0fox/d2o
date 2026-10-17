@@ -125,6 +125,7 @@ typedef int (*tg_epoll_select_route_fn)(
     void *context, const tg_listener_destination *original,
     const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
     tg_epoll_route_selection *selection);
+/* Резолвер возвращает 0 при готовом адресе, 1 при ожидании DNS и -1 при ошибке. */
 typedef int (*tg_epoll_resolve_domain_fn)(
     void *context, const char *domain, tg_listener_destination *upstream);
 

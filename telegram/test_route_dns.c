@@ -3,6 +3,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -21,6 +22,8 @@ typedef struct {
     size_t calls;
     int fail;
     int private_only;
+    atomic_int hold;
+    atomic_int entered;
 } resolver_fixture;
 
 static int test_lookup(void *opaque, const char *domain,
@@ -35,6 +38,11 @@ static int test_lookup(void *opaque, const char *domain,
     int fail = fixture->fail;
     int private_only = fixture->private_only;
     pthread_mutex_unlock(&fixture->mutex);
+    atomic_store(&fixture->entered, 1);
+    while (atomic_load(&fixture->hold)) {
+        struct timespec delay = {.tv_nsec = 1000000L};
+        (void)nanosleep(&delay, NULL);
+    }
     *count = 0;
     if (fail) return -1;
     if (private_only) {
@@ -204,6 +212,55 @@ static void test_private_and_invalid_results_are_rejected(void) {
     pthread_mutex_destroy(&fixture.mutex);
 }
 
+static void test_resolve_status_distinguishes_pending_and_failure(void) {
+    resolver_fixture fixture = {0};
+    assert(pthread_mutex_init(&fixture.mutex, NULL) == 0);
+    atomic_init(&fixture.hold, 1);
+    atomic_init(&fixture.entered, 0);
+    tg_route_dns *cache = tg_route_dns_create(NULL, 0, NULL,
+                                               test_lookup, &fixture);
+    assert(cache && tg_route_dns_prefetch(cache, "edge.example") == 0);
+    for (unsigned attempt = 0; attempt < 200 && !atomic_load(&fixture.entered);
+         ++attempt) {
+        struct timespec delay = {.tv_nsec = 10000000L};
+        (void)nanosleep(&delay, NULL);
+    }
+    assert(atomic_load(&fixture.entered));
+    tg_listener_destination address = {0};
+    assert(tg_route_dns_resolve_status(cache, "edge.example", &address) == 1);
+    atomic_store(&fixture.hold, 0);
+    int status = 1;
+    for (unsigned attempt = 0; attempt < 200 && status == 1; ++attempt) {
+        status = tg_route_dns_resolve_status(cache, "edge.example", &address);
+        if (status == 1) {
+            struct timespec delay = {.tv_nsec = 10000000L};
+            (void)nanosleep(&delay, NULL);
+        }
+    }
+    assert(status == 0 && address.family == AF_INET && address.port == 443);
+    tg_route_dns_destroy(cache);
+    pthread_mutex_destroy(&fixture.mutex);
+
+    resolver_fixture offline = {.fail = 1};
+    assert(pthread_mutex_init(&offline.mutex, NULL) == 0);
+    atomic_init(&offline.hold, 0);
+    atomic_init(&offline.entered, 0);
+    cache = tg_route_dns_create(NULL, 0, NULL, test_lookup, &offline);
+    assert(cache && tg_route_dns_prefetch(cache, "offline.example") == 0);
+    status = tg_route_dns_resolve_status(cache, "offline.example", &address);
+    assert(status == 1);
+    for (unsigned attempt = 0; attempt < 200 && calls(&offline) == 0;
+         ++attempt) {
+        struct timespec delay = {.tv_nsec = 10000000L};
+        (void)nanosleep(&delay, NULL);
+    }
+    struct timespec delay = {.tv_nsec = 10000000L};
+    (void)nanosleep(&delay, NULL);
+    assert(tg_route_dns_resolve_status(cache, "offline.example", &address) == -1);
+    tg_route_dns_destroy(cache);
+    pthread_mutex_destroy(&offline.mutex);
+}
+
 int main(void) {
     test_doh_dns_message_validation();
     test_http_body_parser_accepts_bounded_chunked_response();
@@ -212,6 +269,7 @@ int main(void) {
     test_http2_doh_headers_and_status();
     test_cache_returns_bounded_public_addresses();
     test_private_and_invalid_results_are_rejected();
+    test_resolve_status_distinguishes_pending_and_failure();
     puts("Тесты DNS-кэша Telegram-маршрутов: ок");
     return 0;
 }

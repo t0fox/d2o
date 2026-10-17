@@ -1264,8 +1264,8 @@ void tg_route_dns_prefetch_cf_pool(tg_route_dns *cache,
     }
 }
 
-int tg_route_dns_resolve(tg_route_dns *cache, const char *domain,
-                         tg_listener_destination *out) {
+int tg_route_dns_resolve_status(tg_route_dns *cache, const char *domain,
+                                tg_listener_destination *out) {
     if (!cache || !valid_domain(domain) || !out) return -1;
     pthread_mutex_lock(&cache->mutex);
     size_t index = get_entry(cache, domain);
@@ -1275,13 +1275,23 @@ int tg_route_dns_resolve(tg_route_dns *cache, const char *domain,
     }
     route_dns_entry *entry = &cache->entries[index];
     uint64_t now = monotonic_ms();
-    if (!entry->address_count || now >= entry->expires_at_ms)
-        (void)enqueue(cache, index, now);
-    if (!entry->address_count) {
+    if (entry->address_count) {
+        if (now >= entry->expires_at_ms) (void)enqueue(cache, index, now);
+        *out = entry->addresses[entry->next_address++ % entry->address_count];
+        pthread_mutex_unlock(&cache->mutex);
+        return 0;
+    }
+    if (entry->retry_at_ms && now < entry->retry_at_ms) {
         pthread_mutex_unlock(&cache->mutex);
         return -1;
     }
-    *out = entry->addresses[entry->next_address++ % entry->address_count];
+    int queued = enqueue(cache, index, now);
+    int status = queued == 0 && entry->pending ? 1 : -1;
     pthread_mutex_unlock(&cache->mutex);
-    return 0;
+    return status;
+}
+
+int tg_route_dns_resolve(tg_route_dns *cache, const char *domain,
+                         tg_listener_destination *out) {
+    return tg_route_dns_resolve_status(cache, domain, out) == 0 ? 0 : -1;
 }

@@ -29,6 +29,8 @@
 #define TG_EPOLL_MAX_LISTEN_PORTS 16u
 #define TG_ROUTE_HEALTH_MAX 256u
 #define TG_HEDGE_DELAY_DEFAULT_MS 125u
+#define TG_ROUTE_DNS_WAIT_TIMEOUT_MS 20000u
+#define TG_ROUTE_DNS_RETRY_MS 50u
 #ifndef TG_ROUTE_HEALTH_COOLDOWN_MS
 #define TG_ROUTE_HEALTH_COOLDOWN_MS 30000u
 #endif
@@ -104,6 +106,12 @@ struct proxy_connection {
     int route_session_tracked;
     tg_active_route_session route_session;
     size_t route_index;
+    size_t route_dns_step_index;
+    uint64_t route_dns_retry_at_ms;
+    uint64_t route_dns_deadline_ms;
+    int route_dns_pending;
+    int route_dns_peer_fin;
+    int route_dns_event_active;
     int route_health_index;
     int route_response_seen;
     uint8_t response_header[4];
@@ -369,13 +377,14 @@ static int queue_flush(int fd, byte_queue *queue, uint64_t *last_activity) {
 
 static uint32_t client_events(const proxy_connection *connection) {
     uint32_t events = 0;
-    int upstream_ready = !connection->direct_wss ||
-                         connection->wss_phase == WSS_READY;
+    int upstream_ready = !connection->route_dns_pending &&
+        (!connection->direct_wss || connection->wss_phase == WSS_READY);
     int wss_backpressure = connection->ws_pump_ready &&
                            connection->ws_pump.tx_memory_bytes != 0;
     int queue_has_room = connection->to_upstream.len <
                          connection->to_upstream.cap;
-    if (!connection->route_racing || queue_has_room) events |= EPOLLRDHUP;
+    if ((!connection->route_dns_pending || !connection->route_dns_peer_fin) &&
+        (!connection->route_racing || queue_has_room)) events |= EPOLLRDHUP;
     if (!connection->client_eof && upstream_ready && !wss_backpressure &&
         (!connection->route_racing || queue_has_room) &&
         (!connection->handshake_done ||
@@ -711,10 +720,10 @@ static int resolve_route_domain(tg_epoll_proxy *server, const char *domain,
                                 tg_listener_destination *out) {
     int rc = server->config.resolve_domain
         ? server->config.resolve_domain(server->config.route_context, domain, out)
-        : tg_route_dns_resolve(server->route_dns, domain, out);
+        : tg_route_dns_resolve_status(server->route_dns, domain, out);
+    if (rc == 1) return 1;
     if (rc != 0 || target_sockaddr(out, &(struct sockaddr_storage){0},
-                                   &(socklen_t){0}) != 0)
-        return -1;
+                                   &(socklen_t){0}) != 0) return -1;
     return server->config.resolve_domain || public_route_target(out) ? 0 : -1;
 }
 
@@ -956,8 +965,9 @@ static int setup_route_attempt(proxy_connection *connection,
                 return -1;
             domain = hostname;
         }
-        if (!domain || resolve_route_domain(server, domain, target) != 0)
-            return -1;
+        if (!domain) return -1;
+        int resolve_status = resolve_route_domain(server, domain, target);
+        if (resolve_status != 0) return resolve_status;
         if (strlen(domain) >= sizeof(connection->tls_hostname)) return -1;
         memcpy(connection->tls_hostname, domain, strlen(domain) + 1u);
         if (step->kind == TG_ROUTE_CF_WORKER) {
@@ -975,12 +985,18 @@ static int start_next_route(proxy_connection *connection) {
         connection->wss_phase == WSS_READY) return -1;
     tg_epoll_proxy *server = connection->server;
     while (connection->route_index < connection->route_plan.count) {
+        size_t step_index = connection->route_index;
         tg_route_step step =
             connection->route_plan.steps[connection->route_index++];
         connection->route_kind = step.kind;
-        route_session_event(connection, step.kind,
-                            TG_ROUTE_SESSION_CONNECTING);
+        int retrying_dns = connection->route_dns_event_active &&
+            connection->route_dns_step_index == step_index;
+        if (!retrying_dns)
+            route_session_event(connection, step.kind,
+                                TG_ROUTE_SESSION_CONNECTING);
         if (step.kind == TG_ROUTE_DIRECT_TCP) {
+            connection->route_dns_event_active = 0;
+            connection->route_dns_pending = 0;
             if (connection->to_upstream.len != 0 ||
                 queue_append(&connection->to_upstream, connection->handshake,
                              sizeof(connection->handshake)) != 0)
@@ -1004,7 +1020,25 @@ static int start_next_route(proxy_connection *connection) {
         }
         tg_listener_destination target;
         memset(&target, 0, sizeof(target));
-        if (setup_route_attempt(connection, &step, &target) != 0 ||
+        int setup_status = setup_route_attempt(connection, &step, &target);
+        if (setup_status == 1) {
+            uint64_t now = monotonic_ms();
+            if (!retrying_dns) {
+                connection->route_dns_step_index = step_index;
+                connection->route_dns_deadline_ms =
+                    now + TG_ROUTE_DNS_WAIT_TIMEOUT_MS;
+                connection->route_dns_peer_fin = 0;
+                connection->route_dns_event_active = 1;
+            }
+            connection->route_dns_pending = 1;
+            connection->route_dns_retry_at_ms = now + TG_ROUTE_DNS_RETRY_MS;
+            return 0;
+        }
+        connection->route_dns_pending = 0;
+        connection->route_dns_retry_at_ms = 0;
+        connection->route_dns_deadline_ms = 0;
+        connection->route_dns_event_active = 0;
+        if (setup_status != 0 ||
             (server->config.enforce_self_dial &&
              tg_listener_is_self_dial_addr(&target, server->listen_ports,
                                            server->config.listen_port_count))) {
@@ -1086,8 +1120,14 @@ static int hedge_launch_next(proxy_connection *parent) {
         candidate->wss_proto = parent->wss_proto;
         memcpy(candidate->handshake, parent->handshake,
                sizeof(candidate->handshake));
-        if (setup_route_attempt(candidate, &step,
-                                &candidate->upstream_target) != 0 ||
+        int setup_status = setup_route_attempt(candidate, &step,
+                                &candidate->upstream_target);
+        if (setup_status == 1) {
+            --parent->route_index;
+            free(candidate);
+            return 0;
+        }
+        if (setup_status != 0 ||
             (server->config.enforce_self_dial &&
              tg_listener_is_self_dial_addr(&candidate->upstream_target,
                                            server->listen_ports,
@@ -1394,6 +1434,7 @@ static int route_after_handshake(proxy_connection *connection) {
 static int receive_client(proxy_connection *connection) {
     uint8_t buffer[TG_EPOLL_IO_CHUNK];
     for (;;) {
+        if (connection->route_dns_pending) return 0;
         if (connection->direct_wss &&
             (connection->wss_phase != WSS_READY ||
              connection->ws_pump.tx_memory_bytes != 0))
@@ -1419,6 +1460,7 @@ static int receive_client(proxy_connection *connection) {
                 if (connection->handshake_len == sizeof(connection->handshake) &&
                     route_after_handshake(connection) != 0)
                     return -1;
+                if (connection->route_dns_pending) return 0;
             } else if (connection->route_racing) {
                 if (queue_append(&connection->to_upstream, buffer,
                                  (size_t)n) != 0)
@@ -1891,10 +1933,40 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
     return 0;
 }
 
+static void handle_pending_dns_client_event(proxy_connection *connection,
+                                           uint32_t events) {
+    if (!connection || connection->closed || !connection->route_dns_pending)
+        return;
+    if (events & (EPOLLERR | EPOLLHUP)) {
+        connection_close(connection);
+        return;
+    }
+    if ((events & EPOLLRDHUP) && !connection->route_dns_peer_fin) {
+        uint8_t byte;
+        ssize_t n = recv(connection->client_fd, &byte, sizeof(byte),
+                         MSG_PEEK | MSG_DONTWAIT);
+        if (n == 0) {
+            connection_close(connection);
+            return;
+        }
+        if (n > 0) {
+            connection->route_dns_peer_fin = 1;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            connection_close(connection);
+            return;
+        }
+    }
+    connection_update(connection);
+}
+
 static void client_event(proxy_connection *connection, uint32_t events) {
     if (!connection || connection->closed) return;
     if ((events & EPOLLERR) && socket_error(connection->client_fd)) {
         connection_close(connection);
+        return;
+    }
+    if (connection->route_dns_pending) {
+        handle_pending_dns_client_event(connection, events);
         return;
     }
     if (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) {
@@ -1904,6 +1976,10 @@ static void client_event(proxy_connection *connection, uint32_t events) {
         }
     }
     if (connection->closed) return;
+    if (connection->route_dns_pending) {
+        handle_pending_dns_client_event(connection, events);
+        return;
+    }
     if ((events & EPOLLOUT) &&
         queue_flush(connection->client_fd, &connection->to_client,
                     &connection->last_activity_ms) != 0) {
@@ -2093,12 +2169,17 @@ static int timeout_until_expiry(tg_epoll_proxy *server, int timeout_ms) {
     uint64_t now = monotonic_ms(), nearest = UINT64_MAX;
     for (proxy_connection *connection = server->connections; connection;
          connection = connection->next) {
-        uint64_t expires = connection->direct_wss &&
-                           connection->wss_phase != WSS_READY
-            ? connection->wss_deadline_ms
-            : connection->handshake_done
-                ? connection->last_activity_ms + server->config.idle_timeout_ms
-                : connection->handshake_deadline_ms;
+        uint64_t expires = connection->route_dns_pending
+            ? connection->route_dns_retry_at_ms
+            : connection->direct_wss && connection->wss_phase != WSS_READY
+                ? connection->wss_deadline_ms
+                : connection->handshake_done
+                    ? connection->last_activity_ms +
+                      server->config.idle_timeout_ms
+                    : connection->handshake_deadline_ms;
+        if (connection->route_dns_pending &&
+            connection->route_dns_deadline_ms < expires)
+            expires = connection->route_dns_deadline_ms;
         if (expires < nearest) nearest = expires;
         if (connection->hedge_due_ms && connection->hedge_due_ms < nearest)
             nearest = connection->hedge_due_ms;
@@ -2145,6 +2226,30 @@ static void expire_connections(tg_epoll_proxy *server) {
                 connection_close(connection);
         }
         if (connection->closed) {
+            connection = next;
+            continue;
+        }
+        if (connection->route_dns_pending) {
+            if (now >= connection->route_dns_deadline_ms) {
+                connection->route_dns_pending = 0;
+                connection->route_dns_retry_at_ms = 0;
+                connection->route_dns_event_active = 0;
+                connection->route_index =
+                    connection->route_dns_step_index + 1u;
+                route_session_event(connection, connection->route_kind,
+                                    TG_ROUTE_SESSION_FAILED);
+            } else if (now >= connection->route_dns_retry_at_ms) {
+                connection->route_dns_pending = 0;
+                connection->route_dns_retry_at_ms = 0;
+                connection->route_index = connection->route_dns_step_index;
+            } else {
+                connection = next;
+                continue;
+            }
+            if (start_next_route(connection) == 0)
+                connection_update(connection);
+            else
+                connection_close(connection);
             connection = next;
             continue;
         }
