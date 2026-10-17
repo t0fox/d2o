@@ -3,10 +3,22 @@
 
 const WIDTH = 760;
 const HEIGHT = 340;
+const MOTION = Object.freeze({
+  maxParticles: 12,
+  maxSparks: 8,
+  maxRipples: 6,
+  attemptDurationMs: 2200,
+  failureDurationMs: 1600,
+  responseDurationMs: 2600,
+  sparkDurationMs: 800,
+  fadeDurationMs: 650,
+  rippleDurationMs: 1100,
+  rippleIntervalMs: 1100,
+});
 const LANE_Y = [32, 98, 170, 242, 308];
-const MAX_PARTICLES = 64;
-const MAX_SPARKS = 24;
-const MAX_RIPPLES = 12;
+const MAX_PARTICLES = MOTION.maxParticles;
+const MAX_SPARKS = MOTION.maxSparks;
+const MAX_RIPPLES = MOTION.maxRipples;
 
 const ROUTES = [
   { transport: "direct_wss", label: "Прямой WSS" },
@@ -408,8 +420,9 @@ function mountTelegramFlow(canvas) {
     lane.transport = nextTransport;
     lane.targetColor = laneColor(lane);
     lane.targetAlpha = nextStatus === "idle" ? 0.22
-      : nextStatus === "cancelled" || nextStatus === "skipped" ? 0.3 : 0.62;
-    lane.targetGlow = ["selected", "connected", "connecting", "race"].includes(nextStatus) ? 0.9 : 0;
+      : nextStatus === "cancelled" || nextStatus === "skipped" ? 0.3 : nextStatus === "selected" ? 0.78 : 0.55;
+    const routeActive = ["selected", "connected", "connecting", "race"].includes(nextStatus);
+    lane.targetGlow = nextStatus === "selected" ? 0.68 : routeActive ? 0.34 : 0;
     if (nextStatus === "failed") lane.markerPulse = 1;
     if (motionPreference?.matches) {
       lane.color = [...lane.targetColor];
@@ -433,14 +446,14 @@ function mountTelegramFlow(canvas) {
       laneIndex,
       path,
       startedAt: now,
-      duration: options.duration || 1250,
+      duration: options.duration || MOTION.attemptDurationMs,
       stopAt: options.stopAt ?? null,
       kind: options.kind || "attempt",
       fadeAt: 0,
       x: path.points[0][0],
       y: path.points[0][1],
       opacity: 1,
-      radius: 2.5,
+      radius: 2,
       trail: [],
       color: options.kind === "failure" ? palette.failure : lanes[laneIndex].targetColor,
     };
@@ -458,7 +471,7 @@ function mountTelegramFlow(canvas) {
       existing.color = palette.failure;
       return;
     }
-    addParticle(sessionId, laneIndex, now, { startsAtHub: true, duration: 760, stopAt: 0.58, kind: "failure" });
+    addParticle(sessionId, laneIndex, now, { startsAtHub: true, duration: MOTION.failureDurationMs, stopAt: 0.58, kind: "failure" });
   }
 
   function fadeAttempt(sessionId, laneIndex, now) {
@@ -474,8 +487,8 @@ function mountTelegramFlow(canvas) {
       const startsAtHub = attemptedSessions.has(session.id);
       attemptedSessions.add(session.id);
       addParticle(session.id, laneIndex, now, { startsAtHub, stopAt: 0.48 });
-      hub.pulse = 0.8;
-      hub.spin = 0.6;
+      hub.pulse = 0.42;
+      hub.spin = 0.18;
     } else if (state === "connected" || state === "selected") {
       fadeAttempt(session.id, laneIndex, now);
     } else if (state === "failed") {
@@ -483,8 +496,8 @@ function mountTelegramFlow(canvas) {
     } else if (state === "cancelled") {
       fadeAttempt(session.id, laneIndex, now);
     } else if (state === "first_binary_response") {
-      addParticle(session.id, laneIndex, now, { direction: "response", kind: "response" });
-      if (!motionPreference?.matches) client.pulse = 1;
+      addParticle(session.id, laneIndex, now, { direction: "response", kind: "response", duration: MOTION.responseDurationMs });
+      if (!motionPreference?.matches) client.pulse = 0.55;
     }
   }
 
@@ -573,7 +586,7 @@ function mountTelegramFlow(canvas) {
     context.globalAlpha = alpha;
     context.strokeStyle = color;
     context.shadowColor = color;
-    context.shadowBlur = glow * 6;
+    context.shadowBlur = glow * 3;
     context.stroke();
     context.shadowBlur = 0;
     context.globalAlpha = 1;
@@ -604,7 +617,7 @@ function mountTelegramFlow(canvas) {
     context.lineWidth = 2.5;
     context.strokeStyle = rgb(palette.accent, 0.35 + 0.65 * glow);
     context.shadowColor = rgb(palette.accent, 0.9);
-    context.shadowBlur = 8 * glow;
+    context.shadowBlur = 5 * glow;
     context.stroke();
     context.shadowBlur = 0;
     context.restore();
@@ -695,13 +708,13 @@ function mountTelegramFlow(canvas) {
     context.lineWidth = 2.5;
     context.strokeStyle = rgb(palette.accent, 0.95);
     context.shadowColor = rgb(palette.accent, 0.9);
-    context.shadowBlur = 6 + 6 * hub.pulse;
+    context.shadowBlur = 4 + 3 * hub.pulse;
     context.stroke();
     context.shadowBlur = 0;
     const dotStates = connectionDotStates(currentView);
     const dotAlpha = 0.45 + 0.45 * Math.min(1, currentView.activeConnections / 12);
     for (let index = 0; index < dotStates.length; index += 1) {
-      const angle = -hub.angle * 1.6 + index * 2.094;
+      const angle = -hub.angle * 0.8 + index * 2.094;
       context.beginPath();
       context.arc(38 * Math.cos(angle), 38 * Math.sin(angle), 2.5, 0, Math.PI * 2);
       const state = dotStates[index];
@@ -724,11 +737,11 @@ function mountTelegramFlow(canvas) {
     }
 
     ripples.forEach(ripple => {
-      const progress = ripple.elapsed / 0.7;
+      const progress = ripple.elapsed / (MOTION.rippleDurationMs / 1000);
       const eased = 1 - (1 - progress) ** 3;
       context.beginPath();
       context.arc(ripple.x, ripple.y, 28 + 40 * eased, 0, Math.PI * 2);
-      context.strokeStyle = rgb(ripple.color, 0.3 * (1 - progress));
+      context.strokeStyle = rgb(ripple.color, 0.2 * (1 - progress));
       context.lineWidth = 2;
       context.stroke();
     });
@@ -741,8 +754,8 @@ function mountTelegramFlow(canvas) {
         context.beginPath();
         context.moveTo(particle.trail[index - 1][0], particle.trail[index - 1][1]);
         context.lineTo(particle.trail[index][0], particle.trail[index][1]);
-        context.strokeStyle = rgb(particle.color, 0.3 * weight * particle.opacity);
-        context.lineWidth = 0.6 + 1.4 * weight;
+        context.strokeStyle = rgb(particle.color, 0.22 * weight * particle.opacity);
+        context.lineWidth = 0.5 + 0.9 * weight;
         context.lineCap = "round";
         context.stroke();
       }
@@ -750,14 +763,14 @@ function mountTelegramFlow(canvas) {
       context.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2);
       context.fillStyle = rgb(particle.color, 0.9 * particle.opacity);
       context.shadowColor = rgb(particle.color);
-      context.shadowBlur = 5;
+      context.shadowBlur = 2.5;
       context.fill();
       context.shadowBlur = 0;
     });
     sparks.forEach(spark => {
       context.beginPath();
-      context.arc(spark.x, spark.y, 1.6, 0, Math.PI * 2);
-      context.fillStyle = rgb(palette.failure, 0.7 * (1 - spark.elapsed / 0.45));
+      context.arc(spark.x, spark.y, 1.3, 0, Math.PI * 2);
+      context.fillStyle = rgb(palette.failure, 0.35 * (1 - spark.elapsed / spark.duration));
       context.fill();
     });
     context.globalCompositeOperation = "source-over";
@@ -765,10 +778,10 @@ function mountTelegramFlow(canvas) {
   }
 
   function burst(x, y) {
-    for (let index = 0; index < 4 && sparks.length < MAX_SPARKS; index += 1) {
+    for (let index = 0; index < 2 && sparks.length < MAX_SPARKS; index += 1) {
       const angle = Math.random() * Math.PI * 2;
-      const speed = 25 + Math.random() * 50;
-      sparks.push({ x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, elapsed: 0 });
+      const speed = 12 + Math.random() * 16;
+      sparks.push({ x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, elapsed: 0, duration: MOTION.sparkDurationMs / 1000 });
     }
   }
 
@@ -777,29 +790,29 @@ function mountTelegramFlow(canvas) {
     if (destroyed || !inView || document.hidden || motionPreference?.matches) return;
     const delta = Math.min(0.05, Math.max(0, (now - lastFrame) / 1000));
     lastFrame = now;
-    const smoothing = 1 - Math.exp(-delta * 7);
+    const smoothing = 1 - Math.exp(-delta * 2.6);
     lanes.forEach(lane => {
       for (let channel = 0; channel < 3; channel += 1) {
         lane.color[channel] += (lane.targetColor[channel] - lane.color[channel]) * smoothing;
       }
       lane.alpha += (lane.targetAlpha - lane.alpha) * smoothing;
       lane.glow += (lane.targetGlow - lane.glow) * smoothing;
-      lane.markerPulse *= Math.exp(-delta * 6);
+      lane.markerPulse *= Math.exp(-delta * 2.8);
     });
-    hub.pulse *= Math.exp(-delta * 5);
-    hub.spin *= Math.exp(-delta * 3);
-    if (currentView.activeConnections > 0) hub.angle += delta * (0.3 + 1.5 * hub.spin);
-    client.pulse *= Math.exp(-delta * 4);
+    hub.pulse *= Math.exp(-delta * 2.2);
+    hub.spin *= Math.exp(-delta * 1.6);
+    if (currentView.activeConnections > 0) hub.angle += delta * (0.08 + 0.3 * hub.spin);
+    client.pulse *= Math.exp(-delta * 2.2);
     for (let index = particles.length - 1; index >= 0; index -= 1) {
       const particle = particles[index];
       if (particle.fadeAt) {
-        const fade = (now - particle.fadeAt) / 300;
+        const fade = (now - particle.fadeAt) / MOTION.fadeDurationMs;
         if (fade >= 1) {
           particles.splice(index, 1);
           continue;
         }
         particle.opacity = 1 - fade;
-        particle.radius = 2.5 * (1 - 0.5 * fade);
+        particle.radius = 2 * (1 - 0.5 * fade);
       } else {
         const progress = Math.min((now - particle.startedAt) / particle.duration, 1);
         const fraction = particle.stopAt == null ? ease(progress) : Math.min(ease(progress), particle.stopAt);
@@ -808,12 +821,12 @@ function mountTelegramFlow(canvas) {
         particle.y = point[1];
         particle.opacity = 1;
         particle.trail.push(point);
-        if (particle.trail.length > 5) particle.trail.shift();
+        if (particle.trail.length > 4) particle.trail.shift();
         if (progress >= 1) {
           if (particle.kind === "failure") {
             burst(particle.x, particle.y);
             lanes[particle.laneIndex].markerPulse = 1;
-          } else if (particle.kind === "response" && now - lastRippleAt > 400) {
+          } else if (particle.kind === "response" && now - lastRippleAt > MOTION.rippleIntervalMs) {
             ripples.push({ x: 60, y: 170, elapsed: 0,
               color: lanes[particle.laneIndex].targetColor });
             if (ripples.length > MAX_RIPPLES) ripples.shift();
@@ -833,11 +846,11 @@ function mountTelegramFlow(canvas) {
       spark.y += spark.vy * delta;
       spark.vx *= 0.94;
       spark.vy *= 0.94;
-      if (spark.elapsed >= 0.45) sparks.splice(index, 1);
+      if (spark.elapsed >= spark.duration) sparks.splice(index, 1);
     }
     for (let index = ripples.length - 1; index >= 0; index -= 1) {
       ripples[index].elapsed += delta;
-      if (ripples[index].elapsed >= 0.7) ripples.splice(index, 1);
+      if (ripples[index].elapsed >= MOTION.rippleDurationMs / 1000) ripples.splice(index, 1);
     }
     draw();
     startLoop();
@@ -971,6 +984,7 @@ function mountTelegramFlow(canvas) {
 }
 
 global.D2kTelegramFlow = {
+  motionProfile: MOTION,
   mountTelegramFlow,
   summarizeTelegramFlow: summarize,
   composeFlowPoints,

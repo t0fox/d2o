@@ -157,4 +157,16 @@ const snapshot = (values = {}) => ({
   assert.match(view.caption, /маршрут пока не определён/);
 }
 
+assert.deepEqual(flow.motionProfile, {
+  maxParticles: 12,
+  maxSparks: 8,
+  maxRipples: 6,
+  attemptDurationMs: 2200,
+  failureDurationMs: 1600,
+  responseDurationMs: 2600,
+  sparkDurationMs: 800,
+  fadeDurationMs: 650,
+  rippleDurationMs: 1100,
+  rippleIntervalMs: 1100,
+}, "реальный поток движется спокойно и ограничивает визуальный шум");
 console.log("telegram flow: active sessions and route states match C11 snapshots");
