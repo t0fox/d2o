@@ -3008,6 +3008,64 @@ int main(void) {
                     }
                     d2k_hold_free(vh); d2k_session_free(v);
                 }
+                /* ПОЛЕ 17.10.2026, LR-rx1/rx2: Chrome переставляет расширения,
+                   и ECH уезжает во второй сегмент. Без планов голова идёт
+                   быстрым путём с догадкой MODERN; целый снимок того же потока
+                   несёт ECH, но подозрение уходило с формой 1, и контроллер
+                   мерил cloudflare-ech.com обычным приветствием («проходит»,
+                   покой 10 мин). Собранное целое приветствие — факт формы. */
+                for (int installed = 0; installed < 2; installed++) {
+                    uint8_t late[2048];
+                    memcpy(late, whole, whole_len);
+                    size_t late_len = whole_len;
+                    const uint8_t versions[] = {0,43,0,3,2,3,4};
+                    const uint8_t ech[] = {0xfe,0x0d,0,11, 0,0,1,0,1,7,0,0,0,1,42};
+                    size_t q = 5 + 4 + 2 + 32;
+                    q += 1 + late[q];
+                    q += 2 + ((size_t)late[q] << 8 | late[q + 1]);
+                    q += 1 + late[q];
+                    memmove(late + q + 2 + sizeof versions, late + q + 2, late_len - q - 2);
+                    memcpy(late + q + 2, versions, sizeof versions);
+                    late_len += sizeof versions;
+                    memcpy(late + late_len, ech, sizeof ech); late_len += sizeof ech;
+                    size_t grow = sizeof versions + sizeof ech;
+                    wr16(late + q, (uint16_t)(((unsigned)late[q] << 8 | late[q + 1]) + grow));
+                    wr16(late + 7, (uint16_t)(((unsigned)late[7] << 8 | late[8]) + grow));
+                    wr16(late + 3, (uint16_t)(((unsigned)late[3] << 8 | late[4]) + grow));
+                    d2k_session *v = d2k_session_new(64, 64);
+                    CHECK(v != NULL, "не выделена сессия для проверки формы ECH");
+                    if (v) {
+                        if (installed) {
+                            d2k_plan *selected = NULL;
+                            CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &selected,
+                                               err, sizeof err) == 0, "разбор плана для позднего ECH");
+                            CHECK(selected && d2k_plantab_set_name_family(d2k_session_plans(v),
+                                name, sizeof name - 1, 1, selected,
+                                D2K_PLAN_SHAPE_MODERN, 0, 4) == 0, "не удалось установить план MODERN для позднего ECH");
+                        }
+                        uint16_t port = 47560;
+                        pn = build_pkt(part, port, 0x02, NULL, 0);
+                        d2k_session_packet(v, part, pn, 1, buf, sizeof buf, &r);
+                        pn = build_pkt(part, port, 0x18, late, 1388);
+                        wr32(part + 24, 1001);
+                        d2k_session_packet(v, part, pn, 2, buf, sizeof buf, &r);
+                        CHECK(d2k_session_applied(v) == (unsigned)installed,
+                              "план не применился к первому сегменту ECH");
+                        d2k_key fk;
+                        CHECK(d2k_key_make(&fk, 6, part + 12, part + 16, part + 20, part + 22) == 0,
+                              "не извлечён ключ потока с фрагментированным ECH");
+                        CHECK(d2k_session_client_shape(v, &fk) == D2K_PLAN_SHAPE_MODERN,
+                              "первый фрагмент ECH не получил быструю предварительную форму MODERN");
+                        pn = build_pkt(part, port, 0x18, late + 1388, late_len - 1388);
+                        wr32(part + 24, 2389);
+                        d2k_session_packet(v, part, pn, 3, buf, sizeof buf, &r);
+                        CHECK(d2k_session_client_shape(v, &fk) == D2K_PLAN_SHAPE_ECH_TCP,
+                              "полный ClientHello с ECH не заменил предварительную форму MODERN");
+                        CHECK(d2k_session_applied(v) == (unsigned)installed && !r.applied,
+                              "исправление формы ECH повторно применило план");
+                        d2k_session_free(v);
+                    }
+                }
                 CHECK(d2k_plan_load(strict_plan, sizeof strict_plan, &gp,
                                     err, sizeof err) == 0, "probe hold plan parse");
                 CHECK(d2k_plantab_set_name_probe(d2k_session_plans(g), name,

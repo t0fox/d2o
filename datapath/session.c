@@ -2184,6 +2184,12 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                 complete.have_hello_middle && !complete.exts_truncated) {
                 size_t k = shape_slot(6, key.family);
                 s->captured_hellos++;
+                /* Форма головы при оборванном блоке расширений — догадка
+                   быстрого пути (MODERN). Целое приветствие с ECH — факт:
+                   Chrome переставляет расширения, и ECH уезжает во второй
+                   сегмент (поле 17.10.2026). Подозрение несёт форму потока. */
+                if (complete.ech_offer && fl->client_shape == D2K_PLAN_SHAPE_MODERN)
+                    fl->client_shape = D2K_PLAN_SHAPE_ECH_TCP;
                 if (!fl->controller_probe) {
                     memcpy(s->last_hello[k], hello, hello_len);
                     s->last_hello_len[k] = hello_len;
