@@ -1157,6 +1157,18 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
     }
     if (hs->cur.phase == PH_BASE) {
         drop_socket(hs);
+        /* Поле 16.10.2026, fast-torrent: клиент получил заглушку провайдера,
+           а свой запрос роутера — тишину. Тишина на свой GET — та же
+           блокировка в другой форме, а не «блока нет»: поиск начинается.
+           Успех кандидата по-прежнему — только полный ответ под планом. */
+        if (!hs->cur.cut && r->answer == D2K_HS_SILENT) {
+            build_cands(hs);
+            say(hs, "HTTP %s: база — тишина на свой запрос после заглушки у клиента: "
+                    "блокировка в другой форме; своих планов %zu, затем вопросы разреза "
+                    "и checksum-приманки", hs->cur.host, hs->cur.n_cands);
+            next_candidate(hs, now);
+            return;
+        }
         if (r->answer == (hs->cur.cut ? D2K_HS_CUT : D2K_HS_INJECTED)) {
             build_cands(hs);
             say(hs, "HTTP %s: база — %s воспроизведён%s; своих планов %zu, затем вопросы разреза и checksum-приманки",

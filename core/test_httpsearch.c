@@ -1037,7 +1037,29 @@ static void test_execution_identity(void) {
     }
 }
 
+/* ПОЛЕ 16.10.2026, fast-torrent на выпуске 1bd394e: клиент получил заглушку
+   провайдера (lawfilter.ertelecom.ru), а базовый запрос роутера — тишину.
+   Тишина на свой GET — та же блокировка в другой форме, а не «блока нет»:
+   поиск обязан начаться. Настоящий ответ сервера (REAL) по-прежнему его не
+   начинает. */
+static void test_silent_base_after_portal(void) {
+    fake f;
+    memset(&f, 0, sizeof f);
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    int64_t now = 1000;
+    d2k_httpsearch_portal(hs, "www.fast-torrent.ru", 4, IP, now);
+    d2k_hs_result r = res(&f, D2K_HS_SILENT);
+    r.seq = f.job.seq; r.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r, now += 100);
+    CHECK(f.set_probe_n == 1 && d2k_httpsearch_busy(hs),
+          "тишина базы после заглушки клиента не начала поиск");
+    CHECK(strstr(f.said, "не воспроизвод") == NULL, "тишина названа «не воспроизводится»");
+    d2k_httpsearch_free(hs);
+}
+
 int main(void) {
+    test_silent_base_after_portal();
     test_probe_cut();
     test_cut_search();
     test_execution_identity();

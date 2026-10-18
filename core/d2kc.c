@@ -286,8 +286,9 @@ static void http_portal(d2k_httpsprobe *hp, int fd, const d2k_ev *ev, int64_t no
                            d2k_httpsprobe_state(hp, ev->name, now), now);
     }
     if (rc == 1) {
-        snprintf(line, sizeof line, "HTTP %.255s: провайдер подменяет ответ порталом блокировки — "
-                 "проверяю HTTPS имени", ev->name);
+        snprintf(line, sizeof line, "HTTP %.255s: %s — проверяю HTTPS имени", ev->name,
+                 ev->kind == D2K_EV_HTTP_RESPONSE ? "ответ перенаправляет на известный портал блокировки"
+                                                : "провайдер подменяет ответ порталом блокировки");
         sched_say(NULL, line);
     } else if (rc == 2) {
         char err[200];
@@ -683,9 +684,18 @@ int main(int argc, char **argv) {
                     case D2K_EV_EXCHANGE: seen_exchange++; break;
                     case D2K_EV_APPLIED:  seen_applied++; break;
                     case D2K_EV_REFUSED:  seen_refused++; break;
-                    case D2K_EV_HTTP_RESPONSE:
+                    case D2K_EV_HTTP_RESPONSE: {
+                        static const uint8_t no_trial[16] = {0};
                         (void)d2k_httpsearch_control(g_hs,&ev,now_ms());
+                        /* Поздний портал сам по себе не доказывает подмену по
+                           времени, но без привязки к пробе всё равно требует
+                           прямой проверки. Результат пробы относится только
+                           к её собственному заданию. */
+                        if (hp && ev.code == 3 && ev.transport == 6 && ev.high_port == 80 &&
+                            !memcmp(ev.trial_id, no_trial, sizeof no_trial))
+                            http_portal(hp, fd, &ev, now_ms());
                         break;
+                    }
                     case D2K_EV_HTTP_PORTAL:
                         (void)d2k_httpsearch_control(g_hs,&ev,now_ms());
                         if (hp) { http_portal(hp, fd, &ev, now_ms()); }
