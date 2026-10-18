@@ -1033,6 +1033,10 @@ static int shape_fits(uint8_t entry_shape, uint8_t seen_shape) {
     return entry_shape != 0 && entry_shape == seen_shape;
 }
 
+static inline int shape_is_udp(uint8_t shape) {
+    return shape == D2K_PLAN_SHAPE_QUIC || shape == D2K_PLAN_SHAPE_VOICE;
+}
+
 size_t d2k_plantab_shape_misses(const d2k_plantab *t) {
     return t ? t->shape_misses : 0;
 }
@@ -1162,6 +1166,18 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
             if (shape_fits(e->shape, seen_shape)) {
                 return e->plan;
             }
+            if (e->shape != D2K_PLAN_SHAPE_ANY &&
+                e->shape != D2K_PLAN_SHAPE_GRANDFATHER &&
+                seen_shape != D2K_PLAN_SHAPE_ANY &&
+                seen_shape != D2K_PLAN_SHAPE_GRANDFATHER &&
+                shape_is_udp(seen_shape) && !shape_is_udp(e->shape)) {
+                /* Запись другого транспорта (TCP TLS у имени при запросе QUIC)
+                   не должна блокировать поиск адресного обхода для своего транспорта:
+                   в частности, для QUIC ECH sched.c специально связывает план с адресом.
+                   В обратную сторону (TCP-поток к имени с QUIC-записью) переход по
+                   адресу запрещён: имя названо, чужой TCP-план соседа по CDN брать нельзя. */
+                goto check_addr;
+            }
             /* Форма не та — по адресу тоже не ищем: имя названо, и план
                соседа по CDN подставлять вместо него нельзя.
 
@@ -1173,6 +1189,7 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
             return NULL;
         }
     }
+check_addr:;
     /* Только теперь по адресу: обратный порядок дал бы плану соседа по CDN
        перебить план, подтверждённый для этого имени. */
     /* Запись СВОЕЙ формы; ECH без своей — запись TLS 1.3 (как у имени);
