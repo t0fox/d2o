@@ -45,12 +45,13 @@ static int reseal_one(const uint8_t *in, size_t n,
     }
     uint8_t pkt[D2K_QW_MAX_DGRAM];
     size_t hlen = h.token_len
-        ? d2k_qw_long_hdr_token(pkt, sizeof pkt, h.version, D2K_QW_LT_INITIAL,
-                                dcid, dcid_len, in + h.scid_off, h.scid_len,
-                                in + h.token_off, h.token_len, pn_len, plain_len)
-        : d2k_qw_long_hdr(pkt, sizeof pkt, h.version, D2K_QW_LT_INITIAL,
-                          dcid, dcid_len, in + h.scid_off, h.scid_len,
-                          pn_len, plain_len);
+        ? d2k_qw_long_hdr_token_w(pkt, sizeof pkt, h.version, D2K_QW_LT_INITIAL,
+                                  dcid, dcid_len, in + h.scid_off, h.scid_len,
+                                  in + h.token_off, h.token_len, pn_len, plain_len,
+                                  h.length_width)
+        : d2k_qw_long_hdr_w(pkt, sizeof pkt, h.version, D2K_QW_LT_INITIAL,
+                            dcid, dcid_len, in + h.scid_off, h.scid_len,
+                            pn_len, plain_len, h.length_width);
     if (hlen == 0) {
         return -1;
     }
@@ -62,9 +63,8 @@ static int reseal_one(const uint8_t *in, size_t n,
     size_t made = d2k_qw_seal(new_k, 1, pkt, hlen, pn, pn_len, plain, plain_len,
                               pkt, sizeof pkt);
     /* Длина обязана совпасть со снимком: добивка уже внутри расшифрованного
-       содержимого, и другая длина значила бы, что ушло что-то ещё, кроме
-       идентификатора. */
-    if (made == 0 || made != n || made > cap) {
+       содержимого, либо хвостовой паддинг/пакет за пределами h.packet_len. */
+    if (made == 0 || made != n || n > cap) {
         return -1;
     }
     memcpy(out, pkt, made);

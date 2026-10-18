@@ -517,8 +517,9 @@ int d2k_quic_hello_recid(const uint8_t *in, size_t n,
     size_t pn_len = h.length_claimed - plain_len - 16;
     if (pn_len < 1 || pn_len > 4) { return -1; }
     uint8_t pkt[D2K_QW_MAX_DGRAM];
-    size_t hlen = d2k_qw_long_hdr(pkt, sizeof pkt, h.version, D2K_QW_LT_INITIAL,
-                                  dcid, dcid_len, scid, h.scid_len, pn_len, plain_len);
+    size_t hlen = d2k_qw_long_hdr_w(pkt, sizeof pkt, h.version, D2K_QW_LT_INITIAL,
+                                  dcid, dcid_len, scid, h.scid_len, pn_len, plain_len,
+                                  h.length_width);
     if (hlen == 0) { return -1; }
     /* ФИКСИРОВАННЫЙ БИТ — ИЗ СНИМКА, а не от сборщика заголовка.
        d2k_qw_long_hdr ставит его всегда (RFC 9000 §17.2 требует единицу), а
@@ -540,7 +541,7 @@ int d2k_quic_hello_recid(const uint8_t *in, size_t n,
     /* Длина обязана совпасть со снимком: добивка уже внутри расшифрованного
        содержимого, и если бы пересборка дала другую длину, значит ушло что-то
        ещё, кроме идентификатора. */
-    if (made != h.pn_offset + h.length_claimed) { return -1; }
+    if (made != h.pn_offset + h.length_claimed || made != n) { return -1; }
     memcpy(out, pkt, made);
     *out_len = made;
     return 0;

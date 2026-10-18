@@ -74,22 +74,38 @@ size_t d2k_qw_varint_len(uint64_t v) {
     return 0;   /* больше 2^62-1 переменной длиной не представимо */
 }
 
-size_t d2k_qw_varint_write(uint8_t *p, size_t cap, uint64_t v) {
-    size_t w = d2k_qw_varint_len(v);
+size_t d2k_qw_varint_write_w(uint8_t *p, size_t cap, uint64_t v, size_t w) {
+    if (w == 0) {
+        w = d2k_qw_varint_len(v);
+    }
     if (!p || w == 0 || cap < w) { return 0; }
     switch (w) {
-    case 1: p[0] = (uint8_t)v; break;
-    case 2: p[0] = (uint8_t)(0x40 | (v >> 8)); p[1] = (uint8_t)v; break;
+    case 1:
+        if (v > 63ull) { return 0; }
+        p[0] = (uint8_t)v;
+        break;
+    case 2:
+        if (v > 16383ull) { return 0; }
+        p[0] = (uint8_t)(0x40 | (v >> 8)); p[1] = (uint8_t)v;
+        break;
     case 4:
+        if (v > 1073741823ull) { return 0; }
         p[0] = (uint8_t)(0x80 | (v >> 24));
         p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
         break;
-    default:
+    case 8:
+        if (v > 4611686018427387903ull) { return 0; }
         p[0] = (uint8_t)(0xc0 | (v >> 56));
         for (size_t i = 1; i < 8; i++) { p[i] = (uint8_t)(v >> (8 * (7 - i))); }
         break;
+    default:
+        return 0;
     }
     return w;
+}
+
+size_t d2k_qw_varint_write(uint8_t *p, size_t cap, uint64_t v) {
+    return d2k_qw_varint_write_w(p, cap, v, 0);
 }
 
 /* --- заголовки ---------------------------------------------------------- */
@@ -123,18 +139,20 @@ static uint8_t long_type_wire(uint32_t version, uint8_t v1) {
     }
 }
 
-size_t d2k_qw_long_hdr_token(uint8_t *out, size_t cap, uint32_t version,
-                             uint8_t type, const uint8_t *dcid, size_t dcid_len,
-                             const uint8_t *scid, size_t scid_len,
-                             const uint8_t *token, size_t token_len,
-                             size_t pn_len, size_t payload_len) {
+size_t d2k_qw_long_hdr_token_w(uint8_t *out, size_t cap, uint32_t version,
+                               uint8_t type, const uint8_t *dcid, size_t dcid_len,
+                               const uint8_t *scid, size_t scid_len,
+                               const uint8_t *token, size_t token_len,
+                               size_t pn_len, size_t payload_len,
+                               size_t length_width) {
     if (!out || dcid_len > D2K_QW_CID_MAX || scid_len > D2K_QW_CID_MAX) { return 0; }
     if ((dcid_len && !dcid) || (scid_len && !scid)) { return 0; }
     if (type != D2K_QW_LT_INITIAL && token_len != 0) { return 0; }
     if (token_len && !token) { return 0; }
     size_t tw = type == D2K_QW_LT_INITIAL ? d2k_qw_varint_len(token_len) : 0;
     if (type == D2K_QW_LT_INITIAL && tw == 0) { return 0; }
-    size_t need = 1 + 4 + 1 + dcid_len + 1 + scid_len + tw + token_len + 8;
+    size_t lw = length_width ? length_width : 8;
+    size_t need = 1 + 4 + 1 + dcid_len + 1 + scid_len + tw + token_len + lw;
     if (cap < need || (type == D2K_QW_LT_INITIAL && token_len > D2K_QW_MAX_DGRAM)) { return 0; }
 
     uint8_t w = long_type_wire(version, type);
@@ -150,9 +168,29 @@ size_t d2k_qw_long_hdr_token(uint8_t *out, size_t cap, uint32_t version,
         o += n;
         if (token_len) { memcpy(out + o, token, token_len); o += token_len; }
     }
-    size_t vl = d2k_qw_varint_write(out + o, cap - o, (uint64_t)(pn_len + payload_len + 16));
+    size_t vl = d2k_qw_varint_write_w(out + o, cap - o, (uint64_t)(pn_len + payload_len + 16), length_width);
     if (vl == 0) { return 0; }
     return o + vl;
+}
+
+size_t d2k_qw_long_hdr_w(uint8_t *out, size_t cap, uint32_t version, uint8_t type,
+                         const uint8_t *dcid, size_t dcid_len,
+                         const uint8_t *scid, size_t scid_len,
+                         size_t pn_len, size_t payload_len,
+                         size_t length_width) {
+    return d2k_qw_long_hdr_token_w(out, cap, version, type, dcid, dcid_len,
+                                   scid, scid_len, NULL, 0, pn_len, payload_len,
+                                   length_width);
+}
+
+size_t d2k_qw_long_hdr_token(uint8_t *out, size_t cap, uint32_t version,
+                             uint8_t type, const uint8_t *dcid, size_t dcid_len,
+                             const uint8_t *scid, size_t scid_len,
+                             const uint8_t *token, size_t token_len,
+                             size_t pn_len, size_t payload_len) {
+    return d2k_qw_long_hdr_token_w(out, cap, version, type, dcid, dcid_len,
+                                   scid, scid_len, token, token_len,
+                                   pn_len, payload_len, 0);
 }
 
 size_t d2k_qw_long_hdr(uint8_t *out, size_t cap, uint32_t version, uint8_t type,
@@ -224,6 +262,7 @@ int d2k_qw_hdr_parse(const uint8_t *p, size_t n, size_t dcid_len_short,
     o += pw;
     if (plen < 1 + 16 || plen > n - o) { return -1; }  /* номер + тег — минимум */
     out->length_claimed = (size_t)plen;
+    out->length_width = pw;
     out->pn_offset = o;
     out->packet_len = o + (size_t)plen;
     /* Сэмпл защиты заголовка берётся с четвёртого байта после начала номера

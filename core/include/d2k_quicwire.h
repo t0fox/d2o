@@ -84,6 +84,7 @@ typedef struct {
     size_t   token_off, token_len; /* значимы только для Initial */
     size_t   pn_offset;     /* где начинается (ещё защищённый) номер пакета */
     size_t   length_claimed;/* поле Length: номер пакета + payload + тег; 0 у короткого */
+    size_t   length_width;  /* ширина поля Length на проводе (1, 2, 4 или 8 байт) */
     size_t   packet_len;    /* сколько байт занимает ВЕСЬ пакет в датаграмме */
 } d2k_qw_hdr;
 
@@ -104,6 +105,8 @@ size_t d2k_qw_varint_len(uint64_t v);
 /* Записывает значение минимальной шириной. Возвращает записанные байты или 0,
  * если не поместилось либо значение не представимо. */
 size_t d2k_qw_varint_write(uint8_t *p, size_t cap, uint64_t v);
+/* Записывает значение заданной шириной w (1, 2, 4 или 8; 0 — минимальной). */
+size_t d2k_qw_varint_write_w(uint8_t *p, size_t cap, uint64_t v, size_t w);
 
 /* --- заголовки ---------------------------------------------------------- */
 
@@ -134,6 +137,12 @@ size_t d2k_qw_long_hdr(uint8_t *out, size_t cap, uint32_t version, uint8_t type,
                        const uint8_t *scid, size_t scid_len,
                        size_t pn_len, size_t payload_len);
 
+size_t d2k_qw_long_hdr_w(uint8_t *out, size_t cap, uint32_t version, uint8_t type,
+                         const uint8_t *dcid, size_t dcid_len,
+                         const uint8_t *scid, size_t scid_len,
+                         size_t pn_len, size_t payload_len,
+                         size_t length_width);
+
 /* То же для Initial с уже выданным сервером Retry-token. Token лежит между
  * полем длины SCID и полем Length; старый d2k_qw_long_hdr оставлен обёрткой
  * с пустым token, чтобы не менять все существующие вызовы. */
@@ -142,6 +151,13 @@ size_t d2k_qw_long_hdr_token(uint8_t *out, size_t cap, uint32_t version,
                              const uint8_t *scid, size_t scid_len,
                              const uint8_t *token, size_t token_len,
                              size_t pn_len, size_t payload_len);
+
+size_t d2k_qw_long_hdr_token_w(uint8_t *out, size_t cap, uint32_t version,
+                               uint8_t type, const uint8_t *dcid, size_t dcid_len,
+                               const uint8_t *scid, size_t scid_len,
+                               const uint8_t *token, size_t token_len,
+                               size_t pn_len, size_t payload_len,
+                               size_t length_width);
 
 /* --- номера пакетов (RFC 9000 §17.1, A.2/A.3) --------------------------- */
 
