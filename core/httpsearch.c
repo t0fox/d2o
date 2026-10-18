@@ -409,6 +409,10 @@ struct d2k_httpsearch {
         char cands[N_CANDS * 4 + 8][40];
         size_t n_cands, idx;
         int ok;            /* настоящих ответов подряд у текущего кандидата */
+        int cand_had_real;     /* кандидат уже дал полный ответ сервера */
+        int cand_retried_cut;  /* кандидат уже использовал повтор после CUT */
+        size_t cand_idx_seen;  /* индекс кандидата для сброса его состояния */
+        int any_had_real;      /* поиск получил полный ответ хотя бы для одного кандидата */
         int question, next_question;
         int split_no, checksum_no;
         int split_conflict, checksum_conflict; /* not negative probe controls */
@@ -684,13 +688,22 @@ static void all_failed(d2k_httpsearch *hs, int64_t now) {
         r->key[0] = '\0';
         if (hs->ops.changed) { hs->ops.changed(hs->ops.ctx); }
     }
-    if (r) { r->no_before_ms = now + D2K_HS_RETRY_MS; }
     if(hs->cur.conflicts) {
+        if (r) { r->no_before_ms = now + D2K_HS_RETRY_MS; }
         say(hs,"HTTP %s: поиск завершён без принятого плана: %zu кандидатов прошли зонд, "
                "но имеют живой отказ в области привязки имени; воспроизведение не объясняет живой поток",
             hs->cur.host,hs->cur.conflicts);
         finish(hs,now);return;
     }
+    if (hs->cur.any_had_real) {
+        if (r) { r->no_before_ms = now + D2K_HS_INCONCLUSIVE_MS; }
+        say(hs, "HTTP %s: поиск завершён без подтверждения — ответ сервера был получен, "
+                "но устойчивость не подтверждена; следующая попытка не раньше чем через %lld мин",
+            hs->cur.host, (long long)(D2K_HS_INCONCLUSIVE_MS / 60000));
+        finish(hs, now);
+        return;
+    }
+    if (r) { r->no_before_ms = now + D2K_HS_RETRY_MS; }
     say(hs, "HTTP %s: обход не найден — ни один вопрос не дал ответа сервера; "
             "следующая попытка не раньше чем через %lld мин", hs->cur.host,
         (long long)(D2K_HS_RETRY_MS / 60000));
@@ -809,6 +822,8 @@ static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now)
     if ((r->answer == D2K_HS_REAL && r->complete_responses >= 2) || r->answer == D2K_HS_INJECTED ||
         r->answer == D2K_HS_CUT) { hs->cur.judged++; }
     if (r->answer == D2K_HS_REAL && r->complete_responses >= 2) {
+        hs->cur.cand_had_real = 1;
+        hs->cur.any_had_real = 1;
         hs->cur.ok++;
         say(hs, "HTTP %s: «%s» — ответ сервера (%s), RTT %lld мкс, ответ через %lld мкс",
             hs->cur.host, key, r->status, (long long)r->rtt_us, (long long)r->reply_us);
@@ -816,10 +831,25 @@ static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now)
         next_candidate(hs, now);     /* тот же кандидат ещё раз */
         return;
     }
+    if (r->answer == D2K_HS_CUT && hs->cur.cand_had_real && !hs->cur.cand_retried_cut) {
+        hs->cur.cand_retried_cut = 1;
+        hs->cur.ok = 0;
+        say(hs, "HTTP %s: «%s» — обрыв тела после ответа сервера "
+                "(запросов %u, полных ответов %u), диагностический повтор: %s",
+            hs->cur.host, key, r->requests_sent, r->complete_responses, r->why);
+        next_candidate(hs, now);
+        return;
+    }
     if(r->answer==D2K_HS_REAL)
         say(hs,"HTTP %s: одиночный ответ без подтверждения keep-alive — кандидат не подтверждён",hs->cur.host);
-    say(hs, "HTTP %s: «%s» — %s%s%s", hs->cur.host, key, d2k_hs_answer_name(r->answer),
-        r->why[0] ? ": " : "", r->why);
+    if (r->answer == D2K_HS_CUT) {
+        say(hs, "HTTP %s: «%s» — %s (запросов %u, полных ответов %u)%s%s",
+            hs->cur.host, key, d2k_hs_answer_name(r->answer), r->requests_sent,
+            r->complete_responses, r->why[0] ? ": " : "", r->why);
+    } else {
+        say(hs, "HTTP %s: «%s» — %s%s%s", hs->cur.host, key, d2k_hs_answer_name(r->answer),
+            r->why[0] ? ": " : "", r->why);
+    }
     if(r->answer!=D2K_HS_REAL && r->answer!=D2K_HS_CONNECT_FAIL && r->answer!=D2K_HS_NONE) {
         if(!strcmp(key,"split")) hs->cur.split_no=1;
         if(!strcmp(key,"fake-badsum-whole")) hs->cur.checksum_no=1;
@@ -847,6 +877,11 @@ static void next_candidate(d2k_httpsearch *hs, int64_t now) {
         default: break;
         }
         if(hs->cur.question==HQ_END) { all_failed(hs,now); return; }
+    }
+    if (hs->cur.idx != hs->cur.cand_idx_seen) {
+        hs->cur.cand_had_real = 0;
+        hs->cur.cand_retried_cut = 0;
+        hs->cur.cand_idx_seen = hs->cur.idx;
     }
     const char *key = hs->cur.cands[hs->cur.idx];
     char text[2048];
@@ -887,6 +922,10 @@ static void build_cands(d2k_httpsearch *hs) {
     hs->cur.n_cands = 0;
     hs->cur.idx = 0;
     hs->cur.ok = 0;
+    hs->cur.cand_had_real = 0;
+    hs->cur.cand_retried_cut = 0;
+    hs->cur.cand_idx_seen = (size_t)-1;
+    hs->cur.any_had_real = 0;
     /* Свой план этого имени (перепроверка), затем свои подтверждённые
        планы других имён — свежие первыми, затем вопросы по порядку. */
     rec *own = rec_find(hs, hs->cur.host, hs->cur.family);
@@ -924,6 +963,7 @@ static void build_fallback(d2k_httpsearch *hs) {
 static void start(d2k_httpsearch *hs, const char *host, uint8_t family, const uint8_t *addr,
                   int recheck, int64_t now) {
     memset(&hs->cur, 0, sizeof hs->cur);
+    hs->cur.cand_idx_seen = (size_t)-1;
     hs->cur.fd = -1;
     snprintf(hs->cur.host, sizeof hs->cur.host, "%s", host);
     hs->cur.family = family;

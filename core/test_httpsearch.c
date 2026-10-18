@@ -512,6 +512,68 @@ static void base_injected(d2k_httpsearch *hs, fake *f, int64_t *now) {
     r.seq = f->job.seq; r.fd = f->job.fd;
     d2k_httpsearch_result(hs, &r, *now += 100);
 }
+
+/* После REAL обрыв получает один повтор того же кандидата; подтверждение
+   требует двух новых REAL подряд, а исчерпание поиска ждёт пять минут. */
+static void test_cut_retry_after_real(void) {
+    fake f = {0};
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    int64_t now = 1000;
+    d2k_httpsearch_portal(hs, "cut-retry.example", 4, IP, now);
+    base_injected(hs, &f, &now);
+
+    CHECK(f.set_probe_n == 1 && strstr(f.last_probe_plan, "split"),
+          "первым испытывается кандидат split");
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    CHECK(f.set_plan_n == 0 && f.set_probe_n == 2 && strstr(f.last_probe_plan, "split"),
+          "один REAL повторяет тот же кандидат без установки плана");
+
+    trial(hs, &f, &now, 1, D2K_HS_CUT);
+    CHECK(f.set_plan_n == 0 && f.set_probe_n == 3 && strstr(f.last_probe_plan, "split"),
+          "CUT после REAL даёт один диагностический повтор того же кандидата");
+    CHECK(strstr(f.said, "диагностический повтор") &&
+          strstr(f.said, "запросов 2, полных ответов 0"),
+          "журнал CUT содержит причину повтора и счётчики ответов");
+
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    CHECK(f.set_plan_n == 0 && f.set_probe_n == 4 && strstr(f.last_probe_plan, "split"),
+          "после CUT одного REAL недостаточно для подтверждения");
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    CHECK(f.set_plan_n == 1 && !strcmp(f.last_plan_host, "cut-retry.example"),
+          "два последовательных REAL после CUT подтверждают план");
+    d2k_httpsearch_free(hs);
+
+    memset(&f, 0, sizeof f);
+    ops = ops_of(&f);
+    hs = d2k_httpsearch_new(&ops);
+    now = 1000;
+    d2k_httpsearch_portal(hs, "cut-retry-delay.example", 4, IP, now);
+    base_injected(hs, &f, &now);
+    trial(hs, &f, &now, 1, D2K_HS_REAL);
+    trial(hs, &f, &now, 1, D2K_HS_CUT);
+    CHECK(f.set_probe_n == 3 && strstr(f.last_probe_plan, "split"),
+          "первый CUT повторяет ранее успешный кандидат");
+    trial(hs, &f, &now, 1, D2K_HS_CUT);
+    CHECK(f.set_probe_n == 4 && strstr(f.last_probe_plan, "badsum"),
+          "второй CUT не повторяет кандидата и продолжает поиск");
+    for (int i = 0; i < 32 && d2k_httpsearch_busy(hs); i++) {
+        trial(hs, &f, &now, 1, D2K_HS_SILENT);
+    }
+    CHECK(!d2k_httpsearch_busy(hs) && f.set_plan_n == 0,
+          "неподтверждённый поиск завершается без плана");
+    CHECK(strstr(f.said, "устойчивость не подтверждена") && strstr(f.said, "5 мин"),
+          "после ответа сервера журнал указывает короткую паузу");
+    int starts = f.start_n;
+    d2k_httpsearch_portal(hs, "cut-retry-delay.example", 4, IP,
+                          now + D2K_HS_INCONCLUSIVE_MS - 1);
+    CHECK(f.start_n == starts, "до пяти минут повторный поиск не начинается");
+    d2k_httpsearch_portal(hs, "cut-retry-delay.example", 4, IP,
+                          now + D2K_HS_INCONCLUSIVE_MS + 1);
+    CHECK(f.start_n == starts + 1, "после пяти минут повторный поиск разрешён");
+    d2k_httpsearch_free(hs);
+}
+
 static void test_inconclusive(void) {
     fake f;
     memset(&f, 0, sizeof f);
@@ -814,6 +876,9 @@ static void test_live_failure_history(void) {
     }
     CHECK(nfailed>=2 && !d2k_httpsearch_plan_of(hs,"history.example",4) &&
           !d2k_httpsearch_busy(hs),"exhausted live-disproved programs remain unconfirmed");
+    int starts=f.start_n;
+    d2k_httpsearch_portal(hs,"history.example",4,IP,now+D2K_HS_INCONCLUSIVE_MS+1);
+    CHECK(f.start_n==starts,"живой отказ сохраняет часовую паузу вместо короткой паузы после REAL");
     int sets=f.set_plan_n;d2k_httpsearch_push_all(hs);
     CHECK(f.set_plan_n==sets,"push_all cannot restore a live-disproved program");
     /* A different address can be measured, but a NAME-wide installation
@@ -1082,6 +1147,7 @@ int main(void) {
     test_keepalive_portal();
     test_search();
     test_persist();
+    test_cut_retry_after_real();
     test_inconclusive();
     test_measured_poison();
     test_stale_result();
