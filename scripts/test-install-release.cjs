@@ -95,6 +95,7 @@ exit 0`));
   fixture('builds/d2ktg-linux-amd64', sh('echo features=telegram-local-tcp-epoll,instagram-ip-probe,meta-hosts-v3'));
   fixture('builds/d2kd-linux-amd64', sh('exit 0'));
   fixture('builds/d2kc-linux-amd64', sh('exit 2'));
+  fixture('builds/d2kfetch-linux-amd64', sh('exit 2'));
   fixture('files/S99d2k', sh('printf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0'));
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_MODE=local\n');
   fixture('files/d2k-ppe-deoffload.sh', sh('d2k_ppe_remove() { :; }'));

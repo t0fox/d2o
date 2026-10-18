@@ -124,7 +124,7 @@ jobs:
           sha256: ${{ env.ZIG_SHA256 }}
           mips64el-version: ${{ env.ZIG_MIPS64EL_VERSION }}
           mips64el-sha256: ${{ env.ZIG_MIPS64EL_SHA256 }}
-      - name: Build d2kd, d2kc and d2kpanel
+      - name: Build d2kd, d2kc, d2kfetch and d2kpanel
         env:
           ARCH: ${{ matrix.arch }}
         run: |

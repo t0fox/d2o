@@ -207,9 +207,9 @@ test-ech: test_ech
 
 check: test-ech
 
-.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-rst-trigger test-voice-sched test-verify FORCE
+.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kfetch-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-rst-trigger test-voice-sched test-verify FORCE
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o d2kask d2kc d2kvoice
+all: meas.o verdict.o crypto.o quic.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o d2kask d2kc d2kfetch d2kvoice
 
 
 meas.o: meas.c $(HDR)
@@ -946,6 +946,7 @@ TARGET_FLAGS ?=
 ARCH ?= arm64
 .PHONY: release check-release
 d2kc-linux-arm64: release
+d2kfetch-linux-arm64: release
 release: hello_profiles.inc tcp1620_whitelist.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -static -Wl,-S \
@@ -953,6 +954,10 @@ release: hello_profiles.inc tcp1620_whitelist.inc
 		crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c \
 		volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c udpplan.c udpruntime.c -lpthread
 	@ls -l $(BUILDDIR)/d2kc-linux-$(ARCH)
+	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -static -Wl,-S \
+		-o $(BUILDDIR)/d2kfetch-linux-$(ARCH) d2kfetch.c verify.c verify_quic_replay.c volume.c quichello.c plantlv.c quicconn.c h3.c quicwire.c quicprobe.c quicsnap.c quicsnap_reseal.c quicarms.c ipfrag.c net4.c props.c \
+		compose.c measured.c hello.c meas.c link.c tls13.c tls12.c p256.c tls13core.c x25519.c crypto.c quic.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c udpplan.c udpruntime.c -lpthread
+	@ls -l $(BUILDDIR)/d2kfetch-linux-$(ARCH)
 
 # Check the deployment recipe itself, not a separately maintained test link.
 # A private output directory preserves existing (possibly uncommitted) builds.
@@ -1147,8 +1152,13 @@ d2kc: d2kc.c httpsprobe.o httpsearch.o httpup_logic.o sched.o verify_quic_replay
 		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
 		$(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
 
+D2KFETCH_OBJ = verify.o verify_quic_replay.o volume.o quichello.o plantlv.o quicconn.o h3.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o \
+	compose.o measured.o hello.o meas.o link.o tls13.o tls12.o p256.o tls13core.o x25519.o crypto.o quic.o
+d2kfetch: d2kfetch.c $(D2KFETCH_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(D2KFETCH_OBJ) $(TEST_LDFLAGS)
+
 clean:
-	rm -f *.o $(TESTS) d2kask d2kc hello_profiles.inc libd2k_udp.a
+	rm -f *.o $(TESTS) d2kask d2kc d2kfetch hello_profiles.inc libd2k_udp.a
 	rm -rf .udp-engine
 
 test_quic_original_arms: test_quic_original_arms.c quicarms.o $(HDR)
@@ -1337,4 +1347,4 @@ san-sched-quic-yield: hello_profiles.inc tcp1620_whitelist.inc
 # test_ip6frag_send_live) не получали её вовсе. Последовательная сборка этого
 # не замечала — библиотека успевала собраться раньше. `make -j` падал за
 # секунду: «no such file or directory: libd2k_udp.a».
-$(TESTS) d2kask d2kc d2kvoice test_tls12 test_d2kc_proto test_ip6frag_send_live: libd2k_udp.a
+$(TESTS) d2kask d2kc d2kfetch d2kvoice test_tls12 test_d2kc_proto test_ip6frag_send_live: libd2k_udp.a

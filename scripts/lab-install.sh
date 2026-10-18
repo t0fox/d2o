@@ -118,13 +118,14 @@ echo "арка: $(uname -m) -> $ARCH"
 echo "== сборка того, что будет установлено =="
 # Сборка НАТИВНАЯ: контейнер той же арки, что и роутер Марка (aarch64).
 # Кросс-сборка проверяется отдельно, гейтом; здесь проверяется установка.
-make -s -C core d2kc
+make -s -C core d2kc d2kfetch
 make -s -C datapath d2kd
 cc -Wall -Wextra -Werror -o /tmp/d2k-ipv6-direct tests/ipv6-direct.c
 
 mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets" "$REL/scripts"
 cp scripts/select-panel-ip.sh scripts/architecture.sh scripts/check-cpu.sh "$REL/scripts/"
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
+cp core/d2kfetch "$REL/builds/d2kfetch-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
 # Для лабораторной установки собирается текущий C-прокси. Статический OpenSSL
 # для роутерного выпуска по-прежнему собирает scripts/build-router.sh.
@@ -242,6 +243,7 @@ ip6tables -t mangle -C POSTROUTING -j D2K_OUT || fail "установщик не
 nfq6_direct
 [ -x /opt/sbin/d2kd ] || fail "d2kd не установлен"
 [ -x /opt/sbin/d2kc ] || fail "d2kc не установлен"
+[ -x /opt/sbin/d2kfetch ] || fail "d2kfetch не установлен"
 [ -x /opt/sbin/d2ktg ] || fail "C-туннель Telegram не установлен"
 [ -x "$DIR/d2k-tg-firewall.sh" ] || fail "не установлен firewall Telegram"
 [ -x "$DIR/d2k-tg-watchdog.sh" ] || fail "не установлен сторож Telegram"
@@ -441,6 +443,7 @@ sh scripts/uninstall.sh >/dev/null
 [ -e /opt/sbin/d2kd ] && fail "после удаления остался d2kd"
 [ -e /opt/sbin/d2ktg ] && fail "после удаления остался C-туннель Telegram"
 [ -e /opt/sbin/d2kc ] && fail "после удаления остался d2kc"
+[ -e /opt/sbin/d2kfetch ] && fail "после удаления остался d2kfetch"
 [ -e /opt/sbin/d2kpanel ] && fail "после удаления осталась C-панель"
 [ -e "$DIR/panel" ] && fail "после удаления остались ресурсы панели"
 [ -e "$DIR/d2k-tg-firewall.sh" ] && fail "после удаления остался firewall Telegram"

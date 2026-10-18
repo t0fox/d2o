@@ -306,14 +306,14 @@ TMP=$(mktemp -d /tmp/d2k-install.XXXXXX) || die "не создать време�
 # мерил только /opt, и то ПОСЛЕ загрузки: на 8/16-МиБ роутере обрыв случался
 # уже внутри fetch, когда отказываться было поздно.
 #
-# Числа — замер, не оценка. Раскладка комплекта: 7635 КиБ на самой тяжёлой
-# арке (mips64el; mips и mipsel — 7470 и 7477), с запасом 8700.
-TMP_NEED_KB=8700
-# Установка выпуска держит в /tmp больше: распакованный архив (7752 КиБ,
-# замер 14.10.2026 на том же mips64el) и поверх него раскладку комплекта,
-# которую делает установщик ИЗ архива. Сам .tar.gz (2764 КиБ) удаляется
-# сразу после распаковки, поэтому пик — архив плюс раскладка, а не все три.
-TMP_RELEASE_NEED_KB=17600
+# Замер d2kfetch для всех девяти арок: максимум 386 КиБ (mips64el).
+# Старый комплект занимал 7635 КиБ на самой тяжёлой арке (mips64el; mips и
+# mipsel — 7470 и 7477). С новым инструментом остаётся около 950 КиБ запаса.
+TMP_NEED_KB=9000
+# Установка выпуска держит в /tmp распакованный архив и поверх него раскладку
+# комплекта, которую делает установщик ИЗ архива. Архив удаляется сразу после
+# распаковки; запас учитывает d2kfetch и изменения контроллера.
+TMP_RELEASE_NEED_KB=18000
 # Оба числа сторожит scripts/test-install-manifest.sh: он измеряет и
 # раскладку, и дерево выпуска и отвергает число ниже замера.
 need_kb=$TMP_NEED_KB
@@ -500,6 +500,7 @@ say "загрузка"
 fetch "scripts/select-panel-ip.sh" "$TMP/select-panel-ip.sh"
 fetch "builds/d2kpanel-linux-$ARCH" "$TMP/d2kpanel"
 fetch "builds/d2kc-linux-$ARCH" "$TMP/d2kc"
+fetch "builds/d2kfetch-linux-$ARCH" "$TMP/d2kfetch"
 fetch "builds/d2kd-linux-$ARCH" "$TMP/d2kd"
 fetch "builds/d2ktg-linux-$ARCH" "$TMP/d2ktg"
 fetch "files/S99d2k"            "$TMP/S99d2k"
@@ -530,7 +531,7 @@ for face in onest jbmono; do
     fetch "internal/web/assets/fonts/OFL-$face.txt" "$TMP/panel/OFL-$face.txt"
 done
 
-chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kd" "$TMP/d2ktg" \
+chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kfetch" "$TMP/d2kd" "$TMP/d2ktg" \
          "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/d2k-ppe-deoffload.sh" "$TMP/d2k-log-maintenance.sh" "$TMP/d2k-update.sh" "$TMP/001-d2k.sh" \
          "$TMP/d2k-tg-firewall.sh" "$TMP/d2k-tg-watchdog.sh" \
          "$TMP/d2k-instagram-dns.sh" "$TMP/d2k-instagram-dns-scheduler.sh"
@@ -568,6 +569,9 @@ esac
 rc=0
 "$TMP/d2kc" >/dev/null 2>&1 || rc=$?
 [ "$rc" = 2 ] || die "скачанный d2kc не запускается на этой системе (код $rc)"
+rc=0
+"$TMP/d2kfetch" >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || die "скачанный d2kfetch не запускается на этой системе (код $rc)"
 say "проверено: $("$TMP/d2kpanel" --version | head -1)"
 
 # --- OpenWrt на nftables: место, пакеты, ядро ----------------------------
@@ -583,7 +587,7 @@ if [ "$FW" = nft ]; then
     opt_fs=/opt; [ -d "$opt_fs" ] || opt_fs=/
     avail_kb=$(df -kP "$opt_fs" 2>/dev/null | awk 'NR == 2 { print $4 }')
     new_kb=$(du -sk "$TMP" | awk '{ print $1 }')
-    old_kb=$(du -sk "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$DIR/panel" 2>/dev/null |
+    old_kb=$(du -sk "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$DIR/panel" 2>/dev/null |
         awk '{ s += $1 } END { print s + 0 }')
     big_kb=$(du -sk "$TMP/d2ktg" | awk '{ print $1 }')
     need_kb=$((new_kb - old_kb + big_kb))
@@ -638,6 +642,7 @@ install_data_atomic() {
 }
 install_atomic "$TMP/d2kpanel" "$SBIN/d2kpanel"
 install_atomic "$TMP/d2kc"   "$SBIN/d2kc"
+install_atomic "$TMP/d2kfetch" "$SBIN/d2kfetch"
 install_atomic "$TMP/d2kd"   "$SBIN/d2kd"
 # Прокси открытого HTTP (d2khttp) больше не нужен: вставку провайдера в
 # HTTP узнаёт d2kd (задача 51). Прежняя версия уже остановлена выше вместе с

@@ -183,7 +183,7 @@ say "правила сняты"
 # Хук NDM снимается ПЕРВЫМ: оставленный, он будет звать сторожа, которого уже
 # нет, на каждое изменение netfilter — мусор в журнале на ровном месте.
 rm -f "$PREFIX/etc/ndm/netfilter.d/001-d2k.sh"
-rm -f "$PREFIX/etc/init.d/S99d2k" "$PREFIX/etc/init.d/S98d2k-update" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kd" "$SBIN/d2ktg" "$SBIN/d2khttp"
+rm -f "$PREFIX/etc/init.d/S99d2k" "$PREFIX/etc/init.d/S98d2k-update" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kd" "$SBIN/d2ktg" "$SBIN/d2khttp"
 # Remove only d2kc snapshots explicitly named as D2K pre-install/work backups.
 # These were created during router development and are not user configuration.
 rm -f "$SBIN"/d2kc.before-d2k-* "$SBIN"/d2kc.pre-goal-* "$SBIN"/d2kc.pre-sched-*
