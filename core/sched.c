@@ -1017,6 +1017,11 @@ typedef struct {
     char       ech_origin[256]; /* known own-probe witness, not inferred hidden SNI */
     char       ech_witnesses[SCHED_ECH_WITNESSES][256];
     size_t     ech_witness_count;
+    int        ech_reselect; /* выбранный свидетель ответил проверкой: выбрать следующий */
+    uint8_t    ech_bad[SCHED_ECH_WITNESSES];
+    int        ech_exhausted;
+    int        ladder_unmeasurable;
+    int        yield_to_own_plan;
     d2k_ver_result rx_identity[2]; /* body evidence only; sockets closed normally */
     int64_t    rx_retry_after_ms;
     /* A late TLS RST is only permission for the paired receive-volume probe.
@@ -1026,7 +1031,7 @@ typedef struct {
     /* Узкий RX-замер не состоялся (ответ короче полосы) и уже сменён обычным
        полным замером. Одноразовый на эпизод; task_reset зануляет задачу. */
     int        rx_short_full;
-    int        rx_volume_candidate_pending; /* special candidate after a measured RX-volume cut */
+    int        rx_volume_candidate_pending; /* особый кандидат после измеренного обрыва объёма */
     /* Очередь долита из запасного перебора (refill_from_fallback), а не
        выведена из замера: панель и журнал называют её своим именем (задача 37). */
     int        fb_queue;
@@ -1034,7 +1039,7 @@ typedef struct {
                              ступени RX-лестницы перед ним — из замера */
     unsigned   rx_volume_next_variant;
     /* ПОДБОР БЕЛОГО ИМЕНИ СЕТИ (поле 10.10.2026). Когда у цели измерен
-       RX-обрыв, а белое имя сети ещё не подобрано (catalog.net не искали),
+       обрыв объёма, а белое имя сети ещё не подобрано (catalog.net не искали),
        RX-лестница перебирает имена-кандидаты из встроенного списка как
        приманку: первое, что снимает обрыв (план подтверждён), и есть белое
        имя сети. net_probe_next — курсор по списку; net_probe_name[k] — имя
@@ -1249,6 +1254,8 @@ struct d2k_sched {
     struct { char name[256]; char public_name[256]; int has; int used;
              int64_t until_ms; } ech_rr[SCHED_ECH_RR];
     size_t       ech_rr_next;
+    struct { char name[256]; int64_t until_ms; } ech_chal[8];
+    size_t       ech_chal_next;
     target_cooldown cooldowns[SCHED_COOLDOWN_SLOTS];
     dead_address    dead_addrs[SCHED_COOLDOWN_SLOTS];
     late_rst_pending late_rst[SCHED_LATE_RST_SLOTS];
@@ -1739,6 +1746,9 @@ static int same_flow(const seen_name *s, const d2k_ev *ev) {
 }
 
 static int ech_rr_known(const d2k_sched *s, const char *name, const char *public_name);
+static int ech_chal_has(const d2k_sched *s, const char *name);
+static int ech_pick_witness(d2k_sched *s, task *t, int real, int allow_chal);
+static int ladder_candidate_at(const task *t, size_t i);
 static void ech_rr_store(d2k_sched *s, const char *name, int has, const char *public_name);
 /* Имя ECH-приманки (net.name либо семя hcaptcha.com) — определено ниже, но
    нужно раньше, в выдаче измерителя (составной вопрос семейства C). */
@@ -2614,9 +2624,32 @@ static void *worker_run(void *vp) {
             vr = d2k_sched_alpn_ver_hook(a_use_fd, t->ip, t->port, t->name,
                                          SCHED_VERIFY_STEP_MS, trig.len, alpn, alpn_len);
         } else if (t->transport == 6 && t->ech_offer) {
-            vr = d2k_verify_probe_ech_origin_on(a_use_fd, t->ip, t->port,
-                t->name, t->ech_origin, SCHED_VERIFY_STEP_MS, trig.len,
-                s->measure_mark, NULL);
+            int picked = !t->ech_exhausted;
+            if (picked && t->ech_reselect) {
+                char was[sizeof t->ech_origin];
+                snprintf(was, sizeof was, "%s", t->ech_origin);
+                t->ech_reselect = 0;
+                t->ech_origin[0] = 0;
+                picked = ech_pick_witness(s, t, 1, 0);
+                if (!picked) {
+                    snprintf(t->ech_origin, sizeof t->ech_origin, "%s", was);
+                    pthread_mutex_lock(&s->mu);
+                    t->ech_exhausted = 1;
+                    pthread_mutex_unlock(&s->mu);
+                }
+            }
+            if (picked) {
+                vr = d2k_verify_probe_ech_origin_on(a_use_fd, t->ip, t->port,
+                    t->name, t->ech_origin, SCHED_VERIFY_STEP_MS, trig.len,
+                    s->measure_mark, NULL);
+            } else {
+                if (a_use_fd >= 0) close(a_use_fd);
+                memset(&vr, 0, sizeof vr);
+                vr.fd = -1;
+                vr.level = D2K_VER_HANDSHAKE;
+                snprintf(vr.reason, sizeof vr.reason,
+                         "свидетеля ECH без страницы проверки не осталось — объём ответа не измерить");
+            }
         } else if (t->transport == 6 && t->measure_path[0]) {
             int encoding = t->rx_phase == 2 ? 1 : 0;
             vr = d2k_sched_path_ver_hook(a_use_fd, t->ip, t->port, t->name,
@@ -2736,31 +2769,7 @@ static void *worker_run(void *vp) {
             real = !d2k_sched_ech_resolve_hook(t->name, s->measure_mark, &cfg) &&
                    !strcmp(cfg.public_name, t->name);
         }
-        if (!t->ech_origin[0]) {
-            for (size_t i = 0; i < t->ech_witness_count && !t->stop; i++) {
-                pthread_mutex_lock(&s->mu);
-                int known = ech_rr_known(s, t->ech_witnesses[i], t->name);
-                pthread_mutex_unlock(&s->mu);
-                if (known == 0) continue;
-                if (known < 0 && !real && i >= 4) continue;
-                d2k_ech_config cfg;
-                int match = known == 1;
-                if (!match) {
-                    int has = !d2k_sched_ech_resolve_hook(t->ech_witnesses[i], s->measure_mark, &cfg);
-                    pthread_mutex_lock(&s->mu);
-                    ech_rr_store(s, t->ech_witnesses[i], has, has ? cfg.public_name : "");
-                    pthread_mutex_unlock(&s->mu);
-                    match = has && !strcmp(cfg.public_name, t->name);
-                }
-                if (match) {
-                    snprintf(t->ech_origin, sizeof t->ech_origin, "%s", t->ech_witnesses[i]);
-                    real = 1;
-                    say(s, "по %s ECH-свидетель найден: %s — его HTTPS RR несёт ECH-конфигурацию "
-                           "с public_name %s", t->name, t->ech_origin, t->name);
-                    break;
-                }
-            }
-        }
+        if (!t->ech_origin[0] && ech_pick_witness(s, t, real, 1)) real = 1;
         if (!real) {
             /* GREASE: обычный путь по имени тем же снимком клиента. Форма
              * вопроса — форма приветствия, а не ECH: иначе цикл, сравнив её
@@ -3909,6 +3918,13 @@ static int sched_probe_cap(const task *t) {
     return SCHED_MAX_PROBES + (t->net_probing ? (int)d2k_net_whitelist_count() : 0);
 }
 
+static int vol_cut_measured(const task *t) {
+    return t->vol.rx_cut || t->vol.verdict == D2K_VOL_CUT;
+}
+static int vol_cut_kb(const task *t) {
+    return t->vol.rx_cut ? t->vol.rx_at_kb : t->vol.at_kb;
+}
+
 /* Ещё есть что долить в RX-лестницу: в режиме подбора — непройденные имена
    списка, иначе — непройденные варианты разреза. */
 static int rx_ladder_pending(const task *t) {
@@ -3925,7 +3941,7 @@ static int next_rx_volume_plan(d2k_sched *s, task *t, d2k_shape sh,
     t->net_probe_scratch[0] = '\0';
     /* ПОДБОР БЕЛОГО ИМЕНИ СЕТИ: одно имя-кандидат за раз, приманкой перед
        настоящим ClientHello, разрез +2 (variant 0). Первое, что снимет
-       RX-обрыв (план подтвердится), и есть белое имя — его запишет
+       измеренный обрыв (план подтвердится), и есть белое имя — его запишет
        verify_confirm, прочитав net_probe_name слота. */
     if (t->net_probing) {
         while (t->net_probe_next < d2k_net_whitelist_count()) {
@@ -3985,21 +4001,23 @@ static size_t refill_from_fallback(d2k_sched *s, task *t) {
         added++;
         if (t->net_probing) {
             say(s, "по %s подбор белого имени сети: кандидат %zu из %zu как приманка "
-                   "снимает ли RX-обрыв около %d КБ",
-                t->name, t->net_probe_next, d2k_net_whitelist_count(), t->vol.rx_at_kb);
+                   "снимает ли обрыв около %d КБ",
+                t->name, t->net_probe_next, d2k_net_whitelist_count(), vol_cut_kb(t));
         } else {
-            say(s, "по %s очередь кандидатов исчерпана — по замеренному обрыву входящего "
-                "объёма около %d КБ проверяю fake-SNI + split-лестницу (%u/%u)",
-                t->name, t->vol.rx_at_kb, t->rx_volume_next_variant,
+            say(s, "по %s очередь кандидатов исчерпана — по замеренному обрыву объёма "
+                "около %d КБ проверяю fake-SNI + split-лестницу (%u/%u)",
+                t->name, vol_cut_kb(t), t->rx_volume_next_variant,
                 (unsigned)D2K_RX_VOLUME_PLAN_VARIANTS);
         }
     }
-    /* ЛЕСТНИЦА — ТОЛЬКО ПО ЗАМЕРЕННОМУ RX-ОБРЫВУ (задача 37). Прежде флаг
+    /* ЛЕСТНИЦА — ТОЛЬКО ПО ЗАМЕРЕННОМУ ОБРЫВУ ОБЪЁМА, RX или TX (задача 37).
+       Прежде флаг
        взводился здесь безусловно, и любая цель на втором доливе получала
        все пять hcaptcha-планов: поле 02.10.2026, edge-mqtt-fallback, у
-       коробки — только «rst», vol.rx_cut = 0. Условие лестницы — парный
-       RX-volume-профиль (verdict_to_plans), а не исчерпание очереди. */
-    t->rx_volume_candidate_pending = t->vol.rx_cut && rx_ladder_pending(t);
+       коробки — только «rst», vol.rx_cut = 0. Условие лестницы задаётся
+       результатом замера (verdict_to_plans), а не исчерпанием очереди. */
+    t->rx_volume_candidate_pending = vol_cut_measured(t) && !t->ladder_unmeasurable &&
+                                     rx_ladder_pending(t);
     size_t ladder = added;
     /* ЗАМЕРЕННЫЙ ОБРЫВ ОТВЕТА — ТОЛЬКО ЛЕСТНИЦА SNI. Обрыв меряется своим
        вопросом, и перебирать для него можно только имя (белое имя сети,
@@ -4142,6 +4160,23 @@ static void exec_refusal(d2k_sched *s, task *t, unsigned code, int late) {
     t->state = T_PLANNING;
 }
 
+static int ech_witness_transport_proof(const task *t) {
+    if (!t || t->transport != 6 || !t->ech_offer || t->ech_replay ||
+        !t->ech_origin[0] || !strcmp(t->ech_origin, t->name)) return 0;
+    if (!t->ver.ech_accepted || t->ver.name_ok != 1 || !t->ver.body_complete ||
+        t->ver.status < 100 || t->ver.status > 599) return 0;
+    return t->ver.level == D2K_VER_CHALLENGE || t->ver.cloudflare_challenge;
+}
+
+static int ech_witness_rx_cut(const task *t) {
+    if (!t || t->transport != 6 || !t->ech_offer || t->ech_replay ||
+        !t->ech_origin[0] || !strcmp(t->ech_origin, t->name)) return 0;
+    return t->ver.ech_accepted && t->ver.name_ok == 1 &&
+           t->ver.status >= 200 && t->ver.status < 400 &&
+           !t->ver.body_complete && t->ver.body_framing_valid &&
+           t->ver.body_bytes >= 8192;
+}
+
 static int local_refusal_verdict(d2k_sched *s, task *t) {
     if (t->unsent_code == 0) { return 0; }
     if (refuse_is_permanent(t->unsent_code)) {
@@ -4211,6 +4246,7 @@ static int install_next(d2k_sched *s, task *t) {
     while (t->next_plan < t->n_plans) {
         if (t->probes >= sched_probe_cap(t)) { return -1; }
         const char *text = t->plans[t->next_plan++];
+        if (t->ladder_unmeasurable && ladder_candidate_at(t, t->next_plan - 1)) continue;
         if (t->transport == 17 && quic_text_is_split(text) && quic_split_unfit(s, t)) {
             /* Свой/готовый план разреза другой цели этому клиенту не
                исполнится (финальное ревью core, I1): не ставим и не судим. */
@@ -5102,20 +5138,21 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
     }
 
     /* После сохранённых коробок и уже найденного самим измерителем приёма,
-       подтверждённый RX-volume профиль добавляет короткую fake-SNI/split-
+       измеренный обрыв объёма добавляет короткую fake-SNI/split-
        лестницу до общего синтеза. Это общий fingerprint-путь, без списка
        имён и без исключения для отдельного сайта. */
-    if (t->transport == 6 && t->vol.rx_cut && sh != D2K_SHAPE_MODERN) {
-        say(s, "по %s RX-volume замер подтверждён, но TLS-форма %u не modern — "
+    if (t->transport == 6 && vol_cut_measured(t) && sh != D2K_SHAPE_MODERN) {
+        say(s, "по %s обрыв объёма измерен, но TLS-форма %u не modern — "
                "fake-SNI/split-профиль не применим",
             t->name, (unsigned)sh);
     }
-    if (t->transport == 6 && t->vol.rx_cut && sh == D2K_SHAPE_MODERN) {
+    if (t->transport == 6 && vol_cut_measured(t) && sh == D2K_SHAPE_MODERN) {
         char text[sizeof t->plans[0]];
-        /* Белое имя сети не решено — RX-лестница сперва перебирает кандидаты
+        /* Белое имя сети не решено — лестница сперва перебирает кандидаты
            как приманку (поле 10.10.2026); решено — берёт готовое/семя. */
         t->net_probing = net_whitelist_undecided(s);
-        while (t->n_plans < cap &&
+        size_t room = t->vol.rx_cut ? cap : (t->n_plans + 1 < cap ? t->n_plans + 1 : cap);
+        while (t->n_plans < room &&
                next_rx_volume_plan(s, t, sh, text, sizeof text)) {
             snprintf(t->plans[t->n_plans], sizeof t->plans[t->n_plans], "%s", text);
             t->plan_boxes[t->n_plans][0] = '\0';
@@ -5126,18 +5163,20 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
         t->rx_volume_candidate_pending = rx_ladder_pending(t);
         if (t->net_probing) {
             say(s, "по %s белое имя сети не известно — подбираю его из %zu имён "
-                   "списка приманкой под измеренный RX-обрыв около %d КБ",
-                t->name, d2k_net_whitelist_count(), t->vol.rx_at_kb);
+                   "списка приманкой под измеренный %s около %d КБ",
+                t->name, d2k_net_whitelist_count(),
+                t->vol.rx_cut ? "RX-обрыв" : "обрыв исходящей лестницы", vol_cut_kb(t));
         } else {
             if (t->rx_volume_candidate_pending) {
                 say(s, "по %s сохранённые планы коробки занимают очередь; "
                     "объёмная fake-SNI/split-лестница ждёт их испытания",
                     t->name);
             }
-            say(s, "по %s повторяемый обрыв входящего identity-тела около %d КБ "
-                   "при полном gzip-ответе: проверю короткую fake-SNI + split-лестницу "
+            say(s, "по %s %s около %d КБ: проверю короткую fake-SNI + split-лестницу "
                    "(приманка «%s») после сохранённых планов",
-                t->name, t->vol.rx_at_kb, rx_decoy_name(s));
+                t->name, t->vol.rx_cut ? "повторяемый обрыв входящего identity-тела"
+                                       : "обрыв исходящей лестницы",
+                vol_cut_kb(t), rx_decoy_name(s));
         }
     }
 
@@ -6303,6 +6342,70 @@ static void ech_rr_store(d2k_sched *s, const char *name, int has, const char *pu
     e->until_ms = s->now_ms + (has ? SCHED_ECH_RR_YES_MS : SCHED_ECH_RR_NO_MS);
 }
 
+static int ech_chal_has(const d2k_sched *s, const char *name) {
+    for (size_t i = 0; i < sizeof s->ech_chal / sizeof s->ech_chal[0]; i++)
+        if (s->ech_chal[i].name[0] && s->ech_chal[i].until_ms > s->now_ms &&
+            !strcmp(s->ech_chal[i].name, name)) return 1;
+    return 0;
+}
+
+static void ech_chal_add(d2k_sched *s, const char *name) {
+    if (ech_chal_has(s, name)) return;
+    size_t k = s->ech_chal_next++ % (sizeof s->ech_chal / sizeof s->ech_chal[0]);
+    snprintf(s->ech_chal[k].name, sizeof s->ech_chal[k].name, "%s", name);
+    s->ech_chal[k].until_ms = s->now_ms + 1800000;
+}
+
+static int ech_pick_witness(d2k_sched *s, task *t, int real, int allow_chal) {
+    for (int pass = 0; pass < (allow_chal ? 2 : 1); pass++) {
+        for (size_t i = 0; i < t->ech_witness_count && !t->stop; i++) {
+            pthread_mutex_lock(&s->mu);
+            int known = ech_rr_known(s, t->ech_witnesses[i], t->name);
+            int chal = ech_chal_has(s, t->ech_witnesses[i]);
+            pthread_mutex_unlock(&s->mu);
+            if (known == 0 || (pass == 0 && chal)) continue;
+            if (!allow_chal && t->ech_bad[i]) continue;
+            if (known < 0 && !real && i >= 4) continue;
+            int match = known == 1;
+            if (!match) {
+                d2k_ech_config cfg;
+                int has = !d2k_sched_ech_resolve_hook(t->ech_witnesses[i], s->measure_mark, &cfg);
+                pthread_mutex_lock(&s->mu);
+                ech_rr_store(s, t->ech_witnesses[i], has, has ? cfg.public_name : "");
+                pthread_mutex_unlock(&s->mu);
+                match = has && !strcmp(cfg.public_name, t->name);
+            }
+            if (match) {
+                snprintf(t->ech_origin, sizeof t->ech_origin, "%s", t->ech_witnesses[i]);
+                say(s, "по %s ECH-свидетель найден: %s — его HTTPS RR несёт ECH-конфигурацию "
+                       "с public_name %s", t->name, t->ech_origin, t->name);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int ech_witness_untried(d2k_sched *s, const task *t) {
+    for (size_t i = 0; i < t->ech_witness_count; i++) {
+        if (t->ech_bad[i]) continue;
+        pthread_mutex_lock(&s->mu);
+        int ok = ech_rr_known(s, t->ech_witnesses[i], t->name) != 0 &&
+                 !ech_chal_has(s, t->ech_witnesses[i]);
+        pthread_mutex_unlock(&s->mu);
+        if (ok) return 1;
+    }
+    return 0;
+}
+
+static void ech_witness_reject(d2k_sched *s, task *t) {
+    for (size_t i = 0; i < t->ech_witness_count; i++)
+        if (!strcmp(t->ech_witnesses[i], t->ech_origin)) t->ech_bad[i] = 1;
+    pthread_mutex_lock(&s->mu);
+    ech_chal_add(s, t->ech_origin);
+    pthread_mutex_unlock(&s->mu);
+}
+
 /* Главный поток, s->mu не держит. Пропускает само внешнее имя, повторы и
    имена со свежим ответом «конфигурация не та». */
 static void ech_witness_add(d2k_sched *s, task *t, const char *name) {
@@ -6334,6 +6437,10 @@ static int start_search(d2k_sched *s, task *t) {
     t->ech_offer = t->transport == 6 && t->trig_snapped && !t->ech_grease &&
                    d2k_hello_ech_offer(t->trig, t->trig_len, NULL) == 1;
     t->ech_origin[0] = 0;
+    t->ech_reselect = 0;
+    memset(t->ech_bad, 0, sizeof t->ech_bad);
+    t->ech_exhausted = 0;
+    t->ladder_unmeasurable = 0;
     t->ech_trial = 0;
     t->ech_replay = 0;
     t->ech_witness_count = 0;
@@ -6358,6 +6465,9 @@ static int start_search(d2k_sched *s, task *t) {
                     snprintf(t->ech_origin, sizeof t->ech_origin, "%s", bd->ech_origin);
             }
         }
+        pthread_mutex_lock(&s->mu);
+        if (t->ech_origin[0] && ech_chal_has(s, t->ech_origin)) t->ech_origin[0] = 0;
+        pthread_mutex_unlock(&s->mu);
         /* Кандидаты в свидетели — только своё знание, по убыванию силы:
          * (1) имена, чей ответ HTTPS RR уже назвал это внешнее имя;
          * (2) свидетели других своих ECH-привязок (любая семья);
@@ -6372,7 +6482,7 @@ static int start_search(d2k_sched *s, task *t) {
          * конфигурацией cloudflare-ech.com) в очередь не попал.
          * Это не утверждение, что кандидат — скрытое имя потока: рабочий
          * поток берёт первого, у кого HTTPS RR даёт ту же конфигурацию. */
-        if (!t->ech_origin[0]) {
+        {
             pthread_mutex_lock(&s->mu);
             char known[SCHED_ECH_WITNESSES][256];
             size_t n_known = 0;
@@ -7957,7 +8067,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
             t->trigger_shape=d2k_hello_ech_offer(ev->shape,ev->shape_len,NULL)==1 ?
                 D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(ev->shape,ev->shape_len);
         }
-        if (t->state == T_ASKING && t->transport == 6 &&
+        if (t->state == T_ASKING && t->transport == 6 && ev->transport == 6 &&
             strcmp(t->name, name) == 0) {
             if (!t->trig_snapped && !t->reasked && ev->shape_len <= sizeof t->snap &&
                 hello_fits_client(t, ev->shape, ev->shape_len)) {
@@ -8210,6 +8320,20 @@ static void say_question_trace(d2k_sched *s, const task *t, const d2k_vres *r) {
    прежде писался без пути, и счёт видел только находки замера. Порядок —
    как у источника на панели: свой план коробки, затем приём замера с путём
    дерева, затем ступень RX-лестницы, затем запасной перебор. */
+static int ladder_candidate_at(const task *t, size_t i) {
+    if (i >= t->n_plans) return 0;
+    if (t->net_probe_name[i][0]) return 1;
+    uint64_t h = fnv1a(t->plans[i]);
+    size_t n = t->n_rx_hashes < D2K_RX_VOLUME_PLAN_VARIANTS
+        ? t->n_rx_hashes : D2K_RX_VOLUME_PLAN_VARIANTS;
+    for (size_t k = 0; k < n; k++)
+        if (t->rx_hashes[k] == h) return 1;
+    return 0;
+}
+static int ladder_candidate(const task *t) {
+    return t->next_plan ? ladder_candidate_at(t, t->next_plan - 1) : 0;
+}
+
 static const char *candidate_path(const task *t) {
     size_t i = t->next_plan ? t->next_plan - 1 : 0;
     if (t->n_known > 0 && t->next_plan <= t->n_known) return "свой план";
@@ -8276,6 +8400,24 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     uint8_t wire_id[D2K_PLAN_ID_LEN];
     plan_ident(text, plan_id, sizeof plan_id, wire_id);
     budget_uncountable_note(s, t);
+    if (!t->partial_finishing && t->transport == 6 &&
+        t->vol.verdict == D2K_VOL_CUT && !t->vol.rx_cut && ladder_candidate(t) &&
+        (t->ver.budget == D2K_BUDGET_NOT_APPLICABLE || t->ver.budget == D2K_BUDGET_CUT ||
+         (t->ver.budget != D2K_BUDGET_PASSED && t->ver.conn_close))) {
+        say(s, "по %s план %s: приложение ответило %d, но измерен обрыв исходящей лестницы "
+               "около %d КБ, а бюджет потока не пройден (%s) — снятие обрыва не доказано, "
+               "кандидата не подтверждаю", t->name, plan_id, t->ver.status, t->vol.at_kb,
+            t->ver.budget_note[0] ? t->ver.budget_note : "проверки не было");
+        if (t->ver.budget != D2K_BUDGET_CUT) {
+            t->ladder_unmeasurable = 1;
+            t->rx_volume_candidate_pending = 0;
+            t->net_probing = 0;
+            say(s, "по %s бюджет потока на этой цели не измерить — лестницу белого имени "
+                   "по исходящему обрыву прекращаю, дальше обычные кандидаты", t->name);
+        }
+        trial_retire(s, t); ver_close(t); t->state = T_PLANNING;
+        return;
+    }
     if (!t->partial_finishing &&
         t->own_first == 2 && t->bound_plan_id[0] && !strcmp(t->bound_plan_id, plan_id) &&
         t->ver.budget != D2K_BUDGET_PASSED) {
@@ -8509,7 +8651,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         s->cat->revision++;
         s->sync_pending = 1;
         t->net_probing = 0;
-        say(s, "по %s белое имя сети подобрано: «%s» снимает RX-обрыв — сохраняю как "
+        say(s, "по %s белое имя сети подобрано: «%s» снимает измеренный обрыв — сохраняю как "
                "свойство сети, подбор больше не повторяю", t->name, nw->name);
     }
     if (t->ver.replay_proof && t->transport == 17)
@@ -8597,6 +8739,21 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     trial_retire(s, t);
     ver_close(t);
     t->state = T_WATCHING;
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        task *ot = &s->tasks[i];
+        if (ot == t || ot->state != T_ASKING || !ot->th_live || ot->yield_to_own_plan)
+            continue;
+        pthread_mutex_lock(&s->mu);
+        int ot_ready = ot->res_ready;
+        pthread_mutex_unlock(&s->mu);
+        if (ot_ready) continue;
+        if (ot->own_first != 1 && own_first_plans(s, ot, 0) > 0) {
+            ot->yield_to_own_plan = 1;
+            ot->stop = 1;
+            say(s, "по %s замер прерывается: в каталоге появился подтверждённый план — "
+                   "перехожу к его проверке", ot->name);
+        }
+    }
     /* Подтверждение — это новое знание, и датапат обязан узнать о нём сразу,
        а не после следующего запуска (та же причина, по которой Sync на
        Go-стороне зовётся «при запуске И после каждого подтверждения»). Но
@@ -9787,6 +9944,33 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
+            int vol_cut = t->transport == 6 &&
+                (t->vol.rx_cut || t->vol.verdict == D2K_VOL_CUT);
+            int direct_clear = (r.verdict == D2K_V_CLEAR && !vol_cut && !t->ech_trial &&
+                                !t->vol.rx_partial_bytes && !t->vol.rx_partial_wire_bytes);
+            if (t->yield_to_own_plan) {
+                t->yield_to_own_plan = 0;
+                t->stop = 0;
+                if (!direct_clear) {
+                    size_t own = own_first_plans(s, t, 1);
+                    if (own > 0) {
+                        t->own_first = 2;
+                        t->res = r;
+                        if (t->transport == 6 && !t->vol.rx_cut)
+                            memset(&t->vol, 0, sizeof t->vol);
+                        t->n_plans = t->n_known = own;
+                        t->next_plan = 0;
+                        t->cached_measure_valid = 0;
+                        t->exec_refused = t->exec_probed = 0;
+                        t->rx_phase = 0;
+                        t->state = T_PLANNING;
+                        say(s, "по %s замер уступил место собственным планам из каталога: %zu",
+                            t->name, own);
+                        moved++;
+                        continue;
+                    }
+                }
+            }
             if (t->addr_ack == 2) {
                 /* Перепроверка мёртвого адреса: тишина без единого триггера —
                    вердикт подтверждён, ступень лестницы растёт. */
@@ -9856,7 +10040,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                от байт клиента действительно зависит, — коробка и её планы. */
             if (t->rx_volume_only && (!snap_restart || t->vol.rx_cut)) {
                 t->rx_volume_only = 0;
-                if (!t->vol.rx_cut) {
+                if (!t->vol.rx_cut && t->vol.verdict == D2K_VOL_CUT) {
+                    say(s, "по %s исходящая лестница оборвалась около %d КБ; входящий замер "
+                           "не измерил бюджет и этот обрыв не отменяет — продолжаю поиск",
+                        t->name, t->vol.at_kb);
+                } else if (!t->vol.rx_cut) {
                     if (t->vol.rx_tls_unavailable && rx_saved_bootstrap(s, t, 0)) {
                         moved++;
                         continue;
@@ -9915,11 +10103,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     moved++;
                     continue;
                 }
-                if (t->vol.rx_compressed_complete) {
+                if (t->vol.rx_cut && t->vol.rx_compressed_complete) {
                     say(s, "по %s подтверждён повторяемый обрыв входящего ответа около %d КБ "
                            "при полном gzip-контроле — теперь ищу коробку и её планы",
                         t->name, t->vol.rx_at_kb);
-                } else {
+                } else if (t->vol.rx_cut) {
                     say(s, "по %s подтверждён пакетный бюджет потока: identity и gzip "
                            "оборвались около %d пакетов с данными — теперь ищу коробку и её планы",
                         t->name, t->vol.rx_cut_packets);
@@ -10140,6 +10328,12 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     say(s, "по %s напрямую проходит — повторный поиск отложен на %lld мин; "
                            "это временный ограничитель, а не запись в каталоге",
                         t->name, (long long)((delay_ms + 59999) / 60000));
+                } else if (r.verdict == D2K_V_FLAKY && t->transport == 6 &&
+                           strstr(r.reason, "замер не состоялся")) {
+                    search_report(s, t, now_ms, "unknown", "none");
+                    say(s, "по %s замер не состоялся: адрес не принимал соединений во время "
+                           "замера — это не отказ и не неубедительный замер; повторю при "
+                           "следующем подозрении, сначала проверю свои планы", t->name);
                 } else {
                     search_report(s, t, now_ms, "inconclusive", "none");
                     cooldown_record(s, t, 2);
@@ -10404,6 +10598,37 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             t->ver_flow.b_port = t->port;
             t->ver_flow.transport = t->transport;
             claim_early_refusal(t);
+            if (ech_witness_transport_proof(t)) {
+                ech_witness_reject(s, t);
+                if (ech_witness_untried(s, t)) {
+                    say(s, "по %s свидетель %s ответил страницей проверки своего сервера "
+                           "(HTTP %d): проход ECH она доказывает, объём ответа на ней не "
+                           "измерить — тот же кандидат проверяю через другого свидетеля",
+                        t->name, t->ech_origin, t->ver.status);
+                    t->ech_reselect = 1;
+                    trial_retire(s, t);
+                    ver_close(t);
+                    t->ver_seen = 0;
+                    t->ver_ok = 0;
+                    if (t->next_plan > 0) { t->next_plan--; }
+                    t->state = T_PLANNING;
+                    moved++;
+                    continue;
+                }
+                t->ech_exhausted = 1;
+            }
+            if (t->transport == 6 && t->ech_offer && !t->ech_replay && t->ech_exhausted) {
+                say(s, "по %s свидетели ECH отвечают только страницей проверки (%s): "
+                       "проход ECH доказан, объём ответа измерить нечем — кандидатов не "
+                       "оцениваю, поиск закрываю неубедительным", t->name, t->ech_origin);
+                trial_retire(s, t);
+                ver_close(t);
+                search_report(s, t, now_ms, "inconclusive", "none");
+                cooldown_record(s, t, 3);
+                task_fail(s, t, now_ms);
+                moved++;
+                continue;
+            }
             if (t->ver.level == D2K_VER_CHALLENGE) {
                 /* Anti-bot challenge means the HTTP edge answered, but the
                    requested content was not established. It is neither a
@@ -10599,6 +10824,16 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            прикладного обмена, и в каталог не идёт ничего (§10). */
                         say(s, "по %s план %zu: зонд не дошёл до приложения (%s) — беру следующего кандидата",
                             t->name, t->next_plan, t->ver.reason);
+                        if (!t->vol.rx_cut && ech_witness_rx_cut(t)) {
+                            t->vol.rx_cut = 1;
+                            t->vol.rx_at_kb = (int)(t->ver.body_bytes / 1024);
+                            t->net_probing = net_whitelist_undecided(s);
+                            t->rx_volume_candidate_pending = rx_ladder_pending(t);
+                            say(s, "по %s под планом через принятый ECH ответ свидетеля %s "
+                                   "оборвался около %d КБ — это объёмный обрыв; добавляю "
+                                   "лестницу белого имени", t->name, t->ech_origin,
+                                t->vol.rx_at_kb);
+                        }
                         /* A measured arm is still a candidate in this context.
                            Only a completed, attributable experiment may unlock
                            fallback: missing execution/local failure is not a
@@ -10971,7 +11206,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     s->sync_pending = 1;
                     t->net_probing = 0;
                     say(s, "по %s белое имя сети не найдено: ни одно из %zu имён списка "
-                           "не сняло RX-обрыв — запоминаю исход, подбор не повторяю",
+                           "не сняло измеренный обрыв — запоминаю исход, подбор не повторяю",
                         t->name, d2k_net_whitelist_count());
                 }
                 if (t->fb_queue) {

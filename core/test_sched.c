@@ -6509,6 +6509,45 @@ shape_test:
         tcp_answer = D2K_V_OPAQUE;
     }
 
+    /* Пачка QUIC того же имени не должна менять вход текущего TCP-замера. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        tcp_wait_until_stop = 1; tcp_release_waiters = 0;
+        tcp_saw_stop = tcp_stop_count = tcp_calls = 0; tcp_last_wire = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev h = ev_hello(6, 39990, "pack.cross.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 39990);
+        d2k_sched_event(s, &su);
+        spin(s, 30);
+        CHECK(tcp_calls == 1, "межпротокольная проверка: TCP-поиск не начался");
+        size_t profile_wire = tcp_last_wire;
+        uint8_t d1[1500], d2[1500];
+        size_t l1 = 0, l2 = 0;
+        CHECK(d2k_test_pq_initials("pack.cross.example", d1, &l1, d2, &l2) == 0,
+              "межпротокольная проверка: не собраны два Initial");
+        const uint8_t *dg[2] = {d1, d2};
+        size_t len[2] = {l1, l2};
+        d2k_ev q = {0}; q.kind = D2K_EV_SHAPE; q.transport = 17; q.family = 4;
+        q.shape_len = d2k_qsnap_pack(dg, len, 2, q.shape, sizeof q.shape);
+        CHECK(q.shape_len > 0, "межпротокольная проверка: QUIC-пачка не упакована");
+        d2k_sched_event(s, &q);
+        spin(s, 30);
+        tcp_release_waiters = 1;
+        spin(s, 120);
+        CHECK(!tcp_saw_stop && !said("останавливаю устаревший прогон"),
+              "QUIC-пачка остановила TCP-замер");
+        CHECK(tcp_calls == 1 && tcp_last_wire == profile_wire,
+              "TCP-замер повторён QUIC-байтами");
+        if (fails) fprintf(stderr, "%s\n", saidbuf);
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        tcp_wait_until_stop = 0; tcp_release_waiters = 0;
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
     /* ЗАДАЧА 31. Поле 02.10.2026, i.ytimg.com: классификатор (первый шаг
        после задачи 30) брошен ради снимка клиента, а пока он доходил до
        границы зонда, общую ячейку TCP-снимка заняло приветствие соседнего
