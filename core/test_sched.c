@@ -9509,6 +9509,8 @@ rx_volume_tests:
         d2k_sched_event(s, &initial_su); settle(s);
         d2k_ev initial_ap = ev_applied(6, 40385);
         d2k_sched_event(s, &initial_ap); settle(s);
+        CHECK(said("ПОДТВЕРЖДЕНО"),
+              "complete-403: исходная подтверждённая привязка не перешла в наблюдение");
         tcp_answer = D2K_V_CLEAR;
         tcp_calls = vol_calls = 0; saidbuf[0] = '\0'; forget_sent();
         d2k_ev h = ev_hello(6, 40386, "complete-403.example");
@@ -9522,10 +9524,17 @@ rx_volume_tests:
         su.planned = D2K_LINK_PLANNED_YES;
         d2k_sched_event(s, &su);
         settle(s);
-        CHECK(tcp_calls == 0 && vol_calls == 1,
+        int inconclusive = said("outcome=inconclusive path=none");
+        int probe_direct = said("outcome=probe-direct") || said("напрямую проходит");
+        if (tcp_calls != 0 || vol_calls != 1 || !inconclusive || probe_direct) {
+            fprintf(stderr, "complete-403: tcp=%d rx=%d inconclusive=%d direct=%d\n%s\n",
+                    tcp_calls, vol_calls, inconclusive, probe_direct, saidbuf);
+        }
+        CHECK(tcp_calls == 0,
+              "complete-403: позднее закрытие запустило обычный TCP-зонд");
+        CHECK(vol_calls == 1,
               "complete-403: позднее закрытие не прошло через RX-only замер");
-        CHECK(said("outcome=inconclusive path=none") &&
-              !said("outcome=probe-direct") && !said("напрямую проходит"),
+        CHECK(inconclusive && !probe_direct,
               "complete-403: неприкладной RX-ответ объявлен прямым проходом");
         CHECK(total_bindings(&c) == 1,
               "complete-403: незавершённый RX повредил подтверждённую привязку");
