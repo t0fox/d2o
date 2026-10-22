@@ -1137,8 +1137,12 @@ static d2k_ver_result verify_probe13_internal(int use_fd, const char *ip, uint16
     int contact = verify_contact(use_fd, ip, port, mark, r.family,
                                  r.local_addr, &r.local_port, &r.fd);
     if (contact != 0) {
-        snprintf(r.reason, sizeof r.reason, contact == -2
-                 ? "метка измерительного сокета не поставилась" : "нет TCP");
+        if (contact == -2) {
+            r.local_refusal = 1;
+            snprintf(r.reason, sizeof r.reason, "метка измерительного сокета не поставилась");
+        } else {
+            snprintf(r.reason, sizeof r.reason, "нет TCP");
+        }
         return r;
     }
     r.level = D2K_VER_TRANSPORT;
@@ -1381,8 +1385,12 @@ static d2k_ver_result verify_probe12_internal(int use_fd, const char *ip, uint16
     int contact = verify_contact(use_fd, ip, port, mark, r.family,
                                  r.local_addr, &r.local_port, &r.fd);
     if (contact != 0) {
-        snprintf(r.reason, sizeof r.reason, contact == -2
-                 ? "метка измерительного сокета не поставилась" : "нет TCP");
+        if (contact == -2) {
+            r.local_refusal = 1;
+            snprintf(r.reason, sizeof r.reason, "метка измерительного сокета не поставилась");
+        } else {
+            snprintf(r.reason, sizeof r.reason, "нет TCP");
+        }
         return r;
     }
     r.level = D2K_VER_TRANSPORT;
@@ -1696,6 +1704,15 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
 d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_t port,
                                              const char *sni, int deadline_ms,
                                              size_t hello_wire, const char *path) {
+    /* Непомеченный QUIC-зонд идёт через установленные планы, как браузер. */
+    return d2k_verify_probe_quic_path_mark_on(use_fd, ip, port, sni, deadline_ms,
+                                             hello_wire, 0, path);
+}
+
+d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, uint16_t port,
+                                                 const char *sni, int deadline_ms,
+                                                 size_t hello_wire, uint32_t mark,
+                                                 const char *path) {
     if (!path || !path[0]) path = "/";
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
@@ -1723,23 +1740,25 @@ d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_
        вида, каким ходит человек (задача 66). */
     o.form = g_verify_quic_form_set ? &g_verify_quic_form : NULL;
     o.use_fd = use_fd;
-    /* Метки НЕТ намеренно — ровно по той же причине, что у TCP-зонда: к
-       помеченному пакету поставленный план не применится, и зонд мерил бы
-       линию БЕЗ обхода, считая, что мерит с обходом. */
+    o.mark = mark;
 
     d2k_qc *c = NULL;
     char err[200];
     err[0] = '\0';
-    if (d2k_qc_connect(&o, &c, err, sizeof err) != 0) {
-        /* Транспорт у QUIC не «встал» отдельно от рукопожатия: датаграмма
-           уходит всегда, и отличить «ушла в никуда» от «ушла и не понравилась»
-           можно только по тому, ответил ли сервер хоть чем-то. Оба случая для
-           нас — «не измерено», и приписывать им уровень транспорта значило бы
-           дописать доказательство. */
-        snprintf(r.reason, sizeof r.reason, "рукопожатия нет: %.150s", err);
+    int qc_rc = d2k_qc_connect(&o, &c, err, sizeof err);
+    if (qc_rc != 0) {
+        if (qc_rc == -2) {
+            r.local_refusal = 1;
+            snprintf(r.reason, sizeof r.reason, "%s", err);
+        } else {
+            /* QUIC не отделяет соединение от рукопожатия: сетевой отказ
+               остаётся неизмеренным до получения ответа сервера. */
+            snprintf(r.reason, sizeof r.reason, "рукопожатия нет: %.150s", err);
+        }
         return r;
     }
     r.level = D2K_VER_HANDSHAKE;
+    r.negotiated_tls = 0x0304;
     r.name_ok = d2k_qc_peer_name(c);
     d2k_qc_local_addr(c, r.local_addr, &r.family, &r.local_port);
     if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);

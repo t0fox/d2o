@@ -947,6 +947,16 @@ int d2k_qc_first_initial(const char *sni, uint8_t *out, size_t cap, size_t *out_
     return rc;
 }
 
+static int qc_no_sigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    int enabled = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof enabled);
+#else
+    (void)fd;
+    return 0;
+#endif
+}
+
 int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap) {
     if (err && errcap) { err[0] = '\0'; }
     if (!o || !o->ip || !out) { say(err, errcap, "нечем поднимать соединение"); return -1; }
@@ -993,7 +1003,14 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
         d2k_qc_close(c); return -1;
     }
     if (c->fd >= 0) {
-        if (o->mark) { (void)d2k_mark_hook(c->fd, o->mark); }
+        if (qc_no_sigpipe(c->fd) != 0) {
+            say(err, errcap, "SO_NOSIGPIPE: %s", strerror(errno));
+            d2k_qc_close(c); return -2;
+        }
+        if (o->mark && d2k_mark_hook(c->fd, o->mark) != 0) {
+            say(err, errcap, "метка измерительного сокета не поставилась");
+            d2k_qc_close(c); return -2;
+        }
         /* connect на UDP не шлёт ни байта: он привязывает сокет к направлению,
            чтобы приходили ошибки ICMP и чтобы recv не принимал чужое. */
         if (connect(c->fd, (struct sockaddr *)&to, tolen) != 0) {
@@ -1007,10 +1024,18 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
            сокет (use_fd) проверен там, где его заняли. */
         int held[D2K_UDP_FRESH_TRIES];
         int n_held = 0;
+        int local_failed = 0;
         for (;;) {
             int fd = socket(af, SOCK_DGRAM, 0);
             if (fd < 0) { say(err, errcap, "сокет: %s", strerror(errno)); break; }
-            if (o->mark) { (void)d2k_mark_hook(fd, o->mark); }
+            if (qc_no_sigpipe(fd) != 0) {
+                say(err, errcap, "SO_NOSIGPIPE: %s", strerror(errno));
+                local_failed = 1; close(fd); break;
+            }
+            if (o->mark && d2k_mark_hook(fd, o->mark) != 0) {
+                say(err, errcap, "метка измерительного сокета не поставилась");
+                local_failed = 1; close(fd); break;
+            }
             if (connect(fd, (struct sockaddr *)&to, tolen) != 0) {
                 say(err, errcap, "connect: %s", strerror(errno)); close(fd); break;
             }
@@ -1021,6 +1046,7 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
             held[n_held++] = fd;
         }
         for (int i = 0; i < n_held; i++) { close(held[i]); }
+        if (local_failed) { free(c); return -2; }
         if (c->fd < 0) { free(c); return -1; }
     }
     struct sockaddr_storage me;

@@ -639,6 +639,13 @@ static int qp_open_fresh(int family, const struct sockaddr *a, socklen_t alen,
         *marked = (mark == 0);
         fd = socket(family, SOCK_DGRAM, 0);
         if (fd < 0) { break; }
+#ifdef SO_NOSIGPIPE
+        int no_sigpipe = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE,
+                       &no_sigpipe, sizeof no_sigpipe) != 0) {
+            close(fd); fd = -1; break;
+        }
+#endif
         if (mark != 0 && d2k_mark_hook(fd, mark) == 0) {
             *marked = 1;
         }

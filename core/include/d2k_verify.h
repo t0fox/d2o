@@ -120,6 +120,8 @@ typedef struct {
      * Это утверждение о НАС, а не о коробке и не о кандидате: в каталог по
      * нему не идёт ничего, ни положительного, ни отрицательного (§10). */
     int      unsupported;
+    /* Отказ зонда на локальной настройке сокета, без сетевого замера. */
+    int      local_refusal;
     int      ech_accepted; /* own ECH acceptance, not extension presence/GREASE */
     /* Зонд говорил ALPN клиента, и этот протокол — НЕ HTTP (задача 37, F3).
        Тогда доказательство на проводе — завершённое рукопожатие TLS (level
@@ -313,6 +315,12 @@ d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t por
 d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_t port,
                                              const char *sni, int deadline_ms,
                                              size_t hello_wire, const char *path);
+
+/* То же, с меткой сокета, установленной перед connect(). */
+d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, uint16_t port,
+                                                 const char *sni, int deadline_ms,
+                                                 size_t hello_wire, uint32_t mark,
+                                                 const char *path);
 
 /* Закрывает сокет обращения и обнуляет fd. Безопасна на любом результате, в
  * том числе на том, где обращения не было. */

@@ -751,10 +751,15 @@ static void *parallel_probe(void *arg) {
    (files/S99d2k), поставленный план к нему не применится, и зонд мерил бы
    линию БЕЗ обхода, считая, что мерит с обходом. Счётчик ловит ровно это. */
 static int mark_calls;
+static uint32_t last_mark;
 static int counting_mark(int fd, uint32_t mark) {
-    (void)fd; (void)mark;
+    (void)fd; last_mark = mark;
     mark_calls++;
     return 0;
+}
+static int failing_mark(int fd, uint32_t mark) {
+    (void)fd; last_mark = mark; mark_calls++;
+    return -1;
 }
 
 /* Свободный порт, на котором заведомо никто не слушает: занимаем и сразу
@@ -865,6 +870,47 @@ int main(int argc,char **argv) {
             100, 0, 0, 0, 0, "/app.css?private=yes");
         CHECK(r.fd == -1 && r.level == D2K_VER_NOT_MEASURED,
               "invalid witness opened a socket");
+    }
+    {
+        /* QUIC-зонд должен передать запрошенную метку сокету и остановиться,
+           если локальная установка SO_MARK не удалась. */
+        mark_calls = 0; last_mark = 0;
+        d2k_ver_result r = d2k_verify_probe_quic_path_on(-1, "127.0.0.1", 1,
+                                                         "stand.example", 1, 0, "/");
+        CHECK(mark_calls == 0, "непомеченный QUIC-зонд вызвал установку метки");
+        d2k_verify_close(&r);
+
+        mark_calls = 0; last_mark = 0;
+        r = d2k_verify_probe_quic_path_mark_on(-1, "127.0.0.1", 1,
+                                               "stand.example", 1, 0, 0x1234, "/");
+        CHECK(mark_calls > 0 && last_mark == 0x1234,
+              "QUIC-зонд не передал правильную метку");
+        CHECK(r.negotiated_tls == 0,
+              "неуспешный QUIC-зонд сообщил TLS до рукопожатия");
+        d2k_verify_close(&r);
+
+        d2k_mark_hook = failing_mark;
+        mark_calls = 0; last_mark = 0;
+        r = d2k_verify_probe_quic_path_mark_on(-1, "127.0.0.1", 1,
+                                               "stand.example", 1, 0, 0x1234, "/");
+        CHECK(mark_calls > 0 && last_mark == 0x1234,
+              "ошибка метки QUIC не проверила запрошенное значение");
+        CHECK(r.level == D2K_VER_NOT_MEASURED && r.fd == -1 &&
+              r.local_refusal && r.negotiated_tls == 0,
+              "ошибка метки QUIC была принята за сетевой отказ");
+        CHECK(strstr(r.reason, "метка измерительного сокета не поставилась") != NULL,
+              "причина отказа метки QUIC потеряна");
+        d2k_verify_close(&r);
+
+        d2k_mark_hook = failing_mark;
+        mark_calls = 0; last_mark = 0;
+        r = d2k_verify_probe_path_on(-1, "127.0.0.1", 1, "stand.example",
+                                     100, 0, 0, 0, 0x1234, NULL);
+        CHECK(mark_calls > 0 && last_mark == 0x1234 && r.local_refusal &&
+              r.level == D2K_VER_NOT_MEASURED,
+              "ошибка TCP-метки не обозначена локальным отказом");
+        d2k_verify_close(&r);
+        d2k_mark_hook = counting_mark;
     }
     {
         struct stand s;
