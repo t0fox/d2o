@@ -4,6 +4,7 @@
 #include <strings.h>
 
 #include "d2k_httpup.h"
+#include "d2k_http_reply.h"
 
 typedef struct {
     char host[256];
@@ -40,6 +41,13 @@ static int host_equal(const char *a, const char *b) {
     if (an && a[an - 1] == '.') { an--; }
     if (bn && b[bn - 1] == '.') { bn--; }
     return an == bn && an != 0 && strncasecmp(a, b, an) == 0;
+}
+
+static int known_portal_host(const char *host) {
+    for (size_t i = 0; i < 6; i++) {
+        if (host_equal(host, d2k_http_portal(i))) { return 1; }
+    }
+    return 0;
 }
 
 static const char *find_crlf(const char *p, const char *end) {
@@ -143,7 +151,7 @@ static int build_redirect(const http_request *req, const char *reason,
 static int portal_marker(const char *host) {
     static const char *const markers[] = {
         "lawfilter", "blockpage", "blocked", "censorship", "access-denied",
-        "provider-filter"
+        "provider-filter", "megafonpro", "blackhole"
     };
     const char *start = host;
     for (const char *p = host;; p++) {
@@ -195,6 +203,7 @@ static int portal_answer(const char *req_host, const char *upstream, size_t upst
          upstream[11] != '7' && upstream[11] != '8')) { return 0; }
 
     int location_seen = 0;
+    int known_portal = 0;
     const char *p = line_end + 2;
     while ((line_end = find_crlf(p, end)) != NULL && line_end != p) {
         const char *colon = memchr(p, ':', (size_t)(line_end - p));
@@ -206,11 +215,13 @@ static int portal_answer(const char *req_host, const char *upstream, size_t upst
             while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t')) { ve--; }
             if (!redirect_location_host(v, (size_t)(ve - v), location_host,
                                         location_cap)) { return 0; }
+            known_portal = known_portal_host(location_host);
         }
         p = line_end + 2;
     }
     return location_seen && line_end && line_end == p &&
-           !host_equal(req_host, location_host) && portal_marker(location_host);
+           !host_equal(req_host, location_host) &&
+           (known_portal || portal_marker(location_host));
 }
 
 int d2k_httpup_portal_response(const char *request, size_t request_len,

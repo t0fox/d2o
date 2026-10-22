@@ -30,6 +30,23 @@ int main(void) {
     static const char deceptive_marker[] =
         "HTTP/1.1 302 Found\r\nLocation: https://unblocked.example/continue\r\n"
         "Content-Length: 0\r\n\r\n";
+    static const char megafon_portal[] =
+        "HTTP/1.1 302 Found\r\nLocation: https://m.megafonpro.ru/rkn-auth?channel=2m\r\n"
+        "Content-Length: 0\r\n\r\n";
+    static const char rt_portal[] =
+        "HTTP/1.1 302 Found\r\nLocation: http://warning.rt.ru/\r\n"
+        "Content-Length: 0\r\n\r\n";
+    static const char beeline_portal[] =
+        "HTTP/1.1 302 Found\r\nLocation: http://warn.beeline.ru/\r\n"
+        "Content-Length: 0\r\n\r\n";
+    static const char megafon_deny[] =
+        "HTTP/1.1 302 Found\r\nLocation: http://deny.megafon.ru/blocked\r\n"
+        "Content-Length: 0\r\n\r\n";
+    static const char unrelated_rkn_path[] =
+        "HTTP/1.1 302 Found\r\nLocation: http://isp.example.org/rkn-landing/rkn?id=1\r\n"
+        "Content-Length: 0\r\n\r\n";
+    char bounded_rt[sizeof rt_portal - 1];
+    memcpy(bounded_rt, rt_portal, sizeof bounded_rt);
     static const char not_redirect[] =
         "HTTP/1.1 200 OK\r\nLocation: https://lawfilter.example/\r\n"
         "Content-Length: 0\r\n\r\n";
@@ -44,6 +61,24 @@ int main(void) {
           strstr(out, "Location: https://RuTracker.org/forum/index.php?q=1\r\n") &&
           strstr(out, "provider-portal"),
           "explicit provider portal redirect did not restart navigation over HTTPS");
+    CHECK(d2k_httpup_portal_response(get, sizeof get - 1, megafon_portal,
+                                     sizeof megafon_portal - 1, out, sizeof out),
+          "портал Megafon не распознан");
+    CHECK(d2k_httpup_portal_response(get, sizeof get - 1, rt_portal,
+                                     sizeof rt_portal - 1, out, sizeof out),
+          "портал Ростелекома не распознан");
+    CHECK(d2k_httpup_portal_response(get, sizeof get - 1, bounded_rt,
+                                     sizeof bounded_rt, out, sizeof out),
+          "ограниченный ответ без NUL не обработан");
+    CHECK(d2k_httpup_portal_response(get, sizeof get - 1, beeline_portal,
+                                     sizeof beeline_portal - 1, out, sizeof out),
+          "портал Beeline не распознан");
+    CHECK(d2k_httpup_portal_response(get, sizeof get - 1, megafon_deny,
+                                     sizeof megafon_deny - 1, out, sizeof out),
+          "портал отказа Megafon не распознан");
+    CHECK(!d2k_httpup_portal_response(get, sizeof get - 1, unrelated_rkn_path,
+                                      sizeof unrelated_rkn_path - 1, out, sizeof out),
+          "чужой редирект с путём /rkn ошибочно признан порталом");
     CHECK(!d2k_httpup_portal_response(get, sizeof get - 1, ordinary_cross_host,
                                       sizeof ordinary_cross_host - 1, out, sizeof out),
           "ordinary cross-host login redirect was mistaken for a filter portal");
