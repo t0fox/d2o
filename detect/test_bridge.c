@@ -507,6 +507,11 @@ int main(void)
         r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
         CHECK(r.verdict == D2K_V_FLAKY && r.split_pos == 0 && !r.have_arm && r.owns_search);
         dialled = 1;
+        memset(&answer, 0, sizeof answer);
+        answer.verdict = D2K_DV_FLAKY; answer.dial_deadline = 1;
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
+        CHECK(r.verdict == D2K_V_FLAKY && r.dial_deadline == 1);
+        memset(&answer, 0, sizeof answer);
         sweep_pass = box_takes;
         r = d2k_detect_sched_tcp("192.0.2.1", 443, tr, ctl, 0x2d, 2, 12000, 321, NULL);
         CHECK(r.have_arm);

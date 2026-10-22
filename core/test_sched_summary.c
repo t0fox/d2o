@@ -390,6 +390,7 @@ static void measurement_absence_is_retryable(d2k_sched *s) {
     t->state = T_ASKING;
     t->res_ready = 1;
     t->res.verdict = D2K_V_FLAKY;
+    t->res.dial_deadline = 1;
     snprintf(t->res.reason, sizeof t->res.reason, "замер не состоялся: адрес не принимал соединения");
     s->sync_pending = 0;
     (void)d2k_sched_tick(s, 900);
@@ -397,6 +398,15 @@ static void measurement_absence_is_retryable(d2k_sched *s) {
     CHECK(strstr(rows, "outcome=unknown") != NULL);
     CHECK(!cooldown_blocks(s, t->name, t->transport, t->family, t->ip, t->port,
                            D2K_SUSPECT_RST, &left, NULL));
+    task_reset(s, t);
+
+    t = fixture(s);
+    t->state = T_ASKING; t->res_ready = 1; t->res.verdict = D2K_V_FLAKY;
+    snprintf(t->res.reason, sizeof t->res.reason, "замер не состоялся: адрес не принимал соединения");
+    s->sync_pending = 0; rows[0] = '\0';
+    (void)d2k_sched_tick(s, 900);
+    CHECK(strstr(rows, "outcome=inconclusive path=none") != NULL);
+    task_reset(s, t);
 }
 
 static void quic_shape_does_not_cancel_tcp_measurement(d2k_sched *s) {
@@ -495,6 +505,42 @@ int main(void) {
     CHECK(strstr(rows, "исходящая лестница оборвалась около 19 КБ") != NULL);
     CHECK(strstr(rows, "пакетный бюджет потока: identity") == NULL);
     if (fails) fprintf(stderr, "%s\n", rows);
+    task_reset(s, t);
+
+    /* Поздний RX без подтверждённого 2xx не даёт исхода probe-direct. */
+    t = fixture(s);
+    t->state = T_ASKING; t->transport = 6;
+    t->trigger_code = D2K_SUSPECT_RST_AFTER_APP; t->res_ready = 1;
+    t->res.verdict = D2K_V_CLEAR; t->vol.verdict = D2K_VOL_PASSED;
+    t->vol.rx_unmeasured = 1;
+    s->sync_pending = 0; rows[0] = '\0';
+    (void)d2k_sched_tick(s, 900);
+    CHECK(strstr(rows, "outcome=inconclusive path=none") != NULL);
+    CHECK(strstr(rows, "outcome=probe-direct") == NULL);
+    CHECK(strstr(rows, "объём ответа измерить не удалось; прямой замер не подтверждён") != NULL);
+    task_reset(s, t);
+
+    /* Завершённый не-2xx выше полосы тоже не подтверждает прямой прикладной успех. */
+    t = fixture(s);
+    t->state = T_ASKING; t->transport = 6;
+    t->trigger_code = D2K_SUSPECT_RST_AFTER_APP; t->res_ready = 1;
+    t->res.verdict = D2K_V_CLEAR; t->vol.verdict = D2K_VOL_PASSED;
+    s->sync_pending = 0; rows[0] = '\0';
+    (void)d2k_sched_tick(s, 900);
+    CHECK(strstr(rows, "outcome=inconclusive path=none") != NULL);
+    CHECK(strstr(rows, "outcome=probe-direct") == NULL);
+    CHECK(strstr(rows, "прямой ответ не подтвердил прикладной успех; прямой замер не подтверждён") != NULL);
+    task_reset(s, t);
+
+    /* RX-пара с завершённым прикладным 2xx подтверждает прямой проход. */
+    t = fixture(s);
+    t->state = T_ASKING; t->transport = 6;
+    t->trigger_code = D2K_SUSPECT_RST_AFTER_APP; t->res_ready = 1;
+    t->res.verdict = D2K_V_CLEAR; t->vol.verdict = D2K_VOL_PASSED;
+    t->vol.rx_direct_complete = 1;
+    s->sync_pending = 0; rows[0] = '\0';
+    (void)d2k_sched_tick(s, 900);
+    CHECK(strstr(rows, "outcome=probe-direct path=direct") != NULL);
     task_reset(s, t);
 
     /* ЗАДАЧА 26, П.3: ДОКАЗАННЫЙ ПУТЬ ПЕРЕЖИВАЕТ ЭПИЗОД. Поле 12.10.2026,

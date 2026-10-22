@@ -1855,6 +1855,12 @@ static void dead_clear(d2k_sched *s, const task *t) {
     if (d) { memset(d, 0, sizeof *d); }
 }
 
+static inline int is_late_volume_suspicion(uint8_t code) {
+    return code == D2K_SUSPECT_RST_AFTER_APP ||
+           code == D2K_SUSPECT_FIN_RETRY ||
+           code == D2K_SUSPECT_TCP_STALL;
+}
+
 static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
                            uint8_t family, const char *ip, uint16_t port,
                            uint8_t signal_code, int64_t *remaining_ms,
@@ -2983,10 +2989,13 @@ static void *worker_run(void *vp) {
     }
 
     if (volume_after) {
-        if (r.verdict == D2K_V_CLEAR && !t->stop) {
-            /* Рукопожатие и запись прошли — теперь блок по объёму. Обрыв
-               ведёт той же веткой, что и прежде: направленная улика и
-               кандидат, без вердикта CLEAR. */
+        int allow_vol = (r.verdict == D2K_V_CLEAR ||
+                         (r.verdict == D2K_V_FLAKY &&
+                          is_late_volume_suspicion(t->trigger_code) &&
+                          !r.dial_deadline)) && !t->stop;
+        if (allow_vol) {
+            /* Для позднего обрыва FLAKY сам по себе не отменяет RX-пару:
+               исключение — истёкший срок нашего подключения, когда замера не было. */
             worker_volume(s, t, trig);
             if (worker_volume_cut(s, t)) { return NULL; }
         } else {
@@ -7129,6 +7138,35 @@ static int installed_family_ready(const d2k_sched *s, const task *t, uint64_t af
     return 0;
 }
 
+/* Та же совместимость форм, что использует датапат при выборе привязки. */
+static const d2k_cat_binding *binding_covering(const d2k_sched *s, const char *name,
+                                               uint8_t transport, uint8_t family,
+                                               uint8_t shape) {
+    const d2k_cat_binding *exact = NULL, *modern = NULL, *unshaped = NULL;
+    if (!s->cat || !name || !name[0]) { return NULL; }
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        const d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t i = 0; i < b->n_binds; i++) {
+            const d2k_cat_binding *bd = &b->binds[i];
+            if (!bd->enabled || bd->level < 3 || bd->recheck_since ||
+                strcmp(bd->kind, "name") != 0 || strcmp(bd->target, name) != 0 ||
+                (bd->transport ? bd->transport : 6) != transport ||
+                (bd->family ? bd->family : 4) != family) { continue; }
+            if (shape == 0 || bd->shape == shape) { if (!exact) exact = bd; }
+            else if (bd->shape == 0) { if (!unshaped) unshaped = bd; }
+            else if (bd->shape == (uint8_t)D2K_SHAPE_MODERN &&
+                     shape == D2K_LINK_SHAPE_ECH_TCP) { if (!modern) modern = bd; }
+        }
+    }
+    return exact ? exact : modern ? modern : unshaped;
+}
+
+static d2k_shape watch_shape(const task *t, const uint8_t *b, size_t n) {
+    if (!t->ech_grease && d2k_hello_ech_offer(b, n, NULL) == 1)
+        return (d2k_shape)D2K_LINK_SHAPE_ECH_TCP;
+    return d2k_hello_shape(b, n);
+}
+
 static int queued_family_ready(const d2k_sched *s, const task *t) {
     return t->queued_ms && t->trigger_planned == D2K_LINK_PLANNED_NO &&
         installed_family_ready(s, t, t->queued_event, 0);
@@ -7541,8 +7579,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
         t = NULL;
     }
     int ordinary_tcp_rst = ev->transport == 6 && ev->code == D2K_SUSPECT_RST;
-    const int late_app_rst = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
-        ev->code == D2K_SUSPECT_FIN_RETRY || ev->code == D2K_SUSPECT_TCP_STALL;
+    const int late_app_rst = is_late_volume_suspicion(ev->code);
     if (t && (t->state == T_VOICE_TRIAL || t->state == T_VOICE_WATCH) &&
         voice_trial_owned(t) && is_voice_class(t->name, t->transport) &&
         !voice_trial_same_context(t, ev)) {
@@ -7601,6 +7638,19 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
         !tcp_stall_in_name_band(s, name, ev)) {
         return 0;
     }
+    if (!t && !by_addr && ev->transport == 6 &&
+        ev->planned == D2K_LINK_PLANNED_NO) {
+        const d2k_cat_binding *bd = binding_covering(
+            s, name, 6, ev->family ? ev->family : 4, ev->client_shape);
+        if (bd) {
+            char quiet_key[300];
+            snprintf(quiet_key, sizeof quiet_key, "unplanned %u %s", ev->transport, name);
+            say_quiet(s, quiet_key, "по %s план %s уже подтверждён, а к этому потоку датапат "
+                      "его не применял — не улика, поиск не начинаю (причина — в журнале "
+                      "датапата)", name, bd->plan_id);
+            return 0;
+        }
+    }
     /* ПОЗДНЕЕ ЗАКРЫТИЕ — ЗАМЕР С ПЕРВОГО СИГНАЛА (владелец, 15.10.2026).
        Прежде здесь ждали второго такого закрытия на независимом потоке за
        30 с. Клиент с одним соединением (старые телевизоры на webOS тянут
@@ -7612,7 +7662,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
        закрытия на 10 мин, и шторма замеров на одном имени не будет. */
     if ((ev->code == D2K_SUSPECT_RST_AFTER_APP ||
          (ev->code == D2K_SUSPECT_FIN_RETRY && ev->planned == D2K_LINK_PLANNED_NO)) &&
-        (!t || t->state == T_WATCHING)) {
+        (!t || (t->state == T_WATCHING && ev->planned != D2K_LINK_PLANNED_NO))) {
         char quiet_key[300];
         snprintf(quiet_key, sizeof quiet_key, "late %u %s", ev->transport, name);
         say_quiet(s, quiet_key, "по %s позднее закрытие (%s) — проверяю обрыв ответа сам, "
@@ -7632,20 +7682,25 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
         }
         if (late_app_rst) {
             if (t->state != T_WATCHING) { return 0; }
-            /* Сохраняем подтверждённую привязку и заменяем наблюдателя
-               адресным замером. */
-            say(s, "по %s позднее закрытие после app-data — проверяю повторяемость обрыва ответа",
-                t->name);
-            task_done(s, t);
-            t = NULL;
+            /* Позднее закрытие без плана не говорит о подтверждённой
+               привязке: продолжаем наблюдение и запрашиваем снимок формы
+               общей веткой ниже. На потоке под планом запускаем RX-замер. */
+            if (ev->planned != D2K_LINK_PLANNED_NO) {
+                say(s, "по %s позднее закрытие после app-data — проверяю повторяемость обрыва ответа",
+                    t->name);
+                task_done(s, t);
+                t = NULL;
+            }
         }
     }
     if (t) {
         /* Поиск уже идёт — но примета всё равно наша: отпечаток растёт по мере
            того, как коробка себя проявляет, и первое подозрение редко
            показывает её целиком. */
-        d2k_cat_signal sig = signal_of(ev);
-        fp_add(&t->fp, &sig);
+        if (!late_app_rst) {
+            d2k_cat_signal sig = signal_of(ev);
+            fp_add(&t->fp, &sig);
+        }
         if (t->state != T_WATCHING) { return 0; }
         /* А эта задача уже подтверждена и только смотрела на живой трафик.
            Новое подозрение по той же цели означает, что коробка вмешалась
@@ -7736,6 +7791,12 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
         size_t len = s->tcp_shape_len[t->family == 6];
         t->trigger_shape = d2k_hello_ech_offer(hello,len,NULL)==1 ?
                 D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(hello,len);
+    }
+    if (t->trigger_shape == D2K_LINK_SHAPE_ECH_TCP) {
+        const d2k_cat_binding *bd = binding_covering(s, name, 6, t->family,
+                                                     D2K_LINK_SHAPE_ECH_TCP);
+        if (bd && bd->shape == (uint8_t)D2K_SHAPE_MODERN)
+            t->trigger_shape = (uint8_t)D2K_SHAPE_MODERN;
     }
     if (t->trigger_planned == D2K_LINK_PLANNED_NO &&
         installed_family_ready(s, t, 0, 0)) {
@@ -8064,8 +8125,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         }
         if ((t->state == T_QUEUED || t->state == T_ASKING) && t->transport == 6 && ev->transport == 6 &&
             ev_matches_flow(ev,&t->trigger_flow) && !t->trigger_shape) {
-            t->trigger_shape=d2k_hello_ech_offer(ev->shape,ev->shape_len,NULL)==1 ?
-                D2K_LINK_SHAPE_ECH_TCP : (uint8_t)d2k_hello_shape(ev->shape,ev->shape_len);
+            t->trigger_shape=(uint8_t)watch_shape(t, ev->shape, ev->shape_len);
         }
         if (t->state == T_ASKING && t->transport == 6 && ev->transport == 6 &&
             strcmp(t->name, name) == 0) {
@@ -8106,9 +8166,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
             strcmp(t->name, name) == 0) {
             if (t->watch_shape_pending && t->transport == 6) {
                 t->watch_shape_pending = 0;
-                d2k_shape shape = d2k_hello_shape(ev->shape, ev->shape_len);
-                if (d2k_hello_ech_offer(ev->shape, ev->shape_len, NULL) == 1)
-                    shape = (d2k_shape)D2K_LINK_SHAPE_ECH_TCP;
+                d2k_shape shape = watch_shape(t, ev->shape, ev->shape_len);
                 int covered = 0;
                 for (size_t bi = 0; s->cat && bi < s->cat->n_boxes; bi++) {
                     const d2k_cat_box *b = &s->cat->boxes[bi];
@@ -8126,7 +8184,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
                     }
                 }
                 if (!covered && shape != D2K_SHAPE_UNKNOWN &&
-                    shape != d2k_hello_shape(t->trig, t->trig_len)) {
+                    shape != watch_shape(t, t->trig, t->trig_len)) {
                     snprintf(t->ip, sizeof t->ip, "%s", t->watch_shape_ip);
                     t->port = t->watch_shape_port;
                     t->started_ms = s->now_ms;
@@ -10305,6 +10363,20 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     (unsigned long long)(t->vol.rx_partial_wire_bytes
                         ? t->vol.rx_partial_wire_bytes : t->vol.rx_partial_bytes));
             }
+            if (r.verdict == D2K_V_CLEAR && is_late_volume_suspicion(t->trigger_code) &&
+                t->transport == 6 && !volume_proven && !t->vol.rx_direct_complete) {
+                r.verdict = D2K_V_INCONCLUSIVE;
+                if (t->vol.rx_unmeasured) {
+                    snprintf(r.reason, sizeof r.reason,
+                             "объём ответа измерить не удалось; прямой замер не подтверждён");
+                } else if (t->vol.verdict == D2K_VOL_SHORT) {
+                    snprintf(r.reason, sizeof r.reason,
+                             "объём ответа меньше полосы; прямой замер не подтверждён");
+                } else {
+                    snprintf(r.reason, sizeof r.reason,
+                             "прямой ответ не подтвердил прикладной успех; прямой замер не подтверждён");
+                }
+            }
             if (!verdict_proves_block(r.verdict) && !volume_proven && !t->ech_trial) {
                 say(s, "по %s прямой замер не подтвердил блокировку (%s: %s) — "
                        "подбор и применение обхода не запускаю",
@@ -10329,7 +10401,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            "это временный ограничитель, а не запись в каталоге",
                         t->name, (long long)((delay_ms + 59999) / 60000));
                 } else if (r.verdict == D2K_V_FLAKY && t->transport == 6 &&
-                           strstr(r.reason, "замер не состоялся")) {
+                           r.dial_deadline) {
                     search_report(s, t, now_ms, "unknown", "none");
                     say(s, "по %s замер не состоялся: адрес не принимал соединений во время "
                            "замера — это не отказ и не неубедительный замер; повторю при "

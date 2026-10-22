@@ -7,7 +7,7 @@ static int expected_legacy;
 static const char *expected_path;
 static size_t expected_wire;
 static int mark_calls;
-static int repeat_missing, opaque_reply;
+static int repeat_missing, opaque_reply, unmeasured_rx, early_rx, full_non_2xx;
 /* Поле 12.10.2026, www.tampermonkey.net: /style.css обрывается на линии восемь
    раз из восьми (15963 против 30182 с VPS), но ОДИН повтор зонда дошёл до
    конца. Шум линии не опровергает обрыв; третий прогон решает. */
@@ -64,6 +64,25 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
           wire == expected_wire && mark == 0x2f);
     CHECK(encoding == (baseline_calls == expected_gzip_call));
     d2k_ver_result r = {0};
+    if (unmeasured_rx || early_rx) {
+        r.fd = -1; r.level = D2K_VER_HANDSHAKE; r.name_ok = 1;
+        r.negotiated_tls = expected_legacy ? 0x0303 : 0x0304;
+        r.rx_tls_wire_bytes = 1400;
+        if (early_rx) {
+            r.status = 200; r.body_bytes = 4000;
+        }
+        baseline_calls++;
+        return r;
+    }
+    if (full_non_2xx) {
+        r.fd = -1; r.level = D2K_VER_APPLICATION; r.name_ok = 1;
+        r.negotiated_tls = expected_legacy ? 0x0303 : 0x0304;
+        r.status = 403; r.body_has_length = 1; r.body_framing_valid = 1;
+        r.body_complete = 1; r.body_bytes = r.body_expected = 20000;
+        r.rx_tls_wire_bytes = 20500;
+        baseline_calls++;
+        return r;
+    }
     r.fd = -1; r.status = 200; r.body_has_length = 1;
     r.body_framing_valid = 1; r.body_expected = 96460;
     r.body_bytes = 23900 + baseline_calls * 10;
@@ -196,6 +215,7 @@ int main(void) {
     d2k_vol_result partial = {0};
     probe_response_volume(&partial, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
     CHECK(!partial.rx_cut && !partial.rx_direct_complete && baseline_calls == 2);
+    CHECK(!partial.rx_unmeasured);
     CHECK(partial.rx_partial_bytes == 23900);
     CHECK(strstr(partial.rx_reason, "23900") && strstr(partial.rx_reason, "identity-2"));
     repeat_missing = 0; opaque_reply = 1;
@@ -207,6 +227,24 @@ int main(void) {
         CHECK(!wire.rx_partial_bytes && wire.rx_partial_wire_bytes == 14005);
         CHECK(strstr(wire.rx_reason, "14005/14025/4500") != NULL);
     }
+    opaque_reply = 0; unmeasured_rx = 1; baseline_calls = 0;
+    expected_legacy = 0; expected_wire = 1536; expected_path = NULL;
+    d2k_vol_result mute = {0};
+    probe_response_volume(&mute, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 2 && mute.rx_unmeasured && !mute.rx_tls_unavailable &&
+          !mute.rx_direct_complete && !mute.rx_cut);
+    unmeasured_rx = 0;
+    early_rx = 1; baseline_calls = 0;
+    d2k_vol_result early = {0};
+    probe_response_volume(&early, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 2 && early.rx_unmeasured && !early.rx_cut);
+    early_rx = 0;
+    full_non_2xx = 1; baseline_calls = 0;
+    d2k_vol_result fn2 = {0};
+    probe_response_volume(&fn2, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
+    CHECK(baseline_calls == 1 && !fn2.rx_cut && !fn2.rx_short &&
+          !fn2.rx_unmeasured && !fn2.rx_direct_complete);
+    full_non_2xx = 0;
     /* ПОЛЕ 12.10.2026, www.tampermonkey.net. /style.css: 30182 байта с VPS
        против 15963 с линии, восемь прогонов байт в байт, без RST и FIN. Зонд
        видел «identity-1 partial=15627; identity-2 HTTP 200 body=22094

@@ -279,6 +279,8 @@ typedef struct {
     /* This provider owns the whole domain-search workflow, including its
      * fallback probes. A missing arm is NOT permission for a second search. */
     int         owns_search;
+    /* Истёк срок нашего подключения: этот опыт не измерил цель. */
+    int         dial_deadline;
     /* ТОЛЬКО У БАЗОВОГО ВОПРОСА (d2k_sched_tcp_base_hook, задача 32): триггер
      * целиком, одной записью, не прошёл ни разу из повторов и без ошибок
      * транспорта — блокировка на рукопожатии подтверждена первым вопросом

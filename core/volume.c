@@ -403,6 +403,27 @@ static int resource_retry_path(const d2k_ver_result *a, const char *sni,
     return 0;
 }
 
+/* Повторяем один и тот же запрос, если TLS согласован, а HTTP-ответ ещё не
+   дал измеримых данных. Настоящий частичный ответ не повторяем: его измеряют
+   парой ниже. */
+static d2k_ver_result rx_probe(const char *ip, uint16_t port, const char *sni,
+                               size_t hello_wire, int tls12, int encoding,
+                               uint32_t mark, const char *path) {
+    d2k_ver_result r = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
+                                                hello_wire, tls12, encoding, mark, path);
+    int early = r.status >= 200 && r.status < 300 && !r.body_complete &&
+                r.body_bytes < (uint64_t)D2K_VOL_MIN_KB * 1024;
+    if ((r.status == 0 || early) && r.level == D2K_VER_HANDSHAKE && r.name_ok == 1 &&
+        (r.negotiated_tls == 0x0303 || r.negotiated_tls == 0x0304) &&
+        !r.local_limit && !d2k_volume_rx_partial(&r)) {
+        d2k_verify_close(&r);
+        nap_ms(RESPONSE_PROBE_GAP_MS);
+        r = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
+                                     hello_wire, tls12, encoding, mark, path);
+    }
+    return r;
+}
+
 /* Входящее измерение — другой вопрос, чем лестница исходящих HEAD выше.
    Ищем воспроизводимую асимметрию: два identity-ответа с одним framing видом
    обрываются на близком объёме, а gzip-представление той же страницы доходит
@@ -419,8 +440,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
                                    size_t hello_wire, uint32_t mark, const char *path,
                                    char *retry, size_t retry_cap) {
     if (!res || !ip || !sni || !sni[0] || port == 80) { return 0; }
-    d2k_ver_result a = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
-                                                  hello_wire, tls12, 0, mark, path);
+    d2k_ver_result a = rx_probe(ip, port, sni, hello_wire, tls12, 0, mark, path);
     res->rx_tls_unavailable = a.level == D2K_VER_TRANSPORT && a.status == 0;
     if (a.body_complete && a.status >= 200 && a.status < 300 &&
         a.http_outcome != D2K_HTTP_BLOCKED && a.http_outcome != D2K_HTTP_LEGAL_DENIAL) {
@@ -434,6 +454,11 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
              (unsigned long long)a.body_expected, a.body_complete, a.negotiated_tls,
              (unsigned long long)a.rx_tls_wire_bytes, a.rx_tls_record_missing, a.reason);
     if (!d2k_volume_rx_partial(&a)) {
+        if ((a.status == 0 || !a.body_complete) && a.level == D2K_VER_HANDSHAKE &&
+            a.name_ok == 1 && (a.negotiated_tls == 0x0303 || a.negotiated_tls == 0x0304) &&
+            !res->rx_direct_complete && !res->rx_tls_unavailable && !a.local_limit) {
+            res->rx_unmeasured = 1;
+        }
         /* ЗАВЕРШЁННЫЙ ОТВЕТ МЕНЬШЕ ПОЛОСЫ — БЮДЖЕТ НЕ ПРОВЕРЕН. Отличаем
            «обрыв не воспроизвёлся» от «мерить было нечем»: ответ дошёл до
            конца, но до D2K_VOL_MIN_KB ему не хватило объёма, поэтому про
@@ -455,8 +480,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
     if (rx_wire_partial(&a)) res->rx_partial_wire_bytes = a.rx_tls_wire_bytes;
     else res->rx_partial_bytes = a.body_bytes;
     nap_ms(RESPONSE_PROBE_GAP_MS);
-    d2k_ver_result b = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
-                                                  hello_wire, tls12, 0, mark, path);
+    d2k_ver_result b = rx_probe(ip, port, sni, hello_wire, tls12, 0, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity-1 partial=%llu/%llu TLS=%04x wire=%llu missing=%u; "
              "identity-2 HTTP %d body=%llu complete=%d TLS=%04x wire=%llu missing=%u: %.40s",
@@ -475,8 +499,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
         /* Повтор дошёл до конца, пройдя полосу: измерения РАСХОДЯТСЯ. Судит
            третий identity-прогон того же домена — см. d2k_volume_rx_needs_repeat. */
         nap_ms(RESPONSE_PROBE_GAP_MS);
-        d2k_ver_result c = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
-                                                      hello_wire, tls12, 0, mark, path);
+        d2k_ver_result c = rx_probe(ip, port, sni, hello_wire, tls12, 0, mark, path);
         int agreed = d2k_volume_rx_pair_agrees(&a, &c);
         snprintf(res->rx_reason, sizeof res->rx_reason,
                  "identity-1 partial=%llu wire=%llu; identity-2 HTTP %d body=%llu "
@@ -500,8 +523,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
         settled_by_third = "; пару решил identity-3";
     }
     nap_ms(RESPONSE_PROBE_GAP_MS);
-    d2k_ver_result gz = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
-                                                   hello_wire, tls12, 1, mark, path);
+    d2k_ver_result gz = rx_probe(ip, port, sni, hello_wire, tls12, 1, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity %llu/%llu (пакетов %u/%u); gzip HTTP %d, тело %llu, complete=%d, "
              "encoding=%d, пакетов %u; TLS RX wire=%llu/%llu/%llu missing=%u/%u/%u%s",
@@ -541,6 +563,7 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     uint64_t was = res->rx_short_bytes;
     res->rx_short = 0;
     res->rx_short_bytes = 0;
+    res->rx_unmeasured = 0;
     nap_ms(RESPONSE_PROBE_GAP_MS);
     (void)measure_response_volume(res, ip, port, sni, tls12, hello_wire, mark, retry,
                                   NULL, 0);
@@ -550,9 +573,11 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
        честный rx_short и возвращался ложным «обрыв не воспроизвёлся».
        Завершённый ответ повтора ВЫШЕ полосы — наоборот, настоящее
        отрицательное измерение: его не подменяем. */
-    if (res->rx_tls_unavailable && !res->rx_cut && !res->rx_short) {
+    if ((res->rx_tls_unavailable || res->rx_unmeasured) &&
+        !res->rx_cut && !res->rx_short) {
         res->rx_short = 1;
         res->rx_short_bytes = was;
+        res->rx_unmeasured = 0;
     }
     /* Журнал обязан называть путь повтора: иначе обрыв прочитают как обрыв
        на «/», которого там не было. Причина складывается в два приёма и с

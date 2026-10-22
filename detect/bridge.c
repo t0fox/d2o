@@ -302,6 +302,7 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
         return out;
     }
     out.verdict = map_verdict(res.verdict);
+    out.dial_deadline = res.dial_deadline;
     trace_questions(&res, opt.repeats, &out);
     out.split_gap_us = (uint32_t)opt.write_gap_ms * 1000u;
     snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);

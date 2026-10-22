@@ -82,6 +82,7 @@ static int voice_calls;
 static int voice_discovery_fixture;
 static int voice_seen_known;
 static d2k_verdict tcp_answer = D2K_V_OPAQUE;
+static int tcp_dial_deadline;
 static int tcp_owns_search;
 static int tcp_found_arm;
 static size_t tcp_last_wire;
@@ -175,6 +176,7 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
     d2k_vres r;
     memset(&r, 0, sizeof r);
     r.verdict = tcp_answer;
+    r.dial_deadline = tcp_dial_deadline;
     r.owns_search = tcp_owns_search;
     r.split_pos = tcp_owns_search ? 1 : 0;
     r.split_gap_us = 60000;
@@ -222,6 +224,7 @@ static d2k_vol_verdict vol_answer = D2K_VOL_PASSED;
 static int vol_rx_cut, vol_rx_wire_basis;
 static int vol_at_kb = 20;
 static int vol_rx_at_kb = 24;
+static int vol_rx_unmeasured;
 static int vol_rx_tls_unavailable;
 static int vol_direct_complete;
 static uint64_t vol_partial_bytes, vol_partial_wire_bytes;
@@ -259,6 +262,7 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     r.at_kb = vol_at_kb;
     int rx_cut = vol_rx_cut && !(vol_rx_cut_first_only && vol_calls > 1);
     r.rx_cut = rx_cut; r.rx_wire_basis = vol_rx_wire_basis;
+    r.rx_unmeasured = vol_rx_unmeasured;
     r.rx_tls_unavailable = vol_rx_tls_unavailable;
     r.rx_short = vol_rx_short;
     r.rx_short_bytes = vol_rx_short_bytes;
@@ -7629,6 +7633,133 @@ recheck_test:
         d2k_sched_free(s);
         d2k_catalog_free(&c);
     }
+    {
+        /* ECH offer GREASE и его снимок должны считаться TLS 1.3, если именно
+           такую форму выбирает подтверждённая привязка. */
+        const char *nm = "grease-watch.example";
+        d2k_catalog c = {0};
+        char pid[40];
+        own_box(&c, "box-grease-watch", pid, 71, 3, "grease-watch.own", 6,
+                D2K_SHAPE_MODERN, 4, 1790000000, 0);
+        d2k_sched_tcp_fn saved_base = d2k_sched_tcp_base_hook;
+        d2k_sched_tcp_base_hook = stub_base;
+        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+        base_blocked_answer = 1; base_wait_until_stop = 0;
+        base_calls = tcp_calls = ver_calls = 0;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6; sh.family = 4;
+        CHECK(ech_offer_hello(nm, sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+              "grease/watch: fixture");
+        ver_answer_port = 40651;
+        d2k_ev h = ev_hello(6, 40651, nm); d2k_sched_event(s, &h);
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40651); d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev ap = ev_applied(6, 40651); d2k_sched_event(s, &ap);
+        spin(s, 40);
+        CHECK(said("GREASE") && said("ПОДТВЕРЖДЕНО"),
+              "grease/watch: GREASE-клиент не подтверждён своим планом");
+        const d2k_cat_binding *bd = binding_of(&c, nm, 6);
+        CHECK(bd && bd->shape == D2K_SHAPE_MODERN && bd->input == D2K_INPUT_TRANSFER,
+              "grease/watch: привязка GREASE-клиента не TLS 1.3/перенос");
+        int base_before = base_calls, tcp_before = tcp_calls;
+        saidbuf[0] = '\0'; forget_sent();
+        h.high_port++; su.high_port++;
+        d2k_sched_event(s, &h);
+        su.planned = D2K_LINK_PLANNED_NO;
+        d2k_sched_event(s, &su); drain();
+        CHECK(sent_command_count(D2K_CMD_ARM_SHAPE, NULL, 0) == 1,
+              "grease/watch: поток без плана не запросил снимок");
+        d2k_sched_event(s, &sh); settle(s);
+        CHECK(!said("перемеряю снимком") && base_calls == base_before && tcp_calls == tcp_before,
+              "grease/watch: снимок подтверждённой цели завёл лишний перемер");
+        d2k_sched_free(s); d2k_catalog_free(&c);
+        d2k_sched_tcp_base_hook = saved_base;
+        d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+    }
+    {
+        /* 9. Поздний RST на потоке, к которому подтверждённый план не
+           применялся, не является уликой против плана: наблюдение должно
+           сохраниться, а снимок формы — запрашиваться. */
+        const char *nm = "late-unplanned.example";
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0;
+        confirm_once(&c, sv[0], nm, 40661);
+        d2k_cat_binding *m = binding_shape(&c, nm, 6, D2K_SHAPE_MODERN);
+        CHECK(m != NULL, "late/unplanned: fixture not confirmed");
+        if (m) m->input = D2K_INPUT_CLIENT;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        ver_answer_port = 40662;
+        d2k_ev h = ev_hello(6, 40662, nm); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40662); d2k_sched_event(s, &su); settle(s);
+        d2k_ev ap = ev_applied(6, 40662); d2k_sched_event(s, &ap); spin(s, 40);
+        CHECK(said("ПОДТВЕРЖДЕНО"), "late/unplanned: цель не подтверждена — наблюдать нечего");
+        vol_calls = tcp_calls = 0; saidbuf[0] = '\0'; forget_sent();
+        h.high_port++; su.high_port++;
+        su.code = D2K_SUSPECT_RST_AFTER_APP; su.planned = D2K_LINK_PLANNED_NO;
+        d2k_sched_event(s, &h); d2k_sched_event(s, &su); settle(s);
+        CHECK(!said("проверяю повторяемость обрыва ответа") && vol_calls == 0 && tcp_calls == 0,
+              "late/unplanned: поздний RST на потоке без плана снёс наблюдателя и перемерил");
+        CHECK(said("НЕ ПРИМЕНЯЛСЯ") && sent_command_count(D2K_CMD_ARM_SHAPE, NULL, 0) == 1,
+              "late/unplanned: наблюдение не продолжено / снимок не запрошен");
+        saidbuf[0] = '\0';
+        h.high_port++; su.high_port++; su.planned = D2K_LINK_PLANNED_YES;
+        d2k_sched_event(s, &h); d2k_sched_event(s, &su); settle(s);
+        CHECK(said("проверяю повторяемость обрыва ответа") && vol_calls == 1,
+              "late/unplanned: поздний RST под планом не перемерен");
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    {
+        /* Поток без плана после снятия наблюдателя не должен запускать поиск,
+           если подтверждённая форма его покрывает. */
+        const char *nm = "unplanned-nowatch.example";
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; tcp_owns_search = 0; tcp_found_arm = 0;
+        ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        vol_answer = D2K_VOL_PASSED; vol_rx_cut = 0;
+        confirm_once(&c, sv[0], nm, 40671);
+        d2k_cat_binding *m = binding_shape(&c, nm, 6, D2K_SHAPE_MODERN);
+        CHECK(m != NULL, "unplanned/nowatch: fixture not confirmed");
+        if (m) m->input = D2K_INPUT_CLIENT;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        ver_answer_port = 40672;
+        d2k_ev h = ev_hello(6, 40672, nm); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40672); d2k_sched_event(s, &su); settle(s);
+        d2k_ev ap = ev_applied(6, 40672); d2k_sched_event(s, &ap); spin(s, 40);
+        CHECK(said("ПОДТВЕРЖДЕНО"), "unplanned/nowatch: цель не подтверждена");
+        saidbuf[0] = '\0';
+        h.high_port++;
+        d2k_ev ex = ev_exchange(6, h.high_port, 1);
+        d2k_sched_event(s, &h); d2k_sched_event(s, &ex); settle(s);
+        CHECK(said("замечен последующий TLS-ответ"),
+              "unplanned/nowatch: наблюдатель не снят");
+        vol_calls = tcp_calls = 0; saidbuf[0] = '\0'; forget_sent();
+        h.high_port++; su.high_port++;
+        su.code = D2K_SUSPECT_RST_AFTER_APP;
+        su.planned = D2K_LINK_PLANNED_NO;
+        su.client_shape = D2K_LINK_SHAPE_ECH_TCP;
+        d2k_sched_event(s, &h); d2k_sched_event(s, &su); settle(s);
+        CHECK(!said("источник нового замера") && vol_calls == 0 && tcp_calls == 0,
+              "unplanned/nowatch: покрытый ECH GREASE-поток запустил повторный поиск");
+        CHECK(said("не улика, поиск не начинаю"),
+              "unplanned/nowatch: причина не названа");
+        saidbuf[0] = '\0';
+        h.high_port++; su.high_port++;
+        su.client_shape = D2K_SHAPE_LEGACY;
+        d2k_sched_event(s, &h); d2k_sched_event(s, &su); settle(s);
+        CHECK(said("источник нового замера"),
+              "unplanned/nowatch: непокрытая TLS 1.2 форма не измерена");
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
     if (recheck_only) { goto voice_only_done; }
 lifecycle_test:
     /* --- ЗАДАЧА 24: жизненный цикл задачи --------------------------------
@@ -9290,6 +9421,116 @@ rx_volume_tests:
         CHECK(!said("напрямую проходит") && said("результат неубедителен"),
               "partial RX body was incorrectly classified as direct success");
         vol_partial_bytes = vol_partial_wire_bytes = 0; vol_answer = D2K_VOL_PASSED;
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    {
+        /* FLAKY сам по себе не отменяет RX-пару позднего закрытия; локальный
+           срок подключения означает, что замер не состоялся и RX не нужен. */
+        d2k_catalog c = {0};
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        vol_rx_unmeasured = 0; vol_rx_cut = 1; vol_rx_at_kb = 18;
+        vol_direct_complete = 0; vol_answer = D2K_VOL_PASSED; vol_calls = 0;
+        tcp_answer = D2K_V_FLAKY; tcp_dial_deadline = 0; tcp_calls = 0;
+        uint8_t ech_bytes[2048]; size_t ech_len = 0;
+        CHECK(ech_offer_hello("flaky-vol.example", ech_bytes,
+                              sizeof ech_bytes, &ech_len) == 0,
+              "flaky-vol: ECH fixture не собрался");
+        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        d2k_ev h = ev_hello(6, 40383, "flaky-vol.example");
+        d2k_sched_event(s, &h);
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        memcpy(sh.shape, ech_bytes, ech_len); sh.shape_len = ech_len;
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40383);
+        su.code = D2K_SUSPECT_RST_AFTER_APP; su.planned = D2K_LINK_PLANNED_YES;
+        d2k_sched_event(s, &su); settle(s);
+        CHECK(vol_calls >= 1,
+              "flaky-vol: поздний обрыв после FLAKY не запустил RX-пару");
+        CHECK(!said("напрямую проходит"), "flaky-vol: неполная пара объявлена прямым проходом");
+        vol_rx_cut = 0; vol_answer = D2K_VOL_PASSED;
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    {
+        /* Таймаут локального подключения не является основанием для RX-пары. */
+        d2k_catalog c = {0};
+        char pid[40];
+        own_box(&c, "box-flaky-deadline", pid, 2, 3, "flaky-deadline.example", 6,
+                D2K_SHAPE_MODERN, 4, 1790000000, 0);
+        CHECK(total_bindings(&c) == 1, "flaky-deadline: начальная привязка не создана");
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        vol_rx_unmeasured = 0; vol_rx_cut = 1; vol_direct_complete = 0;
+        vol_answer = D2K_VOL_PASSED; vol_calls = 0;
+        tcp_answer = D2K_V_FLAKY; tcp_dial_deadline = 1; tcp_calls = 0;
+        uint8_t ech_bytes[2048]; size_t ech_len = 0;
+        CHECK(ech_offer_hello("flaky-deadline.example", ech_bytes,
+                              sizeof ech_bytes, &ech_len) == 0,
+              "flaky-deadline: ECH fixture не собрался");
+        d2k_sched_ech_resolve_hook = stub_ech_resolve;
+        d2k_ev h = ev_hello(6, 40387, "flaky-deadline.example");
+        d2k_sched_event(s, &h);
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        memcpy(sh.shape, ech_bytes, ech_len); sh.shape_len = ech_len;
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40387);
+        su.code = D2K_SUSPECT_RST_AFTER_APP; su.planned = D2K_LINK_PLANNED_YES;
+        d2k_sched_event(s, &su); settle(s);
+        CHECK(tcp_calls == 1, "flaky-deadline: TCP-замер не вызван");
+        CHECK(vol_calls == 0, "flaky-deadline: после таймаута подключения запущен RX-замер");
+        CHECK(total_bindings(&c) == 1,
+              "flaky-deadline: не состоявшийся замер удалил подтверждённую привязку");
+        CHECK(said("outcome=unknown path=none"),
+              "flaky-deadline: исход замера не отмечен как unknown");
+        tcp_dial_deadline = 0; vol_rx_cut = 0; vol_answer = D2K_VOL_PASSED;
+        d2k_sched_ech_resolve_hook = d2k_ech_resolve;
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+    {
+        /* Полный ответ без прикладного успеха (например, 403) не даёт
+           оснований объявлять поздний RX-прогон прямым проходом. */
+        d2k_catalog c = {0};
+        d2k_verdict saved_tcp = tcp_answer;
+        tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        confirm_once(&c, sv[0], "complete-403.example", 40384);
+        CHECK(total_bindings(&c) == 1, "complete-403: начальная привязка не создана");
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0'; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        vol_rx_cut = 0; vol_rx_unmeasured = 0; vol_rx_tls_unavailable = 0;
+        vol_rx_short = 0; vol_rx_short_bytes = 0; vol_direct_complete = 0;
+        vol_partial_bytes = vol_partial_wire_bytes = 0;
+        vol_answer = D2K_VOL_PASSED;
+        tcp_answer = D2K_V_PREFIX; tcp_calls = 0;
+        ver_answer_port = 40385;
+        d2k_ev initial = ev_hello(6, 40385, "complete-403.example");
+        d2k_sched_event(s, &initial);
+        d2k_ev initial_su = ev_suspect(6, 40385);
+        d2k_sched_event(s, &initial_su); settle(s);
+        d2k_ev initial_ap = ev_applied(6, 40385);
+        d2k_sched_event(s, &initial_ap); settle(s);
+        tcp_answer = D2K_V_CLEAR;
+        tcp_calls = vol_calls = 0; saidbuf[0] = '\0'; forget_sent();
+        d2k_ev h = ev_hello(6, 40386, "complete-403.example");
+        d2k_sched_event(s, &h);
+        d2k_ev sh;
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
+              "complete-403: TLS fixture не собрался");
+        d2k_sched_event(s, &sh);
+        d2k_ev su = ev_suspect(6, 40386);
+        su.code = D2K_SUSPECT_RST_AFTER_APP;
+        su.planned = D2K_LINK_PLANNED_YES;
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(tcp_calls == 0 && vol_calls == 1,
+              "complete-403: позднее закрытие не прошло через RX-only замер");
+        CHECK(said("outcome=inconclusive path=none") &&
+              !said("outcome=probe-direct") && !said("напрямую проходит"),
+              "complete-403: неприкладной RX-ответ объявлен прямым проходом");
+        CHECK(total_bindings(&c) == 1,
+              "complete-403: незавершённый RX повредил подтверждённую привязку");
+        tcp_answer = saved_tcp;
+        vol_direct_complete = 0; vol_answer = D2K_VOL_PASSED;
         d2k_sched_free(s); d2k_catalog_free(&c);
     }
     if (partial_only) goto voice_only_done;
