@@ -190,6 +190,10 @@ test-http-reply: test_http_reply
 	./test_http_reply
 test_http_reply: test_http_reply.c include/d2k_http_reply.h
 	$(CC) $(CFLAGS) -o $@ test_http_reply.c $(LDFLAGS)
+check: test-d2kfetch-cli
+.PHONY: test-d2kfetch-cli
+test-d2kfetch-cli: d2kfetch
+	python3 ../scripts/test-d2kfetch-cli.py
 check: test-domain test-groups
 check: test-groups-catalog
 .PHONY: test-groups-catalog

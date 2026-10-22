@@ -38,6 +38,39 @@
 #include "d2k_verify.h"
 #include "d2k_volume.h"
 
+static void json_string(const char *s) {
+    if (!s) { printf("null"); return; }
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') { putchar('\\'); putchar(*p); }
+        else if (*p < 32) printf("\\u%04x", *p);
+        else if (*p < 128) putchar(*p);
+        else {
+            unsigned width = *p >= 0xc2 && *p <= 0xdf ? 2 :
+                             *p >= 0xe0 && *p <= 0xef ? 3 :
+                             *p >= 0xf0 && *p <= 0xf4 ? 4 : 0;
+            int valid = width != 0;
+            for (unsigned i = 1; valid && i < width; i++)
+                if (!p[i] || (p[i] & 0xc0) != 0x80) valid = 0;
+            if (valid && ((*p == 0xe0 && p[1] < 0xa0) || (*p == 0xed && p[1] >= 0xa0) ||
+                          (*p == 0xf0 && p[1] < 0x90) || (*p == 0xf4 && p[1] >= 0x90))) valid = 0;
+            if (valid) { for (unsigned i = 0; i < width; i++) putchar(p[i]); p += width - 1; }
+            else printf("\\u%04x", *p);
+        }
+    }
+    putchar('"');
+}
+
+static const char *vol_verdict_code(d2k_vol_verdict v) {
+    switch (v) {
+    case D2K_VOL_UNREACHABLE: return "unreachable";
+    case D2K_VOL_CUT:         return "cut";
+    case D2K_VOL_PASSED:      return "passed";
+    case D2K_VOL_SHORT:       return "short";
+    default:                  return "unknown";
+    }
+}
+
 static void usage(void) {
     fprintf(stderr,
         "d2kfetch — обращение к цели как у браузера (через планы D2K)\n"
@@ -56,14 +89,16 @@ static void usage(void) {
         "              лестницу, которой меряет планировщик, и показать её\n"
         "              вердикт: так видно, совпадает ли её обрыв с тем, что\n"
         "              видит браузерное обращение\n"
-        "  --mark 0xN  метка SO_MARK для лестницы: с ней она идёт МИМО планов\n"
-        "              (так её гоняет планировщик), без неё — через планы\n"
+        "  --mark 0xN  сокетная метка SO_MARK; обход очереди — только при\n"
+        "              совпадении с MEASURE_MARK роутера (штатно 0x2f)\n"
         "  --quic      идти по QUIC/HTTP3 вместо TCP (как браузер по h3)\n"
         "  --tls12     старое приветствие TLS 1.2 вместо 1.3\n"
         "  --deadline  потолок на рукопожатие и на ответ, по умолчанию 15000 мс\n"
+        "  --json      машиночитаемый вывод одной строкой JSON\n"
+        "  --version   показать версию сборки и выйти\n"
         "\n"
-        "Обращение идёт НЕПОМЕЧЕННЫМ: датапат применяет к нему тот же план,\n"
-        "что и к потоку браузера. Это и есть смысл инструмента.\n");
+        "По умолчанию обращение идёт НЕПОМЕЧЕННЫМ: датапат применяет к нему тот\n"
+        "же план, что и к потоку браузера. Это и есть смысл инструмента.\n");
 }
 
 static int resolve_first(const char *name, char *out, size_t cap) {
@@ -123,7 +158,7 @@ int main(int argc, char **argv) {
     const char *name = NULL, *ip = NULL, *path = "/";
     uint16_t port = 443;
     size_t wire = 0;
-    int tls12 = 0, deadline = 15000, ladder = 0, quic = 0;
+    int tls12 = 0, deadline = 15000, ladder = 0, quic = 0, json = 0;
     uint32_t mark = 0;
     long snap_ms = 0;
 
@@ -140,8 +175,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--ladder")) { ladder = 1; }
         else if (!strcmp(a, "--quic")) { quic = 1; }
         else if (!strcmp(a, "--mark") && !last) { mark = (uint32_t)strtoul(argv[++i], NULL, 0); }
+        else if (!strcmp(a, "--json")) { json = 1; }
         else if (!strcmp(a, "--snapshot")) { snap_ms = 60000; }
         else if (!strncmp(a, "--snapshot=", 11)) { snap_ms = atol(a + 11); }
+        else if (!strcmp(a, "--version") || !strcmp(a, "-v")) {
+            printf("d2kfetch %s\n", D2K_RELEASE_ID);
+            return 0;
+        }
         else { usage(); return 2; }
     }
     if (!name || !name[0]) { usage(); return 2; }
@@ -169,9 +209,14 @@ int main(int argc, char **argv) {
 
     char addr[128];
     if (!ip || !ip[0]) {
-        if (resolve_first(name, addr, sizeof addr) != 0) {
-            fprintf(stderr, "имя %s не разрешилось\n", name);
-            return 1;
+        if ((ip && !ip[0]) || resolve_first(name, addr, sizeof addr) != 0) {
+            if (json) {
+                printf("{\"schema\":2,\"shape\":\"dns_failed\",\"measured\":false,\"name\":");
+                json_string(name); printf(",\"ip\":null,\"reason\":\"адрес не разрешился\"}\n");
+            } else {
+                fprintf(stderr, "имя %s не разрешилось\n", name);
+            }
+            return 2;
         }
         ip = addr;
     }
@@ -179,64 +224,133 @@ int main(int argc, char **argv) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     if (ladder) {
-        /* Та же проба, которой меряет планировщик. С меткой она идёт мимо
-           планов (меряет линию), без метки — через них, как браузер. */
+        /* Та же проба, которой меряет планировщик. Действие --mark зависит
+           от правил установленного роутера; непомеченная идёт через планы. */
         d2k_vol_result v = d2k_volume_probe_path(ip, port, name, port == 80,
-                                                  tls12, wire, mark,
-                                                  (path && path[0] && strcmp(path, "/"))
-                                                      ? path : NULL);
+                                                 tls12, wire, mark,
+                                                 (path && path[0] && strcmp(path, "/"))
+                                                     ? path : NULL);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         long lms = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+        if (json) {
+            printf("{\"schema\":2,\"shape\":\"ladder\",\"mode\":\"ladder\",\"name\":"); json_string(name);
+            printf(",\"ip\":"); json_string(ip);
+            printf(",\"port\":%u,\"verdict\":", port); json_string(vol_verdict_code(v.verdict));
+            printf(",\"verdict_human\":"); json_string(d2k_vol_verdict_name(v.verdict));
+            printf(",\"tx_passed\":%s,\"at_kb\":%d,\"rx_cut\":%s,\"rx_at_kb\":%d,"
+                   "\"elapsed_ms\":%ld,\"reason\":",
+                   v.verdict == D2K_VOL_PASSED ? "true" : "false",
+                   v.at_kb,
+                   v.rx_cut ? "true" : "false",
+                   v.rx_at_kb,
+                   lms);
+            json_string(v.reason);
+            printf(",\"rx_short\":%s,\"rx_unmeasured\":%s,\"rx_direct_complete\":%s,"
+                   "\"rx_tls_unavailable\":%s,\"measured_path\":",
+                   v.rx_short ? "true" : "false", v.rx_unmeasured ? "true" : "false",
+                   v.rx_direct_complete ? "true" : "false", v.rx_tls_unavailable ? "true" : "false");
+            json_string(v.measured_path);
+            printf(",\"rx_reason\":"); json_string(v.rx_reason); puts("}");
+            if (v.verdict == D2K_VOL_CUT || v.rx_cut) return 1;
+            if (v.verdict == D2K_VOL_PASSED && !v.rx_cut) return 0;
+            return 2;
+        }
         printf("цель:        %s (%s:%u), путь %s\n", name, ip, (unsigned)port, path);
-        printf("приветствие: %zu байт, %s, метка 0x%x\n", wire,
-               tls12 ? "TLS 1.2" : "TLS 1.3", (unsigned)mark);
+        if (mark) {
+            printf("приветствие: %zu байт, %s, метка 0x%x\n", wire,
+                   tls12 ? "TLS 1.2" : "TLS 1.3", (unsigned)mark);
+        } else {
+            printf("приветствие: %zu байт, %s, через планы (как браузер, без метки)\n", wire,
+                   tls12 ? "TLS 1.2" : "TLS 1.3");
+        }
         printf("лестница:    %s%s\n", d2k_vol_verdict_name(v.verdict),
-               v.verdict == D2K_VOL_CUT ? "" : " (обрыва нет)");
+               v.verdict == D2K_VOL_PASSED ? " (исходящая лестница пройдена)" : "");
         if (v.at_kb) { printf("оборвалась:  около %d КБ\n", v.at_kb); }
         if (v.rx_cut) { printf("вход:        обрыв ответа около %d КБ\n", v.rx_at_kb); }
         printf("время:       %ld мс\n", lms);
         if (v.reason[0]) { printf("причина:     %s\n", v.reason); }
-        return v.verdict == D2K_VOL_CUT || v.rx_cut ? 1 : 0;
+        if (v.verdict == D2K_VOL_CUT || v.rx_cut) return 1;
+        if (v.verdict == D2K_VOL_PASSED && !v.rx_cut) return 0;
+        return 2;
     }
     /* Без --mark обращение идёт НЕПОМЕЧЕННЫМ, и датапат применяет к нему тот
        же план, что к потоку браузера, — ради этого инструмент и сделан.
-       С --mark пакеты уходят мимо очереди: так видно ГОЛУЮ линию, без
-       обхода. Два прогона рядом отвечают на вопрос «обход работает или
-       блокировки уже нет».
+       Для голой линии нужен --mark, совпадающий с MEASURE_MARK в правилах
+       роутера (штатно 0x2f). Произвольная метка обхода очереди не гарантирует.
        «/» задаётся как NULL: у probe_path непустой путь — это свидетель-
        таблица стилей со своей проверкой допустимости, и «/» она отвергает. */
     const char *req = (path && path[0] && strcmp(path, "/")) ? path : NULL;
-    /* QUIC-зонд метки не принимает по устройству: по QUIC инструмент всегда
-       идёт через планы. */
     d2k_ver_result r = quic
-        ? d2k_verify_probe_quic_path_on(-1, ip, port, name, deadline, wire, req)
+        ? d2k_verify_probe_quic_path_mark_on(-1, ip, port, name, deadline, wire, mark, req)
         : d2k_verify_probe_path_on(-1, ip, port, name, deadline,
                                    wire, tls12, 0, mark, req);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long ms = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
 
-    printf("цель:        %s (%s:%u), путь %s\n", name, ip, (unsigned)port, path);
-    printf("приветствие: %zu байт, %s, %s\n", wire, tls12 ? "TLS 1.2" : "TLS 1.3",
-           mark ? "МИМО планов (голая линия)" : "через планы (как браузер)");
-    printf("TLS:         %s\n",
-           r.negotiated_tls == 0x0304 ? "1.3" :
-           r.negotiated_tls == 0x0303 ? "1.2" : "рукопожатия нет");
-    printf("HTTP:        %d\n", r.status);
-    if (r.body_has_length || r.body_chunked || r.body_bytes) {
-        printf("тело:        %llu из %llu байт%s%s\n",
-               (unsigned long long)r.body_bytes,
-               (unsigned long long)r.body_expected,
-               r.body_chunked ? " (chunked)" : "",
-               r.body_encoding == 1 ? ", gzip" : "");
+    if (json) {
+        printf("{\"schema\":2,\"client\":\"d2k-own-profile\",\"name\":");
+        json_string(name); printf(",\"shape\":"); json_string(quic ? "quic" : "tcp");
+        printf(",\"ip\":"); json_string(ip);
+        printf(",\"port\":%u,\"path\":", port); json_string(path);
+        printf(",\"protocol\":"); json_string(quic ? "quic" : tls12 ? "tls12" : "tls13");
+        /* app_progress в QUIC считает поток запроса целиком, включая заголовки
+           HTTP/3 и обрамление; проверка пока разбирает только :status. */
+        if (quic) {
+            printf(",\"body_bytes\":null,\"quic_stream_bytes\":%llu,"
+                   "\"body_expected\":null,\"body_has_length\":null,"
+                   "\"headers_inspected\":false,\"location\":null,\"cloudflare_challenge\":null",
+                   (unsigned long long)r.body_bytes);
+        } else {
+            printf(",\"body_bytes\":%llu,\"body_expected\":%llu,\"body_has_length\":%s,"
+                   "\"headers_inspected\":true,\"cloudflare_challenge\":%s,\"location\":",
+                   (unsigned long long)r.body_bytes, (unsigned long long)r.body_expected,
+                   r.body_has_length ? "true" : "false", r.cloudflare_challenge ? "true" : "false");
+            json_string(r.location);
+        }
+        printf(",\"wire_requested\":%zu,\"mark\":%u,\"elapsed_ms\":%ld,\"local_port\":%u,"
+               "\"negotiated_tls\":%u,\"http_status\":%d,"
+               "\"response_complete\":%s,\"level\":%d,\"local_refusal\":%s,\"measured\":%s,"
+               "\"name_ok\":%d",
+               wire, mark, ms, (unsigned)r.local_port, (unsigned)r.negotiated_tls, r.status,
+               r.body_complete ? "true" : "false", r.level,
+               r.local_refusal ? "true" : "false", r.local_refusal ? "false" : "true", r.name_ok);
+        printf(",\"reason\":");
+        json_string(r.reason); puts("}");
+    } else {
+        printf("цель:        %s (%s:%u), путь %s\n", name, ip, (unsigned)port, path);
+        if (mark) {
+            printf("приветствие: %zu байт, %s, метка 0x%x\n", wire,
+                   quic ? "QUIC (HTTP/3)" : tls12 ? "TLS 1.2" : "TLS 1.3",
+                   (unsigned)mark);
+        } else {
+            printf("приветствие: %zu байт, %s, через планы (как браузер, без метки)\n", wire,
+                   quic ? "QUIC (HTTP/3)" : tls12 ? "TLS 1.2" : "TLS 1.3");
+        }
+        printf("TLS:         %s\n",
+               quic ? (r.level >= D2K_VER_HANDSHAKE ? "QUIC (TLS 1.3)" : "рукопожатия нет") :
+               r.negotiated_tls == 0x0304 ? "1.3" :
+               r.negotiated_tls == 0x0303 ? "1.2" : "рукопожатия нет");
+        printf("HTTP:        %d\n", r.status);
+        if (quic) {
+            printf("поток H3:    %llu байт, включая заголовки и обрамление; тело отдельно не измерено\n",
+                   (unsigned long long)r.body_bytes);
+        } else if (r.body_has_length || r.body_chunked || r.body_bytes) {
+            printf("тело:        %llu из %llu байт%s%s\n",
+                   (unsigned long long)r.body_bytes,
+                   (unsigned long long)r.body_expected,
+                   r.body_chunked ? " (chunked)" : "",
+                   r.body_encoding == 1 ? ", gzip" : "");
+        }
+        printf("итог:        %s\n",
+               r.local_refusal ? "НЕ ИЗМЕРЕНО: локальный отказ"
+               : r.body_complete ? "ОТВЕТ ПОЛУЧЕН ЦЕЛИКОМ"
+               : r.status      ? "ОБРЫВ: ответ начался и не доехал"
+                               : "ОБРЫВ: ответа нет");
+        printf("время:       %ld мс, местный порт %u\n", ms, (unsigned)r.local_port);
+        if (r.reason[0]) { printf("причина:     %s\n", r.reason); }
     }
-    printf("итог:        %s\n",
-           r.body_complete ? "ОТВЕТ ПОЛУЧЕН ЦЕЛИКОМ"
-           : r.status      ? "ОБРЫВ: ответ начался и не доехал"
-                           : "ОБРЫВ: ответа нет");
-    printf("время:       %ld мс, местный порт %u\n", ms, (unsigned)r.local_port);
-    if (r.reason[0]) { printf("причина:     %s\n", r.reason); }
     d2k_verify_close(&r);
-    /* 0 — ответ целиком; 1 — оборвано; так вызывающий скрипт отличит их без
-       разбора текста. */
+    /* 0 — ответ целиком; 2 — локальный отказ (не измерено); 1 — оборвано */
+    if (r.local_refusal) { return 2; }
     return r.body_complete ? 0 : 1;
 }
