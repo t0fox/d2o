@@ -41,7 +41,9 @@
  * касаются вовсе. Всё остальное делает цикл. Причина — в шапке d2k_sched.h
  * (единственное подключение к датапату) и в комментарии у Run на Go-стороне.
  */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #if defined(__linux__)
 #define _DEFAULT_SOURCE   /* madvise: ячейка задачи отдаёт страницы (задача 60) */
 #include <sys/mman.h>
@@ -1326,6 +1328,8 @@ struct d2k_sched {
     int          sync_weak;   /* привязки, чьё доказательство слабее обмена */
     int          sync_unshaped; /* адресные привязки без однозначной формы протокола */
     int          sync_recheck;  /* привязки «требует повторной проверки» (задача 21) */
+    int          sync_refused;  /* отказы датапата на планах каталога с прошлой сводки */
+    unsigned     sync_refused_code; /* причина последнего отказа */
     installed_area *areas;
     size_t n_areas;
     installed_area area_pending;
@@ -6163,7 +6167,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
         s->sync_active = 0;
         stall_budgets_push(s);
         if (s->sync_sent > 0 || s->sync_skipped > 0 || s->sync_weak > 0 ||
-            s->sync_unshaped > 0 || s->sync_recheck > 0) {
+            s->sync_unshaped > 0 || s->sync_recheck > 0 || s->sync_refused > 0) {
             say(s, "каталог: поставлено планов по подтверждённым привязкам: %d%s",
                 s->sync_sent, s->sync_skipped ? " (пропущено негодных: см. выше)" : "");
             if (s->sync_weak > 0) {
@@ -6179,6 +6183,12 @@ int d2k_sched_sync_step(d2k_sched *s) {
             if (s->sync_recheck > 0) {
                 say(s, "каталог: не поставлено привязок, ждущих повторной проверки "
                        "после прямого прохода: %d", s->sync_recheck);
+            }
+            if (s->sync_refused > 0) {
+                say(s, "каталог: датапат отверг планов с прошлой сводки: %d (%s) — обход по "
+                       "этим целям не исполняется, причина в журнале датапата",
+                    s->sync_refused, ack_reason_text(s->sync_refused_code));
+                s->sync_refused = 0;
             }
         }
         return 0;
@@ -9388,6 +9398,13 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
             }
             s->area_command = 0;
             return 0;
+        }
+        if ((ev->code == D2K_CMD_SET_NAME || ev->code == D2K_CMD_SET_NAME_BOUND ||
+             ev->code == D2K_CMD_SET_SUFFIX || ev->code == D2K_CMD_SET_ADDR) &&
+            ((ev->num >> 8) & 0xffu) != 1u) {
+            /* Подтверждение не содержит имени цели: считаем отказ до следующей сводки. */
+            s->sync_refused++;
+            s->sync_refused_code = ev->num & 0xffu;
         }
         /* ТИП КОМАНДЫ В ПОДТВЕРЖДЕНИИ ЕСТЬ, И ОН ОБЯЗАТЕЛЕН.
            Имени цели подтверждение не несёт, но тип команды несёт (d2k_link.h:

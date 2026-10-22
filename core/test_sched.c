@@ -29,7 +29,9 @@
  * `c.remember(ev.Key, ev.Name)` на EvHello). Поэтому каждый случай ниже сперва
  * шлёт приветствие и лишь затем подозрение: тест, который клал бы имя прямо в
  * подозрение, проверял бы путь, которого на проводе не существует. */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #define _XOPEN_SOURCE 700 /* strptime under -std=c99 on glibc/musl */
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
@@ -8400,6 +8402,81 @@ lifecycle_test:
                   "подтверждённой либо пропала молча");
             d2k_sched_free(s);
             d2k_catalog_free(&c7);
+        }
+    }
+
+    /* Отказ датапата на планах каталога виден в сводке прохода. */
+    {
+        d2k_catalog c9;
+        memset(&c9, 0, sizeof c9);
+        c9.boxes = calloc(1, sizeof *c9.boxes);
+        CHECK(c9.boxes != NULL, "каталог для отказов не завёлся");
+        if (c9.boxes) {
+            c9.n_boxes = 1;
+            c9.boxes[0].plans = calloc(1, sizeof *c9.boxes[0].plans);
+            c9.boxes[0].binds = calloc(1, sizeof *c9.boxes[0].binds);
+            CHECK(c9.boxes[0].plans && c9.boxes[0].binds,
+                  "записи каталога для отказов не завелись");
+            if (c9.boxes[0].plans && c9.boxes[0].binds) {
+                c9.boxes[0].n_plans = c9.boxes[0].n_binds = 1;
+                snprintf(c9.boxes[0].id, sizeof c9.boxes[0].id, "box-отказ");
+                d2k_cat_plan *p = &c9.boxes[0].plans[0];
+                snprintf(p->id, sizeof p->id, "plan-отказ");
+                snprintf(p->proto, sizeof p->proto, "tls");
+                p->enabled = 1;
+                p->text = strdup("d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                                 "proto tcp tls\nsplit payload_start +1\norder reverse\n");
+                CHECK(p->text != NULL, "текст плана для отказа не завёлся");
+                d2k_cat_binding *bd = &c9.boxes[0].binds[0];
+                snprintf(bd->plan_id, sizeof bd->plan_id, "%s", p->id);
+                snprintf(bd->kind, sizeof bd->kind, "name");
+                snprintf(bd->target, sizeof bd->target, "отвергнутая.example");
+                bd->transport = 6;
+                bd->enabled = 1;
+
+                d2k_sched *s = d2k_sched_new(&c9, sv[0], 0x2d);
+                CHECK(s != NULL, "планировщик для отказов не создался");
+                saidbuf[0] = '\0';
+                d2k_sched_set_say(s, collect_say, NULL);
+                d2k_ev nak = {0};
+                nak.kind = D2K_EV_ACK;
+                nak.code = D2K_CMD_SET_NAME;
+                nak.num = (0u << 8) | D2K_ACK_BAD_PLAN;
+                d2k_sched_event(s, &nak);
+                d2k_sched_event(s, &nak);
+                CHECK(!said("датапат отверг планов"),
+                      "отказ напечатан до сводки прохода");
+                (void)d2k_sched_sync(s);
+                int rounds = 0;
+                while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+                drain();
+                CHECK(said("поставлено планов по подтверждённым привязкам: 1"),
+                      "проход по каталогу не подытожил поставленный план");
+                CHECK(said("датапат отверг планов с прошлой сводки: 2 (план не разобран или не "
+                           "годится способу отправки)"),
+                      "отказы планов каталога не попали в сводку прохода");
+                saidbuf[0] = '\0';
+                (void)d2k_sched_sync(s);
+                rounds = 0;
+                while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+                drain();
+                CHECK(!said("датапат отверг планов"),
+                      "отказ прошлой сводки объявлен повторно");
+                d2k_ev ok = {0};
+                ok.kind = D2K_EV_ACK;
+                ok.code = D2K_CMD_SET_NAME;
+                ok.num = 1u << 8;
+                d2k_sched_event(s, &ok);
+                saidbuf[0] = '\0';
+                (void)d2k_sched_sync(s);
+                rounds = 0;
+                while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+                drain();
+                CHECK(!said("датапат отверг планов"),
+                      "успешное подтверждение посчитано отказом");
+                d2k_sched_free(s);
+            }
+            d2k_catalog_free(&c9);
         }
     }
 
