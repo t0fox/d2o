@@ -204,6 +204,9 @@ static struct {
     uint64_t busy_lines;       /* строк «сокет полон» в журнале (первые 16) */
     uint64_t routes_watch;     /* уведомлений о правилах/маршрутах */
     uint64_t icmp_seen;        /* ICMP time-exceeded из очереди */
+    uint64_t hold_owned;       /* сегментов приветствия взято у ядра (DROP в слот) */
+    uint64_t hold_resent;      /* оригиналов возвращено на провод своей посылкой */
+    uint64_t hold_resend_fail; /* оригиналов, которые вернуть не удалось */
 } st;
 
 /* ICMP time-exceeded на собственные фальшивки с пониженным TTL (поле
@@ -407,6 +410,66 @@ static void delayed_verdict_done(void *ctx, const d2k_key *key,
  * У клиентских потоков строка «план не применён» есть на каждом, у зонда — ни
  * одной, и по общему счётчику («составной вход: начато=1 собрано=0
  * таймаутов=1») нельзя было сказать, ЧЕЙ это поток. Теперь можно. */
+/* ВЛАДЕНИЕ ВМЕСТО УДЕРЖАНИЯ (поле 21.10.2026, hello-shape-probe, rutracker.org).
+ *
+ * Приветствие Chrome (1734 Б, постквантовый key_share) не влезает в сегмент,
+ * и имя у него через раз лежит во втором куске. Голова без имени шла в слот,
+ * а вердикт ядру не выдавался до сборки. Для потоков самого роутера это
+ * тупик: пока голова лежит в очереди без вердикта, TCP-стек хвост не
+ * выпускает (ядро держит его за неотправленной головой), сборка не
+ * завершается никогда, через 100 мс голова уходит голой — и коробка режет
+ * рукопожатие. Прибор на роутере: Safari 6/6, Chrome 6/20; у провалов
+ * SYN→голова 150–360 мс против 60 у удач. У LAN-клиентов хвост приходит
+ * (стек не наш), и та же сборка работала.
+ *
+ * Поэтому сегмент, взятый в слот, снимается у ядра СРАЗУ (NF_DROP): копия
+ * уже в слоте, буфер ядра свободен, хвост выходит за ~0,2 мс и тоже ложится в
+ * слот. Лёг план — оригиналы ушли его посылкой, как и раньше у READY. Не лёг
+ * (таймаут, смена ревизии, несовместимый кусок, READY без плана) — оригиналы
+ * возвращаются на провод нашей посылкой, байт в байт, по порядку потока.
+ * Метка сырого сокета (0x2d) исключена из очереди правилом D2K_OUT, повторно
+ * они не удерживаются. Так уже живут хвосты удержанной пачки UDP (задачи 42,
+ * 46). Для TCP-стека DROP в OUTPUT после nf_queue — «отправлено»: номер
+ * сдвинут, ретрансмита до нашего повтора (≤ 100 мс, RTO ≥ 200 мс) не будет.
+ *
+ * Только TLS-удержание. Составной запрос HTTP (порт 80) остаётся на вердиктах:
+ * его оригиналу вердикт выдаёт http80 (замена вставки провайдера), и
+ * снимать его у ядра здесь нельзя. Режим наблюдения (без сырого сокета) —
+ * как было. */
+static int hold_owns(const hold_context *c, const uint8_t *p, size_t n) {
+    d2k_hold_info v;
+    if (!c || !c->raw || !d2k_hold_parse(p, n, &v)) { return 0; }
+    const uint8_t *tcp = p + v.ihl;
+    return !(tcp[2] == 0 && tcp[3] == 80);
+}
+
+/* Оригинал, уже снятый у ядра, — обратно на провод как есть. Ошибка отправки
+   — наша, не коробки: считается и называется, первые строки — в журнал. */
+static int resend_original(hold_context *c, const uint8_t *p, size_t n) {
+    char err[256];
+    if (d2k_raw_prepare(c->raw, p, n, err, sizeof err) != 0 ||
+        d2k_raw_send(c->raw, p, n, err, sizeof err) != 0) {
+        st.hold_resend_fail++;
+        st.send_fail++;
+        if (st.hold_resend_fail <= 16) {
+            fprintf(stderr, "d2kd: оригинал приветствия не возвращён на провод: %s\n", err);
+        }
+        return -1;
+    }
+    st.hold_resent++;
+    st.emitted++;
+    st.emitted_now++;
+    return 0;
+}
+
+static int resend_originals(hold_context *c, const d2k_hold_batch *b) {
+    int failed = 0;
+    for (size_t i = 0; i < b->orig_count; i++) {
+        if (resend_original(c, b->orig[i], b->orig_len[i]) != 0) { failed++; }
+    }
+    return failed;
+}
+
 static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n) {
     hold_context *c = ctx;
     /* A released segment is never marked (holds refuse marked packets), and
@@ -424,6 +487,12 @@ static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n)
     d2k_session_note_unassembled(c->sess, p, n, now_ns());
     d2k_session_observe_tcp(c->sess, p, n, now_ns());
     d2k_session_set_route_mark(c->sess, keep_mark);
+    if (hold_owns(c, p, n)) {
+        /* Ядро этот сегмент уже отдало (DROP при взятии в слот) — вердикта
+           у него нет, на провод он возвращается нашей посылкой. */
+        (void)resend_original(c, p, n);
+        return;
+    }
     (void)send_original_verdict(ctx, id, D2K_NF_ACCEPT);
 }
 
@@ -801,6 +870,9 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
            hs.started, hs.ready, hs.released, hs.timed_out, hs.timed_out_pkts,
            hs.plan_changed, hs.dropped_all, hs.joined, hs.mismatched, hs.sided,
            hs.full, hs.pending);
+    printf("владение приветствием: взято у ядра=%" PRIu64
+           " возвращено на провод оригиналов=%" PRIu64 " не возвращено=%" PRIu64 "\n",
+           st.hold_owned, st.hold_resent, st.hold_resend_fail);
     printf("пакетов %" PRIu64 ", байт %" PRIu64
            ", пропущено %" PRIu64 ", снято %" PRIu64 "\n",
            st.seen, st.bytes, st.accepted, st.dropped);
@@ -1508,6 +1580,9 @@ int main(int argc, char **argv) {
 
                     d2k_hold_batch batch;
                     memset(&batch, 0, sizeof batch);
+                    /* Группа READY, чьи оригиналы уже сняты у ядра (см.
+                       hold_owns): вердиктов им не будет, без плана — повтор. */
+                    int batch_owned = 0;
                     d2k_udp_hold_batch udp_batch;
                     memset(&udp_batch, 0, sizeof udp_batch);
                     int udp_replay = 0;
@@ -1557,13 +1632,31 @@ int main(int argc, char **argv) {
                         uint32_t anchor = 0;
                         int have_anchor = d2k_session_stream_anchor(sess, np.payload,
                                                                     np.payload_len, &anchor);
+                        /* Решается по ОРИГИНАЛУ до сборки: после READY np.payload
+                           — синтетический пакет, у него порт тот же, но правило
+                           должно читаться с того, что взято у ядра. */
+                        int owned_take = hold_owns(&hc, np.payload, np.payload_len);
                         int hr = d2k_hold_feed(holding, np.id, np.payload, np.payload_len,
                             t, d2k_session_plan_revision(sess),
                             d2k_session_hold_candidate(sess, np.payload, np.payload_len),
                             anchor, have_anchor,
                             release_original, &hc, &batch);
-                        if (hr == 1) { continue; } /* ID still held or already released */
+                        if (hr == 1) {
+                            /* Взят в слот (или уже возвращён на провод из него):
+                               у ядра копия больше не нужна — иначе хвост
+                               локального потока не выйдет (см. hold_owns). */
+                            if (owned_take) {
+                                (void)send_original_verdict(&hc, np.id, D2K_NF_DROP);
+                                st.hold_owned++;
+                            }
+                            continue; /* Идентификатор ещё удерживается или уже освобождён. */
+                        }
                         if (hr == 2) {
+                            if (owned_take) {
+                                (void)send_original_verdict(&hc, np.id, D2K_NF_DROP);
+                                st.hold_owned++;
+                                batch_owned = 1;
+                            }
                             np.payload = batch.packet;
                             np.payload_len = batch.len;
                         }
@@ -2002,6 +2095,15 @@ int main(int argc, char **argv) {
                            спланированного Initial снимался всякий раз. Только
                            в окне столкновения (та же пачка приёма или ≤5 мс);
                            позже — обычный ACCEPT. Вердикт выдан там. */
+                    } else if (!delayed_originals && batch_owned) {
+                        /* ОРИГИНАЛЫ СОБРАННОГО ПРИВЕТСТВИЯ УЖЕ У НАС (hold_owns).
+                           План лёг (fate drop) — они ушли его посылкой. Не лёг
+                           или отказан — возвращаются на провод как есть, по
+                           порядку потока. Вердиктов этим ID больше нет. */
+                        original_failed = 0;
+                        if (verdict == D2K_NF_ACCEPT) {
+                            original_failed = resend_originals(&hc, &batch) != 0;
+                        }
                     } else if (!delayed_originals) {
                         const uint32_t *original_ids = batch.count ? batch.ids : &np.id;
                         size_t original_count = batch.count ? batch.count : 1;

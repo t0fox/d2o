@@ -192,6 +192,30 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
     (void)d2k_hold_parse(s->packets[head_i], s->len[head_i], &hv);
     batch->count = s->count;
     memcpy(batch->ids, s->ids, s->count * sizeof s->ids[0]);
+    /* ОРИГИНАЛЫ — ПО ПОРЯДКУ ПОТОКА, а не прихода: владелец вернёт их на
+       провод сам, и серверу они нужны в том порядке, в каком их слал клиент.
+       Смещение от головы, беззнаковое — перенос номера через ноль учтён;
+       равные смещения (повтор того же куска) сохраняют порядок прихода. */
+    {
+        size_t order[D2K_HOLD_IDS];
+        uint32_t off[D2K_HOLD_IDS];
+        for (size_t i = 0; i < s->count; i++) {
+            d2k_hold_info pv;
+            off[i] = d2k_hold_parse(s->packets[i], s->len[i], &pv) ? pv.seq - hello_seq : 0;
+            order[i] = i;
+        }
+        for (size_t i = 1; i < s->count; i++) {
+            size_t k = order[i];
+            size_t j = i;
+            while (j > 0 && off[order[j - 1]] > off[k]) { order[j] = order[j - 1]; j--; }
+            order[j] = k;
+        }
+        batch->orig_count = s->count;
+        for (size_t i = 0; i < s->count; i++) {
+            batch->orig[i] = s->packets[order[i]];
+            batch->orig_len[i] = s->len[order[i]];
+        }
+    }
     batch->len = hv.header + hello_len;
     memcpy(batch->packet, s->packets[head_i], hv.header);
     memcpy(batch->packet + hv.header, hello, hello_len);

@@ -30,6 +30,15 @@ typedef struct {
     size_t len;
     /* Synthetic view for session/Plan only. NEVER send this packet itself. */
     uint8_t packet[D2K_HOLD_HEADER + D2K_CAPTURE_BYTES];
+    /* ОРИГИНАЛЫ ГОТОВОЙ ГРУППЫ — ПО ПОРЯДКУ ПОТОКА (seq от головы), байт в
+       байт как пришли. Нужны владельцу, который уже забрал их у ядра (DROP при
+       взятии в слот) и обязан вернуть на провод сам, если план на собранное
+       приветствие не лёг. Указатели — в память модуля: годны до следующего
+       d2k_hold_feed/d2k_hold_flush, копировать незачем (батч обнуляется на
+       каждом пакете, и 13 КиБ копий на каждом пакете роутеру не нужны). */
+    size_t orig_count;
+    const uint8_t *orig[D2K_HOLD_IDS];
+    size_t orig_len[D2K_HOLD_IDS];
 } d2k_hold_batch;
 typedef void (*d2k_hold_release)(void *ctx, uint32_t id, const uint8_t *p, size_t n);
 typedef struct d2k_hold d2k_hold;

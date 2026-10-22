@@ -54,6 +54,10 @@ int main(void) {
     CHECK(d2k_hold_feed(h, 2, p, n, 2, 1, 0, 0, 0, release, NULL, &batch)==2);
     CHECK(batch.count==2 && batch.ids[0]==1 && batch.ids[1]==2);
     CHECK(batch.len==40+sizeof hello && !memcmp(batch.packet+40,hello,sizeof hello));
+    /* Оригиналы — байт в байт и по порядку потока: голова, затем хвост. */
+    CHECK(batch.orig_count==2 && batch.orig_len[0]==1448+40 && batch.orig_len[1]==n);
+    CHECK(batch.orig[0] && !memcmp(batch.orig[0], old, 1448+40));
+    CHECK(batch.orig[1] && !memcmp(batch.orig[1], p, n));
     CHECK(!memcmp(batch.packet+24, old+24, 12)); /* seq/ACK/window from head */
     CHECK(d2k_hold_next(h)==0 && nreleased==0);
     /* Matching retransmit, reordering after head, wrap, tiny initial piece. */
@@ -66,6 +70,13 @@ int main(void) {
     n=packet(p,2001,seq+1,hello+1,99);
     CHECK(d2k_hold_feed(h,6,p,n,6,1,0, 0, 0,release,NULL,&batch)==2);
     CHECK(batch.count==4 && !memcmp(batch.packet+40,hello,sizeof hello));
+    /* Пришли: голова, её повтор, большой хвост (seq+100), кусок seq+1. Порядок
+       потока: голова, повтор (равное смещение — порядок прихода), seq+1, seq+100.
+       Перенос номера через ноль (seq = UINT32_MAX-40) учтён. */
+    CHECK(batch.orig_count==4 && batch.orig_len[0]==41 && batch.orig_len[1]==41 &&
+          batch.orig_len[2]==99+40 && batch.orig_len[3]==(sizeof hello-100)+40);
+    CHECK(batch.orig[2] && batch.orig[2][40]==hello[1] && !memcmp(batch.orig[2]+40, hello+1, 99));
+    CHECK(batch.orig[3] && !memcmp(batch.orig[3]+40, hello+100, sizeof hello-100));
     /* Timeout releases exact originals, not reconstructed bytes. */
     n=packet(p,2002,1000,hello,100);
     CHECK(d2k_hold_feed(h,7,p,n,7,1,1, 0, 0,release,NULL,&batch)==1);
