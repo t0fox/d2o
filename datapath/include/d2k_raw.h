@@ -127,6 +127,13 @@ size_t d2k_raw_route_maxlen_family(d2k_raw *r, const uint8_t *dst, uint8_t famil
  * d2k_plan.h). Никогда не ноль. */
 size_t d2k_raw_maxlen(const d2k_raw *r);
 
+/* Уточняет угаданный общий предел по MTU интерфейсов выхода сырой посылки.
+ * oifs — их индексы из поиска маршрута; названный оператором --iface предел
+ * не меняется. names получает читаемый список интерфейсов и MTU, если задан.
+ * 1 — предел изменён, 0 — тот же, -1 — уточнить не удалось или предел назван. */
+int d2k_raw_adopt_egress(d2k_raw *r, const uint32_t *oifs, size_t n,
+                         char *names, size_t names_cap);
+
 /* Отправляет готовый IPv4-пакет. Адрес назначения берётся из его заголовка.
  * 0 — отправлено, -1 — ошибка (причина в err, errno сохранён). Никогда не
  * ждёт: полный сокет — -1 с EAGAIN/EWOULDBLOCK/ENOBUFS (d2k_raw_busy). */

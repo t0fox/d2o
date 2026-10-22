@@ -183,6 +183,9 @@ jobs:
           node-version: '24'
       - name: ${{ matrix.run }}
         run: ${{ matrix.run }}
+      - name: Проверить MTU выхода сырого пакета в namespace
+        if: matrix.component == 'datapath'
+        run: sudo make -C datapath test-raw-cap-linux
 
   # ── Stage 3: sanitizers and integration ───────────────────────────────────
 

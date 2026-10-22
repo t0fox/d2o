@@ -369,6 +369,51 @@ static void routes_refresh(void) {
     }
 }
 static d2k_udp_path udp_path;
+static void cap_refresh(d2k_raw *raw, d2k_sched *sched, d2k_ctl *ctl,
+                        d2k_ctlsrv *cx) {
+    if (!raw || !sched || !cx) { return; }
+    uint32_t oifs[2 * D2K_ROUTEMARK_OIF_MAX];
+    size_t n = 0;
+    if (routes.oifs_read4) {
+        for (size_t i = 0; i < routes.n_oif4 && n < sizeof oifs / sizeof oifs[0]; i++) {
+            oifs[n++] = routes.oif4[i];
+        }
+    }
+    if (routes.oifs_read6) {
+        for (size_t i = 0; i < routes.n_oif6 && n < sizeof oifs / sizeof oifs[0]; i++) {
+            oifs[n++] = routes.oif6[i];
+        }
+    }
+    if (!n) { return; }
+    size_t before = d2k_raw_maxlen(raw);
+    char names[256];
+    int adopted = d2k_raw_adopt_egress(raw, oifs, n, names, sizeof names);
+    if (adopted < 0) { return; }
+    size_t after = d2k_raw_maxlen(raw);
+    if (adopted > 0) {
+        fprintf(stderr, "d2kd: предел длины посылки %zu байт — по MTU выхода сырой посылки (%s); "
+                        "было %zu%s\n", after, names, before,
+                before < after ? " — наименьший MTU среди поднятых интерфейсов, "
+                                 "туннель к делу не относится" : "");
+    }
+    /* Вместимость слотов фиксирована; расширяем очередь до объявления лимита. */
+    int grown = d2k_sched_grow_slot_size(sched, after);
+    static size_t failed_size = 0;
+    if (grown < 0) {
+        if (failed_size != after) {
+            fprintf(stderr, "d2kd: не удалось увеличить очередь до %zu байт — "
+                            "контроллеру оставлен прежний предел %u байт\n",
+                    after, cx->send_maxlen);
+            failed_size = after;
+        }
+        return;
+    }
+    failed_size = 0;
+    if (cx->send_maxlen == after) { return; }
+    cx->send_maxlen = (uint32_t)after;
+    if (ctl && d2k_ctl_peer_fd(ctl) >= 0) { d2k_ctlsrv_greet(ctl, cx->send_maxlen); }
+}
+
 static int send_original_verdict(void *ctx, uint32_t id, uint32_t verdict) {
     hold_context *c = ctx;
     char err[256];
@@ -1396,6 +1441,12 @@ int main(int argc, char **argv) {
         }
     }
     routes_refresh();
+    cap_refresh(raw, sched, ctl, &cx);
+    if (raw) {
+        fprintf(stderr, "d2kd: предел длины посылки для планов %u байт (%s)\n",
+                cx.send_maxlen, ifname ? "назван --iface" :
+                "по MTU выхода сырой посылки; если маршрут не прочитан — по MTU поднятых интерфейсов");
+    }
     uint64_t last_routes = now_ns();
     uint64_t next_routes = last_routes + D2K_ROUTEMARK_REFRESH_NS;
     udp_path.sess = sess;
@@ -1501,6 +1552,7 @@ int main(int argc, char **argv) {
         }
         if (now_ns() >= next_routes) {
             routes_refresh();
+            cap_refresh(raw, sched, ctl, &cx);
             ct_probe(sess, 0);
             last_routes = now_ns();
             next_routes = last_routes + D2K_ROUTEMARK_REFRESH_NS;
@@ -1510,7 +1562,7 @@ int main(int argc, char **argv) {
             if (il != (nfds_t)-1 && (pfd[il].revents & POLLIN)) {
                 d2k_ctl_accept(ctl);
                 /* Версия провода — первым делом, до любых других событий. */
-                d2k_ctlsrv_greet(ctl, raw ? (uint32_t)d2k_raw_maxlen(raw) : 0u);
+                d2k_ctlsrv_greet(ctl, cx.send_maxlen);
             }
             if (ip != (nfds_t)-1 && (pfd[ip].revents & (POLLIN | POLLHUP))) {
                 d2k_ctl_poll(ctl, d2k_ctlsrv_command, &cx);

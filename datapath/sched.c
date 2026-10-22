@@ -70,6 +70,23 @@ d2k_sched *d2k_sched_new(size_t slots, size_t slot_size) {
     return s;
 }
 
+int d2k_sched_grow_slot_size(d2k_sched *s, size_t slot_size) {
+    if (!s || !slot_size) { return -1; }
+    if (slot_size <= s->slot_size) { return 0; }
+    if (s->cap > (size_t)-1 / slot_size) { return -1; }
+    uint8_t *mem = calloc(s->cap, slot_size);
+    if (!mem) { return -1; }
+    for (size_t i = 0; i < s->n; i++) {
+        const entry *e = &s->heap[i];
+        memcpy(mem + e->slot * slot_size,
+               s->mem + e->slot * s->slot_size, e->len);
+    }
+    free(s->mem);
+    s->mem = mem;
+    s->slot_size = slot_size;
+    return 1;
+}
+
 void d2k_sched_free(d2k_sched *s) {
     if (!s) {
         return;

@@ -59,6 +59,34 @@ int main(void) {
         d2k_sched_free(s);
     }
 
+    /* --- очередь растёт вместе с уточнённым MTU выхода -------------------- */
+    {
+        d2k_sched *s = d2k_sched_new(2, 8);
+        uint8_t small[8], big[16], out[16];
+        size_t outlen = 0;
+        mark(small, sizeof small, 1);
+        mark(big, sizeof big, 2);
+        CHECK(d2k_sched_push(s, 10, small, sizeof small, &tag) == 0,
+              "маленькая посылка не попала в очередь до роста");
+        CHECK(d2k_sched_grow_slot_size(s, sizeof big) == 1,
+              "очередь не расширила слот");
+        CHECK(d2k_sched_grow_slot_size(s, sizeof big) == 0,
+              "повторное расширение изменило размер");
+        CHECK(d2k_sched_grow_slot_size(s, 4) == 0,
+              "запрос меньшего слота изменил очередь");
+        CHECK(d2k_sched_grow_slot_size(s, (size_t)-1) == -1,
+              "переполнение размера слота принято");
+        CHECK(d2k_sched_push(s, 11, big, sizeof big, &tag) == 0,
+              "посылка нового размера не попала в расширенную очередь");
+        CHECK(d2k_sched_pop_due(s, 10, out, sizeof out, &outlen, &back) == 1 &&
+              outlen == sizeof small && memcmp(out, small, sizeof small) == 0,
+              "рост очереди повредил уже ожидавшую посылку");
+        CHECK(d2k_sched_pop_due(s, 11, out, sizeof out, &outlen, &back) == 1 &&
+              outlen == sizeof big && memcmp(out, big, sizeof big) == 0,
+              "расширенная очередь повредила новую посылку");
+        d2k_sched_free(s);
+    }
+
     /* --- срок соблюдается -------------------------------------------------- */
     {
         d2k_sched *s = d2k_sched_new(4, 64);

@@ -50,6 +50,7 @@ struct d2k_raw {
     uint64_t busy;     /* EAGAIN/ENOBUFS: the socket is full, nothing waited */
     uint32_t mark;
     int      maxlen_declared;  /* предел назван оператором (--iface), а не угадан */
+    size_t   egress_mtu;       /* MTU выхода, принятый в прошлый раз */
     route_entry route[ROUTE_CACHE];
     size_t   route_next;
 };
@@ -275,6 +276,30 @@ size_t d2k_raw_maxlen(const d2k_raw *r) {
     /* Никогда не ноль: ноль означал бы «предел не объявлен», и вызывающий
        перестал бы проверять длину вовсе. */
     return (r && r->maxlen) ? r->maxlen : (size_t)D2K_RAW_MTU_FALLBACK;
+}
+
+int d2k_raw_adopt_egress(d2k_raw *r, const uint32_t *oifs, size_t n,
+                         char *names, size_t names_cap) {
+    if (names && names_cap) { names[0] = 0; }
+    if (!r || !oifs || !n || r->maxlen_declared) { return -1; }
+    size_t best = 0, w = 0;
+    for (size_t i = 0; i < n; i++) {
+        char name[IF_NAMESIZE] = "";
+        if (!oifs[i] || !if_indextoname(oifs[i], name)) { continue; }
+        unsigned m = if_mtu(name);
+        if (names && names_cap > w) {
+            int k = snprintf(names + w, names_cap - w, "%s%s %u", w ? ", " : "", name, m);
+            if (k > 0) { w += (size_t)k < names_cap - w ? (size_t)k : names_cap - w - 1; }
+        }
+        if (m < D2K_RAW_MTU_FLOOR) { continue; }
+        if (!best || m < best) { best = m; }
+    }
+    if (!best) { return -1; }
+    if (best == r->egress_mtu) { return 0; }
+    r->egress_mtu = best;
+    if (best == r->maxlen) { return 0; }
+    r->maxlen = best;
+    return 1;
 }
 
 /* Ответ маршрута против общего предела: см. maxlen_declared выше. */

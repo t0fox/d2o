@@ -39,6 +39,7 @@ datapath/*
 !datapath/*.c
 !datapath/*.h
 !datapath/Makefile
+!datapath/test_raw_cap.sh
 !datapath/include/
 !datapath/testdata/
 

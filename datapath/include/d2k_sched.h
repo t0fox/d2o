@@ -40,6 +40,10 @@ typedef struct d2k_sched d2k_sched;
 d2k_sched *d2k_sched_new(size_t slots, size_t slot_size);
 void       d2k_sched_free(d2k_sched *s);
 
+/* Увеличивает размер ячейки, сохраняя ожидающие посылки. 1 — выросла,
+ * 0 — уже достаточна, -1 — некорректный размер или не хватило памяти. */
+int        d2k_sched_grow_slot_size(d2k_sched *s, size_t slot_size);
+
 /*  0 — принято.
  * -1 — очередь полна.
  * -2 — пакет длиннее слота.
