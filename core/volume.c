@@ -9,7 +9,9 @@
  * TX-ступень и RX-обрыв возвращаются отдельными полями и попадают в каталог
  * под разными видами приметы.
  */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>

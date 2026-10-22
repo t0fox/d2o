@@ -22,7 +22,9 @@
  * HTTP мог вернуть посредник. Это ограничение нельзя переносить с объёмного
  * измерителя на достоверность обхода без отдельной проверки подлинности.
  */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <errno.h>
 #include <stdio.h>

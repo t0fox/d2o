@@ -113,7 +113,9 @@
  * счёта (d2k_tally: pass/fail/marked/err) — она достаточно общая, чтобы не
  * заводить копию только ради другого имени типа.
  */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 /* IP_TTL (задача 6, приманка с укороченным TTL — см. qp_send_one) не POSIX:
  * на macOS <netinet/in.h> прячет его за этим переключателем при строгом
  * _POSIX_C_SOURCE (проверено эмпирически на машине разработки), на Linux/glibc

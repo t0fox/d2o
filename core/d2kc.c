@@ -17,7 +17,9 @@
  * fsync, rename. Оборванная запись каталога стоила бы всего накопленного
  * знания разом, а падение питания на роутере — обычное дело.
  */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "../runtime/d2k_runtime.h"
 #include "d2k_crypto.h"
 #include <errno.h>

@@ -1,4 +1,6 @@
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #define _DARWIN_C_SOURCE
 #define _DEFAULT_SOURCE 1
 #include <arpa/inet.h>

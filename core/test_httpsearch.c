@@ -1,5 +1,7 @@
 /* test_httpsearch.c — поиск обхода открытого HTTP (задача 51, шаг 4). */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>

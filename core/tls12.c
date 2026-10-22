@@ -23,7 +23,9 @@
  * подмены client_random: иначе наш Finished считался бы по байтам, которых
  * сервер не видел.
  */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include <errno.h>
 #include <poll.h>
 #include <stdarg.h>
