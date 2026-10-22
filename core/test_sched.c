@@ -9488,12 +9488,13 @@ rx_volume_tests:
     }
     {
         /* Полный ответ без прикладного успеха (например, 403) не даёт
-           оснований объявлять поздний RX-прогон прямым проходом. */
+           оснований объявлять поздний RX-прогон прямым проходом. TLS 1.2
+           исключает отдельный ECH-baseline: здесь проверяется именно RX-only. */
         d2k_catalog c = {0};
-        d2k_verdict saved_tcp = tcp_answer;
-        tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION;
-        ver_fail_first = 0;
-        confirm_once(&c, sv[0], "complete-403.example", 40384);
+        const char *nm = "complete-403.example";
+        char pid[40];
+        own_box(&c, "box-complete-403", pid, 2, 3, nm, 6,
+                D2K_SHAPE_LEGACY, 4, 1790000000, 0);
         CHECK(total_bindings(&c) == 1, "complete-403: начальная привязка не создана");
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         saidbuf[0] = '\0'; forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
@@ -9501,22 +9502,12 @@ rx_volume_tests:
         vol_rx_short = 0; vol_rx_short_bytes = 0; vol_direct_complete = 0;
         vol_partial_bytes = vol_partial_wire_bytes = 0;
         vol_answer = D2K_VOL_PASSED;
-        tcp_answer = D2K_V_PREFIX; tcp_calls = 0;
-        ver_answer_port = 40385;
-        d2k_ev initial = ev_hello(6, 40385, "complete-403.example");
-        d2k_sched_event(s, &initial);
-        d2k_ev initial_su = ev_suspect(6, 40385);
-        d2k_sched_event(s, &initial_su); settle(s);
-        d2k_ev initial_ap = ev_applied(6, 40385);
-        d2k_sched_event(s, &initial_ap); settle(s);
-        CHECK(said("ПОДТВЕРЖДЕНО"),
-              "complete-403: исходная подтверждённая привязка не перешла в наблюдение");
         tcp_answer = D2K_V_CLEAR;
         tcp_calls = vol_calls = 0; saidbuf[0] = '\0'; forget_sent();
-        d2k_ev h = ev_hello(6, 40386, "complete-403.example");
+        d2k_ev h = ev_hello(6, 40386, nm);
         d2k_sched_event(s, &h);
         d2k_ev sh;
-        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0,
+        CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_LEGACY) == 0,
               "complete-403: TLS fixture не собрался");
         d2k_sched_event(s, &sh);
         d2k_ev su = ev_suspect(6, 40386);
@@ -9538,7 +9529,6 @@ rx_volume_tests:
               "complete-403: неприкладной RX-ответ объявлен прямым проходом");
         CHECK(total_bindings(&c) == 1,
               "complete-403: незавершённый RX повредил подтверждённую привязку");
-        tcp_answer = saved_tcp;
         vol_direct_complete = 0; vol_answer = D2K_VOL_PASSED;
         d2k_sched_free(s); d2k_catalog_free(&c);
     }
