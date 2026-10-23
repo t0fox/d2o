@@ -256,6 +256,11 @@ static int emit_fake(d2k_emit *e, const d2k_plan *p, const struct d2k_fake *f,
         e->ttl = po->ttl;
         e->poison = po->flags;
         e->seq_shift = po->seq_shift;
+        e->ts_up = po->ts_up;
+        e->autottl = po->autottl;
+        e->autottl_delta = po->autottl_delta;
+        e->autottl_min = po->autottl_min;
+        e->autottl_max = po->autottl_max;
     }
     return 0;
 }
@@ -683,6 +688,11 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
                     e->ttl = ovl_po->ttl;
                     e->poison = ovl_po->flags;
                     e->seq_shift = ovl_po->seq_shift;
+                    e->ts_up = ovl_po->ts_up;
+                    e->autottl = ovl_po->autottl;
+                    e->autottl_delta = ovl_po->autottl_delta;
+                    e->autottl_min = ovl_po->autottl_min;
+                    e->autottl_max = ovl_po->autottl_max;
                 }
             }
             start = end;

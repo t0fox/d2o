@@ -984,6 +984,7 @@ static int handle_net_whitelist_key(jctx *j, const char *key, void *ctx, int dep
     d2k_net_whitelist *n = (d2k_net_whitelist *)ctx;
     if (!strcmp(key, "name")) return jparse_string_fixed(j, n->name, sizeof n->name, "network_whitelist.name", err, errcap);
     if (!strcmp(key, "searched")) return jparse_bool_i(j, &n->searched, "network_whitelist.searched", err, errcap);
+    if (!strcmp(key, "tx_only")) return jparse_bool_i(j, &n->tx_only, "network_whitelist.tx_only", err, errcap);
     if (!strcmp(key, "confirmed_utc")) return jparse_rfc3339(j, &n->confirmed_at, "network_whitelist.confirmed_utc", err, errcap);
     return jskip_value(j, depth + 1, err, errcap);
 }
@@ -1387,6 +1388,9 @@ int d2k_catalog_save(const d2k_catalog *c, const char *path, char *err, size_t e
         fputs(",\n  \"network_whitelist\": {\"name\": ", f);
         write_json_string(f, c->net.name);
         fprintf(f,", \"searched\": %s", c->net.searched?"true":"false");
+        /* Пишется только когда взведён: старый каталог не обрастает ключом, а
+           его отсутствие читается как «доказано входящим обрывом». */
+        if(c->net.tx_only) { fputs(", \"tx_only\": true", f); }
         if(c->net.confirmed_at) {
             char at[32]; format_rfc3339(c->net.confirmed_at,at,sizeof at);
             fprintf(f,", \"confirmed_utc\": \"%s\"",at);

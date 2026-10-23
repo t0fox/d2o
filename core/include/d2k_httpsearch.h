@@ -171,6 +171,12 @@ size_t d2k_hs_plan_poisons(const char *plan_text, char out[][64], size_t cap);
 /* Поиск, в котором ни один кандидат не судим (нет исполнения, отказ
  * датапата, нет подтверждения), — не измерен: план не снимается, «обход не
  * найден» не говорится, повтор — через этот срок (ревью I-2). */
+/* ПОВТОРОВ БАЗЫ ПОСЛЕ МЕСТНОГО ОТКАЗА СОЕДИНЕНИЯ. Поле 23.10.2026: один
+ * неустановившийся сокет нашего зонда закрывал цель с настоящим обрывом на
+ * 10 минут. Один повтор — не бюджет, а отличение нашего сбоя от ответа
+ * коробки: о коробке местный отказ не говорит ничего (§2.4). */
+#define D2K_HS_BASE_RETRIES 1
+
 #define D2K_HS_INCONCLUSIVE_MS (5ll * 60 * 1000)
 /* Requires the current ACKed permanent binding and a completed request execution.
  * Unknown/stale identity is ignored; plan hash and timestamps alone are not proof. */

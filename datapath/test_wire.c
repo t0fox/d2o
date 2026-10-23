@@ -74,6 +74,108 @@ static void check_golden(void) {
 }
 
 int main(void) {
+    /* --- tcp_ts_up: МЕТКА ВРЕМЕНИ ПЕРВОЙ В ОПЦИЯХ ------------------------
+     * Документация zapret2, standard fooling: «поднять tcp timestamp опцию в
+     * самое начало, если она есть», и там же объяснение — «если есть tcp опция
+     * timestamp, linux стабильно отбрасывает пакеты с валидным seq и
+     * инвалидным ack ТОЛЬКО ЕСЛИ ОПЦИЯ ИДЁТ ПЕРВОЙ. nfqws1 не соблюдал
+     * порядок tcp опций, timestamp получался первым всегда. Поэтому
+     * оказалось, что старая версия работает стабильно, а новая нет».
+     *
+     * Профиль tcp-template-v1 копирует опции потока КАК ЕСТЬ, то есть условие
+     * срабатывания наших tcpts-планов зависит от того, где клиент поставил
+     * метку, и от нас это скрыто. Приём поднимает её в начало. */
+    {
+        /* Опции клиента: SACK-permitted, затем метка времени (не первая). */
+        static const uint8_t opts[] = {1, 1, 4, 2, 8, 10, 0x11, 0x22, 0x33, 0x44,
+                                       0, 0, 0, 0, 1, 1};
+        const uint8_t data[] = {7, 8, 9};
+        uint8_t out[128];
+        d2k_conn c = {.family = 4, .ttl = 64, .window = 1024};
+        memcpy(c.tcp_options, opts, sizeof opts);
+        c.tcp_options_len = sizeof opts;
+        d2k_emit e = {.bytes = data, .len = sizeof data, .seq = 9,
+                      .wire_profile = D2K_WIRE_TCP_TEMPLATE,
+                      .poison = D2K_POISON_TCPTS_BACK, .ts_up = 1};
+        size_t n = d2k_wire_build(&c, &e, out, sizeof out);
+        CHECK(n > 40, "tcp_ts_up: посылка не собралась");
+        if (n > 40) {
+            const uint8_t *o = out + 20 + 20;
+            CHECK(o[0] == 8 && o[1] == 10,
+                  "tcp_ts_up: метка времени не поднята в начало опций");
+            /* Значение по-прежнему сдвинуто назад: приём не отменяет порчу. */
+            uint32_t ts = (uint32_t)o[2] << 24 | (uint32_t)o[3] << 16 |
+                          (uint32_t)o[4] << 8 | o[5];
+            CHECK(ts == 0x11223344u - 1000u,
+                  "tcp_ts_up: сдвиг метки назад потерян");
+            /* Длина опций не изменилась — заголовок тот же размер. */
+            CHECK(((size_t)(out[20 + 12] >> 4) * 4 - 20) == sizeof opts,
+                  "tcp_ts_up: длина опций изменилась");
+            /* Остальные опции не потеряны: SACK-permitted на месте. */
+            int sack = 0;
+            for (size_t i = 0; i + 1 < sizeof opts; i++) {
+                if (o[i] == 4 && o[i + 1] == 2) { sack = 1; }
+            }
+            CHECK(sack, "tcp_ts_up: прочие опции клиента потеряны");
+        }
+        /* Без признака порядок опций клиента не меняется. */
+        e.ts_up = 0;
+        n = d2k_wire_build(&c, &e, out, sizeof out);
+        CHECK(n > 40 && out[40] == 1 && out[40 + 1] == 1,
+              "tcp_ts_up: без признака порядок опций всё равно изменён");
+    }
+    /* --- ip_autottl: TTL ИЗ ИЗМЕРЕННОГО ПУТИ ------------------------------
+     * Документация zapret2, standard fooling: «изменить TTL в ipv4 заголовке
+     * на автоматически определяемый по шаблону autottl delta,min-max. При
+     * невозможности определения TTL берётся ip_ttl, если есть. Иначе TTL не
+     * меняется», и «autottl производит эвристическую догадку о длине в хопах
+     * на базе TTL входящих пакетов». Константа приметна сама: у донора жёсткий
+     * ip_ttl=8 палился с роутера в 50 хопах от назначения. */
+    {
+        const uint8_t data[] = {1, 2, 3};
+        uint8_t out[128];
+        /* Сервер ответил с TTL 57: исходный 64, значит путь 7 хопов.
+           delta=+1 → 8, в диапазоне [2,12] → TTL фальшивки 8. */
+        d2k_conn c = {.family = 4, .ttl = 64, .rev_ttl = 57, .window = 1024};
+        d2k_emit e = {.bytes = data, .len = sizeof data, .seq = 9,
+                      .autottl = 1, .autottl_delta = 1,
+                      .autottl_min = 2, .autottl_max = 12};
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) == 43 && out[8] == 8,
+              "autottl: TTL не вычислен по пути (ждали 8)");
+        /* Исходный 128 (Windows-сервер): 128-120 = 8 хопов, +1 → 9. */
+        c.rev_ttl = 120;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 9,
+              "autottl: догадка об исходном TTL 128 не сработала");
+        /* Исходный 255: 255-250 = 5 хопов, +1 → 6. */
+        c.rev_ttl = 250;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 6,
+              "autottl: догадка об исходном TTL 255 не сработала");
+        /* Диапазон зажимает: путь 30 хопов, +1 = 31 > max 12 → 12. */
+        c.rev_ttl = 34;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 12,
+              "autottl: верхняя граница диапазона не применена");
+        /* И снизу: путь 0 хопов, +1 = 1 < min 2 → 2. */
+        c.rev_ttl = 64;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 2,
+              "autottl: нижняя граница диапазона не применена");
+        /* Ответа не было (rev_ttl 0): берём заданный ttl. */
+        c.rev_ttl = 0; e.ttl = 5;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 5,
+              "autottl: без ответа не взят заданный ttl");
+        /* Ответа не было и ttl не задан: TTL не меняется (как обычно). */
+        e.ttl = 0;
+        CHECK(d2k_wire_build(&c, &e, out, sizeof out) && out[8] == 64,
+              "autottl: без ответа и без ttl TTL всё равно подменён");
+        /* IPv6: то же поле hop limit. */
+        d2k_conn c6 = {.family = 6, .ttl = 64, .rev_ttl = 57, .window = 1024,
+            .src_ip6 = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,1},
+            .dst_ip6 = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,2}};
+        d2k_emit e6 = {.bytes = data, .len = sizeof data, .seq = 9,
+                       .autottl = 1, .autottl_delta = 1,
+                       .autottl_min = 2, .autottl_max = 12};
+        CHECK(d2k_wire_build(&c6, &e6, out, sizeof out) && out[7] == 8,
+              "autottl: IPv6 hop limit не вычислен по пути");
+    }
     {
         d2k_conn v6 = {.family = 6, .ttl = 57, .window = 1024,
             .src_ip6 = {0x20,1,0xdb,8,0,0,0,0,0,0,0,0,0,0,0,1},

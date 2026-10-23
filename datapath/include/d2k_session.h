@@ -441,6 +441,11 @@ const uint8_t *d2k_session_shape_family(const d2k_session *s, uint8_t transport,
 
 /* Приветствие, готовое к выдаче. NULL — не готово. */
 const uint8_t *d2k_session_shape(const d2k_session *s, uint8_t transport, size_t *len);
+/* Набор опций TCP пакета, с которого снят TCP-снимок семейства family
+ * (замысел 2026-10-23, п. 5.1). NULL — TCP-снимка нет; иначе указатель и
+ * длина 0..40 (0 — клиент без опций в данных, набор известен и пуст). */
+const uint8_t *d2k_session_shape_tcp_options_family(const d2k_session *s, uint8_t family,
+                                                    size_t *len);
 
 const d2k_journal *d2k_session_journal(const d2k_session *s);
 

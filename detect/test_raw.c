@@ -421,7 +421,7 @@ static void test_dial_survives_missing_rst_rule(void)
     d2k_raw_rule_hook = test_rule_hook;
 
     rule_rc = 0; rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     CHECK(c.rule_up == 1);
     CHECK(rule_count == 1 && strstr(rule_cmds[0], "iptables -w -I OUTPUT") != NULL);
     raw_close(&c);
@@ -436,7 +436,7 @@ static void test_dial_survives_missing_rst_rule(void)
     }
 
     rule_rc = 256; rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; err[0] = '\0';
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     CHECK(c.rule_up == 0);
     CHECK(outgoing_count == 2); /* SYN and the final ACK: probe went on */
     raw_close(&c);
@@ -484,18 +484,18 @@ static void test_failed_release_is_retried(void)
 
     /* Отказ один раз: повтор тут же, правило снято. */
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     raw_close(&c);
     CHECK(rule_count == 3 && strstr(rule_cmds[1], " -D OUTPUT") && strstr(rule_cmds[2], " -D OUTPUT"));
 
     /* Отказ дважды: правило запомнено и снимается перед следующей вставкой. */
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 2;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     uint16_t leaked = c.sport;
     raw_close(&c);
     CHECK(rule_count == 3);
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     char want[64];
     snprintf(want, sizeof want, "-D OUTPUT -p tcp --sport %u ", (unsigned)leaked);
     CHECK(rule_count == 2 && strstr(rule_cmds[0], want) != NULL &&
@@ -508,12 +508,12 @@ static void test_failed_release_is_retried(void)
        неудачный -D под общим мьютексом. */
     del_fail_code = 1 << 8;
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 100;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     raw_close(&c);
     /* -I, -D (exit 1) и -C, подтвердивший отсутствие (финальное ревью, I2). */
     CHECK(rule_count == 3 && strstr(rule_cmds[2], " -C OUTPUT") != NULL);
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 0;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     CHECK(rule_count == 1 && strstr(rule_cmds[0], " -I OUTPUT") != NULL);
     raw_close(&c);
 
@@ -521,16 +521,16 @@ static void test_failed_release_is_retried(void)
        попыток запись бросается, и вставки больше не тянут за собой -D. */
     del_fail_code = 4 << 8;
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1; del_fail_left = 1000;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     raw_close(&c);
     for (int round = 0; round < RST_RELEASE_ATTEMPTS + 2; round++) {
         rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-        CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+        CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
         c.rule_up = 0; /* только вставка: смотрим, сколько -D идёт перед ней */
         raw_close(&c);
     }
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     CHECK(rule_count == 1 && strstr(rule_cmds[0], " -I OUTPUT") != NULL);
     c.rule_up = 0;
     raw_close(&c);
@@ -575,7 +575,7 @@ static void test_rule_lifecycle_has_no_leaks(void)
     m_up = 0; m_kill_ins = 1; m_kill_commits = 1; m_del_generic_left = 0;
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
     unsigned long f0 = d2k_raw_rst_fail_count();
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     CHECK(c.rule_up == 0 && m_up == 0);
     CHECK(d2k_raw_rst_fail_count() == f0 + 1);
     CHECK(rule_count == 2 && strstr(rule_cmds[1], " -D OUTPUT") != NULL);
@@ -586,7 +586,7 @@ static void test_rule_lifecycle_has_no_leaks(void)
           отсутствие — запись не копится. */
     m_up = 0; m_kill_ins = 1; m_kill_commits = 0;
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     CHECK(rule_count == 3 && strstr(rule_cmds[2], " -C OUTPUT") != NULL);
     raw_close(&c);
     CHECK(d2k_raw_pending_count() == pend0 && m_up == 0);
@@ -595,7 +595,7 @@ static void test_rule_lifecycle_has_no_leaks(void)
           слово не верим, запись остаётся в отложенных... */
     m_kill_ins = 0; m_del_generic_left = 2;
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     CHECK(c.rule_up == 1 && m_up == 1);
     raw_close(&c);
     CHECK(m_up == 1 && d2k_raw_pending_count() == pend0 + 1);
@@ -620,7 +620,7 @@ static void test_rule_lifecycle_has_no_leaks(void)
             close(p[0]);
             m_up = 0; m_kill_ins = 0; m_del_generic_left = 4;
             dial_recv_fd = -1; outgoing_count = 0;
-            if (raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) != 0) _exit(3);
+            if (raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) != 0) _exit(3);
             raw_close(&c);
             if (d2k_raw_pending_count() != pend0 + 1) _exit(4);
             exit_pipe_fd = p[1];
@@ -653,7 +653,7 @@ static void *failing_worker(void *arg)
     (void)arg;
     unsigned long f0 = d2k_raw_rst_fail_count(), d0 = d2k_raw_dial_count();
     rule_rc = 2 << 8; rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    if (raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0) raw_close(&c);
+    if (raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0) raw_close(&c);
     other_fail_delta = d2k_raw_rst_fail_count() - f0;
     other_dial_delta = d2k_raw_dial_count() - d0;
     rule_rc = 0;
@@ -739,7 +739,7 @@ static void test_rule_without_comment_module(void)
     d2k_raw_rule_hook = nocomment_hook;
     unsigned long fails0 = d2k_raw_rst_fail_count();
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     CHECK(c.rule_up == 1);
     CHECK(rule_count == 2 && strstr(rule_cmds[0], "--comment") && !strstr(rule_cmds[1], "--comment") &&
           strstr(rule_cmds[1], "-I OUTPUT"));
@@ -747,7 +747,7 @@ static void test_rule_without_comment_module(void)
     CHECK(rule_count == 3 && strstr(rule_cmds[2], "-D OUTPUT") && !strstr(rule_cmds[2], "--comment"));
     CHECK(d2k_raw_rst_fail_count() == fails0); /* the rule did go in */
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     CHECK(c.rule_up == 1 && rule_count == 1 && !strstr(rule_cmds[0], "--comment"));
     raw_close(&c);
     d2k_raw_rule_hook = raw_rule_system;
@@ -778,7 +778,7 @@ static void test_rule_through_nft(void)
 
     rule_rc = 0; nft_del_rc = 0; nft_get_rc = 1 << 8;
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     sport = c.sport;
     CHECK(c.rule_up == 1 && rule_count == 1);
     /* Ключ — кортеж зонда, а не один порт (ревью 07.10): элемент другого
@@ -794,7 +794,7 @@ static void test_rule_through_nft(void)
        отложенные снятия ничего не попадает. */
     nft_del_rc = 1 << 8;
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     raw_close(&c);
     CHECK(rule_count == 3 && strstr(rule_cmds[2], "nft get element inet d2k_rst rst4 { ") != NULL);
     CHECK(d2k_raw_pending_count() == 0);
@@ -803,7 +803,7 @@ static void test_rule_through_nft(void)
     unsigned long fails0 = d2k_raw_rst_fail_count();
     rule_rc = 1 << 8;
     rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
-    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, 1, err, sizeof err) == 0);
     CHECK(c.rule_up == 0 && rule_count == 1);
     raw_close(&c);
     CHECK(rule_count == 1);
@@ -988,6 +988,94 @@ static void test_lost_syn_is_retransmitted(void) {
     dial_drop_syns = 0;
 }
 
+/* ЗАМЫСЕЛ 2026-10-23, п. 5.1: ЗОНД ЗДОРОВАЕТСЯ НАБОРОМ ОПЦИЙ КЛИЕНТА.
+ * Поле issue #7 (22.10.2026): план с меткой времени подтверждён зондом, у
+ * которого метка в SYN стояла литералом, а ПК репортёра метку не предлагает —
+ * план ему не исполняется. Зонд обязан предлагать метку только тогда, когда её
+ * несёт клиент, чьё приветствие он повторяет; набор не снят — прежний набор. */
+static int tcp_has_ts(const uint8_t *pkt) {
+    size_t ihl = (size_t)(pkt[0] & 15) * 4;
+    const uint8_t *t = pkt + ihl;
+    size_t hlen = (size_t)(t[12] >> 4) * 4;
+    for (size_t off = 20; off < hlen;) {
+        uint8_t kind = t[off];
+        if (!kind) break;
+        if (kind == 1) { off++; continue; }
+        if (off + 2 > hlen || t[off + 1] < 2 || t[off + 1] > hlen - off) break;
+        if (kind == 8 && t[off + 1] == 10) return 1;
+        off += t[off + 1];
+    }
+    return 0;
+}
+static void test_syn_follows_client_tcp_profile(void) {
+    d2k_raw_rule_hook = test_rule_hook;
+    rule_rc = 0; dial_silent = 0; payload_recv_error = 0; dial_drop_syns = 0;
+    uint8_t ip[16] = {198, 51, 100, 1}; char err[160] = "";
+    d2k_trigger tr; memset(&tr, 0, sizeof tr);
+    static const uint8_t rec[] = {0x16, 0x03, 0x01, 0x00, 0x03, 1, 2, 3};
+    memcpy(tr.payload, rec, sizeof rec); tr.len = sizeof rec; tr.accept = D2K_ACCEPT_ANY;
+    d2k_poison none; memset(&none, 0, sizeof none); snprintf(none.name, sizeof none.name, "none");
+
+    /* Клиент без метки времени (ПК репортёра): SYN без метки, данные без опций. */
+    tr.client_tcp_known = 1; tr.client_tcp_options_len = 0;
+    peer_timestamps = 0; outgoing_count = 0; dial_recv_fd = -1;
+    (void)d2k_raw_probe_poison_family(ip, 4, 443, &tr, &none, 2500, 0x2d, NULL, err, sizeof err);
+    CHECK(outgoing_count >= 3);
+    if (outgoing_count >= 3) {
+        CHECK((outgoing[0][33] & (TCP_SYN | TCP_ACK)) == TCP_SYN);
+        CHECK(!tcp_has_ts(outgoing[0]));
+        CHECK(((outgoing[0][32] >> 4) * 4) % 4 == 0 && (outgoing[0][32] >> 4) >= 5);
+        CHECK(!tcp_has_ts(outgoing[2]) && (outgoing[2][32] >> 4) == 5);
+    }
+    CHECK(!d2k_trigger_offers_ts(&tr));
+    /* Клиент с меткой (NOP NOP TS в данных): SYN предлагает метку. */
+    memcpy(tr.client_tcp_options, (uint8_t[]){1, 1, 8, 10, 0, 1, 2, 3, 0, 0, 0, 0}, 12);
+    tr.client_tcp_options_len = 12;
+    peer_timestamps = 1; outgoing_count = 0; dial_recv_fd = -1;
+    (void)d2k_raw_probe_poison_family(ip, 4, 443, &tr, &none, 2500, 0x2d, NULL, err, sizeof err);
+    CHECK(outgoing_count >= 3);
+    if (outgoing_count >= 3) { CHECK(tcp_has_ts(outgoing[0])); }
+    CHECK(d2k_trigger_offers_ts(&tr));
+    /* Набор не снят: прежний набор, с меткой. */
+    tr.client_tcp_known = 0; tr.client_tcp_options_len = 0;
+    outgoing_count = 0; dial_recv_fd = -1;
+    (void)d2k_raw_probe_poison_family(ip, 4, 443, &tr, &none, 2500, 0x2d, NULL, err, sizeof err);
+    CHECK(outgoing_count >= 1 && tcp_has_ts(outgoing[0]));
+    CHECK(d2k_trigger_offers_ts(&tr));
+    /* Приём «метка времени назад» клиенту без метки не задаётся. */
+    d2k_poison ts; memset(&ts, 0, sizeof ts); ts.tcp_ts = 1;
+    tr.client_tcp_known = 1; tr.client_tcp_options_len = 0;
+    CHECK(!d2k_trigger_allows_poison(&tr, &ts) && d2k_trigger_allows_poison(&tr, &none));
+    tr.client_tcp_known = 0;
+    CHECK(d2k_trigger_allows_poison(&tr, &ts));
+
+    /* НАБОР ОПЦИЙ КЛИЕНТА НЕ СНЯТ — СПРАШИВАЕМ СВОЙ СТЕК, А НЕ УГАДЫВАЕМ.
+     *
+     * Поле 23.10.2026 (`cand-32e84f2-nots-1`, rutracker.org 16:31:44):
+     * составной вопрос семейства C прошёл 2/2, план из него построен, и его
+     * отверг датапат причиной 6 — испытательный поток зонда идёт обычным
+     * сокетом и метку не несёт, потому что её нет у локального стека.
+     * Ответ «метка есть» при неизвестном клиенте был догадкой, и она стоила
+     * цели всех её планов: «выведенные планы исчерпаны (зондов 1)».
+     *
+     * Правило: клиент известен — решает он; не известен — решает стек, чьим
+     * сокетом зонд и пойдёт. На роутере с включённой меткой это то же самое,
+     * что прежде, поэтому обычный случай не меняется. */
+    tr.client_tcp_known = 0; tr.client_tcp_options_len = 0;
+    d2k_trigger_host_ts_override(0);
+    CHECK(!d2k_trigger_offers_ts(&tr)); /* стек без метки, клиент не известен */
+    CHECK(!d2k_trigger_allows_poison(&tr, &ts)); /* приём с меткой не задаётся */
+    d2k_trigger_host_ts_override(1);
+    CHECK(d2k_trigger_offers_ts(&tr)); /* стек с меткой — как прежде */
+    CHECK(d2k_trigger_allows_poison(&tr, &ts)); /* приём доступен */
+    /* Известный клиент сильнее стека: он и есть тот, для кого мы мерим. */
+    tr.client_tcp_known = 1; tr.client_tcp_options_len = 0;
+    d2k_trigger_host_ts_override(1);
+    CHECK(!d2k_trigger_offers_ts(&tr)); /* клиент сильнее стека */
+    d2k_trigger_host_ts_override(-1);
+    peer_timestamps = 1;
+}
+
 int main(void)
 {
     {
@@ -1048,6 +1136,7 @@ int main(void)
     }
     test_connect_timeout_is_not_a_trigger_result();
     test_lost_syn_is_retransmitted();
+    test_syn_follows_client_tcp_profile();
     test_plan_rejection_has_error();
     test_concurrent_ports_are_unique();
     test_checksum_matches_original();

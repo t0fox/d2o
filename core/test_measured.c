@@ -479,8 +479,67 @@ static size_t measured_max_emit(const d2k_arm *a, const d2k_arm_input *in) {
     return m;
 }
 
+/* Самая длинная посылка ГОТОВОГО текста плана — тем же шлюзом датапата. */
+static size_t text_max_emit(const char *text) {
+    char err[200];
+    uint8_t tlv[D2K_PLAN_TLV_MAX];
+    size_t tlv_len = 0, m = 0;
+    d2k_plan *p = NULL;
+    if (d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tlv_len, err, sizeof err) != 0 ||
+        d2k_plan_load(tlv, tlv_len, &p, err, sizeof err) != 0) { return 0; }
+    m = d2k_plan_max_emit(p);
+    d2k_plan_free(p);
+    return m;
+}
+
+/* Поле 22.10.2026 (issue #5/#7): сегмент плана укладывается под предел канала.
+ * При обычном канале (1500, 1492) — прежние 1400, тексты и идентификаторы
+ * планов не меняются; при узком — короче, а не отказ: у человека с туннелем
+ * (предел 1280) или LTE измеренных TCP-планов не было вовсе. */
+static void segment_under_cap(void) {
+    case_name = "segment-under-cap";
+    CHECK(d2k_arm_segment(0) == 1400);
+    CHECK(d2k_arm_segment(1500) == 1400);
+    CHECK(d2k_arm_segment(1492) == 1400);
+    CHECK(d2k_arm_segment(1472) == 1400);
+    CHECK(d2k_arm_segment(1471) == 1399);
+    CHECK(d2k_arm_segment(1280) == 1208);
+    CHECK(d2k_arm_segment(72) == 0);
+    CHECK(d2k_arm_segment(1) == 0);
+
+    char text[8192];
+    CHECK(d2k_rx_volume_plan_named(0, D2K_SHAPE_MODERN, 1492, "hcaptcha.com", text, sizeof text) == 0);
+    CHECK(strstr(text, "\nsegment 1400\n") != NULL);
+    CHECK(d2k_rx_volume_plan_named(0, D2K_SHAPE_MODERN, 1280, "hcaptcha.com", text, sizeof text) == 0);
+    CHECK(strstr(text, "\nsegment 1208\n") != NULL);
+    CHECK(text_max_emit(text) > 0 && text_max_emit(text) <= 1280);
+
+    CHECK(d2k_tcp_split_plan(1558, 7, 0, 0, text, sizeof text) == 0);
+    CHECK(strstr(text, "\nsegment 1400\n") != NULL);
+    CHECK(d2k_tcp_split_plan(1558, 7, 0, 1280, text, sizeof text) == 0);
+    CHECK(strstr(text, "\nsegment 1208\n") != NULL);
+    CHECK(d2k_tcp_split_plan(1558, 7, 0, 72, text, sizeof text) != 0);
+
+    /* Запасной сборщик: тело фальшивки он и прежде урезал по каналу (body_room),
+       строки segment у такого плеча нет — посылка укладывается в предел; при
+       пределе без сегмента плечо не задаётся. */
+    d2k_arm fb;
+    memset(&fb, 0, sizeof fb);
+    fb.badsum = 1; fb.repeats = 2; fb.decoy_hello = 1;
+    CHECK(d2k_arm_plan(&fb, D2K_SHAPE_MODERN, "example.com", 1280, text, sizeof text) == 0);
+    CHECK(text_max_emit(text) > 0 && text_max_emit(text) <= 1280);
+    CHECK(d2k_arm_plan(&fb, D2K_SHAPE_MODERN, "example.com", 72, text, sizeof text) != 0);
+    /* Перестановка запасного списка несёт segment — и он под пределом. */
+    memset(&fb, 0, sizeof fb);
+    fb.disorder_pos = 7; fb.disorder = 1;
+    CHECK(d2k_arm_plan(&fb, D2K_SHAPE_MODERN, "example.com", 1280, text, sizeof text) == 0);
+    CHECK(strstr(text, "\nsegment 1208\n") != NULL);
+    CHECK(d2k_arm_plan(&fb, D2K_SHAPE_MODERN, "example.com", 1500, text, sizeof text) == 0);
+    CHECK(strstr(text, "\nsegment 1400\n") != NULL);
+}
+
 static void send_limit_cases(void) {
-    static const size_t caps[] = { 1500, 1492, 1460, 1459, 1452, 1440, 1400, 600 };
+    static const size_t caps[] = { 1500, 1492, 1460, 1459, 1452, 1440, 1400, 1280, 600 };
     d2k_arm arms[8];
     memset(arms, 0, sizeof arms);
     arms[0].seqovl_hello = 1; arms[0].decoy_hello = 1;              /* seqovl-hello */
@@ -499,11 +558,26 @@ static void send_limit_cases(void) {
     for (size_t ai = 0; ai < sizeof arms / sizeof arms[0]; ai++) {
         size_t need = measured_max_emit(&arms[ai], &in);
         char text[8192];
+        /* Обычный канал: прежний сегмент 1400, посылка та же, что без предела. */
         CHECK(d2k_arm_plan_measured_cap(&arms[ai], &in, 1500, text, sizeof text) == 0);
+        CHECK(strstr(text, "\nsegment 1400\n") != NULL);
+        CHECK(text_max_emit(text) == need);
         for (size_t ci = 0; ci < sizeof caps / sizeof caps[0]; ci++) {
+            /* Поле 22.10.2026: плечо задаётся при любом пределе, где есть сегмент,
+               и его самая длинная посылка — по тому же шлюзу, что у датапата
+               (d2k_plan_max_emit) — укладывается в предел. Прежде при пределе
+               ниже самой длинной посылки плечо не задавалось вовсе. */
             int rc = d2k_arm_plan_measured_cap(&arms[ai], &in, caps[ci], text, sizeof text);
-            if (rc == 0) { CHECK(need <= caps[ci]); }
-            else { CHECK(need > caps[ci]); }
+            CHECK(rc == 0);
+            if (rc == 0) {
+                /* Ноль — у плеча нет собственных посылок (чистая перестановка). */
+                size_t m = text_max_emit(text);
+                if (m > caps[ci]) {
+                    fprintf(stderr, "send-limit: плечо %zu при пределе %zu — посылка %zu байт\n%s\n",
+                            ai, caps[ci], m, text);
+                }
+                CHECK(m <= caps[ci]);
+            }
         }
     }
 }
@@ -590,6 +664,94 @@ static void whitelist_names(void) {
  * зашитого hcaptcha.com. Имя — в бинарном payload, не в тексте плана, поэтому
  * сверяем, что РАЗНЫЕ имена дают разный план, а обёртка по умолчанию равна
  * плану с hcaptcha.com. Пустое имя — отказ. */
+/* ЗАМЫСЕЛ 2026-10-23, п. 5.2: ПОРЧА СОСТАВНОГО ПЛАНА — ИЗ ПЛЕЧА, НЕ ИЗ СТРОКИ.
+ *
+ * template_plan писал «poison 1 tcpts» литералом: план семейства C нёс метку
+ * времени потому, что так написано в файле, а не потому, что это измерено на
+ * этом клиенте. Клиенту без метки времени (ПК репортёра #7, поле 22.10.2026)
+ * такой план датапат исполнить не может. Теперь порча берётся из d2k_arm:
+ * множители (приманка ECH, серия ×8, разрез +2) те же, порча — та, что
+ * измерена. Запасная лестница остаётся прежней программой с меткой. */
+static void template_poison_from_arm(void) {
+    char text[4096];
+    uint8_t decoy[1024];
+    size_t dlen = 0;
+    d2k_arm a;
+    d2k_arm_input in;
+    case_name = "composite template poison from the measured arm";
+    CHECK(d2k_white_decoy_hello("hcaptcha.com", decoy, sizeof decoy, &dlen) == 0);
+    memset(&in, 0, sizeof in);
+    in.trigger_len = 600; in.sni_off = 100; in.sni_len = 11;
+    in.decoy_len = dlen;
+    memcpy(in.decoy, decoy, dlen);
+
+    /* Клиент с меткой времени: прежняя программа, байт в байт. */
+    memset(&a, 0, sizeof a);
+    a.tcpts = 1; a.decoy_hello = 1; a.repeats = 8; a.split_pos = 2;
+    CHECK(d2k_arm_plan_measured_cap(&a, &in, 1492, text, sizeof text) == 0);
+    CHECK(strstr(text, "wire tcp-template-v1\n") != NULL);
+    CHECK(strstr(text, "poison 1 tcpts\n") != NULL);
+    CHECK(strstr(text, "badsum") == NULL);
+    CHECK(strstr(text, "fake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n") != NULL);
+    CHECK(strstr(text, "split payload_start +2\norder forward\n") != NULL);
+
+    /* Клиент без метки времени: ТОТ ЖЕ составной план, порча — битая сумма. */
+    memset(&a, 0, sizeof a);
+    a.badsum = 1; a.decoy_hello = 1; a.repeats = 8; a.split_pos = 2;
+    CHECK(d2k_arm_plan_measured_cap(&a, &in, 1492, text, sizeof text) == 0);
+    CHECK(strstr(text, "wire tcp-template-v1\n") != NULL);
+    CHECK(strstr(text, "poison 1 badsum\n") != NULL);
+    CHECK(strstr(text, "tcpts") == NULL);
+    CHECK(strstr(text, "fake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n") != NULL);
+    CHECK(strstr(text, "split payload_start +2\norder forward\n") != NULL);
+
+    /* Запасная лестница — восстановленная программа поля, с меткой времени. */
+    CHECK(d2k_rx_volume_plan(0, D2K_SHAPE_MODERN, 1492, text, sizeof text) == 0);
+    CHECK(strstr(text, "poison 1 tcpts\n") != NULL);
+    CHECK(strstr(text, "badsum") == NULL);
+}
+
+/* ЗАПАСНАЯ ЛЕСТНИЦА ПОД КЛИЕНТА (поле issue #7, 23.10.2026). Программа поля
+ * держится на метке времени, а метку даёт КЛИЕНТ: у ПК на Windows её нет, и
+ * датапат такой план исполнить не может — 13 отказов из 13 при работающих
+ * телефонах. Для такого клиента та же программа идёт с TTL по измеренному
+ * пути. Клиент с меткой получает прежний план БАЙТ В БАЙТ. */
+static void rx_ladder_follows_client(void) {
+    char with_ts[4096], no_ts[4096], legacy[4096];
+    case_name = "RX ladder follows the client's TCP options";
+    CHECK(d2k_rx_volume_plan_client(0, D2K_SHAPE_MODERN, 1492, "hcaptcha.com", 1,
+                                    with_ts, sizeof with_ts) == 0);
+    CHECK(d2k_rx_volume_plan_named(0, D2K_SHAPE_MODERN, 1492, "hcaptcha.com",
+                                   legacy, sizeof legacy) == 0);
+    /* Прежняя подпись и клиент с меткой — одно и то же, байт в байт. */
+    CHECK(!strcmp(with_ts, legacy));
+    CHECK(strstr(with_ts, "poison 1 tcpts\n") != NULL);
+    CHECK(strstr(with_ts, "autottl") == NULL);
+    CHECK(strstr(with_ts, "d2k-plan 1 8\n") != NULL);
+
+    CHECK(d2k_rx_volume_plan_client(0, D2K_SHAPE_MODERN, 1492, "hcaptcha.com", 0,
+                                    no_ts, sizeof no_ts) == 0);
+    /* Клиент без метки: метки в плане нет, есть TTL по пути, minexec поднят. */
+    CHECK(strstr(no_ts, "tcpts") == NULL);
+    CHECK(strstr(no_ts, "poison 1 autottl=1,2-12\n") != NULL);
+    CHECK(strstr(no_ts, "d2k-plan 1 13\n") != NULL);
+    /* Множители программы те же: приманка, серия ×8, разрез. */
+    CHECK(strstr(no_ts, "fake payload=1 poison=1 repeats=8 gap_us=0 place=before tlsmod=rnd,dupsid\n") != NULL);
+    CHECK(strstr(no_ts, "split payload_start +2\norder forward\n") != NULL);
+    CHECK(strstr(no_ts, "wire tcp-template-v1\n") != NULL);
+    /* И такой план ДОЕЗЖАЕТ до исполнителя: это и есть закрытие issue #7. */
+    uint8_t tlv[D2K_PLAN_TLV_MAX];
+    size_t tn = 0;
+    char err[200];
+    d2k_plan *pl = NULL;
+    CHECK(d2k_plan_text_to_tlv(no_ts, tlv, sizeof tlv, &tn, err, sizeof err) == 0);
+    CHECK(d2k_plan_load(tlv, tn, &pl, err, sizeof err) == 0 && pl);
+    /* Главное: плану НЕ нужна метка времени от потока, значит датапат его не
+       отвергнет кодом FLOW_UNFIT, как отвергал прежний. */
+    CHECK(pl && (d2k_plan_flow_needs(pl) & D2K_FLOW_NEED_TCPTS) == 0);
+    d2k_plan_free(pl);
+}
+
 static void rx_volume_named(void) {
     case_name = "rx-volume named decoy";
     char def[4096], hc[4096], other[4096], empty[4096];
@@ -606,6 +768,8 @@ static void rx_volume_named(void) {
 }
 
 int main(void) {
+    template_poison_from_arm();
+    rx_ladder_follows_client();
     whitelist_names();
     rx_volume_named();
     md5_plan_contract();
@@ -614,6 +778,7 @@ int main(void) {
     fallback_disorder_pos2();
     rx_volume_fake_sni_split();
     send_limit_cases();
+    segment_under_cap();
     d2k_arm a = {0};
     a.seqovl = 1; run_case("seqovl-1", a, 289, 0);
     a.seqovl = 0; a.badsum = 1; a.repeats = 2; a.gap_ms = 20;

@@ -69,6 +69,7 @@
 #include "d2k_quichello.h"
 #include "d2k_quicconn.h"
 #include "d2k_plantlv.h"
+#include "d2k_plan.h"
 #include "d2k_quicprobe.h"
 #include "d2k_sched.h"
 #include "d2k_voice_discovery.h"
@@ -299,7 +300,13 @@ static int refuse_is_permanent(uint8_t code) {
     /* NOT_APPLIED постоянен в том же смысле, что TOO_LONG: тот же план на том
        же приветствии будет отвергнут исполнителем снова. Повторять нечего,
        кандидат не виноват, свойство коробки не пишется. */
-    return code == D2K_REFUSE_TOO_LONG || code == D2K_REFUSE_NOT_APPLIED;
+    /* FLOW_UNFIT — поток клиента не несёт того, что план требует (метка
+       времени у tcp-template-v1): тот же план на том же потоке будет отвергнут
+       снова. Для чужого потока это знак перемерить цель для этого клиента
+       (on_refused_unfit), для зондового — опыт невозможен, кандидат не
+       виноват. Замысел 2026-10-23, п. 5.3. */
+    return code == D2K_REFUSE_TOO_LONG || code == D2K_REFUSE_NOT_APPLIED ||
+           code == D2K_REFUSE_FLOW_UNFIT;
 }
 
 /* Поток испорчен недоисполнением: часть плана ушла, остаток нет. Отличается
@@ -698,6 +705,16 @@ typedef struct {
        по заготовке — то есть выдавалась бы за измерение то, что им не
        является (§2.4). Ноль означает «форма клиента не измерена». */
     int        trig_snapped;
+    /* Набор опций TCP клиента снимка в trig (замысел 2026-10-23, п. 5.1):
+       едет зонду вместе с байтами; known == 0 — снимок без набора, зонд
+       здоровался прежним набором, и привязка помечается PROFILE. snap_* —
+       то же для снимка, ждущего перезапуска в snap. */
+    uint8_t    client_opts[40];
+    size_t     client_opts_len;
+    int        client_opts_known;
+    uint8_t    snap_opts[40];
+    size_t     snap_opts_len;
+    int        snap_opts_known;
     /* ПРОГОН ОСТАНОВЛЕН РАДИ СНИМКА КЛИЕНТА (задача 31). Взводит on_shape,
        когда приветствие клиента приходит во время профильного замера; байты
        снимка лежат здесь, у задачи, а не только в общей ячейке tcp_shape:
@@ -1153,6 +1170,7 @@ typedef struct {
     uint8_t    negative_streak;
     int64_t    until_ms;
     int        challenge;
+    int        denied;      /* сервис отказал по закону (451): остывание как у антибота */
     int        exhausted;
     int        ech_input;
     int        late_rst_only; /* глушит только поздние RST/объёмные триггеры */
@@ -1277,7 +1295,8 @@ struct d2k_sched {
     /* Ячейка — размером со вход задачи: датапат снимает TCP-приветствие до
        4096 байт, и с провода v20 длинное ECH-приветствие доходит целиком. */
     struct { char name[256]; uint8_t bytes[SCHED_TRIG_MAX]; size_t len;
-             uint8_t family; int64_t observed_ms; } ech_inputs[8];
+             uint8_t family; int64_t observed_ms;
+             uint8_t opts[40]; size_t opts_len; int opts_known; } ech_inputs[8];
     size_t ech_input_next;
     /* ПАЧКИ QUIC ПО ИМЕНИ (поле 15.10.2026). Общая ячейка quic_shape держит
        только последнюю пачку любого имени, и к поиску цели в ней почти
@@ -1329,7 +1348,19 @@ struct d2k_sched {
     int          sync_unshaped; /* адресные привязки без однозначной формы протокола */
     int          sync_recheck;  /* привязки «требует повторной проверки» (задача 21) */
     int          sync_refused;  /* отказы датапата на планах каталога с прошлой сводки */
-    unsigned     sync_refused_code; /* причина последнего отказа */
+    int          sync_unfit;    /* планы, не влезающие в посылку датапата: не поставлены, привязки на повторную проверку */
+    /* ЦЕЛИ, УЖЕ ПЕРЕМЕРЕННЫЕ ПО ОТКАЗУ «ПОТОК НЕ НЕСЁТ ТРЕБУЕМОГО» (ревью
+       ветки, находка 3). Подтверждение снимает пометку повторной проверки
+       (bind_confirmed), и следующее соединение того же клиента помечало цель
+       заново — полный поиск на КАЖДОЕ соединение, ровно патология журналов
+       #5/#7. Тот же план на том же клиенте отказывает детерминированно, и
+       перемерять его второй раз нечем: помним пару «цель + план», для которой
+       перемер уже заводили. ДРУГОЙ план той же цели (каталог сменился) заводит
+       перемер снова — он ещё не проверялся. */
+    struct { char name[256]; uint8_t family, transport;
+             uint8_t plan_id[D2K_PLAN_ID_LEN]; } unfit_done[8];
+    size_t       unfit_done_next;
+    unsigned     sync_refused_code; /* причина последнего отказа (D2K_ACK_*) */
     installed_area *areas;
     size_t n_areas;
     installed_area area_pending;
@@ -1395,6 +1426,18 @@ struct d2k_sched {
     size_t       tcp_shape_len[2];
     char         tcp_shape_name[2][256];
     d2k_flowkey   tcp_shape_flow[2];
+    /* НАБОР ОПЦИЙ TCP КЛИЕНТА рядом со снимком (замысел 2026-10-23, п. 5.1).
+       Датапат шлёт его событием CLIENT_TCP ровно перед SHAPE того же потока:
+       wait — набор пришёл и ждёт свой снимок; known — снимок связан с набором
+       (ноль: снимок без набора — старый датапат, зонд пойдёт прежним набором,
+       привязка PROFILE). Нулевая длина при known — клиент без опций. */
+    uint8_t      tcp_shape_opts[2][40];
+    size_t       tcp_shape_opts_len[2];
+    int          tcp_shape_opts_known[2];
+    uint8_t      tcp_opts_wait_bytes[2][40];
+    size_t       tcp_opts_wait_len[2];
+    int          tcp_opts_wait[2];
+    d2k_flowkey  tcp_opts_wait_flow[2];
 
     /* Для вида панели: сколько подтверждено и сколько зондов потрачено за
        жизнь процесса, и отметка стенных часов, от которой считается «с
@@ -1969,8 +2012,16 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
         c->family = t->family;
         c->used = 1;
     }
-    if (kind == 1) {
+    if (kind == 1 || kind == 4) {
+        /* ВИД 4 — ЮРИДИЧЕСКИЙ ОТКАЗ СЕРВИСА (HTTP 451). Срок тот же, что у
+           антибот-ответа, и признак `challenge` тот же, чтобы правила
+           `cooldown_blocks` не раздваивались; отличается только слово в
+           журнале, потому что это РАЗНЫЕ наблюдения и путать их нельзя.
+           Поле 23.10.2026, x-minus.pro: без остывания тот же сервис
+           перемерялся каждые пару минут (поиски 33 и 36 за 145 с, по 4 зонда
+           и установке плана каждый) и каждый раз отвечал тем же 451. */
         c->challenge = 1;
+        c->denied = kind == 4;
         c->exhausted = 0;
         c->late_rst_only = 0;
         c->until_ms = s->now_ms + SCHED_CHALLENGE_BACKOFF_MS;
@@ -1992,6 +2043,7 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
            or advance the CLEAR 10/30/60-minute escalation. */
         c->negative_streak = 0;
         c->challenge = 0;
+        c->denied = 0;
         c->exhausted = 1;
         c->ech_input = t->trig_snapped && t->transport == 6 &&
             d2k_hello_ech_offer(t->trig, t->trig_len, NULL) == 1;
@@ -2001,6 +2053,7 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
     }
     if (c->negative_streak < UINT8_MAX) { c->negative_streak++; }
     c->challenge = 0;
+    c->denied = 0;   /* иначе позже причина читалась бы «юридический отказ» */
     c->exhausted = 0;
     c->signal_code = t->trigger_code;
     c->until_ms = s->now_ms + clear_backoff_ms(c->negative_streak);
@@ -2183,6 +2236,44 @@ static int quic_named_find(const d2k_sched *s, const char *name, uint8_t family)
     return -1;
 }
 
+/* НЕСЁТ ЛИ ПОТОК КЛИЕНТА МЕТКУ ВРЕМЕНИ TCP (вид 8, длина 10).
+ *
+ * От этого зависит, исполним ли для него план с порчей «метка времени назад»:
+ * датапат копирует опции потока и сдвигает метку в них, а если метки нет —
+ * отказывается кодом FLOW_UNFIT (поле issue #7: ПК на Windows, 13 отказов из
+ * 13 при работающих телефонах). Набор не снят — считаем, что метка есть: так
+ * было всегда, и прежнее поведение сохраняется.
+ *
+ * Разбор побайтный, тот же, что у датапата и у зонда: NOP и EOL отдельно,
+ * кривая длина — «нет». */
+static int client_offers_ts(const task *t) {
+    if (!t->client_opts_known) { return 1; }
+    const uint8_t *o = t->client_opts;
+    size_t n = t->client_opts_len;
+    if (n > sizeof t->client_opts) { return 0; }
+    for (size_t off = 0; off < n;) {
+        uint8_t kind = o[off];
+        if (kind == 0) { break; }
+        if (kind == 1) { off++; continue; }
+        if (off + 2 > n || o[off + 1] < 2 || o[off + 1] > n - off) { return 0; }
+        if (kind == 8 && o[off + 1] == 10) { return 1; }
+        off += o[off + 1];
+    }
+    return 0;
+}
+
+/* Набор опций клиента — задаче вместе со снимком (замысел 2026-10-23, п. 5.1). */
+static void take_shape_opts(const d2k_sched *s, task *t) {
+    int f = t->family == 6;
+    t->client_opts_known = s->tcp_shape_opts_known[f];
+    t->client_opts_len = t->client_opts_known ? s->tcp_shape_opts_len[f] : 0;
+    if (t->client_opts_len) { memcpy(t->client_opts, s->tcp_shape_opts[f], t->client_opts_len); }
+}
+static void drop_client_opts(task *t) {
+    t->client_opts_known = 0;
+    t->client_opts_len = 0;
+}
+
 static int fill_hellos(d2k_sched *s, task *t) {
     if (t->transport == 17) {
         /* Донор quicprobe.buildInitial начинает замер собственным QUIC
@@ -2283,7 +2374,11 @@ static int fill_hellos(d2k_sched *s, task *t) {
                 !strcmp(s->ech_inputs[k].name, t->name) &&
                 hello_fits_client(t, s->ech_inputs[k].bytes, s->ech_inputs[k].len)) {
                 memcpy(t->trig, s->ech_inputs[k].bytes, s->ech_inputs[k].len);
-                t->trig_len = s->ech_inputs[k].len; t->trig_snapped = 1; break;
+                t->trig_len = s->ech_inputs[k].len; t->trig_snapped = 1;
+                t->client_opts_known = s->ech_inputs[k].opts_known;
+                t->client_opts_len = t->client_opts_known ? s->ech_inputs[k].opts_len : 0;
+                if (t->client_opts_len) memcpy(t->client_opts, s->ech_inputs[k].opts, t->client_opts_len);
+                break;
             }
         }
     }
@@ -2296,8 +2391,10 @@ static int fill_hellos(d2k_sched *s, task *t) {
         memcpy(t->trig, s->tcp_shape[t->family == 6], s->tcp_shape_len[t->family == 6]);
         t->trig_len = s->tcp_shape_len[t->family == 6];
         t->trig_snapped = 1;
+        take_shape_opts(s, t);
     }
     if (t->trig_len == 0) {
+        drop_client_opts(t);
         /* Холодный старт: снимка ещё нет. Профиль — это заведомо НЕ те байты,
            что шлёт настоящий клиент (§4), и вердикт на нём слабее; но
            альтернатива — не измерять вовсе, пока цель не откроют второй раз.
@@ -2335,6 +2432,8 @@ typedef struct {
     d2k_sched *s; task *t; int use_fd;
     uint8_t trig[SCHED_TRIG_MAX], ctrl[2048];
     size_t trig_len, ctrl_len;
+    uint8_t client_opts[40]; size_t client_opts_len; int client_opts_known;
+    int trig_snapped; /* вход снят с провода: приманка строится клоном */
     int split_unfit; /* решено главным потоком (quic_split_unfit) */
     unsigned budget; /* бюджет потока испытания (JOB_VERIFY), 0 — без проверки */
 } worker_arg;
@@ -2550,8 +2649,11 @@ static void *worker_run(void *vp) {
     uint8_t trigger_bytes[sizeof a->trig], control_bytes[sizeof a->ctrl];
     memcpy(trigger_bytes, a->trig, a->trig_len);
     memcpy(control_bytes, a->ctrl, a->ctrl_len);
-    d2k_hello trig = {trigger_bytes, a->trig_len};
-    d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len};
+    uint8_t opts_bytes[sizeof a->client_opts];
+    memcpy(opts_bytes, a->client_opts, a->client_opts_len);
+    d2k_hello trig = {trigger_bytes, a->trig_len, opts_bytes, a->client_opts_len,
+                      a->client_opts_known, a->trig_snapped};
+    d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len, NULL, 0, 0, 0};
     free(a);
     /* Ход сообщает только прогон измерителя (JOB_CLASSIFY); поток живёт ровно
        одну задачу, поэтому снимать приёмник не нужно. */
@@ -3118,6 +3220,10 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
                 ? task_budget(s, t) : 0;
     memcpy(a->trig, t->trig, t->trig_len);
     memcpy(a->ctrl, t->ctrl, t->ctrl_len);
+    a->client_opts_known = t->client_opts_known;
+    a->client_opts_len = t->client_opts_known ? t->client_opts_len : 0;
+    memcpy(a->client_opts, t->client_opts, a->client_opts_len);
+    a->trig_snapped = t->trig_snapped;
     /* Сокет вопроса забирается ЗДЕСЬ, в главном потоке, и поле задачи
        очищается сразу: два владельца одного дескриптора — двойное закрытие. */
     a->use_fd = job == JOB_CONTACT ? t->prop_bound_fd : job == JOB_VERIFY ? t->probe_fd : -1;
@@ -3588,7 +3694,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
        опросника из командной строки. */
     static uint8_t planbuf[2 * 1800 + 256];
     static char hex[2 * sizeof planbuf + 1];
-    d2k_hello ctl; ctl.bytes = t->ctrl_len ? t->ctrl : NULL; ctl.len = t->ctrl_len;
+    d2k_hello ctl = {0}; ctl.bytes = t->ctrl_len ? t->ctrl : NULL; ctl.len = t->ctrl_len;
 
     /* План ПРЕЖНЕГО вопроса снимается до следующего (задача 20): иначе на
        датапате копились пробные записи по уже свободным портам вопросов. */
@@ -3923,6 +4029,17 @@ static int net_whitelist_undecided(const d2k_sched *s) {
     return s->cat && !s->cat->net.searched && !s->cat->net.name[0];
 }
 
+/* Нужен ли подбор ИМЕННО ЭТОЙ задаче (поле 23.10.2026). Кроме нерешённого
+   имени подбор открывает ещё один случай: имя записано, но доказано только
+   проходом ИСХОДЯЩЕЙ лестницы, а у этой задачи обрыв ВХОДЯЩИЙ — против него
+   имя не проверялось. Семь целей парного прогона наследовали такое имя и
+   рвали тело на 13–17 КБ при ответе 200. Цена названа: список имён, и потолок
+   зондов на время подбора уже расширен (sched_probe_cap). */
+static int net_whitelist_needs_probe(const d2k_sched *s, const task *t) {
+    if (net_whitelist_undecided(s)) { return 1; }
+    return t->vol.rx_cut && s->cat && s->cat->net.name[0] && s->cat->net.tx_only;
+}
+
 /* Потолок зондов задачи. Подбор белого имени сети перебирает до сотен
    кандидатов (цена названа прямо, §0 «искусственных бюджетов нет»): пока он
    идёт, потолок расширен на длину списка — только для этой задачи, обычный
@@ -3959,7 +4076,8 @@ static int next_rx_volume_plan(d2k_sched *s, task *t, d2k_shape sh,
     if (t->net_probing) {
         while (t->net_probe_next < d2k_net_whitelist_count()) {
             const char *name = d2k_net_whitelist_name(t->net_probe_next++);
-            if (!name || d2k_rx_volume_plan_named(0, sh, s->send_cap, name, text, cap) != 0) {
+            if (!name || d2k_rx_volume_plan_client(0, sh, s->send_cap, name,
+                                                  client_offers_ts(t), text, cap) != 0) {
                 continue;
             }
             uint32_t h = fnv1a(text);
@@ -3980,7 +4098,8 @@ static int next_rx_volume_plan(d2k_sched *s, task *t, d2k_shape sh,
     const char *decoy = rx_decoy_name(s);
     while (t->rx_volume_next_variant < D2K_RX_VOLUME_PLAN_VARIANTS) {
         unsigned variant = t->rx_volume_next_variant++;
-        if (d2k_rx_volume_plan_named(variant, sh, s->send_cap, decoy, text, cap) != 0) { continue; }
+        if (d2k_rx_volume_plan_client(variant, sh, s->send_cap, decoy,
+                                      client_offers_ts(t), text, cap) != 0) { continue; }
         uint32_t h = fnv1a(text);
         int seen = 0;
         for (size_t i = 0; i < t->n_plans && !seen; i++) {
@@ -4200,6 +4319,9 @@ static int local_refusal_verdict(d2k_sched *s, task *t) {
             t->unsent_code == D2K_REFUSE_NOT_APPLIED
                 ? "исполнитель отверг план на приветствии зонда: зонд ушёл БЕЗ "
                   "плана, и ответ линии о плане ничего не говорит"
+            : t->unsent_code == D2K_REFUSE_FLOW_UNFIT
+                ? "поток зонда не несёт того, что план требует (метка времени "
+                  "TCP у tcp-template-v1): зонд ушёл БЕЗ плана"
                 : "план не помещается в посылку",
             (unsigned)t->unsent_code);
         t->unsent_code = 0;
@@ -5163,7 +5285,12 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
         char text[sizeof t->plans[0]];
         /* Белое имя сети не решено — лестница сперва перебирает кандидаты
            как приманку (поле 10.10.2026); решено — берёт готовое/семя. */
-        t->net_probing = net_whitelist_undecided(s);
+        t->net_probing = net_whitelist_needs_probe(s, t);
+        /* При одном TX-обрыве сразу — одна ступень: места в очереди остаются
+           кандидатам, выведенным из замера, как в выпуске (их вытесняла
+           лестница, тесты коробок задачи 23). Остальные ступени долива —
+           после них и перед запасным перебором (refill_from_fallback). Это
+           порядок, а не предел: число ступеней не урезается. */
         size_t room = t->vol.rx_cut ? cap : (t->n_plans + 1 < cap ? t->n_plans + 1 : cap);
         while (t->n_plans < room &&
                next_rx_volume_plan(s, t, sh, text, sizeof text)) {
@@ -5174,6 +5301,16 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
             t->n_plans++;
         }
         t->rx_volume_candidate_pending = rx_ladder_pending(t);
+        /* КАКОЙ ПРОГРАММОЙ ПОШЛА ЛЕСТНИЦА — В ЖУРНАЛ (поле issue #7). У
+           клиента без метки времени восстановленная программа поля неисполнима
+           (датапат отказывает кодом FLOW_UNFIT), и лестница идёт с TTL по
+           измеренному пути. Разные программы — разные опыты, и в журнале их
+           обязано быть видно. */
+        if (t->n_plans > 0 && !client_offers_ts(t)) {
+            say(s, "по %s поток клиента не несёт метку времени — лестница идёт "
+                   "с TTL по измеренному пути вместо метки (план с меткой "
+                   "датапат этому клиенту не исполнит)", t->name);
+        }
         if (t->net_probing) {
             say(s, "по %s белое имя сети не известно — подбираю его из %zu имён "
                    "списка приманкой под измеренный %s около %d КБ",
@@ -5199,7 +5336,9 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
         if (!r->have_arm && (v == D2K_V_PREFIX || v == D2K_V_WHOLE) &&
             r->split_pos > 0 && (size_t)r->split_pos < t->trig_len) {
             if (d2k_tcp_split_plan(t->trig_len, (unsigned)r->split_pos, r->split_gap_us,
-                                   t->plans[0], sizeof t->plans[0]) == 0) { t->n_plans = 1; }
+                                   s->send_cap, t->plans[0], sizeof t->plans[0]) == 0) {
+                t->n_plans = 1;
+            }
         }
         /* ЗАМЕР ВЛАДЕЕТ ПОИСКОМ, НО ПОСТАВИТЬ НЕЧЕГО. Поле 04.10, чистый
            каталог: rutracker.org и discord.com — «решает содержимое», взят
@@ -5724,6 +5863,7 @@ int d2k_sched_sync(d2k_sched *s) {
     s->sync_weak = 0;
     s->sync_unshaped = 0;
     s->sync_recheck = 0;
+    s->sync_unfit = 0;
     s->area_sync_failed = 0;
     return 0;
 }
@@ -6006,6 +6146,22 @@ static int sync_areas(d2k_sched *s) {
     return 0;
 }
 
+/* Самая длинная посылка плана каталога — тем же шлюзом, что у датапата на
+   активации (d2k_plan_max_emit, ctlsrv.c d2k_plan_fits). 0 — текст не
+   собрался (такую запись ниже отвергнет d2k_plan_text_to_hex) либо у плана
+   нет собственных посылок. */
+static size_t plan_text_max_emit(const char *text) {
+    static uint8_t tlv[D2K_PLAN_TLV_MAX];
+    size_t n = 0;
+    char err[200];
+    d2k_plan *p = NULL;
+    if (d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &n, err, sizeof err) != 0 ||
+        d2k_plan_load(tlv, n, &p, err, sizeof err) != 0) { return 0; }
+    size_t m = d2k_plan_max_emit(p);
+    d2k_plan_free(p);
+    return m;
+}
+
 int d2k_sched_sync_step(d2k_sched *s) {
     if (!s || !s->cat || !s->sync_active) { return 0; }
     static char hex[2 * D2K_PLAN_TLV_MAX + 1];
@@ -6105,6 +6261,46 @@ int d2k_sched_sync_step(d2k_sched *s) {
             s->sync_skipped++;
             continue;
         }
+        /* ПЛАН, КОТОРЫЙ ДАТАПАТ НЕ УНЕСЁТ, НА ПРОВОД НЕ ЕДЕТ (поле 22.10.2026,
+           issue #5/#7). Предел длины посылки датапат объявляет приветствием
+           (send_cap); план, чья самая длинная посылка в него не укладывается,
+           он отвергнет на активации (ctlsrv.c, d2k_plan_fits) — и так каждый
+           проход: 3302 отказа за ночь у репортёра, а цель всё это время без
+           обхода и без нового замера, потому что привязка «подтверждена».
+           Считаем тем же шлюзом до отправки: такой план не ставим, привязку
+           помечаем «требует повторной проверки» и снимаем с провода (там его,
+           как правило, и нет) — тогда следующее подозрение по цели ведёт к
+           новому замеру с сегментом под предел (d2k_arm_segment), а правило
+           «план уже подтверждён — не улика» (binding_covering пропускает
+           recheck_since) её не прикрывает. Каталог цел: запись и план
+           остаются, подтверждение того же или нового плана снимает пометку. */
+        if (s->send_cap > 0) {
+            size_t need = plan_text_max_emit(text);
+            if (need > s->send_cap) {
+                d2k_cat_box *bx = &s->cat->boxes[s->sync_box];
+                d2k_cat_binding *bdm = &bx->binds[s->sync_bind - 1];
+                bdm->recheck_since = wall_s(s, s->now_ms);
+                bdm->recheck_mono_ms = s->now_ms ? s->now_ms : 1;
+                bx->updated = bdm->recheck_since;
+                s->cat->revision++;
+                s->sync_unfit++;
+                if (strcmp(bd->kind, "name") == 0) {
+                    uint8_t tr = bd->transport ? bd->transport : 6;
+                    uint8_t wire_shape = bd->shape ? (uint8_t)bd->shape
+                                                   : (uint8_t)D2K_LINK_SHAPE_GRANDFATHER;
+                    if (d2k_link_del_name_family(s->link_fd, bd->target, tr, wire_shape,
+                                                 family, err, sizeof err) != 0) {
+                        say(s, "по %s привязку %s не удалось снять с провода: %s",
+                            bd->target, bd->plan_id, err);
+                    }
+                }
+                say(s, "каталог: план %s для %s не влезает в посылку датапата (%zu байт при "
+                       "пределе %u) — не ставлю, привязка помечена на повторную проверку: "
+                       "следующее подозрение перемерит цель сегментом под предел",
+                    p->id, bd->target, need, (unsigned)s->send_cap);
+                continue;
+            }
+        }
         if (strcmp(bd->kind, "addr") == 0) {
             uint8_t addr_shape = addr_binding_shape(bd);
             if (!addr_shape) {
@@ -6167,7 +6363,8 @@ int d2k_sched_sync_step(d2k_sched *s) {
         s->sync_active = 0;
         stall_budgets_push(s);
         if (s->sync_sent > 0 || s->sync_skipped > 0 || s->sync_weak > 0 ||
-            s->sync_unshaped > 0 || s->sync_recheck > 0 || s->sync_refused > 0) {
+            s->sync_unshaped > 0 || s->sync_recheck > 0 || s->sync_unfit > 0 ||
+            s->sync_refused > 0) {
             say(s, "каталог: поставлено планов по подтверждённым привязкам: %d%s",
                 s->sync_sent, s->sync_skipped ? " (пропущено негодных: см. выше)" : "");
             if (s->sync_weak > 0) {
@@ -6184,12 +6381,22 @@ int d2k_sched_sync_step(d2k_sched *s) {
                 say(s, "каталог: не поставлено привязок, ждущих повторной проверки "
                        "после прямого прохода: %d", s->sync_recheck);
             }
-            if (s->sync_refused > 0) {
-                say(s, "каталог: датапат отверг планов с прошлой сводки: %d (%s) — обход по "
-                       "этим целям не исполняется, причина в журнале датапата",
-                    s->sync_refused, ack_reason_text(s->sync_refused_code));
-                s->sync_refused = 0;
+            if (s->sync_unfit > 0) {
+                say(s, "каталог: не поставлено планов, не влезающих в посылку датапата: %d "
+                       "(привязки помечены на повторную проверку, каталог сохранён)",
+                    s->sync_unfit);
             }
+        }
+        if (s->sync_refused > 0) {
+            /* Отказы приходят ПОСЛЕ команд и без имени цели (см. on_event,
+               D2K_EV_ACK), поэтому считаются между сводками и выдаются здесь.
+               Поле 22.10.2026 (issue #5/#7): 3302 отказа «посылка 1440 байт
+               при пределе 1280» лежали только в журнале датапата, а контроллер
+               молча ставил каталог заново каждые полторы минуты. */
+            say(s, "каталог: датапат отверг планов с прошлой сводки: %d (%s) — обход по "
+                   "этим целям не исполняется, причина в журнале датапата",
+                s->sync_refused, ack_reason_text(s->sync_refused_code));
+            s->sync_refused = 0;
         }
         return 0;
     }
@@ -7561,7 +7768,8 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
     if (cooldown_blocks(s, name, ev->transport, ev->family,
                         endpoint_ip, endpoint_port, ev->code,
                         &cooldown_left_ms, &cool)) {
-        const char *reason = cool && cool->challenge ? "антибот-ответа" :
+        const char *reason = cool && cool->denied ? "юридического отказа сервиса" :
+                             cool && cool->challenge ? "антибот-ответа" :
                              cool && cool->exhausted ? "неподтверждённого прошлого замера" :
                              "повторного CLEAR";
         /* Транспорт — часть ключа отдыха и называется вслух: поле 03.10,
@@ -7889,6 +8097,10 @@ static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_
     /* Байты могут лежать в самой задаче (t->snap): memmove, и копия
        гасится — перемер у задачи один. */
     memmove(t->trig, bytes, len);
+    /* Набор опций — вместе с байтами: у TCP это набор последнего снимка
+       семейства (SHAPE и его CLIENT_TCP уже связаны в on_shape), у QUIC
+       набора нет. */
+    if (t->transport == 6) { take_shape_opts(s, t); } else { drop_client_opts(t); }
     t->snap_len = 0;
     t->snap_stop = 0;
     t->trig_len = len;
@@ -8071,6 +8283,35 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         name[len] = '\0';
     }
     if (name[0] == '\0') { return; }
+    if (ev->transport == 6) {
+        /* НАБОР ОПЦИЙ СВЯЗЫВАЕТСЯ ТОЛЬКО С ТЕМ СНИМКОМ, КОТОРЫЙ СОХРАНЯЕТСЯ
+           (ревью ветки, находка 1; замысел 2026-10-23, п. 5.1). Датапат шлёт
+           CLIENT_TCP ровно перед своим SHAPE, и связывать их надо ПОСЛЕ всех
+           ранних отказов: прежде это стояло в начале on_shape, и обрезанный
+           снимок (целого ClientHello в нём нет) успевал привязать опции СВОЕГО
+           приветствия к ранее сохранённому снимку ДРУГОГО — зонд здоровался бы
+           набором одного клиента, повторяя байты другого, — а заодно гасил
+           набор, ожидавший следующий годный снимок. Отвергнутый снимок теперь
+           не трогает ожидание вовсе. Снимок без своего набора — known = 0:
+           зонд идёт прежним набором. */
+        int f = ev->family == 6;
+        if (s->tcp_opts_wait[f] && ev_matches_flow(ev, &s->tcp_opts_wait_flow[f])) {
+            s->tcp_shape_opts_known[f] = 1;
+            s->tcp_shape_opts_len[f] = s->tcp_opts_wait_len[f];
+            memcpy(s->tcp_shape_opts[f], s->tcp_opts_wait_bytes[f], s->tcp_opts_wait_len[f]);
+        } else {
+            s->tcp_shape_opts_known[f] = 0;
+            s->tcp_shape_opts_len[f] = 0;
+        }
+        /* Ожидание гаснет на ПЕРВОМ сохранённом снимке, совпал ключ или нет:
+           набор, чей снимок так и не доехал (кадр управления потерян), не
+           должен позже достаться чужому снимку. Полностью это закрывает только
+           неподдельный ключ: немедленный ответ на ARM_SHAPE кладёт в оба
+           события нулевой ключ (datapath/ctlsrv.c), и при ПОТЕРЕ двух кадров
+           подряд — снимка одной цели и набора следующей — нулевой ключ
+           совпадёт с нулевым. Остаток названного риска в журнале работ. */
+        s->tcp_opts_wait[f] = 0;
+    }
     if (ev->transport == 6 && ev->shape_len <= sizeof s->ech_inputs[0].bytes &&
         d2k_hello_ech_offer(ev->shape, ev->shape_len, NULL) == 1) {
         size_t slot = 8;
@@ -8089,6 +8330,10 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         s->ech_inputs[slot].len = ev->shape_len;
         s->ech_inputs[slot].family = family;
         s->ech_inputs[slot].observed_ms = s->now_ms;
+        s->ech_inputs[slot].opts_known = s->tcp_shape_opts_known[family == 6];
+        s->ech_inputs[slot].opts_len = s->ech_inputs[slot].opts_known ? s->tcp_shape_opts_len[family == 6] : 0;
+        if (s->ech_inputs[slot].opts_len)
+            memcpy(s->ech_inputs[slot].opts, s->tcp_shape_opts[family == 6], s->ech_inputs[slot].opts_len);
     }
     /* СНИМОК QUIC СОХРАНЯЕТСЯ ОБЩИМ, а не только задаче своего имени.
        Собственный Initial позволяет начать без него, но не является
@@ -8149,6 +8394,9 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
                    announced once per run. */
                 memcpy(t->snap, ev->shape, ev->shape_len);
                 t->snap_len = ev->shape_len;
+                t->snap_opts_known = s->tcp_shape_opts_known[ev->family == 6];
+                t->snap_opts_len = t->snap_opts_known ? s->tcp_shape_opts_len[ev->family == 6] : 0;
+                if (t->snap_opts_len) memcpy(t->snap_opts, s->tcp_shape_opts[ev->family == 6], t->snap_opts_len);
                 t->stop = 1;
                 if (!t->snap_stop) {
                     t->snap_stop = 1;
@@ -8556,7 +8804,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     }
     if (unfit_here) {
         say(s, "по %s план %s зонду исполнился, а потоку клиента — нет "
-               "(не помещается в посылку). Подтверждать не буду: обход, "
+               "(не помещается в посылку либо поток не несёт того, что план "
+               "требует). Подтверждать не буду: обход, "
                "который не достаётся человеку, обходом не является. "
                "Беру следующего кандидата",
             t->name, plan_id);
@@ -8714,13 +8963,25 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     if (t->net_probing && t->next_plan > 0 && t->net_probe_name[t->next_plan - 1][0]) {
         d2k_net_whitelist *nw = &s->cat->net;
         snprintf(nw->name, sizeof nw->name, "%s", t->net_probe_name[t->next_plan - 1]);
-        nw->searched = 1;
+        /* ДОКАЗАТЕЛЬСТВО СВЯЗЫВАЕТСЯ С ТИПОМ ОБРЫВА (поле 23.10.2026). Подбор
+           закрывает только проход ВХОДЯЩЕГО обрыва: поле определено как имя,
+           под которым коробка пропускает поток за RX-обрыв. Проход исходящей
+           лестницы имя запоминает — он настоящая находка для этой цели, — но
+           подбор держит открытым: иначе цели с входящим обрывом наследуют
+           имя, против их обрыва не проверенное (семь целей, тела 13–17 КБ при
+           ответе 200). */
+        nw->tx_only = t->vol.rx_cut ? 0 : 1;
+        nw->searched = t->vol.rx_cut ? 1 : 0;
         nw->confirmed_at = wall_s(s, now_ms);
         s->cat->revision++;
         s->sync_pending = 1;
         t->net_probing = 0;
-        say(s, "по %s белое имя сети подобрано: «%s» снимает измеренный обрыв — сохраняю как "
-               "свойство сети, подбор больше не повторяю", t->name, nw->name);
+        say(s, "по %s белое имя сети подобрано: «%s» снимает %s — сохраняю как "
+               "свойство сети, %s", t->name, nw->name,
+            t->vol.rx_cut ? "RX-обрыв" : "обрыв исходящей лестницы (бюджет потока пройден)",
+            t->vol.rx_cut ? "подбор больше не повторяю"
+                          : "но подбор остаётся открытым: входящий обрыв этим именем "
+                            "не проверялся");
     }
     if (t->ver.replay_proof && t->transport == 17)
         say(s, "по %s (QUIC, ECH) ПОДТВЕРЖДЕНО повтором пачки клиента на уровне "
@@ -9126,6 +9387,97 @@ static void on_refused_foreign(d2k_sched *s, const d2k_ev *ev) {
         name, (unsigned)ev->code);
 }
 
+/* ПОТОК КЛИЕНТА НЕ НЕСЁТ ТОГО, ЧТО ПЛАН ТРЕБУЕТ (D2K_REFUSE_FLOW_UNFIT) —
+ * перемерить цель для этого клиента, а не докладывать «подтверждено».
+ *
+ * Поле issue #7, 22.10.2026: план tcp-template-v1 со сдвигом метки времени
+ * подтверждён зондом (зонд метку предлагает всегда — detect/raw.c), телефоны
+ * его исполняют, ПК без метки времени — 13 из 13 «план не применён». Привязка
+ * при этом числилась подтверждённой, и правило «план уже подтверждён — не
+ * улика» (on_suspect, binding_covering) закрывало цель от нового замера.
+ *
+ * Что делается: привязка этого плана на эту цель помечается «требует
+ * повторной проверки» (задача 21: каталог цел, план не стёрт, подтверждение
+ * того же или нового плана снимает пометку) и по цели заводится подозрение —
+ * оно и ведёт к замеру. С провода план НЕ снимается: клиентам с меткой он
+ * исполняется, и отнять у них обход до нового замера — вред без пользы.
+ * Повторный такой отказ (следующее соединение того же ПК) пометку не
+ * обновляет и второй строки не пишет.
+ *
+ * Чего НЕ делается: свойство коробки не пишется и план не бракуется — отказ
+ * говорит о клиенте, не о коробке (§2.4). Замысел 2026-10-23, п. 5.3. */
+static void on_refused_unfit(d2k_sched *s, const d2k_ev *ev) {
+    const char *found = recall(s, ev);
+    if (!found || found[0] == '\0' || !s->cat) { return; }
+    char name[256];
+    snprintf(name, sizeof name, "%s", found);
+    uint8_t transport = ev->transport ? ev->transport : 6;
+    uint8_t family = ev->family ? ev->family : 4;
+    uint8_t present = 0;
+    for (size_t i = 0; i < D2K_PLAN_ID_LEN; i++) { present |= ev->plan_id[i]; }
+    /* ЭТУ ПАРУ «ЦЕЛЬ + ПЛАН» УЖЕ ПЕРЕМЕРЯЛИ — второй раз нечем (находка 3). */
+    size_t n_done = sizeof s->unfit_done / sizeof s->unfit_done[0];
+    for (size_t i = 0; i < n_done; i++) {
+        if (!s->unfit_done[i].name[0] || s->unfit_done[i].transport != transport ||
+            s->unfit_done[i].family != family ||
+            strcmp(s->unfit_done[i].name, name) != 0) { continue; }
+        if (memcmp(s->unfit_done[i].plan_id, ev->plan_id, D2K_PLAN_ID_LEN) == 0) {
+            char quiet_key[300];
+            snprintf(quiet_key, sizeof quiet_key, "unfit-done %u %s", transport, name);
+            say_quiet(s, quiet_key, "по %s поток этого клиента не несёт того, что план "
+                      "требует, и цель по этому плану уже перемеряна — второй раз "
+                      "перемерять нечем, отказ детерминирован (причина %u)",
+                      name, (unsigned)ev->code);
+            return;
+        }
+    }
+    size_t marked = 0, waiting = 0;
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t j = 0; j < b->n_binds; j++) {
+            d2k_cat_binding *bd = &b->binds[j];
+            if (!bd->enabled || strcmp(bd->kind, "name") || strcmp(bd->target, name) ||
+                (bd->transport ? bd->transport : 6) != transport ||
+                (bd->family ? bd->family : 4) != family) { continue; }
+            if (present) {
+                uint8_t id[D2K_PLAN_ID_LEN] = {0};
+                size_t n = strlen(bd->plan_id); if (n > sizeof id) { n = sizeof id; }
+                memcpy(id, bd->plan_id, n);
+                if (memcmp(id, ev->plan_id, sizeof id) != 0) { continue; }
+            }
+            if (bd->recheck_since) { waiting++; continue; }
+            bd->recheck_since = wall_s(s, s->now_ms);
+            bd->recheck_mono_ms = s->now_ms ? s->now_ms : 1;
+            b->updated = bd->recheck_since;
+            marked++;
+            /* НЕ «для этого клиента» (ревью, находка 4): событие отказа не
+               несёт набор опций отказавшего потока, и замер пойдёт тем
+               снимком и набором, который попадёт в ячейку первым — может
+               оказаться другой клиент той же цели. Говорим ровно то, что
+               делаем: цель перемеряется заново. */
+            say(s, "по %s привязка %s помечена на повторную проверку: поток клиента не "
+                   "несёт того, что план требует (причина %u; у tcp-template-v1 это "
+                   "метка времени TCP) — перемеряю цель заново тем клиентом, чьё "
+                   "приветствие снимется первым, план с провода не снимаю "
+                   "(каталог сохранён)",
+                name, bd->plan_id, (unsigned)ev->code);
+        }
+    }
+    if (marked) { s->cat->revision++; }
+    if (waiting || task_of(s, name, transport, family)) { return; }
+    /* Запоминаем пару до завода замера: он один на эту пару (находка 3). */
+    size_t slot = s->unfit_done_next++ % n_done;
+    snprintf(s->unfit_done[slot].name, sizeof s->unfit_done[slot].name, "%s", name);
+    s->unfit_done[slot].transport = transport;
+    s->unfit_done[slot].family = family;
+    memcpy(s->unfit_done[slot].plan_id, ev->plan_id, D2K_PLAN_ID_LEN);
+    d2k_ev suspicion = *ev;
+    suspicion.kind = D2K_EV_SUSPECT;
+    suspicion.code = D2K_SUSPECT_REPEAT;
+    suspicion.planned = D2K_LINK_PLANNED_NO;
+    (void)on_suspect(s, &suspicion);
+}
+
 static void on_refused(d2k_sched *s, const d2k_ev *ev) {
     if (ev->code == 0) { return; }
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
@@ -9172,6 +9524,20 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
     /* Ни одна задача этот отказ своим не признала: поток не наш, его открыл
        кто-то в доме. План при этом применялся — значит он стоит на цели, а
        браузер под него не подошёл. */
+    if (ev->code == D2K_REFUSE_FLOW_UNFIT) {
+        /* ТОЛЬКО on_refused_unfit. on_refused_foreign здесь ЗАПРЕЩЁН (ревью
+           ветки, находка 2): он пишет план в t->unfit_plan_id[], и
+           verify_confirm по этому идентификатору отказывается подтверждать
+           («обход, который не достаётся человеку, обходом не является»). Это
+           верно для НЕПОМЕСТИВШЕЙСЯ посылки — там план не исполнится никому с
+           таким приветствием. Здесь же план исполняется каждому, кто несёт
+           метку времени, и один ПК без метки накладывал бы вето на
+           подтверждение tcpts-плана по любой цели: телефоны теряли бы рабочий
+           обход. Это прямо против решения 5.3 — с провода план не снимаем
+           именно потому, что он работает у остальных. */
+        on_refused_unfit(s, ev);
+        return;
+    }
     if (refuse_is_permanent((uint8_t)ev->code) && s->cat->groups) {
         const char *name = recall(s, ev);
         if (name) {
@@ -9466,6 +9832,19 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
     case D2K_EV_SHAPE:
         on_shape(s, ev);
         return 0;
+    case D2K_EV_CLIENT_TCP: {
+        /* Набор опций TCP клиента — ждёт свой SHAPE (тот же поток), см. on_shape. */
+        int f = ev->family == 6;
+        if (ev->tcp_options_len > sizeof s->tcp_opts_wait_bytes[f]) { return 0; }
+        memcpy(s->tcp_opts_wait_bytes[f], ev->tcp_options, ev->tcp_options_len);
+        s->tcp_opts_wait_len[f] = ev->tcp_options_len;
+        d2k_flowkey *flow = &s->tcp_opts_wait_flow[f];
+        memcpy(flow->a_ip, ev->low_ip, 16); memcpy(flow->b_ip, ev->high_ip, 16);
+        flow->a_port = ev->low_port; flow->b_port = ev->high_port;
+        flow->transport = 6; flow->family = ev->family ? ev->family : 4;
+        s->tcp_opts_wait[f] = 1;
+        return 0;
+    }
     case D2K_EV_APPLIED:
         on_applied(s, ev);
         return 0;
@@ -9532,6 +9911,7 @@ static void own_first_continue(d2k_sched *s, task *t) {
         memcpy(t->trig, s->tcp_shape[f], s->tcp_shape_len[f]);
         t->trig_len = s->tcp_shape_len[f];
         t->trig_snapped = 1;
+        take_shape_opts(s, t);
         t->reasked = 1;
         t->ctrl_len = 0;
         say(s, "по %s снимок клиента пришёл во время проверки своих планов — "
@@ -10243,6 +10623,13 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 memcpy(t->trig, snap, snap_len);
                 t->trig_len = snap_len;
                 t->trig_snapped = 1;
+                if (snap_restart) {
+                    t->client_opts_known = t->snap_opts_known;
+                    t->client_opts_len = t->snap_opts_known ? t->snap_opts_len : 0;
+                    if (t->client_opts_len) memcpy(t->client_opts, t->snap_opts, t->client_opts_len);
+                } else {
+                    take_shape_opts(s, t);
+                }
                 t->ctrl_len = 0;   /* контроль соберётся из новых байт */
                 if (other_form) {
                     say(s, "по %s замер шёл приветствием другой формы, чем у клиента "
@@ -10738,6 +11125,19 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (t->ver.level == D2K_VER_DENIED) {
                 say(s, "по %s HTTP 451: юридический отказ, не доказательство блокировки провайдера; перебор остановлен",
                     t->name);
+                /* ОТКАЗАЛ СЕРВИС, А НЕ КОРОБКА — значит перемерять эту цель
+                   сейчас же бессмысленно: следующий замер получит тот же 451.
+                   Остывание такое же, как у антибот-ответа рядом; без него
+                   поле 23.10.2026 показало два полных поиска одной цели за
+                   145 секунд с одинаковым исходом. Что опыт при этом
+                   выбрасывается целиком (план снял блок рукопожатия, а
+                   пользователь получает разорванное соединение вместо
+                   страницы отказа) — отдельный вопрос, см. замысел
+                   2026-10-23 «HTTP 451: приём снял блок рукопожатия». */
+                cooldown_record(s, t, 4);
+                say(s, "по %s юридический отказ сервиса: активный замер этой цели "
+                       "поставлен на паузу на %lld мин", t->name,
+                    (long long)(SCHED_CHALLENGE_BACKOFF_MS / 60000));
                 ver_close(t);
                 task_fail(s, t, now_ms);
                 moved++;
@@ -10916,7 +11316,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                         if (!t->vol.rx_cut && ech_witness_rx_cut(t)) {
                             t->vol.rx_cut = 1;
                             t->vol.rx_at_kb = (int)(t->ver.body_bytes / 1024);
-                            t->net_probing = net_whitelist_undecided(s);
+                            t->net_probing = net_whitelist_needs_probe(s, t);
                             t->rx_volume_candidate_pending = rx_ladder_pending(t);
                             say(s, "по %s под планом через принятый ECH ответ свидетеля %s "
                                    "оборвался около %d КБ — это объёмный обрыв; добавляю "

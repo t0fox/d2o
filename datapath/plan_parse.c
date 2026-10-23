@@ -122,6 +122,16 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             }
             c->poisons++;
             break;
+        case REC_AUTOTTL:
+            /* minexec 13: старый исполнитель записи не знает и поставил бы
+               фальшивку с константным TTL — другое воздействие (§2.5). */
+            if (rd16(b + 6) < 13 || ln != 5) {
+                fail(err, errlen, "autottl требует minexec=13 и 5 байт"); return -1;
+            }
+            if (b[off + 3] > b[off + 4] && b[off + 4] != 0) {
+                fail(err, errlen, "autottl: min больше max"); return -1;
+            }
+            break;
         case REC_SPLIT:
             if (ln != 4) { fail(err, errlen, "разрез не 4 байта"); return -1; }
             c->splits++;
@@ -456,7 +466,23 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
             po->id = rd16(v);
             po->ttl = v[2];
             po->flags = v[3];
+            po->ts_up = (v[3] & D2K_POISON_TS_UP) ? 1 : 0;
             po->seq_shift = (int32_t)rd32(v + 4);
+            break;
+        }
+        case REC_AUTOTTL: {
+            /* Ссылка на порчу по id: запись идёт ПОСЛЕ своей порчи, как и
+               прочие ссылающиеся записи. Висячая ссылка — отказ. */
+            uint16_t pid = rd16(v);
+            struct d2k_poison *po = NULL;
+            for (size_t k = 0; k < p->n_poisons; k++) {
+                if (p->poisons[k].id == pid) { po = &p->poisons[k]; break; }
+            }
+            if (!po) { fail(err, errlen, "autottl ссылается на неизвестную порчу"); return -1; }
+            po->autottl = 1;
+            po->autottl_delta = (int8_t)v[2];
+            po->autottl_min = v[3];
+            po->autottl_max = v[4];
             break;
         }
         case REC_SPLIT: {
@@ -563,6 +589,13 @@ uint8_t d2k_plan_poison_used(const d2k_plan *p) {
         used |= p->poisons[i].flags;
     }
     return used;
+}
+
+uint8_t d2k_plan_flow_needs(const d2k_plan *p) {
+    if (!p || p->wire_profile != D2K_WIRE_TCP_TEMPLATE) {
+        return 0;
+    }
+    return (d2k_plan_poison_used(p) & D2K_POISON_TCPTS_BACK) ? D2K_FLOW_NEED_TCPTS : 0;
 }
 
 int d2k_plan_quic_deny(const d2k_plan *p) {

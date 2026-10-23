@@ -142,6 +142,15 @@ static int bridge_input(const char *ip, uint16_t port,
     memcpy(trp->payload, trigger.bytes, trigger.len);
     trp->len = trigger.len;
     trp->accept = D2K_ACCEPT_SERVERHELLO;
+    /* Набор опций TCP клиента — вместе с его приветствием: зонд здоровается
+     * им, а не литералом (замысел 2026-10-23, п. 5.1). */
+    if (trigger.tcp_known && trigger.tcp_options_len <= sizeof trp->client_tcp_options) {
+        trp->client_tcp_known = 1;
+        trp->client_tcp_options_len = trigger.tcp_options_len;
+        if (trigger.tcp_options_len) {
+            memcpy(trp->client_tcp_options, trigger.tcp_options, trigger.tcp_options_len);
+        }
+    }
     if (d2k_hello_sni(trp->payload, trp->len, &off, &len) == 0) {
         trp->sni_off = (int)off;
         trp->sni_len = (int)len;
@@ -166,6 +175,56 @@ static int bridge_input(const char *ip, uint16_t port,
          * silent unvouched control cannot prove an address block. The
          * scheduler hook carries no explicit operator-vouch argument. */
         optp->control_vouched = 0;
+    }
+    /* ПРИМАНКА — КЛОН ПРИВЕТСТВИЯ КЛИЕНТА С БЕЗОБИДНЫМ ИМЕНЕМ.
+     *
+     * Документированный механизм zapret2 (bol-van, docs/manual.md):
+     * `tls_client_hello_clone` «подготавливает blob… заполненный результатом
+     * модификации текущего reasm», умеет операции со SNI (`sni_del`,
+     * `sni_first`, `sni_snt_new`) и принимает `fallback` — блоб, который
+     * копируется в результат, «если пейлоад неверного типа или невалидный».
+     * Дальше этот блоб уходит телом `fake`. Мы переносили только fallback:
+     * приманка всегда была чужой формой (шаблон, снятый с www.microsoft.com)
+     * с безобидным именем внутри, а коробка, разбирающая L7, смотрит именно
+     * В приманку.
+     *
+     * Имя берётся у контроля: его подбирает планировщик (белое имя сети), и
+     * менять эту ось здесь нечего. Байты — снятого приветствия, и ТОЛЬКО
+     * снятого: заготовка холодного старта такой же синтетикой и осталась бы.
+     *
+     * Отличие от документированной функции названо честно: она удаляет все
+     * хосты и добавляет свой первым (`sni_del` + `sni_first`), а
+     * d2k_hello_rename подменяет значение имеющегося SNI. Для приветствия с
+     * одним хостом — обычного случая — это то же самое; приветствие с
+     * несколькими хостами мы так не трогаем.
+     *
+     * Зондов не добавляется: это другой ИСТОЧНИК тех же байт в тех же
+     * вопросах, а не новая ось перебора. */
+    if (trigger.snapped && trigger.len > 5 && trigger.bytes[0] == 0x16 &&
+        control.bytes && control.len >= 2) {
+        size_t coff = 0, clen = 0;
+        char benign[256];
+        if (d2k_hello_sni(optp->control.payload, optp->control.len, &coff, &clen) == 0 &&
+            clen > 0 && clen < sizeof benign &&
+            !memchr(optp->control.payload + coff, 0, clen)) {
+            size_t out_len = 0;
+            memcpy(benign, optp->control.payload + coff, clen);
+            benign[clen] = '\0';
+            /* d2k_hello_rename работает с рукопожатием, обёртка записи своя. */
+            if (d2k_hello_rename(trigger.bytes + 5, trigger.len - 5, benign,
+                                 optp->decoy.payload + 5,
+                                 sizeof optp->decoy.payload - 5, &out_len) == 0 &&
+                out_len <= 0xffff) {
+                memcpy(optp->decoy.payload, trigger.bytes, 3);
+                optp->decoy.payload[3] = (uint8_t)(out_len >> 8);
+                optp->decoy.payload[4] = (uint8_t)out_len;
+                optp->decoy.len = out_len + 5;
+                optp->decoy.accept = D2K_ACCEPT_TLSRECORD;
+                snprintf(optp->decoy.name, sizeof optp->decoy.name, "clone");
+            } else {
+                optp->decoy.len = 0;   /* fallback, как в документации */
+            }
+        }
     }
     /* Белое имя сети приманкой для вопроса «приветствие под меткой» (поле
        10.10.2026): полный ClientHello-record, не имя контроля. Пусто —

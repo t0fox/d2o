@@ -316,7 +316,7 @@ static unsigned long long query_ok_cmds(probe *p) {
  * случайности: самодельные байты здесь были бы тем самым грехом, против
  * которого возражает вся остальная приманка этого файла. */
 static d2k_hello build_trigger(uint8_t *buf, size_t cap, const char *sni) {
-    d2k_hello h; h.bytes = NULL; h.len = 0;
+    d2k_hello h = {0}; h.bytes = NULL; h.len = 0;
     size_t len = 0;
     if (d2k_hello_from_profile(D2K_SHAPE_LEGACY, sni, buf, cap, &len) == 0) {
         h.bytes = buf;
@@ -1174,7 +1174,7 @@ int main(int argc, char **argv) {
               pr.counts_duplicates == D2K_P_UNKNOWN,
               "link_fd < 0 обязан дать вектор из одних D2K_P_UNKNOWN");
 
-        d2k_hello empty = { NULL, 0 };
+        d2k_hello empty = {NULL, 0, NULL, 0, 0, 0};
         pr = d2k_props_ask(-1, NULL, 0, empty, empty, 0);
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN &&
               pr.tolerates_reorder == D2K_P_UNKNOWN &&
@@ -1217,13 +1217,13 @@ int main(int argc, char **argv) {
     {
         uint8_t tb[2048];
         d2k_hello trig = build_trigger(tb, sizeof tb, "guard2.example");
-        d2k_hello empty = { NULL, 0 };
+        d2k_hello empty = {NULL, 0, NULL, 0, 0, 0};
 
         d2k_props pr = d2k_props_ask(fd, NULL, 443, trig, empty, 0x2d);
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN && pr.parses_l7 == D2K_P_UNKNOWN,
               "ip == NULL при валидном fd всё равно обязан дать вектор из одних UNKNOWN");
 
-        d2k_hello notrig = { NULL, 0 };
+        d2k_hello notrig = {NULL, 0, NULL, 0, 0, 0};
         pr = d2k_props_ask(fd, stand_port ? "127.0.0.1" : "127.0.0.1", stand_port, notrig, empty, 0x2d);
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN,
               "trigger без байт при валидных fd/ip обязан дать вектор из одних UNKNOWN");
@@ -1232,7 +1232,7 @@ int main(int argc, char **argv) {
            честно откажет, а не подставит первые байты за имя. */
         uint8_t garbage[32];
         memset(garbage, 0x99, sizeof garbage);
-        d2k_hello notls = { garbage, sizeof garbage };
+        d2k_hello notls = {garbage, sizeof garbage, NULL, 0, 0, 0};
         pr = d2k_props_ask(fd, "127.0.0.1", stand_port, notls, empty, 0x2d);
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN,
               "триггер без извлекаемого SNI обязан дать вектор из одних UNKNOWN, а не имя из мусора");
@@ -1433,7 +1433,7 @@ int main(int argc, char **argv) {
     {
         uint8_t tb[2048];
         d2k_hello trig = build_trigger(tb, sizeof tb, "b3.example");
-        d2k_hello nodecoy = { NULL, 0 };
+        d2k_hello nodecoy = {NULL, 0, NULL, 0, 0, 0};
         CHECK(trig.bytes, "build_trigger(b3) не собрался");
 
         /* Перекрытие, дубликаты, порядок, сумма — все промах. Дубликаты
@@ -1488,7 +1488,7 @@ int main(int argc, char **argv) {
     {
         uint8_t tb[2048];
         d2k_hello trig = build_trigger(tb, sizeof tb, "b5.example");
-        d2k_hello nodecoy = { NULL, 0 };
+        d2k_hello nodecoy = {NULL, 0, NULL, 0, 0, 0};
         CHECK(trig.bytes, "build_trigger(b5) не собрался");
 
         size_t sni_off = 0, sni_len = 0;

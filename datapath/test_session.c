@@ -1364,8 +1364,176 @@ static void test_tcp_stall(void) {
     }
 }
 
+/* ЗАМЫСЕЛ 23.10.2026, п. 5.3: ПЛАН ВЕЗЁТ СВОИ ТРЕБОВАНИЯ К ПОТОКУ.
+ *
+ * Поле issue #7 (22.10.2026): план tcp-template-v1 с порчей «метка времени
+ * назад» подтверждён зондом, а с ПК репортёра — 13 из 13 «план не применён».
+ * Профиль копирует опции потока клиента и сдвигает в них метку; у клиента
+ * метки нет, и d2k_wire_build возвращал 0 — тот же ноль, что «не поместилось»,
+ * с текстом «буфер отправки кончился» и без кода. Контроллер читал это как
+ * «план подтверждён, датапат его не применял» и ничего не перемерял.
+ *
+ * Требование: датапат проверяет требования плана к потоку ДО сборки и
+ * отказывает своей причиной и своим кодом (D2K_REFUSE_FLOW_UNFIT); поток с
+ * меткой времени план исполняет как прежде. */
+static void put_rec(uint8_t *b, size_t *n, uint16_t type, const uint8_t *v, uint16_t len) {
+    b[(*n)++] = (uint8_t)(type >> 8); b[(*n)++] = (uint8_t)type;
+    b[(*n)++] = (uint8_t)(len >> 8);  b[(*n)++] = (uint8_t)len;
+    if (len) { memcpy(b + *n, v, len); }
+    *n += len;
+}
+
+static size_t build_pkt_ts(uint8_t *o, uint16_t sport, uint8_t flags,
+                           const uint8_t *pay, size_t paylen) {
+    static const uint8_t ts[12] = {1, 1, 8, 10, 0x00, 0x12, 0x34, 0x56, 0, 0, 0, 0};
+    size_t n = build_pkt_opt(o, sport, flags, pay, paylen, sizeof ts);
+    memcpy(o + 40, ts, sizeof ts);
+    return n;
+}
+
+static size_t template_ts_plan(uint8_t *plan, size_t cap) {
+    uint8_t hello[512];
+    size_t hlen = build_hello(hello);
+    size_t n = 0;
+    if (cap < 64 + hlen) { return 0; }
+    memcpy(plan, "D2KP", 4);
+    plan[4] = 0; plan[5] = 1;             /* версия 1 */
+    plan[6] = 0; plan[7] = 8;             /* minexec 8: tcp-template-v1 */
+    plan[8] = 0; plan[9] = 0; plan[10] = 0; plan[11] = 8;
+    n = 12;
+    uint8_t id[16] = {0x7A, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    put_rec(plan, &n, 0x0001, id, sizeof id);
+    uint8_t proto[2] = {6, 1};
+    put_rec(plan, &n, 0x0002, proto, sizeof proto);
+    put_rec(plan, &n, 0x010a, NULL, 0);   /* input tls-sni */
+    uint8_t wire = 2;                     /* tcp-template-v1 */
+    put_rec(plan, &n, 0x0109, &wire, 1);
+    uint8_t payload[2 + 512];
+    payload[0] = 0; payload[1] = 1;
+    memcpy(payload + 2, hello, hlen);
+    put_rec(plan, &n, 0x0010, payload, (uint16_t)(2 + hlen));
+    uint8_t poison[8] = {0, 1, 0, D2K_POISON_TCPTS_BACK, 0, 0, 0, 0};
+    put_rec(plan, &n, 0x0011, poison, sizeof poison);
+    uint8_t fake[11] = {0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 3};
+    put_rec(plan, &n, 0x0101, fake, sizeof fake);
+    uint8_t order = 0;
+    put_rec(plan, &n, 0x0103, &order, 1);
+    return n;
+}
+
+static size_t count_refused_code(const d2k_journal *j, uint8_t code) {
+    size_t n = d2k_journal_count(j), k = 0;
+    for (size_t i = 0; i < n; i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e && e->kind == D2K_JRN_PLAN_REFUSED && e->code == code) { k++; }
+    }
+    return k;
+}
+
+static void test_template_plan_needs_client_timestamp(void) {
+    d2k_nat_fn saved = d2k_nat_hook;
+    d2k_nat_hook = nat_stub;
+    uint8_t hello[512], pkt[1024], buf[8192], plan[1024];
+    char err[128];
+    size_t hlen = build_hello(hello);
+    size_t plen = template_ts_plan(plan, sizeof plan);
+    d2k_result r;
+
+    d2k_session *g = d2k_session_new(8, 8);
+    d2k_plan *p = NULL;
+    CHECK(plen > 0 && d2k_plan_load(plan, plen, &p, err, sizeof err) == 0,
+          "план tcp-template-v1 с меткой времени не разобран");
+    if (!p) { fprintf(stderr, "  %s\n", err); d2k_session_free(g); d2k_nat_hook = saved; return; }
+    d2k_session_set_plan(g, p);
+    nat_calls = 0;
+    nat_miss_first_n = 0;
+
+    /* --- клиент без метки времени (ПК репортёра #7) ---------------------- */
+    size_t n = build_pkt(pkt, 41400, 0x02, NULL, 0);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    n = build_rev_pkt(pkt, 41400, 0x12, NULL, 0);
+    d2k_session_packet(g, pkt, n, 2000, buf, sizeof buf, &r);
+    n = build_pkt(pkt, 41400, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 3000, buf, sizeof buf, &r);
+    CHECK(r.n_out == 0 && r.verdict == D2K_VERDICT_ACCEPT,
+          "поток без метки: план частично собран или оригинал снят");
+    CHECK(r.skipped != NULL && strstr(r.skipped, "метк") != NULL,
+          "поток без метки: отказ не назван требованием плана к потоку");
+    CHECK(r.skipped == NULL || strstr(r.skipped, "буфер") == NULL,
+          "поток без метки: отказ выдан за нехватку буфера");
+    CHECK(count_refused_code(d2k_session_journal(g), D2K_REFUSE_FLOW_UNFIT) == 1,
+          "поток без метки: отказ не записан кодом «поток не несёт требуемого»");
+    CHECK(d2k_session_applied(g) == 0, "поток без метки: счётчик применений сдвинулся");
+
+    /* --- клиент с меткой времени: план исполняется ----------------------- */
+    n = build_pkt_ts(pkt, 41401, 0x02, NULL, 0);
+    d2k_session_packet(g, pkt, n, 4000, buf, sizeof buf, &r);
+    n = build_rev_pkt(pkt, 41401, 0x12, NULL, 0);
+    d2k_session_packet(g, pkt, n, 5000, buf, sizeof buf, &r);
+    n = build_pkt_ts(pkt, 41401, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 6000, buf, sizeof buf, &r);
+    CHECK(r.n_out > 0 && r.skipped == NULL, "поток с меткой: план не исполнен");
+    CHECK(count_refused_code(d2k_session_journal(g), D2K_REFUSE_FLOW_UNFIT) == 1,
+          "поток с меткой: отказ «не несёт требуемого» записан зря");
+    d2k_session_free(g);
+    d2k_nat_hook = saved;
+}
+
+/* ЗАМЫСЕЛ 2026-10-23, п. 5.1: СНИМОК ПРИВЕТСТВИЯ НЕСЁТ НАБОР ОПЦИЙ TCP КЛИЕНТА.
+ * Датапат уже снимает приветствие по запросу (ARM_SHAPE); набор опций TCP того
+ * же пакета (тот, что профиль tcp-template-v1 копирует в фальшивки) отдаётся
+ * рядом, чтобы зонд здоровался этим набором, а не литералом. Пустой набор —
+ * честный профиль клиента без опций (ПК репортёра #7), не «нет данных». */
+static void test_shape_carries_client_tcp_options(void) {
+    uint8_t hello[512], pkt[1024], buf[4096];
+    size_t hlen = build_hello(hello);
+    const uint8_t name[] = "hetzner.com";
+    d2k_result r;
+    size_t olen = 77;
+
+    /* Снимка ещё нет — набора тоже. */
+    d2k_session *g = d2k_session_new(8, 8);
+    CHECK(d2k_session_shape_tcp_options_family(g, 4, &olen) == NULL && olen == 0,
+          "опции без снимка: не NULL");
+
+    /* Ловушка взведена, приветствие с меткой времени: набор 12 байт, вид 8. */
+    CHECK(d2k_session_want_shape(g, name, sizeof name - 1, 6) == 0, "ловушка не взвелась");
+    size_t n = build_pkt_ts(pkt, 41500, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(d2k_session_shape(g, 6, &olen) != NULL, "снимок с меткой не снят");
+    const uint8_t *o = d2k_session_shape_tcp_options_family(g, 4, &olen);
+    CHECK(o != NULL && olen == 12 && o[2] == 8 && o[3] == 10,
+          "опции снимка с меткой: не те байты");
+    d2k_session_free(g);
+
+    /* Приветствие без опций: набор известен и пуст. */
+    g = d2k_session_new(8, 8);
+    CHECK(d2k_session_want_shape(g, name, sizeof name - 1, 6) == 0, "ловушка не взвелась");
+    n = build_pkt(pkt, 41501, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(d2k_session_shape(g, 6, &olen) != NULL, "снимок без опций не снят");
+    olen = 77;
+    o = d2k_session_shape_tcp_options_family(g, 4, &olen);
+    CHECK(o != NULL && olen == 0, "опции снимка без опций: не пустой известный набор");
+    d2k_session_free(g);
+
+    /* Снимок отдан из последнего приветствия (ловушка после пакета): набор с ним. */
+    g = d2k_session_new(8, 8);
+    n = build_pkt_ts(pkt, 41502, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(d2k_session_want_shape(g, name, sizeof name - 1, 6) == 1, "последнее приветствие не отдано");
+    olen = 77;
+    o = d2k_session_shape_tcp_options_family(g, 4, &olen);
+    CHECK(o != NULL && olen == 12 && o[2] == 8, "опции последнего приветствия не отданы со снимком");
+    /* IPv6-слот чужой: там ничего нет. */
+    CHECK(d2k_session_shape_tcp_options_family(g, 6, &olen) == NULL, "IPv6-слот отдал чужие опции");
+    d2k_session_free(g);
+}
+
 int main(void) {
     D2K_TEST_NAT_NO_TABLE();
+    test_template_plan_needs_client_timestamp();
+    test_shape_carries_client_tcp_options();
     test_tcp_stall();
     test_route_mark_does_not_leak();
     test_routed_flag_reset_on_new_syn();

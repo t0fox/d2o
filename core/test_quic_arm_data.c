@@ -259,7 +259,7 @@ static void test_ladder_handshake_without_data(uint16_t port) {
     d2k_quic_arm_context c;
     memset(&c, 0, sizeof c);
     c.pool = pool; c.n_pool = 1; c.marked = 1;
-    d2k_hello trigger = {trig, tl}, control = {NULL, 0};
+    d2k_hello trigger = {trig, tl, NULL, 0, 0, 0}, control = {NULL, 0, NULL, 0, 0, 0};
     d2k_quic_arm r = d2k_quic_original_measure(&c, port, trigger, control, 100, 0);
     int filter_passes = 0;
     for (size_t i = 0; i < r.n_trace; i++) {
@@ -599,7 +599,7 @@ static void test_length_runtime(uint16_t port){
     uint8_t initial[4096];size_t n=0;
     CHECK(!d2k_quic_probe_initial(TARGET,initial,sizeof initial,&n),"length input builds");
     g_mode=M_BOUND;g_seen_n=0;int sent=0;
-    d2k_tally t=d2k_quic_ask_longer_hook("127.0.0.1",port,NULL,0,(d2k_hello){initial,n},
+    d2k_tally t=d2k_quic_ask_longer_hook("127.0.0.1",port,NULL,0,(d2k_hello){initial, n, NULL, 0, 0, 0},
         400,0,3,NULL,NULL,&sent,NULL);
     CHECK(t.pass==3 && sent==3,"runtime length question receives bound replies 3/3");
     pthread_mutex_lock(&g_mu);

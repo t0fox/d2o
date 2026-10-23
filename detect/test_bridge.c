@@ -3,6 +3,7 @@
  * is intercepted so a correct classifier cannot hide a broken adapter. */
 #include "d2k_detect.h"
 #include "d2k_verdict.h"
+#include "d2k_hello.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -138,7 +139,7 @@ static size_t build_hello(uint8_t *o, const char *sni);
 static d2k_vres measure_base(int pass, int fail, const char *err)
 {
     uint8_t hello[300], ctl[] = {0x16, 0x03, 0x01};
-    d2k_hello tr = {hello, build_hello(hello, "base.example")}, control = {ctl, sizeof ctl};
+    d2k_hello tr = {hello, build_hello(hello, "base.example"), NULL, 0, 0, 0}, control = {ctl, sizeof ctl, NULL, 0, 0, 0};
     memset(&answer, 0, sizeof answer);
     answer.verdict = D2K_DV_PREFIX; /* дальше дерево не идёт — вердикт не берётся */
     answer.repeats = 2;
@@ -156,7 +157,7 @@ static d2k_vres measure(void)
 {
     uint8_t hello[] = {0x16, 0x03};
     uint8_t ctl[] = {0x16, 0x03, 0x01};
-    d2k_hello tr = {hello, sizeof hello}, control = {ctl, sizeof ctl};
+    d2k_hello tr = {hello, sizeof hello, NULL, 0, 0, 0}, control = {ctl, sizeof ctl, NULL, 0, 0, 0};
     return d2k_detect_sched_tcp("192.0.2.1", 443, tr, control,
                                 0x2d, 2, 12000, 321, NULL);
 }
@@ -181,12 +182,55 @@ static size_t build_hello(uint8_t *o, const char *sni)
     return p;
 }
 
+/* ПРИМАНКА — КЛОН ПРИВЕТСТВИЯ КЛИЕНТА (документация zapret2, docs/manual.md,
+ * tls_client_hello_clone: блоб «заполненный результатом модификации текущего
+ * reasm», с аргументом fallback на неверный или невалидный пейлоад). Мы
+ * переносили только fallback: приманка была чужой формой с нашим безобидным
+ * именем внутри. Проверяем: снятый с провода вход даёт приманку-клон с именем
+ * приманки, а заготовка холодного старта оставляет fallback. */
+static void decoy_is_a_clone_of_the_client(void)
+{
+    uint8_t hello[400], ctl[400];
+    size_t hlen = build_hello(hello, "target.example");
+    size_t clen = build_hello(ctl, "decoy.example");
+
+    d2k_hello tr = {hello, hlen, NULL, 0, 0, 1};
+    d2k_hello control = {ctl, clen, NULL, 0, 0, 0};
+    memset(&answer, 0, sizeof answer);
+    answer.verdict = D2K_DV_PREFIX;
+    memset(&seen, 0, sizeof seen);
+    (void)d2k_detect_sched_tcp("192.0.2.1", 443, tr, control, 0x2d, 2, 0, 0, NULL);
+    /* Форма клиента, а не шаблона: длина та же, с поправкой на разницу имён. */
+    CHECK(seen.decoy.len ==
+          hlen - (strlen("target.example") - strlen("decoy.example")));
+    CHECK(seen.decoy.payload[0] == 0x16 &&
+          ((size_t)seen.decoy.payload[3] << 8 | seen.decoy.payload[4]) ==
+              seen.decoy.len - 5);
+    size_t off = 0, len = 0;
+    CHECK(d2k_hello_sni(seen.decoy.payload, seen.decoy.len, &off, &len) == 0);
+    CHECK(len == strlen("decoy.example") &&
+          memcmp(seen.decoy.payload + off, "decoy.example", len) == 0);
+    /* Имени цели в приманке не остаётся: иначе коробка срежет её по имени. */
+    int target_left = 0;
+    for (size_t i = 0; i + 14 <= seen.decoy.len; i++) {
+        if (memcmp(seen.decoy.payload + i, "target.example", 14) == 0) { target_left = 1; }
+    }
+    CHECK(!target_left);
+
+    /* ЗАГОТОВКА холодного старта: клона нет, остаётся fallback. */
+    d2k_hello cold = {hello, hlen, NULL, 0, 0, 0};
+    memset(&seen, 0, sizeof seen);
+    (void)d2k_detect_sched_tcp("192.0.2.1", 443, cold, control, 0x2d, 2, 0, 0, NULL);
+    CHECK(seen.decoy.len == 0);
+}
+
 int main(void)
 {
     d2k_vres r;
     d2k_arm arm;
     d2k_poison p;
     char why[160];
+    decoy_is_a_clone_of_the_client();
     {
         d2k_hello empty = {0};
         r = d2k_detect_sched_tcp("192.0.2.1", 443, empty, empty, 0x2d, 2, 12000, 321, NULL);
@@ -196,7 +240,7 @@ int main(void)
         /* The response-direction probe takes its SNI from tr.name; it must be
          * the client's name, never the address being measured. */
         uint8_t h[300], c[] = {0x16, 0x03, 0x01};
-        d2k_hello tr, ctl = {c, sizeof c};
+        d2k_hello tr, ctl = {c, sizeof c, NULL, 0, 0, 0};
         tr.bytes = h;
         tr.len = build_hello(h, "blocked.example");
         answer.verdict = D2K_DV_INCONCLUSIVE; answer.has_hit = 0;
@@ -393,7 +437,7 @@ int main(void)
     {
         /* Полный прогон с ответом базы: подсказка доходит до измерителя. */
         uint8_t hello[] = {0x16, 0x03};
-        d2k_hello tr = {hello, sizeof hello}, none = {0};
+        d2k_hello tr = {hello, sizeof hello, NULL, 0, 0, 0}, none = {0};
         d2k_base_seed seed;
         memset(&seed, 0, sizeof seed);
         seed.valid = 1; seed.repeats = 2; seed.pass = 0; seed.fail = 2;
@@ -470,7 +514,7 @@ int main(void)
         static const char *const only_unexpr[] = {"syndata", NULL};
         static const char *const box_oob[] = {"oob", NULL};
         uint8_t h[300], c[] = {0x16, 0x03, 0x01};
-        d2k_hello tr = {h, 0}, ctl = {c, sizeof c};
+        d2k_hello tr = {h, 0, NULL, 0, 0, 0}, ctl = {c, sizeof c, NULL, 0, 0, 0};
         tr.len = build_hello(h, "rutracker.org");
         memset(&answer, 0, sizeof answer);
         sweep_pass = box_takes;

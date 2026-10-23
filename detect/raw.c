@@ -190,6 +190,10 @@ typedef struct {
     int      rule_up;
     uint8_t tcp_options[12];
     uint8_t tcp_options_len;
+    /* Предлагать ли метку времени в SYN — по набору опций клиента, чьё
+     * приветствие повторяет зонд (d2k_trigger_offers_ts; замысел 2026-10-23,
+     * п. 5.1). Прежде метка стояла литералом, и зонд здоровался не как клиент. */
+    uint8_t offer_ts;
     /* raw_recv returns a slice which must survive until the next receive
      * on THIS connection, without being overwritten by another worker. */
     raw_buffers *buffers; /* heap-owned: do not grow the router worker stack */
@@ -799,8 +803,15 @@ static int raw_sendto(raw_conn *c, const uint8_t *pkt, size_t n)
  * замечали: он просыпается ровно тогда, когда мерят теми байтами, которыми
  * ходит настоящий браузер. То есть в продукте — всегда.
  *
- * 1400 — с запасом под PPPoE (1492) и под опции TCP в нашем же заголовке. */
-#define D2K_SEG_MAX D2K_ARM_SEGMENT_MAX
+ * 1400 — с запасом под PPPoE (1492) и под опции TCP в нашем же заголовке.
+ *
+ * Потолок — переменная, а не константа (поле 22.10.2026, issue #5/#7): ядро
+ * ставит его по пределу датапата (d2k_arm_segment), и замер уходит теми же
+ * сегментами, какими потом пойдёт план. Иначе на узком канале (туннель, LTE)
+ * замер шёл сегментами 1400, а план с таким сегментом датапат отвергал — и
+ * измеренное расходилось с исполнимым. По умолчанию — прежние 1400. */
+static unsigned seg_max = D2K_ARM_SEGMENT_MAX;
+void d2k_raw_set_segment_max(unsigned seg) { seg_max = seg ? seg : D2K_ARM_SEGMENT_MAX; }
 
 /* send кладёт нагрузку на провод. Номер последовательности НЕ двигается при
  * отравленной посылке: фальшивка обязана занять ту же область, что займут
@@ -829,8 +840,8 @@ static int raw_send(raw_conn *c, const uint8_t *payload, size_t plen,
     do {
         size_t take = plen - off;
         size_t n;
-        if (take > D2K_SEG_MAX) {
-            take = D2K_SEG_MAX;
+        if (take > seg_max) {
+            take = seg_max;
         }
         n = build_ip_tcp(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
                            seq + (uint32_t)off, c->ack, flags,
@@ -852,20 +863,32 @@ static int raw_send(raw_conn *c, const uint8_t *payload, size_t plen,
  * коробка вправе относиться к такому потоку иначе. */
 static int raw_send_syn(raw_conn *c)
 {
-    static const uint8_t opts[] = {
+    /* Набор с меткой времени — прежний литерал; без метки — как здоровается
+     * клиент, метку не предлагающий (MSS, окно, SACK): так ответ сервера не
+     * принесёт эха метки, и данные пойдут без неё, как у этого клиента. */
+    static const uint8_t opts_ts[] = {
         2, 4, 0x05, 0xac,               /* MSS 1452 */
         4, 2,                           /* SACK permitted */
         8, 10, 0, 0, 0, 1, 0, 0, 0, 0,  /* timestamps */
         1,                              /* NOP */
         3, 3, 7                         /* window scale 7 */
     };
+    static const uint8_t opts_plain[] = {
+        2, 4, 0x05, 0xac,               /* MSS 1452 */
+        1,                              /* NOP */
+        3, 3, 7,                        /* window scale 7 */
+        1, 1,                           /* NOP, NOP */
+        4, 2                            /* SACK permitted */
+    };
+    const uint8_t *opts = c->offer_ts ? opts_ts : opts_plain;
+    size_t optlen = c->offer_ts ? sizeof(opts_ts) : sizeof(opts_plain);
     uint8_t pkt[256];
     d2k_poison none;
     size_t n;
 
     memset(&none, 0, sizeof(none));
     n = build_ip_tcp(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
-                       c->seq, 0, TCP_SYN, NULL, 0, &none, opts, sizeof(opts));
+                       c->seq, 0, TCP_SYN, NULL, 0, &none, opts, optlen);
     if (n == 0) {
         return -1;
     }
@@ -1068,13 +1091,14 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
 /* dialRaw поднимает соединение своими руками и возвращает его установленным. */
 static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dport,
                     int timeout_ms, uint32_t mark_val, const d2k_detect_stop *cancel,
-                    char *err, size_t errcap)
+                    int offer_ts, char *err, size_t errcap)
 {
     int one = 1;
     int mark = (int)mark_val;
     struct timeval tv;
 
     memset(c, 0, sizeof(*c));
+    c->offer_ts = offer_ts ? 1 : 0;
     c->send_fd = -1;
     c->recv_fd = -1;
     if (family != 4 && family != 6) return -1;
@@ -1160,12 +1184,13 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
  * 2026-08-28, googlevideo: тот фронтенд обслуживает только заблокированные
  * имена, безобидной нагрузки для него не существует, и самопроверка падала не
  * потому, что слой сломан, а потому, что отвечать было не на что. */
-int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t port,
+int d2k_raw_probe_handshake_as(const uint8_t *ip4, uint8_t family, uint16_t port,
                             int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
-                            char *err, size_t errcap)
+                            int offer_ts, char *err, size_t errcap)
 {
     raw_conn c;
-    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap);
+    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel,
+                           offer_ts ? 1 : 0, err, errcap);
     if (dial_rc != 0) return dial_rc;
     raw_close(&c);
     return 1;
@@ -1254,7 +1279,8 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
     size_t resp_len = 0;
     int rc = 0;
 
-    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel, err, errcap);
+    int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel,
+                          d2k_trigger_offers_ts(tr), err, errcap);
     if (dial_rc != 0) return dial_rc;
     resp = c.buffers->resp;
 
@@ -1300,6 +1326,7 @@ senderr:
  * результат отравления без сырых сокетов не означает ничего, и вердикт обязан
  * это сказать (см. res.RawUsable в эталоне), а не промолчать. */
 int d2k_raw_supported(void) { return 0; }
+void d2k_raw_set_segment_max(unsigned seg) { (void)seg; }
 unsigned long d2k_raw_rst_fail_count(void) { return 0; }
 unsigned long d2k_raw_dial_count(void) { return 0; }
 void d2k_raw_flush_pending(void) {}
@@ -1315,11 +1342,12 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
     return -1;
 }
 
-int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t port,
+int d2k_raw_probe_handshake_as(const uint8_t *ip4, uint8_t family, uint16_t port,
                             int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
-                            char *err, size_t errcap)
+                            int offer_ts, char *err, size_t errcap)
 {
     (void)family; (void)ip4; (void)port; (void)timeout_ms; (void)mark; (void)cancel;
+    (void)offer_ts;
     snprintf(err, errcap, "classify: сырой слой доступен только на Linux");
     return -1;
 }
@@ -1330,6 +1358,15 @@ int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
     int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel, char *err, size_t errcap)
 {
     return d2k_raw_probe_handshake_family(ip4, 4, port, timeout_ms, mark, cancel, err, errcap);
+}
+
+/* Прежняя подпись — прежний набор с меткой времени. */
+int d2k_raw_probe_handshake_family(const uint8_t *ip4, uint8_t family, uint16_t port,
+                            int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
+                            char *err, size_t errcap)
+{
+    return d2k_raw_probe_handshake_as(ip4, family, port, timeout_ms, mark, cancel, 1,
+                                      err, errcap);
 }
 
 int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,

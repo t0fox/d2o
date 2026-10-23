@@ -106,7 +106,7 @@ d2k_ver_result d2k_verify_quic_replay_on(int use_fd, const char *ip, uint16_t po
            раскрываемый ключами из нашего DCID и адресованный нашему SCID, или
            Retry с верным тегом (qp_verify_bound). Чужое, VN и мусор —
            не доказательство, что коробка пропустила полёт. */
-        if (d2k_quic_verify_bound(buf, (size_t)n, (d2k_hello){fresh, fresh_len}) == 0) {
+        if (d2k_quic_verify_bound(buf, (size_t)n, (d2k_hello){fresh, fresh_len, NULL, 0, 0, 0}) == 0) {
             r.level = D2K_VER_HANDSHAKE;
             r.replay_proof = 1;
             snprintf(r.reason, sizeof r.reason,

@@ -184,7 +184,7 @@ static int send_control_hook(uint16_t port, int *sent) {
                               &control_len) != 0) {
         return -1;
     }
-    d2k_hello control = {control_bytes, control_len};
+    d2k_hello control = {control_bytes, control_len, NULL, 0, 0, 0};
     (void)d2k_quic_ask_control_hook("127.0.0.1", port, NULL, 0, control, 30, 0,
                                     REPEATS, NULL, NULL, sent, NULL);
     return 0;

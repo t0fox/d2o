@@ -136,9 +136,11 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
  * exact input constraints. Packet-size checks remain mandatory. */
 int d2k_arm_plan_measured(const d2k_arm *arm, const d2k_arm_input *input,
                           char *buf, size_t cap);
-/* Pure TCP split: the same program is measured by raw.c and exported by sched. */
+/* Pure TCP split: the same program is measured by raw.c and exported by sched.
+ * send_cap — предел длины посылки датапата (0 — не объявлен): сегмент плана
+ * укладывается под него (d2k_arm_segment). */
 int d2k_tcp_split_plan(size_t trigger_len, unsigned split, uint32_t gap_us,
-                       char *buf, size_t cap);
+                       size_t send_cap, char *buf, size_t cap);
 /* То же с объявленным пределом отправки (0 — не объявлен). Плечо, чья самая
  * длинная посылка (по сегменту замера) в предел не помещается, НЕ строится
  * (-1): урезать измеренные байты значило бы поставить другое воздействие. */
@@ -160,6 +162,19 @@ int d2k_rx_volume_plan(unsigned variant, d2k_shape shape, size_t send_cap,
  * имя — отказ: план без приманки смысла не имеет. */
 int d2k_rx_volume_plan_named(unsigned variant, d2k_shape shape, size_t send_cap,
                              const char *name, char *buf, size_t cap);
+/* ТА ЖЕ ЛЕСТНИЦА, НО ПОД КЛИЕНТА (поле issue #7, 23.10.2026). client_has_ts —
+ * несёт ли поток клиента метку времени TCP. Несёт: прежняя восстановленная
+ * программа поля с tcpts, байт в байт. Не несёт: та же программа с TTL по
+ * измеренному пути (ip_autottl документации zapret2) — ему от клиентской ОС
+ * не нужно ничего, а план с меткой датапат такому клиенту исполнить не может.
+ * Множители программы (приманка, серия ×8, разрез) не меняются. */
+int d2k_rx_volume_plan_client(unsigned variant, d2k_shape shape, size_t send_cap,
+                              const char *name, int client_has_ts,
+                              char *buf, size_t cap);
+/* Шаблон autottl запасной лестницы: +1 хоп за коробкой, зажим 2..12. */
+#define D2K_RX_AUTOTTL_DELTA 1
+#define D2K_RX_AUTOTTL_MIN   2u
+#define D2K_RX_AUTOTTL_MAX   12u
 /* Полный TLS-record ClientHello с name в SNI (приманка). 0 — собрано в out,
  * *len — длина; -1 — имя пустое или не поместилось. */
 int d2k_white_decoy_hello(const char *name, uint8_t *out, size_t cap, size_t *len);

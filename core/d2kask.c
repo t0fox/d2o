@@ -865,8 +865,8 @@ int main(int argc, char **argv) {
           "иначе только что поставленный план-кандидат прошёл бы мимо NFQUEUE нетронутым "
           "(files/S99d2k, правило mangle) — ниже везде \"метка: не ставится\"\n", (unsigned)a.mark);
 
-    d2k_hello trigger; trigger.bytes = trig_buf; trigger.len = trig_len;
-    d2k_hello control; control.bytes = have_ctrl ? ctrl_buf : NULL; control.len = have_ctrl ? ctrl_len : 0;
+    d2k_hello trigger = {0}; trigger.bytes = trig_buf; trigger.len = trig_len;
+    d2k_hello control = {0}; control.bytes = have_ctrl ? ctrl_buf : NULL; control.len = have_ctrl ? ctrl_len : 0;
 
     d2k_props_step steps[D2K_PROPS_QUESTIONS];
     d2k_props pr = d2k_props_ask_traced(fd, a.ip, a.port, trigger, control, a.mark, steps);

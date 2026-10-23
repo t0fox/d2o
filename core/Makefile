@@ -855,10 +855,19 @@ cross: hello_profiles.inc
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_link-mipsel \
 		test_link.c link.c quicsnap.c quic.c quicwire.c crypto.c -lpthread || exit 1
 	@echo "== test_plantlv целиком =="
+# Исполнитель плана нужен здесь с 23.10.2026: тест оси autottl грузит TLV
+# настоящим d2k_plan_load и применяет его d2k_plan_apply, то есть проверяет
+# «измерено == исполнено» на кросс-целях тоже. В родном check эти символы
+# приходят из libd2k_udp.a через LDFLAGS, а здесь линковка идёт исходниками —
+# значит источники датапата перечисляются явно, как у test_measured ниже.
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_plantlv-a64 \
-		test_plantlv.c plantlv.c compose.c measured.c hello.c meas.c link.c udpplan.c -lpthread || exit 1
+		test_plantlv.c plantlv.c compose.c measured.c hello.c meas.c link.c udpplan.c \
+		quic.c quicwire.c crypto.c \
+		../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_plantlv-mipsel \
-		test_plantlv.c plantlv.c compose.c measured.c hello.c meas.c link.c udpplan.c -lpthread || exit 1
+		test_plantlv.c plantlv.c compose.c measured.c hello.c meas.c link.c udpplan.c \
+		quic.c quicwire.c crypto.c \
+		../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
 	@echo "== test_sched целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_sched-a64 \
 		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \

@@ -32,6 +32,9 @@
 #include <unistd.h>
 
 #include "d2k_sched.h"
+#include "d2k_arm.h"
+#include "d2k_diagnostics.h"
+#include "../runtime/d2k_diagnostics_files.h"
 #include "d2k_httpsprobe.h"
 #include "d2k_httpsearch.h"
 #include "d2k_plantlv.h"
@@ -45,6 +48,10 @@
 /* Просит перенесённый измеритель бросить всё, что он сейчас меряет. Нужен на
  * остановке: без него выход ждал окончания замера — до десятков минут. */
 void d2k_detect_stop_all(void);
+/* Потолок сегмента отправителя замера (detect/raw.c): ставится по пределу
+ * датапата вместе с d2k_sched_set_send_cap, чтобы замер и план шли одними
+ * сегментами (поле 22.10.2026, issue #5/#7). */
+void d2k_raw_set_segment_max(unsigned seg);
 
 d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
                               d2k_hello trigger, d2k_hello control,
@@ -508,6 +515,7 @@ int main(int argc, char **argv) {
     }
     d2k_sched_set_measure_mark(s, have_measure_mark ? measure_mark : mark);
     d2k_sched_set_send_cap(s, greeting.send_maxlen);
+    d2k_raw_set_segment_max(d2k_arm_segment(greeting.send_maxlen));
 
     d2k_sched_set_say(s, sched_say, NULL);
 
@@ -722,6 +730,7 @@ int main(int argc, char **argv) {
                         /* Предел отправки едет тем же событием и нужен сборке
                            планов: тело фальшивки обязано помещаться в канал. */
                         d2k_sched_set_send_cap(s, ev.send_maxlen);
+                        d2k_raw_set_segment_max(d2k_arm_segment(ev.send_maxlen));
                         if (ev.num != (uint32_t)D2K_CTL_PROTO_VERSION) {
                             fprintf(stderr,
                                 "d2kc: датапат говорит на версии протокола %u, наша %u — "

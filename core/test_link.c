@@ -904,6 +904,31 @@ int main(void) {
             close(sv[0]); close(sv[1]);
         }
     }
+    /* ЗАМЫСЕЛ 2026-10-23, п. 5.1: CLIENT_TCP — набор опций TCP клиента перед
+       его SHAPE. Пустое тело — известный пустой набор; длиннее 40 — отказ. */
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (CLIENT_TCP) не создался");
+        if (sv[0] >= 0) {
+            static const uint8_t ts[12] = {1, 1, 8, 10, 0, 0, 0x23, 0x28, 0, 0, 0, 0};
+            send_synthetic(sv[1], D2K_EV_CLIENT_TCP, ts, sizeof ts);
+            d2k_ev ev; char e[200] = {0};
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0 &&
+                  ev.kind == D2K_EV_CLIENT_TCP &&
+                  ev.tcp_options_len == 12 && memcmp(ev.tcp_options, ts, 12) == 0,
+                  "CLIENT_TCP: набор опций клиента не разобран");
+            send_synthetic(sv[1], D2K_EV_CLIENT_TCP, NULL, 0);
+            memset(&ev, 0xff, sizeof ev);
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0 &&
+                  ev.kind == D2K_EV_CLIENT_TCP && ev.tcp_options_len == 0,
+                  "CLIENT_TCP: пустой набор не принят как известный");
+            static const uint8_t over[41] = {0};
+            send_synthetic(sv[1], D2K_EV_CLIENT_TCP, over, sizeof over);
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == -1,
+                  "CLIENT_TCP длиннее 40 байт должен отклоняться");
+            close(sv[0]); close(sv[1]);
+        }
+    }
     {
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (SHAPE переполнение) не создался");

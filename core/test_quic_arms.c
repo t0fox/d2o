@@ -147,7 +147,7 @@ static void test_real_ttl_hook_on_wire(void) {
     uint16_t port = ntohs(a.sin_port);
 
     static const uint8_t prefix[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    d2k_hello msg = {g_trig_bytes, sizeof g_trig_bytes};
+    d2k_hello msg = {g_trig_bytes, sizeof g_trig_bytes, NULL, 0, 0, 0};
     int sent = 0;
     d2k_tally t =
         d2k_quic_ask_ttl_hook("127.0.0.1", port, prefix, sizeof prefix, 5, msg, 300, 0, 1, &sent);
@@ -255,7 +255,7 @@ static void test_arm_to_plan(void) {
     /* Тело приманки — выведенное, как и в бою: то же, что подбор и увидит. */
     static uint8_t decoy[2048];
     size_t blen = 0;
-    d2k_hello trg = {g_trig_bytes, sizeof g_trig_bytes};
+    d2k_hello trg = {g_trig_bytes, sizeof g_trig_bytes, NULL, 0, 0, 0};
     CHECK(d2k_quic_hello_rename(trg.bytes, trg.len, TEST_DECOY_SNI, decoy, sizeof decoy, &blen) == 0,
           "приманка не вывелась из снятого приветствия");
     const uint8_t *blob = decoy;
@@ -306,7 +306,7 @@ static void test_arm_to_plan(void) {
  * соединения. Ничего более похожего на него, чем оно само, не существует —
  * значит берётся оно, с подменённым именем. */
 static void test_decoy_is_derived(void) {
-    d2k_hello trg = {g_trig_bytes, sizeof g_trig_bytes};
+    d2k_hello trg = {g_trig_bytes, sizeof g_trig_bytes, NULL, 0, 0, 0};
     uint8_t out[2048];
     size_t olen = 0;
     char sni[256];
@@ -332,7 +332,7 @@ static void test_decoy_is_derived(void) {
 
     /* Вывести не из чего — честный отказ, а не подстановка заготовки. */
     {
-        d2k_hello empty = {NULL, 0};
+        d2k_hello empty = {NULL, 0, NULL, 0, 0, 0};
         size_t n = 1;
         CHECK(d2k_quic_hello_rename(empty.bytes, empty.len, TEST_DECOY_SNI, out, sizeof out, &n) != 0,
               "приманка «вывелась» из пустого снимка");

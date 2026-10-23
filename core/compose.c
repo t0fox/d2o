@@ -712,7 +712,7 @@ int d2k_props_question_plan(int q, d2k_hello control, size_t truth_len,
     /* Тело фальшивки собирается на стеке: 2× приветствия браузера — три
        килобайта, и держать их статически ради трёх вопросов незачем. */
     static uint8_t fake[2 * D2K_COMPOSE_HELLO_MAX];
-    d2k_hello nodecoy; nodecoy.bytes = NULL; nodecoy.len = 0;
+    d2k_hello nodecoy = {0}; nodecoy.bytes = NULL; nodecoy.len = 0;
     size_t flen = 0;
     /* ПОРЯДОК — ДОНОРСКИЙ (propProbes, z2k-detect/internal/classify/
        compose.go:33-91): перекрытие, порядок сегментов, контрольная сумма,
@@ -1467,6 +1467,10 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
     a = *arm;
     /* MD5 is expressed only by the measured/raw wire builder. */
     if (a.md5) { return -1; }
+    /* Сегмент — под предел канала (d2k_arm_segment, поле 22.10.2026): при
+       обычном канале прежние 1400, при узком — короче, а не отказ. */
+    unsigned seg = d2k_arm_segment(send_cap);
+    if (!seg) { return -1; }
     if (a.disorder_pos) {
         if (a.disorder_pos > D2K_ARM_DECOY_MAX || !a.disorder || a.seqovl ||
             a.seqovl_hello || a.badsum || a.repeats || a.gap_ms || a.between ||
@@ -1478,7 +1482,7 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
             "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
             "wire detect-tcp-v1\ninput tls-sni\nsegment %u\nsplit payload_start +%u\n"
             "order reverse\n",
-            (unsigned)D2K_ARM_SEGMENT_MAX, a.disorder_pos);
+            seg, a.disorder_pos);
     }
     if (a.oob) {
         if (a.seqovl || a.seqovl_hello || a.badsum || a.repeats || a.gap_ms ||
@@ -1488,7 +1492,7 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
         return append_fmt(buf, cap, &pos,
             "d2k-plan 1 8\nid 00000000000000000000000000000000\nproto tcp tls\n"
             "wire detect-tcp-v1\ninput tls-sni\nsegment %u\noob sni_middle 0f\norder forward\n",
-            (unsigned)D2K_ARM_SEGMENT_MAX);
+            seg);
     }
 
     uint8_t hello[D2K_COMPOSE_HELLO_MAX];
@@ -1528,7 +1532,7 @@ int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
             a.disorder_pos >= D2K_ARM_DECOY_MAX) { return -1; }
         if (append_fmt(buf, cap, &pos, "wire detect-tcp-v1\ninput tls-sni\nsegment %u\n"
                        "split payload_start +%u\norder reverse\n",
-                       (unsigned)D2K_ARM_SEGMENT_MAX, a.disorder_pos)) { return -1; }
+                       seg, a.disorder_pos)) { return -1; }
         return 0;
     }
 

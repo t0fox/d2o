@@ -59,7 +59,7 @@ int main(void){
         CHECK(bl>0);
         ctx(4);current_ttl=47;sent_count=lower_count=elapsed=0;
         int marked=0;
-        d2k_hello msg={blob,bl};
+        d2k_hello msg={blob,bl,NULL,0,0, 0};
         int fd=qp_send_one("127.0.0.1",443,NULL,0,0,0,0,msg,0,&marked,0,0);
         CHECK(sent_count==2);
         CHECK(sent[0].len==l1 && sent[1].len==l2);

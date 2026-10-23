@@ -1125,7 +1125,94 @@ static void test_silent_base_after_portal(void) {
     d2k_httpsearch_free(hs);
 }
 
+/* МЕСТНЫЙ ОТКАЗ СОЕДИНЕНИЯ НА БАЗЕ — «НЕ ИЗМЕРЕНО», А НЕ «НЕ ВОСПРОИЗВОДИТСЯ».
+ *
+ * Поле 23.10.2026. `media5.cdnbase.com` отдавал клиенту 33 120 Б из 106 050
+ * трижды подряд, то есть обрыв был. Базовый зонд один раз не установил
+ * соединение, и поиск закрылся:
+ *
+ *   16:34:27 база — соединение не установилось: обрыв с роутера не
+ *            воспроизводится, поиск HTTP не начат (подозрение не равно блокировке)
+ *
+ * Приём `fake-badsum`, которым тот же билд в повторе того же вечера
+ * (`cand-32e84f2-2`, 16:41:03) отдал полные 106 050 Б, не был даже опробован,
+ * и цель ушла на 10 минут штрафа.
+ *
+ * Отказ НАШЕГО сокета не говорит о коробке ничего (§2.4). Его цена не должна
+ * равняться цене измеренного «блока нет»: повтор базы в том же поиске, а если
+ * и он местный — короткий срок «не измерено», а не длинный «не воспроизводится».
+ */
+static void test_base_connect_fail_is_unmeasured(void) {
+    fake f;
+    memset(&f, 0, sizeof f);
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    int64_t now = 1000;
+    d2k_httpsearch_cut(hs, "media5.cdnbase.com", 4, IP, "/media/theme/fast.5.css", 33120, now);
+    CHECK(f.start_n == 1, "база не запущена");
+    d2k_hs_result r = res(&f, D2K_HS_CONNECT_FAIL);
+    r.seq = f.job.seq; r.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r, now += 100);
+    CHECK(strstr(f.said, "не воспроизводится") == NULL,
+          "местный отказ соединения назван «не воспроизводится»");
+    CHECK(f.start_n == 2, "база не повторена после местного отказа");
+    CHECK(d2k_httpsearch_busy(hs), "поиск брошен после местного отказа базы");
+    /* Повтор базы увидел обрыв — поиск идёт своим чередом. */
+    d2k_hs_result r2 = res(&f, D2K_HS_CUT);
+    r2.seq = f.job.seq; r2.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r2, now += 100);
+    CHECK(f.set_probe_n >= 1, "после повтора базы вопросы не начались");
+    d2k_httpsearch_free(hs);
+}
+
+/* ТИШИНА НА БАЗЕ ОБРЫВА — ТОЖЕ НЕ «БЛОКА НЕТ».
+ *
+ * Поле 23.10.2026, тот же `media5.cdnbase.com`, прогон `final-e861d26-1`:
+ *
+ *   17:13:47 обрыв ответа на /media/theme/fast.5.css после 33120 байт тела
+ *   17:13:57 обрыв ответа без портала — поиск обхода HTTP — база: тот же
+ *            запрос своим зондом без плана
+ *   17:14:03 база — ТИШИНА: обрыв с роутера не воспроизводится, поиск HTTP
+ *            не начат (подозрение не равно блокировке)
+ *   17:15:47 обрыв ответа ... после 33120 байт тела
+ *   17:17:48 обрыв ответа ... после 33120 байт тела
+ *
+ * Клиент получал обрыв и до, и после. Ответа на НАШ запрос не было вовсе —
+ * это отсутствие замера, а не измеренное «блока нет». Ветка портала ровно
+ * так тишину и читает с 16.10.2026 («тишина на свой GET — та же блокировка
+ * в другой форме»), но была закрыта условием `!hs->cur.cut`, то есть для
+ * цели с обрывом не работала.
+ *
+ * Правило здесь то же, что у местного отказа соединения: повтор базы, а
+ * повторная тишина — сигнал, с которого поиск начинается, а не вердикт
+ * «не воспроизводится». */
+static void test_base_silence_on_cut_is_not_absence(void) {
+    fake f;
+    memset(&f, 0, sizeof f);
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    int64_t now = 1000;
+    d2k_httpsearch_cut(hs, "media5.cdnbase.com", 4, IP, "/media/theme/fast.5.css", 33120, now);
+    CHECK(f.start_n == 1, "база не запущена");
+    d2k_hs_result r = res(&f, D2K_HS_SILENT);
+    r.seq = f.job.seq; r.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r, now += 100);
+    CHECK(strstr(f.said, "не воспроизводится") == NULL,
+          "тишина на базе обрыва названа «не воспроизводится»");
+    CHECK(f.start_n == 2, "база не повторена после тишины");
+    /* Повторная тишина — сигнал: поиск начинается. */
+    d2k_hs_result r2 = res(&f, D2K_HS_SILENT);
+    r2.seq = f.job.seq; r2.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r2, now += 100);
+    CHECK(f.set_probe_n >= 1, "повторная тишина не начала поиск");
+    CHECK(strstr(f.said, "не воспроизводится") == NULL,
+          "повторная тишина названа «не воспроизводится»");
+    d2k_httpsearch_free(hs);
+}
+
 int main(void) {
+    test_base_silence_on_cut_is_not_absence();
+    test_base_connect_fail_is_unmeasured();
     test_silent_base_after_portal();
     test_probe_cut();
     test_cut_search();

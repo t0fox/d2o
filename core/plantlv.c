@@ -57,7 +57,8 @@ enum {
     REC_OOB     = 0x010d,
     REC_UDPLEN  = 0x010e,
     REC_QSPLIT  = 0x010f,
-    REC_QDENY   = 0x0110
+    REC_QDENY   = 0x0110,
+    REC_AUTOTTL = 0x0111
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -80,6 +81,12 @@ typedef struct {
     uint8_t  ttl;
     uint8_t  flags;
     int32_t  seq_shift;
+    /* autottl=<delta>,<min>-<max> в строке порчи: TTL считает датапат по TTL
+       ответной стороны потока (ip_autottl документации zapret2). */
+    uint8_t  autottl;
+    int8_t   autottl_delta;
+    uint8_t  autottl_min;
+    uint8_t  autottl_max;
 } pl_poison;
 
 typedef struct { uint16_t anchor; int16_t offset; } pl_split;
@@ -447,6 +454,22 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 else if (strcmp(f[i], "tcpts") == 0) { v->flags |= 1u << 1; }
                 else if (strcmp(f[i], "ipidzero") == 0) { v->flags |= 1u << 2; }
                 else if (strcmp(f[i], "md5") == 0) { v->flags |= 1u << 3; }
+                else if (strcmp(f[i], "tsup") == 0) { v->flags |= 1u << 4; }
+                else if (strncmp(f[i], "autottl=", 8) == 0) {
+                    /* Формат документации: delta,min-max. Дельта со знаком. */
+                    int d = 0; unsigned lo = 0, hi = 0;
+                    if (sscanf(f[i] + 8, "%d,%u-%u", &d, &lo, &hi) != 3 ||
+                        d < -128 || d > 127 || lo > 255 || hi > 255 ||
+                        (hi && lo > hi)) {
+                        say(err, errcap, "строка %zu: autottl ждёт delta,min-max \"%s\"",
+                            lineno, f[i]);
+                        goto bad;
+                    }
+                    v->autottl = 1;
+                    v->autottl_delta = (int8_t)d;
+                    v->autottl_min = (uint8_t)lo;
+                    v->autottl_max = (uint8_t)hi;
+                }
                 else if (strncmp(f[i], "ttl=", 4) == 0) {
                     if (kv_u32(f[i], "ttl", 255, &u) != 0) {
                         say(err, errcap, "строка %zu: ttl вне 0..255 \"%s\"", lineno, f[i]); goto bad;
@@ -697,7 +720,10 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
        ID, PROTO, приманки, порчи, разрезы, фальшивки, перекрытия, ORDER, и
        только при ненулевых защитах — GUARD. */
     wbuf w = { out, cap, 0, 0 };
-    size_t n_records = 2 + p.n_payloads + p.n_poisons + p.n_splits +
+    /* У каждой порчи с autottl есть своя запись REC_AUTOTTL — считаем их. */
+    size_t n_autottl = 0;
+    for (size_t i = 0; i < p.n_poisons; i++) { n_autottl += p.poisons[i].autottl ? 1u : 0u; }
+    size_t n_records = 2 + n_autottl + p.n_payloads + p.n_poisons + p.n_splits +
                        p.n_fakes + p.n_seqovls + 1 + (p.pace_us ? 1u : 0u) +
                        (p.guards ? 1u : 0u) + (p.input_len ? 1u : 0u) + (p.settle_us ? 1u : 0u) +
                        (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u) +
@@ -740,6 +766,13 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
         v[4] = (uint8_t)(ss >> 24); v[5] = (uint8_t)(ss >> 16);
         v[6] = (uint8_t)(ss >> 8);  v[7] = (uint8_t)ss;
         put_rec(&w, REC_POISON, v, sizeof v);
+        /* Своей записью СРАЗУ ЗА порчей, на которую ссылается: разбор ищет
+           порчу по id и висячую ссылку отвергает. */
+        if (p.poisons[i].autottl) {
+            uint8_t a[5] = { v[0], v[1], (uint8_t)p.poisons[i].autottl_delta,
+                             p.poisons[i].autottl_min, p.poisons[i].autottl_max };
+            put_rec(&w, REC_AUTOTTL, a, sizeof a);
+        }
     }
     for (size_t i = 0; i < p.n_splits; i++) {
         uint16_t off = (uint16_t)p.splits[i].offset;

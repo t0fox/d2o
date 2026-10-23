@@ -61,6 +61,8 @@ const char *d2k_refuse_text(uint8_t code) {
     case D2K_REFUSE_DAMAGED:  return "поток испорчен недоисполнением плана";
     case D2K_REFUSE_NOT_APPLIED:
         return "исполнитель отверг план на этом пакете (причина — в записи)";
+    case D2K_REFUSE_FLOW_UNFIT:
+        return "поток клиента не несёт того, что план требует (причина — в записи)";
     default:                  return "отказ без кода";
     }
 }

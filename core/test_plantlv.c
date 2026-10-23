@@ -20,6 +20,8 @@
 #include "d2k_compose_internal.h"
 #include "d2k_hello.h"
 #include "d2k_plantlv.h"
+#include "d2k_plan.h"
+#include "d2k_wire.h"
 
 static int fails;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("ПРОВАЛ: %s\n", (msg)); fails++; } } while (0)
@@ -68,7 +70,68 @@ static int write_file_text(const char *path, const char *s) {
     return (fclose(f) == 0 && ok) ? 0 : -1;
 }
 
+/* AUTOTTL СКВОЗЬ ВЕСЬ ПУТЬ: текст → TLV → разбор → посылка (замысел
+ * 2026-10-23 «приёмы без настроек клиентской ОС», п. 6.1). Документация
+ * zapret2, standard fooling: ip_autottl меняет TTL «на автоматически
+ * определяемый по шаблону autottl delta,min-max». Проверяем, что число
+ * считает ДАТАПАТ по TTL ответной стороны, а не контроллер константой. */
+static void autottl_end_to_end(void) {
+    static const char text[] =
+        "d2k-plan 1 13\nid 00000000000000000000000000000000\n"
+        "proto tcp tls\npayload 1 aabbcc\n"
+        "poison 1 badsum autottl=1,2-12\n"
+        "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\norder forward\n";
+    uint8_t tlv[D2K_PLAN_TLV_MAX];
+    size_t n = 0;
+    char err[200];
+    d2k_plan *pl = NULL;
+    CHECK(d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &n, err, sizeof err) == 0,
+          "autottl: текст не переведён в TLV");
+    CHECK(d2k_plan_load(tlv, n, &pl, err, sizeof err) == 0 && pl,
+          "autottl: TLV не разобран исполнителем");
+    if (!pl) { return; }
+    uint8_t hello[64] = {0x16, 3, 1, 0, 5, 1, 0, 0, 1, 0};
+    d2k_pkt in = {0};
+    in.payload = hello; in.payload_len = sizeof hello; in.seq = 100;
+    d2k_actions a = {0};
+    CHECK(d2k_plan_apply(pl, NULL, &in, &a) == 0 && a.n >= 1,
+          "autottl: план не применился к приветствию");
+    if (a.n >= 1) {
+        /* Плечо доехало до посылки. */
+        CHECK(a.v[0].autottl == 1 && a.v[0].autottl_delta == 1 &&
+              a.v[0].autottl_min == 2 && a.v[0].autottl_max == 12,
+          "autottl: признак и шаблон не доехали до посылки");
+        /* И сборщик считает его по ответу: TTL ответа 57 → путь 7 → +1 = 8. */
+        uint8_t wire[256];
+        d2k_conn c = {0};
+        c.family = 4; c.ttl = 64; c.rev_ttl = 57; c.window = 1024;
+        size_t w = d2k_wire_build(&c, &a.v[0], wire, sizeof wire);
+        CHECK(w > 20 && wire[8] == 8,
+          "autottl: сборщик не посчитал TTL по ответу (ждали 8)");
+    }
+    d2k_actions_free(&a);
+    d2k_plan_free(pl);
+    /* Старый исполнитель такой план НЕ берёт: minexec ниже 13. */
+    static const char old_text[] =
+        "d2k-plan 1 12\nid 00000000000000000000000000000000\n"
+        "proto tcp tls\npayload 1 aabbcc\n"
+        "poison 1 badsum autottl=1,2-12\n"
+        "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\norder forward\n";
+    size_t n2 = 0;
+    CHECK(d2k_plan_text_to_tlv(old_text, tlv, sizeof tlv, &n2, err, sizeof err) != 0 ||
+          d2k_plan_load(tlv, n2, &pl, err, sizeof err) != 0,
+          "autottl: план с minexec 12 принят старым исполнителем");
+    d2k_plan_free(pl);
+    /* Кривой шаблон отвергается с объяснением. */
+    size_t n3 = 0;
+    CHECK(d2k_plan_text_to_tlv(
+        "d2k-plan 1 13\nproto tcp tls\npoison 1 autottl=1,20-2\n",
+        tlv, sizeof tlv, &n3, err, sizeof err) != 0,
+          "autottl: кривой шаблон min>max принят");
+}
+
 int main(void) {
+    autottl_end_to_end();
     /* --- перекрытие слева ------------------------------------------------ */
     {
         char text[4096];

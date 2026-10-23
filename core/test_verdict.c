@@ -45,7 +45,7 @@ int main(void) {
     uint8_t hello[64];
     memset(hello, 0xAA, sizeof hello);
     memcpy(hello, d2k_test_sig, sizeof d2k_test_sig);
-    d2k_hello trig = { hello, sizeof hello };
+    d2k_hello trig = { hello, sizeof hello , NULL, 0, 0, 0};
 
     /* Контроль: другое имя на ту же цель. Начинается с того же 0x16, что и
        любая TLS-запись, но дальше расходится с d2k_test_sig на третьем
@@ -57,7 +57,7 @@ int main(void) {
     ctl_bytes[1] = 0x03;
     ctl_bytes[2] = 0x03; /* d2k_test_sig[2] == 0x01 — здесь другое имя */
     ctl_bytes[3] = 0x00;
-    d2k_hello ctl = { ctl_bytes, sizeof ctl_bytes };
+    d2k_hello ctl = { ctl_bytes, sizeof ctl_bytes , NULL, 0, 0, 0};
 
     /* --- чистая линия: обходить нечего ------------------------------------ */
     {
@@ -220,7 +220,7 @@ int main(void) {
         CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "a.example", leg, sizeof leg,
                                      &leg_len) == 0,
               "профиль TLS 1.2 не собрался — проверять оговорку не на чем");
-        d2k_hello leg_trig = { leg, leg_len };
+        d2k_hello leg_trig = { leg, leg_len , NULL, 0, 0, 0};
 
         struct stand s;
         memset(&s, 0, sizeof s);
@@ -240,7 +240,7 @@ int main(void) {
         CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "a.example", mod, sizeof mod,
                                      &mod_len) == 0,
               "профиль TLS 1.3 не собрался");
-        d2k_hello mod_trig = { mod, mod_len };
+        d2k_hello mod_trig = { mod, mod_len , NULL, 0, 0, 0};
         d2k_vres rm = d2k_classify("127.0.0.1", p, mod_trig, ctl, 0, 3, 5000, 700);
         CHECK(rm.verdict == D2K_V_CLEAR, "чистая линия на приветствии 1.3 не опознана");
         CHECK(strstr(rm.reason, "обратное направление") == NULL,

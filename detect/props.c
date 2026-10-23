@@ -41,13 +41,18 @@ typedef struct {
     prop_set    set;
 } prop_probe;
 
+/* СКОЛЬКО ВОПРОСОВ О СВОЙСТВАХ. Одна константа на массив, его обнуление и
+   вызов: прежде число 12 стояло в четырёх местах, и добавление вопроса писало
+   за границу массива молча. */
+#define PROP_QUESTIONS 12
+
 static int prop_probes(prop_probe *out, int cap)
 {
     int k = 0;
-    if (cap < 12) {
+    if (cap < PROP_QUESTIONS) {
         return 0;
     }
-    memset(out, 0, sizeof(*out) * 12);
+    memset(out, 0, sizeof(*out) * PROP_QUESTIONS);
 
     out[k].label = "перекрытие слева";
     snprintf(out[k].p.name, sizeof(out[k].p.name), "seqovl-1");
@@ -112,6 +117,18 @@ static int prop_probes(prop_probe *out, int cap)
     out[k].set = SET_TIMESTAMPS;
     k++;
 
+    /* ОСИ `tcp_ts_up` И `ip_autottl` СПРАШИВАЛИСЬ ЗДЕСЬ И СНЯТЫ ПОЛЕМ.
+     * Прогон 23.10.2026 `ttl-ae30825-1`: 12 провалов контроля из 56 против 10
+     * у выпуска, и ни одного исполнения новых осей — все находки пути
+     * «свойство» в раунде пришлись на ПЕРВЫЙ вопрос списка (`seqovl-1`), до
+     * восьмого замер не дошёл ни на одной из 22 целей. Вопрос в конце списка
+     * на этой линии стоит 2–4 зонда у глубоких целей и ответа не даёт.
+     * Снят ВОПРОС, механизм остался: `ip_autottl` — запись языка плана
+     * (REC_AUTOTTL, minexec 13), её выбирает RX-лестница для клиента без
+     * метки времени (issue #7); `tcp_ts_up` — бит порчи. Вернуть вопрос,
+     * когда поле покажет цель, доходящую до конца списка.
+     * Регрессия: test_unreachable_axes_not_asked (detect/test_repeats.c). */
+
     /* Размер перекрытия не перебирается (прежде seqovl 2…681): длина —
      * до конца имени в приветствии, её задаёт run_properties по триггеру. */
     out[k].label = "перекрытие до конца имени";
@@ -173,10 +190,12 @@ static int prop_probes(prop_probe *out, int cap)
     out[k].set = SET_SYN;
     k++;
 
-    return k;
+    /* Если вопрос добавили, а константу забыли — ломаемся здесь, а не молча
+       за границей массива. */
+    return k <= PROP_QUESTIONS ? k : 0;
 }
 
-static void apply_set(d2k_dprops *pr, prop_set s, int ok)
+static void apply_set(d2k_dprops *pr, prop_set s, int ok, const d2k_poison *p)
 {
     switch (s) {
     case SET_LEFT_OVERLAP:
@@ -222,12 +241,16 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok)
         if (ok) { pr->counts_duplicates = D2K_TRI_TRUE; }
         break;
     case SET_WHITE_TS:
-        /* Проход: коробка приняла пакет со старой меткой (метку не сверяет) И
-         * разобрала фальшивое ECH-приветствие (разбирает L7), зацепившись за
-         * ECH-поток вместо имени. Оба вывода — только по проходу (§2.4). */
+        /* Проход: коробка разобрала фальшивое ECH-приветствие (разбирает L7),
+         * зацепившись за ECH-поток вместо имени. Про ПОРЧУ утверждаем только
+         * то, что в этом вопросе действительно было: у клиента без метки
+         * времени её в зонде нет, и «метку не сверяет» по такому проходу —
+         * выдумка о коробке (§2.4, замысел 2026-10-23 п. 5.2). Все выводы —
+         * только по проходу. */
         if (ok) {
-            pr->validates_timestamps = D2K_TRI_FALSE;
             pr->parses_l7 = D2K_TRI_TRUE;
+            if (p && p->tcp_ts) { pr->validates_timestamps = D2K_TRI_FALSE; }
+            if (p && p->badsum) { pr->validates_checksum = D2K_TRI_FALSE; }
         }
         break;
     }
@@ -245,22 +268,55 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
                        const d2k_trigger *tr, const d2k_opts *opt,
                        d2k_result *res, d2k_poison *hit)
 {
-    prop_probe pp[12];
-    int n = prop_probes(pp, 12);
+    prop_probe pp[PROP_QUESTIONS];
+    int n = prop_probes(pp, PROP_QUESTIONS);
     int i, j;
     char err[160];
 
     for (i = 0; i < n; i++) {
         d2k_poison p = pp[i].p;
         d2k_obs *obs;
-        char label[160];
+        char label[200];
         int pass = 0, done = 0, local_err = 0, got;
+        int decoy_cloned = 0;
 
         if (d2k_detect_stopped(&opt->cancel)) {
             break;
         }
         if (d2k_opts_skipped(opt, p.name)) {
             continue;
+        }
+        /* ВОПРОС ЗАДАЁТСЯ КАК КЛИЕНТ (замысел 2026-10-23, п. 5.1 и 5.2).
+         *
+         * Порча «метка времени назад» исполнима только на потоке, который
+         * метку предлагает: датапат копирует опции потока и сдвигает метку в
+         * них (datapath/wire.c, профиль tcp-template-v1). Клиенту без метки
+         * одиночный вопрос о метке не задаётся вовсе — его «нет» говорило бы
+         * о нашем зонде, а не о коробке.
+         *
+         * СОСТАВНОЙ ВОПРОС СЕМЕЙСТВА C при этом НЕ ПРОПАДАЕТ, А СОБИРАЕТСЯ:
+         * множители (приманка ECH, серия ×8, разрез +2) остаются, а порча
+         * берётся из того, что уже измерено, — тем же правилом, которым
+         * d2k_compose_from_props берёт битую сумму (пробуем, пока коробка не
+         * доказала, что сумму сверяет): нечем сделать фальшивку отвергаемой
+         * сервером — вопрос не задаётся, потому что приём, который примет и
+         * сервер, обходом не является.
+         *
+         * Оговорка про «доказала» сегодня не срабатывает ни разу: TRI_TRUE в
+         * validates_checksum не пишет никто — по §2.4 свойство ставится только
+         * по ПРОХОДУ, а проход доказывает обратное (сумму НЕ сверяет). Условие
+         * оставлено как страховка на случай, когда появится источник такого
+         * доказательства; сегодня подстановка битой суммы безусловна, и это
+         * безопасно: сервер такую фальшивку бракует по построению. */
+        if (p.tcp_ts && !d2k_trigger_offers_ts(tr)) {
+            if (pp[i].set != SET_WHITE_TS) {
+                continue;
+            }
+            p.tcp_ts = 0;
+            if (res->props.validates_checksum == D2K_TRI_TRUE) {
+                continue;
+            }
+            p.badsum = 1;
         }
         if (pp[i].set == SET_OVERLAP_SNI) {
             /* До конца имени: без имени в приветствии вопрос не задаётся. */
@@ -282,13 +338,31 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
             p.decoy = opt->white.payload;
             p.decoy_len = opt->white.len;
         } else if (p.decoy_hello) {
-            p.decoy = opt->control.payload;
-            p.decoy_len = opt->control.len;
+            const d2k_trigger *d = d2k_opts_decoy(opt);
+            p.decoy = d->payload;
+            p.decoy_len = d->len;
+            decoy_cloned = d == &opt->decoy;
         }
         /* Паузу и число копий кладём в наблюдение явно: без этого трасса
          * показывала «пауза=0мс» у зонда, который её честно выдерживает, и
          * читалась как поломка механизма. */
-        snprintf(label, sizeof(label), "свойство:%s", pp[i].label);
+        /* ЯРЛЫК НАЗЫВАЕТ ТО, ЧТО УШЛО НА ПРОВОД (ревью ветки, находка 9).
+         * Составной вопрос клиента без метки собран без неё: писать в трассу
+         * «под меткой» значило бы назвать в журнале опыта воздействие,
+         * которого не было. Имя гипотезы (p.name) при этом НЕ меняется — по
+         * нему ведётся учёт заданных и пропущенных вопросов. */
+        if (pp[i].set == SET_WHITE_TS && !p.tcp_ts) {
+            snprintf(label, sizeof(label), "свойство:ECH-приветствие под битой суммой");
+        } else if (decoy_cloned) {
+            /* КАКОЙ ПРИМАНКОЙ ЗАДАН ВОПРОС — В ЗАПИСЬ ОПЫТА. Клон приветствия
+             * клиента и встроенный шаблон (fallback) — разные стимулы для
+             * коробки, разбирающей L7, и в журнале их обязано быть видно:
+             * иначе два разных опыта выглядят одинаково (ТЗ §5). */
+            snprintf(label, sizeof(label), "свойство:%s (приманка — клон клиента)",
+                     pp[i].label);
+        } else {
+            snprintf(label, sizeof(label), "свойство:%s", pp[i].label);
+        }
         obs = d2k_trace_add(res, label);
         obs->delay_ms = p.gap_ms;
         /* ОТВЕТ — БОЛЬШИНСТВОМ ПОВТОРОВ (поле 14.10.2026, fost.club с роутера,
@@ -329,7 +403,7 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
         got = d2k_prop_majority(pass, opt->repeats);
         /* A local compile/apply/send refusal is not an answer from the box. */
-        if (!local_err) apply_set(&res->props, pp[i].set, got);
+        if (!local_err) apply_set(&res->props, pp[i].set, got, &p);
         /* Находку, которую план не выражает (фильтр дерева, d2k_opts.accept),
          * не берём и не останавливаемся: ответ уже в векторе, а следующие
          * вопросы могут найти выразимый приём — в переборе их может не быть. */

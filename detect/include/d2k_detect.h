@@ -128,6 +128,18 @@ typedef struct {
     int           sni_off;   /* где в нагрузке лежит имя, 0 если неизвестно */
     int           sni_len;
     d2k_accept_t  accept;
+    /* НАБОР ОПЦИЙ TCP КЛИЕНТА, ЧЬЁ ПРИВЕТСТВИЕ ЭТО (замысел 2026-10-23,
+     * п. 5.1). Снят датапатом с того же пакета, что и приветствие
+     * (D2K_EV_CLIENT_TCP); зонд здоровается этим набором, а не своим
+     * литералом: вопрос «коробка глотает устаревшую метку времени» задаётся
+     * только клиенту, который метку предлагает. client_tcp_known == 0 — набор
+     * не снят (холодный старт, старый датапат): зонд идёт прежним набором, с
+     * меткой времени, как раньше. Пустой известный набор (known, len 0) —
+     * клиент без опций в данных, и это честный профиль. Полноту входа привязки
+     * (CLIENT/PROFILE) это поле не решает — см. core/include/d2k_meas.h. */
+    int           client_tcp_known;
+    uint8_t       client_tcp_options[40];
+    size_t        client_tcp_options_len;
 } d2k_trigger;
 
 int d2k_trigger_accepts(const d2k_trigger *t, const uint8_t *b, size_t n);
@@ -140,6 +152,13 @@ int d2k_trigger_accepts(const d2k_trigger *t, const uint8_t *b, size_t n);
 typedef struct {
     char    name[64];
     int     ttl;           /* >0 — пакет умрёт по дороге, не дойдя до сервера */
+    /* TTL, вычисляемый по входящему TTL (ip_autottl документации zapret2):
+     * приёму не нужно НИЧЕГО от клиентской ОС, в отличие от метки времени.
+     * autottl == 0 — поля не значимы. */
+    int     autottl;
+    int     autottl_delta;
+    int     autottl_min;
+    int     autottl_max;
     int     badsum;        /* испортить контрольную сумму TCP */
     int32_t seq_shift;     /* сдвинуть номер последовательности за окно */
     int     md5;           /* добавить опцию TCP-MD5, которой сервер не ждёт */
@@ -149,6 +168,7 @@ typedef struct {
     int     disorder;      /* слать сегменты НЕ ПО ПОРЯДКУ */
     int     disorder_pos;  /* одиночный абсолютный разрез для reverse-disorder */
     int     tcp_ts;        /* метка времени со сдвигом назад */
+    int     tcp_ts_up;     /* и поднять её в начало опций (tcp_ts_up) */
     int     ip_id_zero;    /* обнулить идентификатор IP */
     int     gap_ms;        /* пауза между копиями фальшивки */
     int     syn_data;      /* приветствие ПРЯМО В SYN */
@@ -165,6 +185,19 @@ typedef struct {
 } d2k_poison;
 
 int d2k_poison_has_fake(const d2k_poison *p);
+/* Предлагает ли клиент триггера метку времени TCP (вид 8). Неизвестный набор
+ * — да: прежний зонд метку предлагал всегда. */
+int d2k_trigger_offers_ts(const d2k_trigger *t);
+/* Задаётся ли приём этому клиенту: порча «метка времени назад» требует
+ * метки в потоке, и клиенту без неё вопрос не задаётся вовсе — ни в вопросах
+ * о свойствах, ни в запасном переборе. */
+/* ТЕСТОВАЯ ПОДМЕНА СПОСОБНОСТИ ЛОКАЛЬНОГО СТЕКА предлагать метку времени:
+ * -1 — спрашивать систему (рабочее поведение), 0/1 — ответ для теста. Нужна
+ * потому, что способность стека иначе не задать из теста, а именно она решает
+ * судьбу плана, когда набор опций клиента не снят. */
+void d2k_trigger_host_ts_override(int v);
+
+int d2k_trigger_allows_poison(const d2k_trigger *t, const d2k_poison *p);
 /* Одна и та же гипотеза по всем параметрам, кроме имени. */
 int d2k_poison_same(const d2k_poison *a, const d2k_poison *b);
 
@@ -332,6 +365,19 @@ typedef struct {
     void (*on_obs)(void *ctx, const d2k_obs *o);
     void *on_obs_ctx;
     d2k_trigger control;
+    /* ТЕЛО ПРИМАНКИ, ОТДЕЛЬНО ОТ КОНТРОЛЬНОГО ТРИГГЕРА (замысел 2026-10-23
+     * «приманка: много фейков, а не один», п. 5.1).
+     *
+     * Приманка и контроль — два РАЗНЫХ измерения, и одни байты на оба им не
+     * годятся. Контроль доказывает, что до цели доходит безобидное
+     * приветствие с другим именем; приманка травит буфер пересборки коробки,
+     * и коробка, разбирающая L7, смотрит В НЕЁ. Документация nfqws (bol-van,
+     * docs/readme.md) задаёт фейк отдельной опцией `--dpi-desync-fake-tls`,
+     * причём МНОГОКРАТНО и с любым фингерпринтом, — то есть источник тела
+     * фальшивки у инструмента свой, не контрольный.
+     *
+     * Пусто (len 0) — приманка берётся из control, то есть прежнее поведение. */
+    d2k_trigger decoy;
     /* БЕЛОЕ ИМЯ СЕТИ ПРИМАНКОЙ (поле 10.10.2026). Полный ClientHello-record с
      * подтверждённым белым именем сети, НЕ имя контроля: вопрос «приветствие
      * под меткой времени» шлёт именно его. Пусто (len 0) — белое имя не
@@ -357,6 +403,8 @@ typedef struct {
 void d2k_opts_defaults(d2k_opts *o);
 int  d2k_opts_acceptable(const d2k_opts *o, const d2k_poison *p);
 int  d2k_opts_skipped(const d2k_opts *o, const char *name);
+/* Байты приманки прогона: opt->decoy, если задан, иначе opt->control. */
+const d2k_trigger *d2k_opts_decoy(const d2k_opts *o);
 
 /* ProbeResponse — не режут ли ОТВЕТ сервера (TLS 1.2, сертификат открытым
  * текстом). Зовётся только там, где запрос уже признан проходящим. */
@@ -421,9 +469,22 @@ int d2k_probe_data_ack(const char *host, const char *port, const d2k_opts *opt,
 /* --- гипотезы (poison.c) ------------------------------------------------ */
 int d2k_raw_probe_handshake_family(const uint8_t *ip, uint8_t family, uint16_t port,
     int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel, char *err, size_t errcap);
+/* ТА ЖЕ САМОПРОВЕРКА НАБОРОМ ОПЦИЙ КЛИЕНТА (ревью ветки, находка 7). Прежняя
+ * подпись всегда предлагала метку времени, а вопросы клиента без метки её не
+ * предлагают: путь, который не отвечает на SYN без метки, давал промахи во
+ * всех вопросах и живой слой в самопроверке — промахи зачлись бы ответами
+ * коробки, а это запрет §2.4. Слой обязан ручаться за ТУ форму потока,
+ * которой идут вопросы. offer_ts — из d2k_trigger_offers_ts. */
+int d2k_raw_probe_handshake_as(const uint8_t *ip, uint8_t family, uint16_t port,
+    int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel, int offer_ts,
+    char *err, size_t errcap);
 int d2k_raw_probe_poison_family(const uint8_t *ip, uint8_t family, uint16_t port,
     const d2k_trigger *tr, const d2k_poison *p, int timeout_ms, uint32_t mark,
     const d2k_detect_stop *cancel, char *err, size_t errcap);
+/* Потолок сегмента сырого отправителя замера. Ядро ставит d2k_arm_segment(предел
+ * датапата), чтобы измеренное уходило теми же сегментами, что исполненное
+ * (поле 22.10.2026, issue #5/#7). 0 — вернуть прежние 1400 (D2K_ARM_SEGMENT_MAX). */
+void d2k_raw_set_segment_max(unsigned seg);
 /* Ответ вопроса о свойствах — большинством повторов (props.c): при N = 3 —
  * два прохода, при N = 1 — один. Общий для измерителя и моста (bridge.c). */
 static inline int d2k_prop_majority(int pass, int repeats)

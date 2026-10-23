@@ -36,6 +36,39 @@ static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)((uint16_t)p[0] << 8 | p[1]);
 }
 
+/* TTL ФАЛЬШИВКИ ПО ИЗМЕРЕННОМУ ПУТИ (ip_autottl документации zapret2).
+ *
+ * Жёсткий TTL сам становится приметой: у донора ip_ttl=8 палился с роутера,
+ * стоящего в 50 хопах от назначения. Здесь длина пути берётся из TTL ТОГО,
+ * ЧТО ОТВЕЧАЛО по этому соединению: исходный TTL сервера угадывается по
+ * ближайшему сверху обычному значению (64, 128, 255 — так ставят ОС), разность
+ * даёт длину пути в хопах, к ней прибавляется delta и результат зажимается в
+ * [min, max].
+ *
+ * Ноль возвращается, когда определить нельзя: ответа ещё не было (rev_ttl 0)
+ * или значение бессмысленно. Вызывающий тогда берёт заданный ttl, а если и его
+ * нет — не меняет TTL вовсе. Это дословно поведение документации.
+ *
+ * Арифметика целочисленная и со знаком только в пределах int: на коробках без
+ * сопроцессора плавающей точки нет (см. шапку файла). */
+static uint8_t auto_ttl(const d2k_emit *e, uint8_t rev_ttl) {
+    static const int guesses[] = {64, 128, 255};
+    if (!rev_ttl) { return 0; }
+    int origin = 0;
+    for (size_t i = 0; i < sizeof guesses / sizeof guesses[0]; i++) {
+        if (rev_ttl <= guesses[i]) { origin = guesses[i]; break; }
+    }
+    if (!origin) { return 0; }
+    int hops = origin - (int)rev_ttl;
+    int ttl = hops + (int)e->autottl_delta;
+    int lo = e->autottl_min, hi = e->autottl_max;
+    if (hi && ttl > hi) { ttl = hi; }
+    if (ttl < lo) { ttl = lo; }
+    if (ttl < 1) { ttl = 1; }
+    if (ttl > 255) { ttl = 255; }
+    return (uint8_t)ttl;
+}
+
 /* Сумма по RFC 1071. Складывает 16-битные слова с переносом. */
 static uint32_t sum16(const uint8_t *b, size_t n, uint32_t acc) {
     size_t i = 0;
@@ -116,7 +149,34 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
             off += native_options[off + 1];
         }
         if ((e->poison & D2K_POISON_TCPTS_BACK) && !found_timestamp) return 0;
+        /* МЕТКУ — ПЕРВОЙ (tcp_ts_up документации zapret2): linux отбрасывает
+           пакет с валидным seq и невалидным ack только когда опция метки идёт
+           первой, и nfqws1 случайно соблюдал это всегда. Переносим опцию
+           целиком в начало, остальные сдвигаем вправо: длина опций не меняется,
+           значит и заголовок остаётся того же размера, а сдвиг значения назад
+           уже применён выше. Ищем заново, потому что смещение после правки
+           значения то же, но код выше его не сохранял. */
+        if (e->ts_up && found_timestamp) {
+            uint8_t reordered[40];
+            size_t at = opt_len;
+            for (size_t off = 0; off + 1 < opt_len;) {
+                uint8_t kind = native_options[off];
+                if (kind == 0) { break; }
+                if (kind == 1) { off++; continue; }
+                if (kind == 8 && native_options[off + 1] == 10) { at = off; break; }
+                off += native_options[off + 1];
+            }
+            if (at + 10 <= opt_len) {
+                memcpy(reordered, native_options + at, 10);
+                memcpy(reordered + 10, native_options, at);
+                memcpy(reordered + 10 + at, native_options + at + 10,
+                       opt_len - at - 10);
+                memcpy(native_options, reordered, opt_len);
+            }
+        }
     }
+    /* TTL по пути считается ОДИН раз на посылку: оба заголовка берут его. */
+    uint8_t auto_hl = e->autottl ? auto_ttl(e, c->rev_ttl) : 0;
     if (e->pre_len > 65535u || e->len > 65535u - e->pre_len) { return 0; }
     const size_t body = e->pre_len + e->len;
     size_t total = ip_hdr + TCP_HDR + opt_len + body;
@@ -129,7 +189,8 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
         wr32(out, 0x60000000u | ((uint32_t)c->traffic_class << 20) | (c->flow_label & 0xfffffu));
         wr16(out + 4, (uint16_t)(total - 40));
         out[6] = 6;
-        out[7] = e->ttl ? e->ttl : (measured ? 64 : (c->ttl ? c->ttl : 64));
+        out[7] = auto_hl ? auto_hl
+               : e->ttl ? e->ttl : (measured ? 64 : (c->ttl ? c->ttl : 64));
         memcpy(out + 8, c->src_ip6, 16);
         memcpy(out + 24, c->dst_ip6, 16);
     } else {
@@ -146,7 +207,8 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     wr16(out + 6, measured ? 0 : 0x4000);
     /* TTL: если порча его задаёт, ставим её значение — пакет умрёт по дороге,
        не дойдя до сервера, но коробку пройдёт. */
-    out[8] = e->ttl ? e->ttl : (measured ? 64 : (c->ttl ? c->ttl : 64));
+    out[8] = auto_hl ? auto_hl
+           : e->ttl ? e->ttl : (measured ? 64 : (c->ttl ? c->ttl : 64));
     out[9] = 6;                          /* TCP */
     wr16(out + 10, 0);                   /* сумма считается ниже */
     memcpy(out + 12, &c->src_ip, 4);

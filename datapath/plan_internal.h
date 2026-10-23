@@ -42,7 +42,13 @@ enum {
     REC_OOB       = 0x010d,
     REC_UDPLEN    = 0x010e,
     REC_QSPLIT    = 0x010f,
-    REC_QDENY     = 0x0110
+    REC_QDENY     = 0x0110,
+    /* TTL фальшивки по измеренному пути (ip_autottl документации zapret2):
+       id порчи, delta со знаком, min, max. Отдельная запись, а не расширение
+       REC_POISON: старый исполнитель обязан отказаться громко, а не исполнить
+       план без autottl — он поставил бы фальшивку с нашим константным TTL,
+       то есть другое воздействие. Гейт — minexec 13. */
+    REC_AUTOTTL   = 0x0111
 };
 
 /* Якоря семантических позиций. */
@@ -72,6 +78,14 @@ struct d2k_poison {
     uint8_t  ttl;
     uint8_t  flags;
     int32_t  seq_shift;
+    /* autottl: 1 — TTL считается на исполнении по TTL ответной стороны
+       потока, delta/min/max из записи REC_AUTOTTL. */
+    /* tcp_ts_up: поднять опцию метки времени в начало (см. d2k_plan.h). */
+    uint8_t  ts_up;
+    uint8_t  autottl;
+    int8_t   autottl_delta;
+    uint8_t  autottl_min;
+    uint8_t  autottl_max;
 };
 
 struct d2k_split {

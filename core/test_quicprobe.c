@@ -378,19 +378,19 @@ static size_t g_extra_n;
  * круг 1), не снимаются через крючок. no_hello() воспроизводит "снимка нет"
  * явно, тем же bytes==NULL, каким его увидел бы настоящий вызывающий. */
 static d2k_hello trig_hello(void) {
-    d2k_hello h;
+    d2k_hello h = {0};
     h.bytes = g_trig_bytes;
     h.len = g_trig_len;
     return h;
 }
 static d2k_hello ctl_hello(void) {
-    d2k_hello h;
+    d2k_hello h = {0};
     h.bytes = g_ctl_bytes;
     h.len = g_ctl_len;
     return h;
 }
 static d2k_hello no_hello(void) {
-    d2k_hello h;
+    d2k_hello h = {0};
     h.bytes = NULL;
     h.len = 0;
     return h;
@@ -1279,7 +1279,7 @@ int main(int argc, char **argv) {
         g_mock_poison_on_trigger = 0;
         g_extra_n = 0;
         g_mock_len_1300 = 0;
-        d2k_hello snap = {big, big_len};
+        d2k_hello snap = {big, big_len, NULL, 0, 0, 0};
         d2k_vres r = d2k_quic_classify("10.0.20.1", 443, "www.example.com", snap, ctl_hello(), 0);
         CHECK(r.verdict == D2K_V_OPAQUE, "большой снимок: контроль жив, решает содержимое");
         CHECK(r.qprops.longer != D2K_PROP_UNKNOWN,
@@ -1310,7 +1310,7 @@ int main(int argc, char **argv) {
         g_mock_poison_on_trigger = 0; /* коробка молчит на триггер, но адрес не поражает */
         g_extra_n = 0;
 
-        d2k_hello snap;
+        d2k_hello snap = {0};
         snap.bytes = d2k_test_v1_initial;
         snap.len = sizeof d2k_test_v1_initial;
         d2k_vres r = d2k_quic_classify("10.0.20.1", 443, "www.example.com", snap, ctl_hello(), 0);
@@ -1375,7 +1375,7 @@ int main(int argc, char **argv) {
         mock_reset();
         g_mock_poison_on_trigger = 0;
         g_extra_n = 0;
-        d2k_hello snap;
+        d2k_hello snap = {0};
         snap.bytes = d2k_test_v1_initial;
         snap.len = sizeof d2k_test_v1_initial;
         d2k_vres r = d2k_quic_classify("10.0.22.1", 443, "www.example.com", snap, ctl_hello(), 0);
@@ -1654,7 +1654,7 @@ int main(int argc, char **argv) {
         CHECK(pl > 0, "пачка не упаковалась");
         g_rs_respond = 10;
         uint16_t port = rs_start();
-        d2k_hello ptrig = {pack, pl};
+        d2k_hello ptrig = {pack, pl, NULL, 0, 0, 0};
         d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", ptrig, ctl_hello(), 0);
         if (r.verdict != D2K_V_CLEAR)
             fprintf(stderr, "пачка: verdict=%d reason=%s\n", (int)r.verdict, r.reason);

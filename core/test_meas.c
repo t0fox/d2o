@@ -45,7 +45,7 @@ int main(void) {
     uint8_t hello[64];
     memset(hello, 0xAA, sizeof hello);
     memcpy(hello, d2k_test_sig, sizeof d2k_test_sig);
-    d2k_hello h = { hello, sizeof hello };
+    d2k_hello h = {hello, sizeof hello, NULL, 0, 0, 0};
 
     {
         struct stand s = {0};
@@ -305,7 +305,7 @@ int main(void) {
         static uint8_t big[16 * 1024 * 1024];
         memset(big, 0xBB, sizeof big);
         memcpy(big, d2k_test_sig, sizeof d2k_test_sig);
-        d2k_hello bh = { big, sizeof big };
+        d2k_hello bh = {big, sizeof big, NULL, 0, 0, 0};
 
         struct stand s;
         memset(&s, 0, sizeof s);

@@ -763,7 +763,7 @@ static int qp_send_one(const char *addr, uint16_t port,
     int packed = d2k_qsnap_is(msg.bytes, msg.len) &&
                  d2k_qsnap_parse(msg.bytes, msg.len, &pack) == 0;
     if(packed){
-        d2k_hello head = {pack.dg[0], pack.len[0]};
+        d2k_hello head = {pack.dg[0], pack.len[0], NULL, 0, 0, 0};
         if((prefix && prefix_len) || split || longer){
             char plan[16384];d2k_quic_arm_question q={0};
             q.blob=prefix;q.blob_len=prefix_len;q.ttl=prefix_ttl;q.copies=prefix_copies;q.split=split;
@@ -806,7 +806,7 @@ static d2k_hello qp_head_of(d2k_hello msg) {
     d2k_qsnap pk;
     if (msg.bytes && d2k_qsnap_is(msg.bytes, msg.len) &&
         d2k_qsnap_parse(msg.bytes, msg.len, &pk) == 0 && pk.n > 0) {
-        return (d2k_hello){pk.dg[0], pk.len[0]};
+        return (d2k_hello){pk.dg[0], pk.len[0], NULL, 0, 0, 0};
     }
     return msg;
 }
@@ -1164,14 +1164,14 @@ static d2k_tally quic_ask_core(const char *addr, uint16_t port,
                попытку (донор probe.go:303-306). Не собрался — попытка не
                отправляется, а не повторяет чужие идентификаторы. */
             clen = qp_build_vn_trigger(copies[i], COPY_CAP);
-            sent[i] = clen ? (d2k_hello){copies[i], clen} : (d2k_hello){NULL, 0};
+            sent[i] = clen ? (d2k_hello){copies[i], clen, NULL, 0, 0, 0} : (d2k_hello){NULL, 0, NULL, 0, 0, 0};
         } else if (fresh_sni && fresh_sni[0]) {
             if (d2k_quic_probe_initial(fresh_sni, copies[i], COPY_CAP, &clen) == 0) {
                 sent[i].bytes = copies[i];
                 sent[i].len = clen;
 
             } else {
-                sent[i] = (d2k_hello){NULL,0};
+                sent[i] = (d2k_hello){NULL, 0, NULL, 0, 0, 0};
             }
         } else if (neutral_control) {
             char neutral_sni[24];
@@ -1187,7 +1187,7 @@ static d2k_tally quic_ask_core(const char *addr, uint16_t port,
             } else {
                 /* A failed rebuild is a local unsent attempt, never a replay
                    of the stale/fixed control name. */
-                sent[i] = (d2k_hello){NULL, 0};
+                sent[i] = (d2k_hello){NULL, 0, NULL, 0, 0, 0};
             }
         } else if (split_sni) {
             /* ПАРА ДАТАГРАММ СОБИРАЕТСЯ НА КАЖДУЮ ПОПЫТКУ ЦЕЛИКОМ, а не
@@ -1221,7 +1221,7 @@ static d2k_tally quic_ask_core(const char *addr, uint16_t port,
                 sent[i].bytes = packs[i];
                 sent[i].len = clen;
             } else {
-                sent[i] = (d2k_hello){NULL, 0};
+                sent[i] = (d2k_hello){NULL, 0, NULL, 0, 0, 0};
             }
         } else if (msg.bytes && msg.len &&
                    d2k_quic_hello_recid(msg.bytes, msg.len, copies[i], COPY_CAP, &clen) == 0) {
@@ -1229,7 +1229,7 @@ static d2k_tally quic_ask_core(const char *addr, uint16_t port,
             sent[i].len = clen;
         } else {
             sent[i] = msg;
-            if(fragment)sent[i]=(d2k_hello){NULL,0}; /* never replay an unrefreshable input */
+            if(fragment)sent[i]=(d2k_hello){NULL, 0, NULL, 0, 0, 0}; /* never replay an unrefreshable input */
         }
     }
 
@@ -1467,7 +1467,7 @@ static d2k_tally quic_ask_arm(const d2k_quic_arm_question *q, const char *sni,
         copies=1;
         fragment=&plan;
     }
-    d2k_hello no_snapshot={NULL,0};
+    d2k_hello no_snapshot={NULL,0,NULL,0,0, 0};
     /* Arm answers are bound to our Initial only (qp_verify_bound, task 39);
        the fragment-survival control keeps the donor's reply criterion. */
     return quic_ask_core(q->addr,port,prefix,prefix_len,ttl,copies,0,NULL,
@@ -1853,7 +1853,7 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
                             int *sent_out) {
     /* Датаграмму собирает quic_ask_ex — свою на каждую попытку (см.
        qp_build_vn_trigger); общего снимка у этого вопроса нет. */
-    d2k_hello msg = {NULL, 0};
+    d2k_hello msg = {NULL, 0, NULL, 0, 0, 0};
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, NULL, msg, wait_ms, mark,
                         D2K_QUIC_REPEATS, NULL, NULL, sent_out, NULL, qp_verify_vn, NULL,NULL,0);
 }

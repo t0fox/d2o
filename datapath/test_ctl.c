@@ -1515,6 +1515,54 @@ int main(void) {
         }
         CHECK(found, "события применения не пришло вовсе");
 
+        /* --- НАБОР ОПЦИЙ TCP КЛИЕНТА ЕДЕТ ПЕРЕД СНИМКОМ (замысел 2026-10-23,
+           п. 5.1). Снимок приветствия по запросу (ARM_SHAPE) контроллер уже
+           получает; набор опций TCP того же пакета едет своим событием
+           D2K_EV_CLIENT_TCP, ровно перед D2K_EV_SHAPE, с тем же ключом потока:
+           так зонд здоровается набором клиента, а не литералом. Проверяется
+           байтами на проводе, как и всё здесь. */
+        {
+            const uint8_t nm[] = "opts.example";
+            CHECK(d2k_session_want_shape(sess, nm, sizeof nm - 1, 6) == 0,
+                  "ловушка снимка не взвелась");
+            uint8_t h2[512], p2[1024];
+            size_t hl2 = build_hello(h2, "opts.example");
+            size_t pl2 = build_pkt(p2, 40101, h2, hl2);
+            /* Опции TCP: NOP NOP TS(10) — как у клиента с меткой времени. */
+            static const uint8_t ts[12] = {1, 1, 8, 10, 0, 0, 0x23, 0x28, 0, 0, 0, 0};
+            memmove(p2 + 40 + 12, p2 + 40, hl2);
+            memcpy(p2 + 40, ts, 12);
+            p2[32] = (uint8_t)(((20 + 12) / 4) << 4);
+            pl2 += 12;
+            wr16(p2 + 2, (uint16_t)pl2);
+            d2k_result r2;
+            d2k_session_packet(sess, p2, pl2, 2000, obuf, sizeof obuf, &r2);
+            size_t sl = 0;
+            CHECK(d2k_session_shape(sess, 6, &sl) != NULL, "снимок для проверки опций не снят");
+            d2k_ctlsrv_pump(c, sess, &seen);
+            d2k_ctl_flush(c);
+            int got_opts = 0, got_shape = 0, shape_after_opts = 0;
+            for (int i = 0; i < 8; i++) {
+                uint16_t type = 0;
+                uint8_t ev[D2K_KEY_WIRE_LEN + 4200];
+                ssize_t n = read_event(cli, &type, ev, sizeof ev);
+                if (n < 0) { break; }
+                if (type == D2K_EV_CLIENT_TCP) {
+                    got_opts = 1;
+                    CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 12) && ev[D2K_KEY_WIRE_LEN + 2] == 8,
+                          "тело CLIENT_TCP не несёт опции пакета-приветствия");
+                    CHECK(ev[D2K_KEY_WIRE_LEN - 1] == 6 && ev[0] == 4,
+                          "ключ CLIENT_TCP без транспорта/семейства");
+                } else if (type == D2K_EV_SHAPE) {
+                    got_shape = 1;
+                    shape_after_opts = got_opts;
+                    break;
+                }
+            }
+            CHECK(got_opts, "события с набором опций TCP клиента не пришло");
+            CHECK(got_shape && shape_after_opts, "снимок пришёл без набора опций перед ним");
+        }
+
         close(cli);
         d2k_session_free(sess);
     }

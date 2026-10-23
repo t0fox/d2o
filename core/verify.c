@@ -1103,7 +1103,7 @@ static int verify_contact(int use_fd, const char *ip, uint16_t port,
             return -2;
         }
     }
-    return d2k_props_contact_on_family(fd, ip, port, (d2k_hello){ NULL, 0 }, family,
+    return d2k_props_contact_on_family(fd, ip, port, (d2k_hello){NULL, 0, NULL, 0, 0, 0}, family,
                                 local_addr, local_port, out_fd);
 }
 
@@ -1250,7 +1250,7 @@ d2k_ver_result d2k_verify_replay_on(int use_fd, const char *ip, uint16_t port,
         return r;
     }
     r.family = strchr(ip, ':') ? 6 : 4;
-    if (d2k_props_contact_on_family(use_fd, ip, port, (d2k_hello){ hello, hello_len },
+    if (d2k_props_contact_on_family(use_fd, ip, port, (d2k_hello){hello, hello_len, NULL, 0, 0, 0},
                                     r.family, r.local_addr, &r.local_port, &r.fd) != 0) {
         snprintf(r.reason, sizeof r.reason, "нет TCP для повтора приветствия клиента");
         return r;

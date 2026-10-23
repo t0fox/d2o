@@ -103,7 +103,7 @@ static d2k_tally arm_probe(const d2k_quic_arm_question *q,const char *sni,
     if(!sni || d2k_quic_probe_initial(sni,initial,sizeof initial,&initial_len)!=0) {
         d2k_tally t={0};t.fail=t.err=D2K_QUIC_REPEATS;t.marked=(mark==0);*sent=0;return t;
     }
-    d2k_hello msg={initial,initial_len};
+    d2k_hello msg={initial,initial_len,NULL,0,0, 0};
     if(q->frag)return d2k_quic_fragment_hook(q->addr,port,q->frag,msg,wait,mark,D2K_QUIC_REPEATS,sent);
     if(q->ttl)return d2k_quic_ask_ttl_hook(q->addr,port,q->blob,q->blob_len,q->ttl,msg,wait,mark,D2K_QUIC_REPEATS,sent);
     if(q->copies>1)return d2k_quic_ask_copies_hook(q->addr,port,q->blob,q->blob_len,q->copies,msg,wait,mark,D2K_QUIC_REPEATS,sent);
@@ -292,7 +292,7 @@ static void post_handshake_stall(void) {
        3/3 и CLEAR, этап данных не задаётся. */
     memset(&arm,0,sizeof arm); calls=0; data_calls=direct_data_calls=0; direct_cut=1;
     d2k_vres r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_CLEAR && direct_data_calls==0 && data_calls==0);
     /* Строка называет, что прошло: только рукопожатие (не TCP-фраза). */
     CHECK(strstr(r.reason,"Initial")!=NULL && strstr(r.reason,"не проверялся")!=NULL &&
@@ -301,7 +301,7 @@ static void post_handshake_stall(void) {
        меряются этапом данных, найденное плечо — кандидат. */
     memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     /* Раунд 3: два своих запроса на свежих соединениях, оба встали. Плечо
        засчитывается только полным ответом (need_complete). */
     CHECK(r.verdict==D2K_V_OPAQUE && direct_data_calls==2 && data_calls>=1);
@@ -332,7 +332,7 @@ static void post_handshake_stall(void) {
     memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
     ctl_calls=0; ctl_verdict=D2K_QAD_CUT;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE && ctl_calls==1);
     CHECK(r.qprops.flow_cut_any_size==D2K_PROP_YES);
     CHECK(strstr(r.reason,"короткий ответ тоже встал")!=NULL);
@@ -340,7 +340,7 @@ static void post_handshake_stall(void) {
     memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
     ctl_calls=0; ctl_verdict=D2K_QAD_NOT_RUN;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE && ctl_calls==1);
     CHECK(r.qprops.flow_cut_any_size==D2K_PROP_UNKNOWN);
     CHECK(strstr(r.reason,"короткий ответ")==NULL);
@@ -366,7 +366,7 @@ static void post_handshake_stall(void) {
         direct_bytes[0]=basis[i].b0; direct_bytes[1]=basis[i].b1;
         direct_pkts[0]=basis[i].p0;  direct_pkts[1]=basis[i].p1;
         r=d2k_quic_run("127.0.0.1",443,"target.example",
-            (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+            (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
         CHECK(r.verdict==D2K_V_OPAQUE && ctl_calls==1);
         CHECK(r.qprops.stop_by_bytes==basis[i].by);
         CHECK(r.qprops.stop_by_packets==basis[i].pk);
@@ -381,14 +381,14 @@ static void post_handshake_stall(void) {
     memset(&arm,0,sizeof arm); arm.data_cut=1; arm.budget_pk=17;
     calls=0; data_calls=direct_data_calls=0; direct_budget=0;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE && direct_budget==17 && arm_budget_seen==17 && arm.budget_pk==17);
     /* Both strategy and fallback arms must reject first-response-only success. */
     memset(&arm,0,sizeof arm); arm.data_cut=1; arm.budget_pk=17;
     calls=0; data_calls=direct_data_calls=0; arm_second_stalls=1;
     char saved_mode=strategy_mode; strategy_mode='Y';
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE && arm.kind==D2K_QA_NOT_FOUND);
     CHECK(data_calls>2 && arm_budget_seen==17);
     arm_second_stalls=0; strategy_mode=saved_mode;
@@ -398,7 +398,7 @@ static void post_handshake_stall(void) {
     memset(&arm,0,sizeof arm); arm.data_cut=2; calls=0; data_calls=direct_data_calls=0;
     ctl_calls=0;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE && direct_data_calls==2 && data_calls==0);
     CHECK(arm.data_cut==2 && arm.data_cut_seen==1);
     /* Перепроверке контроль не нужен: ей нужен один ответ «встаёт ли ещё». */
@@ -408,7 +408,7 @@ static void post_handshake_stall(void) {
     memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
     direct_cut=0;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_CLEAR && direct_data_calls==1 && data_calls==0);
     CHECK(strstr(r.reason,"не воспроизв")!=NULL);
     CHECK(arm.data_cut_seen==0);
@@ -417,7 +417,7 @@ static void post_handshake_stall(void) {
     memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0;
     direct_seq[0]=1; direct_seq[1]=2;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_FLAKY && direct_data_calls==2 && data_calls==0);
     CHECK(arm.kind==D2K_QA_NOT_FOUND || !arm.original);
     direct_seq[0]=direct_seq[1]=0;
@@ -439,7 +439,7 @@ int main(void) {
     d2k_quic_arm arm;
     memset(&arm,0,sizeof arm);
     d2k_vres r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE);
     CHECK(first_prefix==1200); /* quic5 before properties' 16-byte junk */
     CHECK(arm_hello_count==1); /* first complete arm ends search */
@@ -459,7 +459,7 @@ int main(void) {
     snprintf(want_path,sizeof want_path,"/static/site.css");
     snprintf(arm.probe_path,sizeof arm.probe_path,"%s",want_path);
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(data_calls==1 && !strcmp(arm.probe_path,want_path));
     /* Задача 40: остаточное разрешение есть — план из ответа, перебора нет,
        «мусор» вопросника второй раз не задаётся. */
@@ -467,7 +467,7 @@ int main(void) {
     calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='Y';
     candidate_passed=diagnostics_after_pass=0;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE && arm.kind==D2K_QA_BLOB && arm.strategy==D2K_QS_CLEARANCE);
     CHECK(arm.len==D2K_QUIC_BENIGN_LEN && arm.copies==1 && strategy_calls==1 && data_calls==1);
     CHECK(fragment_calls==0 && first_prefix==0);
@@ -478,14 +478,14 @@ int main(void) {
     calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='N';
     candidate_passed=diagnostics_after_pass=0;length_pass=1;length_calls=0;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(arm.kind==D2K_QA_UDPLEN && arm.strategy==D2K_QS_LENGTH);
     CHECK(length_calls==1 && data_calls==1 && !first_prefix && !fragment_calls);
     CHECK(r.qprops.longer==D2K_PROP_YES && !diagnostics_after_pass);
     memset(&arm,0,sizeof arm);calls=length_calls=length_diagnostics=0;
     candidate_passed=0;arm_second_stalls=1;d2k_quic_arm_data_hook=data_failed;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(arm.kind==D2K_QA_NOT_FOUND && arm.longer==D2K_PROP_NO);
     CHECK(length_calls==1 && !length_diagnostics);
     CHECK(r.qprops.longer==D2K_PROP_NO && r.qtrace[5].sent==0);
@@ -495,7 +495,7 @@ int main(void) {
     memset(&arm,0,sizeof arm);
     calls=0;first_prefix=0;fragment_calls=0;data_calls=0;strategy_calls=0;strategy_mode='N';
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},0,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     /* Круг 1: приманки не перебираются, но вопросы фрагментации задаются;
        стенд пропускает фрагменты — план из ответа. */
     CHECK(arm.kind==D2K_QA_FRAG && arm.strategy==D2K_QS_FRAG && arm.frag_kind==1 &&
@@ -507,7 +507,7 @@ int main(void) {
     memset(&arm,0,sizeof arm);
     calls=0;first_prefix=0;lose_base_mark=1;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
-        (d2k_hello){tb,tn},(d2k_hello){cb,cn},99,&arm);
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},99,&arm);
     CHECK(!r.marked && arm.kind==D2K_QA_FLAKY);
     lose_base_mark=0; calls=0;
     stall_machine();

@@ -355,6 +355,18 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
                    проводе уже есть, и контроллер разбирает его общим путём. */
                 body[D2K_KEY_WIRE_LEN - 1] = want_tr;
                 if (slen <= sizeof body - D2K_KEY_WIRE_LEN) {
+                    /* Набор опций TCP клиента — ПЕРЕД снимком, тем же ключом
+                       (замысел 2026-10-23, п. 5.1). */
+                    if (want_tr == 6) {
+                        size_t olen = 0;
+                        const uint8_t *o = d2k_session_shape_tcp_options_family(
+                            cx->sess, want_family, &olen);
+                        if (o && olen <= 40) {
+                            memcpy(body + D2K_KEY_WIRE_LEN, o, olen);
+                            d2k_ctl_event(cx->ctl, D2K_EV_CLIENT_TCP, body,
+                                          D2K_KEY_WIRE_LEN + olen);
+                        }
+                    }
                     memcpy(body + D2K_KEY_WIRE_LEN, sh, slen);
                     d2k_ctl_event(cx->ctl, D2K_EV_SHAPE, body, D2K_KEY_WIRE_LEN + slen);
                 }
@@ -626,6 +638,18 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
                                                          e->key.family == 6 ? 6 : 4, &slen);
             if (!sh || slen == 0 || n + slen > sizeof body) {
                 continue;
+            }
+            /* Набор опций TCP клиента — своим событием ПЕРЕД снимком, тем же
+               ключом (замысел 2026-10-23, п. 5.1): контроллер связывает
+               набор со снимком до того, как задача возьмёт снимок в замер. */
+            if (e->key.proto == 6) {
+                size_t olen = 0;
+                const uint8_t *o = d2k_session_shape_tcp_options_family(
+                    s, e->key.family == 6 ? 6 : 4, &olen);
+                if (o && olen <= 40 && n + olen <= sizeof body) {
+                    memcpy(body + n, o, olen);
+                    d2k_ctl_event(ctl, D2K_EV_CLIENT_TCP, body, n + olen);
+                }
             }
             type = D2K_EV_SHAPE;
             memcpy(body + n, sh, slen);

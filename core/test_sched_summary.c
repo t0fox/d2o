@@ -380,7 +380,16 @@ static void tx_ladder_requires_volume_proof(int passed) {
     }
     fprintf(stderr, "исходящий обрыв + короткий 403: бюджет пройден=%d, сеть=%s, поиск=%d\n%s\n", passed, cat.net.name, cat.net.searched, rows);
     CHECK((cat.net.name[0] != 0) == passed);
-    CHECK((cat.net.searched != 0) == passed);
+    /* ДОКАЗАТЕЛЬСТВО СВЯЗАНО С ТИПОМ ОБРЫВА (поле 23.10.2026, правка 8ba945d).
+     * Здесь обрыв ИСХОДЯЩЕЙ лестницы, а не RX: имя запоминается — находка для
+     * этой цели настоящая, — но подбор остаётся ОТКРЫТЫМ (`searched == 0`) и
+     * имя помечено `tx_only`. Прежде оба доказательства закрывали подбор, и
+     * цели с ВХОДЯЩИМ обрывом наследовали имя, против их обрыва не
+     * проверенное: семь целей отдавали тела 13–17 КБ при ответе 200.
+     * Поэтому утверждение здесь не «перевёрнуто», а усилено: проверяются и
+     * открытость подбора, и сама пометка. */
+    CHECK(cat.net.searched == 0);
+    CHECK((cat.net.tx_only != 0) == passed);
     CHECK((strstr(rows, "outcome=probe-confirmed") != NULL) == passed);
     d2k_sched_free(s); d2k_catalog_free(&cat);
 }
@@ -638,7 +647,7 @@ int main(void) {
         d2k_sched_vol_hook = stub_vol_root;
         vol_cut_path = "/observed.css";
         vol_asks = 0;
-        d2k_hello trig;
+        d2k_hello trig = {0};
         trig.bytes = t->trig; trig.len = t->trig_len;
         worker_volume(s, t, trig);
         CHECK(vol_asks == 2 && !strcmp(vol_asked[0], "/witness.css") &&

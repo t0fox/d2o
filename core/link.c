@@ -409,6 +409,17 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
             out->planned = rest[7];
         }
         break;
+    case D2K_EV_CLIENT_TCP:
+        /* Набор опций TCP клиента перед его SHAPE (замысел 2026-10-23,
+           п. 5.1). Нулевая длина — известный пустой набор; длиннее заголовка
+           TCP не бывает — отказ, а не усечение. */
+        if (rlen > sizeof out->tcp_options) {
+            say(err, errcap, "набор опций TCP клиента длиннее 40 байт (%zu)", rlen);
+            return -1;
+        }
+        memcpy(out->tcp_options, rest, rlen);
+        out->tcp_options_len = rlen;
+        break;
     case D2K_EV_SHAPE:
         if (rlen > sizeof out->shape) {
             say(err, errcap, "форма приветствия длиннее буфера (%zu байт)", rlen);

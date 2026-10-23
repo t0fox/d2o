@@ -719,10 +719,11 @@ static void bind_decoy(d2k_poison *p, const d2k_opts *opt)
     if (!p->decoy_hello) {
         return;
     }
-    p->decoy = opt->control.payload;
-    p->decoy_len = opt->control.len;
+    const d2k_trigger *d = d2k_opts_decoy(opt);
+    p->decoy = d->payload;
+    p->decoy_len = d->len;
     if (p->seqovl_exact) {
-        p->seqovl = (int)opt->control.len;
+        p->seqovl = (int)d->len;
     }
 }
 
@@ -755,17 +756,25 @@ static int answered_by_props(const d2k_result *res, const d2k_poison *p)
 #define D2K_RAW_ERR_STREAK    3
 
 static pthread_mutex_t g_selftest_mu = PTHREAD_MUTEX_INITIALIZER;
-static int  g_selftest_ok[2];
-static int64_t g_selftest_at[2];
-static int  g_raw_err_streak[2];
+/* Слот на (семейство, предлагает ли клиент метку времени): слой ручается за
+   ТУ форму потока, которой идут вопросы, и кэш одной формы не отвечает за
+   другую (ревью ветки, находка 7). */
+static int  g_selftest_ok[4];
+static int64_t g_selftest_at[4];
+static int  g_raw_err_streak[4];
 
 static int fam_ix(uint8_t family) { return family == 6 ? 1 : 0; }
+/* Набор С МЕТКОЙ остаётся в прежних слотах 0/1 (это и прежнее поведение, и
+   набор клиента, чей профиль не снят), набор без метки — в 2/3. */
+static int self_ix(uint8_t family, int offer_ts) {
+    return fam_ix(family) + (offer_ts ? 0 : 2);
+}
 
 /* Возраст кэшированной самопроверки в мс или -1, если кэша нет. */
-static int64_t selftest_cached_age(uint8_t family)
+static int64_t selftest_cached_age(uint8_t family, int offer_ts)
 {
     int64_t age = -1;
-    int k = fam_ix(family);
+    int k = self_ix(family, offer_ts);
     pthread_mutex_lock(&g_selftest_mu);
     if (g_selftest_ok[k]) {
         int64_t d = d2k_now_ms() - g_selftest_at[k];
@@ -779,9 +788,9 @@ static int64_t selftest_cached_age(uint8_t family)
     return age;
 }
 
-static void selftest_store(uint8_t family, int ok)
+static void selftest_store(uint8_t family, int offer_ts, int ok)
 {
-    int k = fam_ix(family);
+    int k = self_ix(family, offer_ts);
     pthread_mutex_lock(&g_selftest_mu);
     g_selftest_ok[k] = ok;
     g_selftest_at[k] = d2k_now_ms();
@@ -800,8 +809,12 @@ void d2k_raw_note_rc(d2k_result *res, uint8_t family, int rc)
     }
     pthread_mutex_lock(&g_selftest_mu);
     if (rc < 0) {
+        /* Серия локальных ОТКАЗОВ ЗОНДА говорит «сырой слой сломан», и это не
+           зависит от набора опций: гасим кэш обоих наборов этого семейства
+           (ревью ветки, находка 7). Счёт серии — один на семейство, как и был. */
         if (++g_raw_err_streak[k] >= D2K_RAW_ERR_STREAK) {
-            g_selftest_ok[k] = 0;
+            g_selftest_ok[self_ix(family, 1)] = 0;
+            g_selftest_ok[self_ix(family, 0)] = 0;
         }
     } else {
         g_raw_err_streak[k] = 0;
@@ -812,7 +825,7 @@ void d2k_raw_note_rc(d2k_result *res, uint8_t family, int rc)
 /* Самопроверка как таковая. Засчитывается по одному успеху, поэтому первый
  * успех её и заканчивает; до провала доходит только после всех повторов. */
 static int raw_selftest(const uint8_t *ip, uint8_t family, uint16_t pnum,
-                        const d2k_opts *opt, d2k_result *res)
+                        const d2k_opts *opt, d2k_result *res, int offer_ts)
 {
     char err[160];
     int i;
@@ -820,8 +833,8 @@ static int raw_selftest(const uint8_t *ip, uint8_t family, uint16_t pnum,
     for (i = 0; i < opt->repeats; i++) {
         int rc;
         if (d2k_detect_stopped(&opt->cancel)) { break; }
-        rc = d2k_raw_probe_handshake_family(ip, family, pnum, opt->timeout_ms, opt->mark,
-                                            &opt->cancel, err, sizeof(err));
+        rc = d2k_raw_probe_handshake_as(ip, family, pnum, opt->timeout_ms, opt->mark,
+                                        &opt->cancel, offer_ts, err, sizeof(err));
         res->probes++;
         if (rc < 0) {
             obs->fail++;
@@ -836,7 +849,7 @@ static int raw_selftest(const uint8_t *ip, uint8_t family, uint16_t pnum,
         }
     }
     obs_done(opt, obs);
-    selftest_store(family, obs->pass > 0);
+    selftest_store(family, offer_ts, obs->pass > 0);
     return obs->pass > 0;
 }
 
@@ -852,10 +865,11 @@ static int raw_doubted(const d2k_result *res)
 /* 1 — слой исправен, перебор продолжается; 0 — слой сломан: прогон
  * заканчивается так же, как при проваленной самопроверке в начале. */
 static int raw_recheck(const uint8_t *ip, uint8_t family, uint16_t pnum,
-                       const d2k_opts *opt, d2k_result *res, const d2k_dprops *props0)
+                       const d2k_opts *opt, d2k_result *res, const d2k_dprops *props0,
+                       int offer_ts)
 {
     res->raw_selftest_cached = 0;
-    if (raw_selftest(ip, family, pnum, opt, res)) {
+    if (raw_selftest(ip, family, pnum, opt, res, offer_ts)) {
         return 1;
     }
     /* Ответы, снятые со сломанного слоя, о коробке ничего не говорят. */
@@ -909,7 +923,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
      * ВСЕ зонды дали бы «тишину», а мы прочитали бы её как «отравить не
      * удалось». Поэтому сперва гоняем по тому же пути безобидную нагрузку без
      * всякой отравы. */
-    age = selftest_cached_age(family);
+    age = selftest_cached_age(family, d2k_trigger_offers_ts(tr));
     if (age >= 0) {
         /* Строка в трассе — чтобы читающий видел, что самопроверку не
          * пропустили, а взяли из кэша, и что зондов она не стоила. */
@@ -918,7 +932,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
                  "прошла %ld с назад в этом процессе, зондов не было", (long)(age / 1000));
         obs_done(opt, obs);
         res->raw_selftest_cached = 1;
-    } else if (!raw_selftest(ip4, family, pnum, opt, res)) {
+    } else if (!raw_selftest(ip4, family, pnum, opt, res, d2k_trigger_offers_ts(tr))) {
         res->raw_usable = 0;
         res->raw_selftest_failed = 1;
         return 0;
@@ -944,11 +958,14 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
                 return 1;
             }
         }
-        if (raw_doubted(res) && !raw_recheck(ip4, family, pnum, opt, res, &props0)) {
+        if (raw_doubted(res) &&
+            !raw_recheck(ip4, family, pnum, opt, res, &props0, d2k_trigger_offers_ts(tr))) {
             return 0;
         }
-        ncands = d2k_compose_from_props(&res->props, opt->control.payload,
-                                        opt->control.len, cands, 8);
+        {
+            const d2k_trigger *d = d2k_opts_decoy(opt);
+            ncands = d2k_compose_from_props(&res->props, d->payload, d->len, cands, 8);
+        }
         for (k = 0; k < ncands; k++) {
             d2k_obs *obs;
             int pass = 0, done = 0;
@@ -977,7 +994,8 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
             obs->pass = pass;
             obs->fail = done - pass;
             obs_done(opt, obs);
-            if (raw_doubted(res) && !raw_recheck(ip4, family, pnum, opt, res, &props0)) {
+            if (raw_doubted(res) &&
+            !raw_recheck(ip4, family, pnum, opt, res, &props0, d2k_trigger_offers_ts(tr))) {
                 return 0;
             }
             if (pass == opt->repeats && d2k_opts_acceptable(opt, &cands[k])) {
@@ -1004,7 +1022,8 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         }
         if (!d2k_poison_supports_family(&p, family) ||
             (p.disorder_pos > 0 && (size_t)p.disorder_pos >= tr->len) ||
-            d2k_opts_skipped(opt, p.name)) {
+            d2k_opts_skipped(opt, p.name) ||
+            !d2k_trigger_allows_poison(tr, &p)) { /* как клиент: без метки — без tcpts */
             continue;
         }
         bind_decoy(&p, opt);
@@ -1034,7 +1053,8 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
             }
         }
         obs_done(opt, obs);
-        if (raw_doubted(res) && !raw_recheck(ip4, family, pnum, opt, res, &props0)) {
+        if (raw_doubted(res) &&
+            !raw_recheck(ip4, family, pnum, opt, res, &props0, d2k_trigger_offers_ts(tr))) {
             return 0;
         }
         /* Единогласие обязательно: одна случайная удача назначила бы
