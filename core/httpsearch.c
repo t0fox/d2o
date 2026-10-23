@@ -1274,7 +1274,7 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
                     "установилось %d раза подряд; о коробке это не говорит ничего, "
                     "повтор не раньше чем через %lld мин", hs->cur.host,
                 D2K_HS_BASE_RETRIES + 1, (long long)(D2K_HS_INCONCLUSIVE_MS / 60000));
-            finish(hs, now, "inconclusive", "baseline-local-failure");
+            finish(hs, now);
             return;
         }
         say(hs, "HTTP %s: база — %s%s%s: %s с роутера не воспроизводится, поиск HTTP "

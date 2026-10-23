@@ -33,8 +33,6 @@
 
 #include "d2k_sched.h"
 #include "d2k_arm.h"
-#include "d2k_diagnostics.h"
-#include "../runtime/d2k_diagnostics_files.h"
 #include "d2k_httpsprobe.h"
 #include "d2k_httpsearch.h"
 #include "d2k_plantlv.h"
