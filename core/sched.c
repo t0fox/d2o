@@ -9475,7 +9475,7 @@ static void on_refused_unfit(d2k_sched *s, const d2k_ev *ev) {
     suspicion.kind = D2K_EV_SUSPECT;
     suspicion.code = D2K_SUSPECT_REPEAT;
     suspicion.planned = D2K_LINK_PLANNED_NO;
-    (void)on_suspect(s, &suspicion);
+    (void)on_suspect(s, &suspicion, 0);
 }
 
 static void on_refused(d2k_sched *s, const d2k_ev *ev) {
