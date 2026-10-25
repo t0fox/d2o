@@ -1,6 +1,6 @@
 # D2K install gate on the relay VPS
 
-A small C service, `d2k-gate`, on `213.176.74.63:9444`. Router installs,
+A small C service, `d2k-gate`, on `192.0.2.44:9444`. Router installs,
 nightly updates and the package managers try it first and fall back to a
 direct download when it does not answer: from part of the lines in Russia
 GitHub (raw files and releases), Entware and the OpenWrt package server do
@@ -55,5 +55,5 @@ into one directory on the VPS and run `sh install-server.sh <dir>` as root.
 The unit runs as `nobody` with a read-only system, no capabilities, 64 MB of
 memory and 160 tasks.
 
-Router side: `D2K_GATE` (default `http://213.176.74.63:9444`) in the
+Router side: `D2K_GATE` (default `http://192.0.2.44:9444`) in the
 environment or in `/opt/d2k/config`; an empty value turns the gate off.
