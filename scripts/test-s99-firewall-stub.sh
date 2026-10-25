@@ -219,22 +219,23 @@ S99_SNIPPET='fw_down' s99
 ok "port-forwarded (DNAT) connections never enter the queue, in both directions"
 
 # --- Проводник установки на VPS — канал самого D2K, не цель ------------------
-# Поле 14.10.2026: туннель CONNECT к 213.176.74.63:9444 датапат принял за
+# Поле 14.10.2026: туннель CONNECT к 192.0.2.44:9444 датапат принял за
 # поток к «github.com», и контроллер начал искать обход своему же каналу.
 # RETURN в обе стороны, раньше очереди, только IPv4; сторож замечает пропажу;
 # пустой D2K_GATE исключение снимает.
+export D2K_GATE=http://192.0.2.44:9444
 rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
 S99_SNIPPET='fw_up && fw_installed' s99 || fail "fw_up with the gate exclusion failed"
-for spec in "D2K_OUT -p tcp -d 213.176.74.63 --dport 9444 -j RETURN" \
-            "D2K_IN -p tcp -s 213.176.74.63 --sport 9444 -j RETURN"; do
+for spec in "D2K_OUT -p tcp -d 192.0.2.44 --dport 9444 -j RETURN" \
+            "D2K_IN -p tcp -s 192.0.2.44 --sport 9444 -j RETURN"; do
     ch=${spec%% *}
     rules iptables mangle | grep -- "-A $ch " | awk -v want="-A $spec" '
         $0 == want { if (!q) seen = 1 }
         /NFQUEUE/ { q = 1 }
         END { exit !seen }' || fail "iptables $ch: no gate RETURN before the first queue rule"
 done
-if rules ip6tables mangle | grep -q '213.176.74.63'; then fail "ip6tables must not carry an IPv4 gate rule"; fi
-FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -D D2K_OUT -p tcp -d 213.176.74.63 --dport 9444 -j RETURN
+if rules ip6tables mangle | grep -q '192.0.2.44'; then fail "ip6tables must not carry an IPv4 gate rule"; fi
+FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -D D2K_OUT -p tcp -d 192.0.2.44 --dport 9444 -j RETURN
 if S99_SNIPPET='fw_installed' s99; then fail "a lost gate exclusion went unnoticed"; fi
 S99_SNIPPET='fw_up' s99 || fail "fw_up did not restore the gate exclusion"
 S99_SNIPPET='fw_down' s99
@@ -242,7 +243,8 @@ rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
 S99_SNIPPET='fw_up && fw_installed' s99 D2K_GATE= || fail "fw_up without a gate failed"
 if rules iptables mangle | grep -q '9444'; then fail "empty D2K_GATE must leave no gate rule"; fi
 S99_SNIPPET='fw_down' s99 D2K_GATE=
-ok "the VPS install gate is D2K's own channel: never queued, in both directions"
+unset D2K_GATE
+ok "explicit user proxy gate is excluded"
 
 # --- DNS роутера — не цель (поле 15.10.2026) ---------------------------------
 # Keenetic резолвит через DoH (https-dns-proxy → geohide.ru:443). Поток к нему
