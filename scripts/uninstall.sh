@@ -226,6 +226,9 @@ cleanup_runtime() (
     [ -d "$runtime" ] || return 0
     rm -f "$runtime/live.json" "$runtime/d2kd.health" "$runtime/d2kc.health" \
         "$runtime/d2kpanel.health" "$runtime/d2ktg.health"
+    if [ "$runtime" = /tmp/d2k-diagnostics ]; then
+        rm -f "$runtime/enabled" "$runtime/report.json" "$runtime/report.new"
+    fi
     # SIGKILL/power loss can leave an abandoned retained tail.
     for stage in "$runtime"/log-tail.??????; do
         [ -f "$stage" ] || [ -L "$stage" ] || continue
@@ -243,6 +246,7 @@ if [ -z "$custom_runtime" ] && [ -r "$DIR/config" ]; then
     esac
 fi
 cleanup_runtime /tmp/d2k
+cleanup_runtime /tmp/d2k-diagnostics
 [ -z "$custom_runtime" ] || cleanup_runtime "$custom_runtime"
 
 if [ "$KEEP" = "1" ]; then

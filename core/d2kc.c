@@ -33,6 +33,8 @@
 
 #include "d2k_sched.h"
 #include "d2k_arm.h"
+#include "d2k_diagnostics.h"
+#include "../runtime/d2k_diagnostics_files.h"
 #include "d2k_httpsprobe.h"
 #include "d2k_httpsearch.h"
 #include "d2k_plantlv.h"
@@ -406,6 +408,47 @@ static int offline_self_check(void) {
         0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad};
     uint8_t got[32]; d2k_sha256((const uint8_t *)"abc", 3, got);
     return D2K_CTL_PROTO_VERSION == D2K_RUNTIME_WIRE && memcmp(got, want, 32) == 0 ? 0 : -1;
+}
+
+/* Ограниченный необязательный наблюдатель; его состояние не влияет на поиск. */
+static d2k_diag *diagnostics;
+static void diagnostic_event(void *ctx,const d2k_diag_event *e) {
+    (void)ctx;d2k_diag_record(diagnostics,e);
+}
+static void diagnostic_tick(d2k_sched *s,int64_t now) {
+    static int64_t checked=-1000,written=-60000;
+    if(now>=checked && now-checked<1000)return;
+    checked=now;
+    if(!d2k_diag_enabled(D2K_DIAG_DIR)) {
+        /* Если выгрузка совпала с выключением, очистить её в следующем цикле. */
+        if(diagnostics) (void)d2k_diag_toggle(D2K_DIAG_DIR,0);
+        d2k_diag_free(diagnostics);diagnostics=NULL;
+        d2k_sched_diagnostics(s,NULL,NULL);
+        d2k_httpsearch_diagnostics(g_hs,NULL,NULL);
+        return;
+    }
+    if(!diagnostics) {
+        diagnostics=d2k_diag_new();if(!diagnostics)return;
+        d2k_sched_diagnostics(s,diagnostic_event,NULL);
+        d2k_httpsearch_diagnostics(g_hs,diagnostic_event,NULL);
+        written=now-60000;
+    }
+    if(now>=written && now-written<60000)return;
+    written=now;
+    d2k_diag_counts counts;d2k_sched_diagnostic_counts(s,&counts);
+    d2k_httpsearch_diagnostic_counts(g_hs,&counts);
+    d2k_diag_sample(diagnostics,now,&counts,"/proc","/opt/d2k/run");
+    char path[512],tmp[512];
+    if(d2k_diag_path(path,sizeof path,D2K_DIAG_DIR,"report.json") ||
+       d2k_diag_path(tmp,sizeof tmp,D2K_DIAG_DIR,"report.new"))return;
+    /* Каталог закрыт; незавершённый файл никогда не отдаётся через панель. */
+    unlink(tmp);
+    int fd=open(tmp,O_WRONLY|O_CREAT|O_EXCL,0600);if(fd<0)return;
+    FILE *f=fdopen(fd,"w");if(!f){close(fd);unlink(tmp);return;}
+    int bad=d2k_diag_write(diagnostics,f);long size=ftell(f);
+    if(size<0||(unsigned long)size>D2K_DIAG_REPORT_MAX)bad=1;
+    if(fclose(f))bad=1;
+    if(bad||!d2k_diag_enabled(D2K_DIAG_DIR)||rename(tmp,path))unlink(tmp);
 }
 
 int main(int argc, char **argv) {
@@ -788,6 +831,7 @@ int main(int argc, char **argv) {
 
         t = now_ms();
         if (more || t - last_tick >= TICK_MS || (pr > 0 && (pfd[1].revents & POLLIN))) {
+            diagnostic_tick(s,t);
             d2k_sched_tick(s, t);
             last_tick = t;
         }
@@ -860,6 +904,7 @@ int main(int argc, char **argv) {
     d2k_hs_runner_free(g_hr);
     d2k_httpsearch_free(g_hs);
     d2k_sched_free(s);
+    d2k_diag_free(diagnostics);diagnostics=NULL;
     if (cat.revision != dirty) {
         if (save_atomic(&cat, catpath, err, sizeof err) != 0) {
             fprintf(stderr, "d2kc: каталог не сохранён на выходе: %s\n", err);

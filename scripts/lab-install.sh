@@ -134,7 +134,7 @@ cp telegram/build-lab/d2ktg "$REL/builds/d2ktg-linux-$ARCH"
 make -s -C panel clean >/dev/null
 make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
-cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/telegram-flow.js internal/web/assets/telegram-flow-prototype.js internal/web/assets/gsap.js "$REL/internal/web/assets/"
+cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/telegram-flow.js internal/web/assets/telegram-flow-prototype.js internal/web/assets/diagnostics.js internal/web/assets/gsap.js "$REL/internal/web/assets/"
 cp internal/web/assets/favicon.svg "$REL/internal/web/assets/"
 mkdir -p "$REL/internal/web/assets/fonts"
 cp internal/web/assets/fonts/onest.woff2 internal/web/assets/fonts/OFL-onest.txt internal/web/assets/fonts/jbmono.woff2 internal/web/assets/fonts/OFL-jbmono.txt "$REL/internal/web/assets/fonts/"

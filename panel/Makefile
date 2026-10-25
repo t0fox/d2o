@@ -99,3 +99,16 @@ test_status_cache: test_status_cache.c server.c server.h
 clean: clean-status-cache
 clean-status-cache:
 	$(RM) test_status_cache
+
+.PHONY: test-diagnostics clean-diagnostics
+test: test-diagnostics
+test-diagnostics: test_diagnostics
+	./test_diagnostics
+	node test_diagnostics.cjs
+test_diagnostics: test_diagnostics.c server.c server.h ../runtime/d2k_diagnostics_files.h
+	$(CC) $(CFLAGS) -o $@ test_diagnostics.c
+clean: clean-diagnostics
+clean-diagnostics:
+	$(RM) test_diagnostics
+
+server.o d2kpanel test_server test_server_san test_config_values test_header_deadline test_response_deadline: ../runtime/d2k_diagnostics_files.h

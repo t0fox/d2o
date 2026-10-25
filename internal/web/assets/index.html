@@ -131,6 +131,37 @@
           <h2 id="diagnostics-title">Диагностика</h2>
           <p>Что движок может подтвердить сам, чего не измеряет, и с какими настройками запущен.</p>
         </header>
+        <section class="diag-history" aria-labelledby="diagnostic-history-title">
+          <div class="diag-history-head">
+            <div><h3 id="diagnostic-history-title">Память и подборы</h3><p>Локальная история работы движка</p></div>
+            <span class="diag-collection-state" id="diagnostic-state">Проверяем…</span>
+          </div>
+          <p id="diagnostic-status" class="diag-history-note" role="status">Проверяем состояние сбора…</p>
+          <div id="diagnostic-data" class="diag-history-data" hidden>
+            <div>
+              <h4>Память процессов</h4>
+              <table class="diag-memory"><thead><tr><th scope="col">Процесс</th><th scope="col">RAM, МиБ</th><th scope="col">Изменение</th></tr></thead><tbody id="diagnostic-processes"></tbody></table>
+              <p class="diag-history-note">Изменение с первого снимка этого процесса. Рост памяти сам по себе не означает утечку.</p>
+            </div>
+            <div>
+              <h4>История подбора</h4>
+              <dl class="diag-history-counts">
+                <div><dt>Завершений поиска</dt><dd id="diagnostic-events">—</dd></div>
+                <div><dt>Без подтверждённого результата</dt><dd id="diagnostic-unconfirmed">—</dd></div>
+                <div><dt>Привязок / планов</dt><dd id="diagnostic-catalog">—</dd></div>
+                <div><dt>Снимков памяти</dt><dd id="diagnostic-samples">—</dd></div>
+              </dl>
+              <p class="diag-history-note">Неподтверждённый результат поиска не равен недоступности сайта.</p>
+            </div>
+          </div>
+          <div class="diag-history-footer">
+            <div class="diag-history-actions">
+              <a class="btn" data-variant="primary" id="diagnostic-download" href="/api/diagnostics?download" download="d2k-diagnostics.json" hidden>Скачать отчёт</a>
+              <button type="button" class="btn" id="diagnostic-toggle">Включить сбор</button>
+            </div>
+            <details class="diag-history-help"><summary>Что сохраняется</summary><p>Последние 120 минутных снимков и 64 завершения поиска, только в оперативной памяти. Для разбора роста RAM также сохраняются первый и последний подробные снимки памяти процессов. Включите сбор, воспроизведите проблему и скачайте отчёт для issue — дополнительные команды на роутере не нужны. Отчёт содержит домены и IP-адреса; автоматически никуда не отправляется. Сбор по умолчанию выключен и отключается после перезагрузки. Перед выключением скачайте отчёт — история будет удалена.</p></details>
+          </div>
+        </section>
         <div id="diagnostics-body"></div>
       </section>
 
@@ -150,5 +181,6 @@
       <button type="button" class="btn" data-variant="confirm" data-ask="yes"></button>
     </div>
   </dialog>
+  <script src="/assets/diagnostics.js" defer></script>
 </body>
 </html>

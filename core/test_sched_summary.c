@@ -437,11 +437,21 @@ static void quic_shape_does_not_cancel_tcp_measurement(d2k_sched *s) {
     task_reset(s, t);
 }
 
+static int diag_calls;
+static void diag_observe(void *ctx,const d2k_diag_event *e) {
+    (void)ctx; CHECK(!strcmp(e->outcome,"failed")); CHECK(e->id==999);diag_calls++;
+}
 int main(void) {
     d2k_catalog cat = {0};
     d2k_sched *s = d2k_sched_new(&cat, -1, 0x2d);
     CHECK(s != NULL);
     if (!s) return 1;
+    d2k_sched_diagnostics(s,diag_observe,NULL);
+    task diag_task={0};diag_task.report_id=999;
+    search_report(s,&diag_task,10,"failed","none");
+    search_report(s,&diag_task,11,"failed","none");
+    CHECK(diag_calls==1); /* Событие записано один раз независимо от текстового журнала. */
+    d2k_sched_diagnostics(s,NULL,NULL);
     d2k_sched_set_say(s, collect, NULL);
     challenge_exclusions_survive_cache_eviction(s);
     tx_ladder_requires_volume_proof(0);

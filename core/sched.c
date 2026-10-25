@@ -1246,6 +1246,8 @@ typedef struct {
 } installed_area;
 
 struct d2k_sched {
+    d2k_diag_observer diagnostic;
+    void *diagnostic_ctx;
     d2k_catalog *cat;
     int          link_fd;
     uint32_t     mark;
@@ -5619,6 +5621,23 @@ static void live_autopick_status(d2k_sched *s, char reason[128], char target[256
 
 static void write_live_groups(FILE *f, const d2k_sched *s);
 
+void d2k_sched_diagnostics(d2k_sched *s,d2k_diag_observer fn,void *ctx) {
+    if(s){s->diagnostic=fn;s->diagnostic_ctx=ctx;}
+}
+void d2k_sched_diagnostic_counts(d2k_sched *s,d2k_diag_counts *c) {
+    if(!s||!c)return;
+    memset(c,0,sizeof *c);c->boxes=s->cat->n_boxes;
+    for(size_t i=0;i<s->cat->n_boxes;i++) {
+        c->bindings+=s->cat->boxes[i].n_binds;c->plans+=s->cat->boxes[i].n_plans;
+    }
+    if(s->cat->groups)c->observations=s->cat->groups->n_observations;
+    c->active=measurements_in_flight(s);c->queued=queued_measurements(s);
+    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
+        const task *t=&s->tasks[i];
+        if(t->state!=T_FREE){c->tasks++;if(t->trig_len||t->snap_len)c->snapshots++;}
+    }
+}
+
 int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_path) {
     if (!s || !path) { return -1; }
     char tmp[512];
@@ -8672,7 +8691,7 @@ static void search_report(d2k_sched *s, task *t, int64_t now_ms,
                           const char *outcome, const char *path) {
     if (!t->report_id || t->report_closed) return;
     t->report_closed = 1;
-    if (!s->say_fn) return;
+    if (!s->say_fn && !s->diagnostic) return;
     if (!path) {
         path = "none";
         if (t->next_plan && t->next_plan <= t->n_plans) {
@@ -8700,6 +8719,19 @@ static void search_report(d2k_sched *s, task *t, int64_t now_ms,
         !strcmp(outcome, "discovery-confirmed") ? "discovery" :
         is_voice_class(t->name, t->transport) || t->trigger_shape == D2K_LINK_SHAPE_VOICE
             ? "udp" : "quic";
+    if (s->diagnostic) {
+        /* Рабочие потоки публикуют результаты под тем же мьютексом. */
+        char reason[D2K_REASON_MAX];
+        pthread_mutex_lock(&s->mu);
+        snprintf(reason,sizeof reason,"%s",t->res.reason);
+        pthread_mutex_unlock(&s->mu);
+        d2k_diag_event e={.id=t->report_id,.target=t->name,.protocol=proto,
+            .family=t->family,.trigger=t->trigger_code,.outcome=outcome,.reason=reason,
+            .elapsed_ms=elapsed,.queue_ms=queued,.probe_units=(int64_t)t->probes+measured,
+            .ip=t->ip,.path=path,.kind=t->by_addr?"addr":"name",.shape=t->trigger_shape};
+        s->diagnostic(s->diagnostic_ctx,&e);
+    }
+    if (!s->say_fn) return;
     snprintf(line, sizeof line,
         "итог поиска: search=%llu target=%s protocol=%s family=%u "
         "outcome=%s path=%s probe_units=%lld accounting=scheduler "

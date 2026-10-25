@@ -393,6 +393,9 @@ enum { PH_IDLE = 0, PH_BASE, PH_ACK, PH_RUN, PH_APPLIED };
 enum { HQ_OWN=0, HQ_SPLIT, HQ_CHECKSUM, HQ_PRODUCT, HQ_FALLBACK, HQ_END };
 
 struct d2k_httpsearch {
+    d2k_diag_observer diagnostic;
+    void *diagnostic_ctx;
+    uint64_t diagnostic_seq;
     d2k_hs_ops ops;
     rec *recs; size_t n_recs, cap_recs;
     char measured[8][40]; size_t n_measured;   /* ключи измеренной порчи */
@@ -401,6 +404,8 @@ struct d2k_httpsearch {
     uint64_t seq;
     struct {
         int phase;
+        int64_t diagnostic_start;
+        uint64_t diagnostic_id;
         char host[256];
         char repeat_path[1024];
         uint8_t family, addr[16];
@@ -630,7 +635,26 @@ const char *d2k_httpsearch_plan_of(const d2k_httpsearch *hs, const char *host, u
 
 static void start_next(d2k_httpsearch *hs, int64_t now);
 
-static void finish(d2k_httpsearch *hs, int64_t now) {
+void d2k_httpsearch_diagnostic_counts(d2k_httpsearch *hs,d2k_diag_counts *c) {
+    if(hs && c){c->http_records=hs->n_recs;c->http_queued=hs->n_q;}
+}
+void d2k_httpsearch_diagnostics(d2k_httpsearch *hs,d2k_diag_observer fn,void *ctx) {
+    if(hs){hs->diagnostic=fn;hs->diagnostic_ctx=ctx;}
+}
+static void diagnostic_end(d2k_httpsearch *hs,int64_t now,const char *outcome,const char *reason) {
+    if(hs->diagnostic && hs->cur.diagnostic_id) {
+        char ip[INET6_ADDRSTRLEN]="";
+        (void)inet_ntop(hs->cur.family==6?AF_INET6:AF_INET,hs->cur.addr,ip,sizeof ip);
+        d2k_diag_event e={.id=hs->cur.diagnostic_id,.target=hs->cur.host,.protocol="http",
+            .family=hs->cur.family,.outcome=outcome,.reason=reason,
+            .elapsed_ms=now-hs->cur.diagnostic_start,.queue_ms=-1,.probe_units=-1,
+            .ip=ip,.path="httpsearch",.kind="name"};
+        hs->diagnostic(hs->diagnostic_ctx,&e);
+    }
+    hs->cur.diagnostic_id=0;
+}
+static void finish(d2k_httpsearch *hs, int64_t now,const char *outcome,const char *reason) {
+    diagnostic_end(hs,now,outcome,reason);
     drop_socket(hs);
     hs->cur.phase = PH_IDLE;
     hs->cur.sport = 0;
@@ -678,7 +702,7 @@ static void all_failed(d2k_httpsearch *hs, int64_t now) {
                 "%lld мин", hs->cur.host,
             r && r->key[0] && !r->revoked ? ", подтверждённый план оставлен" : "",
             (long long)(D2K_HS_INCONCLUSIVE_MS / 60000));
-        finish(hs, now);
+        finish(hs,now,"inconclusive","no-executed-trial");
         return;
     }
     if (r && r->key[0] && !r->revoked) {
@@ -694,21 +718,21 @@ static void all_failed(d2k_httpsearch *hs, int64_t now) {
         say(hs,"HTTP %s: поиск завершён без принятого плана: %zu кандидатов прошли зонд, "
                "но имеют живой отказ в области привязки имени; воспроизведение не объясняет живой поток",
             hs->cur.host,hs->cur.conflicts);
-        finish(hs,now);return;
+        finish(hs,now,"inconclusive","live-conflict");return;
     }
     if (hs->cur.any_had_real) {
         if (r) { r->no_before_ms = now + D2K_HS_INCONCLUSIVE_MS; }
         say(hs, "HTTP %s: поиск завершён без подтверждения — ответ сервера был получен, "
                 "но устойчивость не подтверждена; следующая попытка не раньше чем через %lld мин",
             hs->cur.host, (long long)(D2K_HS_INCONCLUSIVE_MS / 60000));
-        finish(hs, now);
+        finish(hs,now,"inconclusive","unstable-response");
         return;
     }
     if (r) { r->no_before_ms = now + D2K_HS_RETRY_MS; }
     say(hs, "HTTP %s: обход не найден — ни один вопрос не дал ответа сервера; "
             "следующая попытка не раньше чем через %lld мин", hs->cur.host,
         (long long)(D2K_HS_RETRY_MS / 60000));
-    finish(hs, now);
+    finish(hs,now,"failed","no-server-response");
 }
 
 static int install(d2k_httpsearch *hs,rec *r,const char *text,const uint8_t plan_id[16],int64_t now) {
@@ -760,7 +784,7 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
     if(r && r->evidence_lost) {
         say(hs,"HTTP %s: сравнение программ неизвестно или история живых отказов утрачена — "
                "зонд не разрешает публикацию, требуется воспроизведение живого контекста",hs->cur.host);
-        finish(hs,now);return;
+        finish(hs,now,"inconclusive","evidence-lost");return;
     }
     if(failure) {
         say(hs,"HTTP %s: «%s» — зонд прошёл, но живой отказ execution=%llu generation=%llu "
@@ -777,7 +801,7 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
     if (d2k_hs_candidate_text(key, id, text, sizeof text) != 0 || !r ||
         install(hs,r,text,id,now) != 0) {
         say(hs, "HTTP %s: план «%s» подтверждён, но не поставлен датапату", hs->cur.host, key);
-        finish(hs, now);
+        finish(hs,now,"local-abort","plan-install-failed");
         return;
     }
     snprintf(r->key, sizeof r->key, "%s", key);
@@ -795,7 +819,7 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
             hs->cur.question==HQ_CHECKSUM ? "checksum-приманка перед целым запросом" : "разрез имени");
     say(hs, "HTTP %s: обход найден — «%s», %d опыта подряд с двумя полными ответами keep-alive под пробным "
             "планом; отправлен на установку (HTTP), живая приёмка ещё не подтверждена", hs->cur.host, key, HS_CONFIRM);
-    finish(hs, now);
+    finish(hs,now,"probe-confirmed","probe-confirmed-live-unknown");
 }
 
 static void add_cand(d2k_httpsearch *, const char *);
@@ -896,7 +920,7 @@ static void next_candidate(d2k_httpsearch *hs, int64_t now) {
     if (d2k_hs_candidate_text(key, hs->cur.plan_id, text, sizeof text) != 0 ||
         open_job(hs, &job) != 0) {
         say(hs, "HTTP %s: «%s» — сокет зонда не открылся, поиск остановлен", hs->cur.host, key);
-        finish(hs, now);
+        finish(hs,now,"local-abort","probe-build-or-socket");
         return;
     }
     if (!hs->ops.set_probe ||
@@ -905,7 +929,7 @@ static void next_candidate(d2k_httpsearch *hs, int64_t now) {
         say(hs, "HTTP %s: «%s» — пробный план не отправлен датапату, поиск остановлен",
             hs->cur.host, key);
         hs->cur.sport = 0;
-        finish(hs, now);
+        finish(hs,now,"local-abort","probe-install-failed");
         return;
     }
     hs->cur.phase = PH_ACK;
@@ -965,6 +989,7 @@ static void start(d2k_httpsearch *hs, const char *host, uint8_t family, const ui
                   int recheck, int64_t now) {
     memset(&hs->cur, 0, sizeof hs->cur);
     hs->cur.cand_idx_seen = (size_t)-1;
+    hs->cur.diagnostic_start=now;hs->cur.diagnostic_id=++hs->diagnostic_seq;
     hs->cur.fd = -1;
     snprintf(hs->cur.host, sizeof hs->cur.host, "%s", host);
     hs->cur.family = family;
@@ -972,7 +997,8 @@ static void start(d2k_httpsearch *hs, const char *host, uint8_t family, const ui
     hs->cur.recheck = recheck;
     rec *context=rec_find(hs,host,family);
     if(context&&context->repro_gap) {
-        say(hs,"HTTP %s: контекст запроса утрачен или не поддержан — воспроизведение не начато",host);return;
+        say(hs,"HTTP %s: контекст запроса утрачен или не поддержан — воспроизведение не начато",host);
+        diagnostic_end(hs,now,"inconclusive","request-context-unavailable");return;
     }
     if(context)snprintf(hs->cur.repeat_path,sizeof hs->cur.repeat_path,"%s",context->repeat_path);
     if(context)hs->cur.cut=context->cut;
@@ -982,6 +1008,7 @@ static void start(d2k_httpsearch *hs, const char *host, uint8_t family, const ui
     job.seq = hs->cur.job_seq;
     if (!opened || !hs->ops.start_probe || hs->ops.start_probe(hs->ops.ctx, &job) != 0) {
         say(hs, "HTTP %s: зонд не запустился — поиск не начат", host);
+        diagnostic_end(hs,now,"local-abort","probe-start-failed");
         drop_socket(hs);
         hs->cur.phase = PH_IDLE;
         return;
@@ -1031,7 +1058,7 @@ int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t f
     if(hs->ops.changed)hs->ops.changed(hs->ops.ctx);
     say(hs,"HTTP %s: связанная вставка под постоянным планом — успех отозван, нужна перепроверка",host);
     if(hs->cur.phase!=PH_IDLE&&hs->cur.family==family&&!strcasecmp(hs->cur.host,host)) {
-        drop_probe(hs);finish(hs,now);
+        drop_probe(hs);finish(hs,now,"cancelled","context-changed");
     }
     d2k_httpsearch_portal(hs,host,family,addr,now);
     return 1;
@@ -1152,7 +1179,7 @@ void d2k_httpsearch_ack(d2k_httpsearch *hs, const uint8_t trial[16], int ok, int
     if (!hs->ops.start_probe || hs->ops.start_probe(hs->ops.ctx, &job) != 0) {
         say(hs, "HTTP %s: зонд не запустился — поиск остановлен", hs->cur.host);
         drop_probe(hs);
-        finish(hs, now);
+        finish(hs,now,"local-abort","probe-start-failed");
         return;
     }
     hs->cur.phase = PH_RUN;
@@ -1274,14 +1301,15 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
                     "установилось %d раза подряд; о коробке это не говорит ничего, "
                     "повтор не раньше чем через %lld мин", hs->cur.host,
                 D2K_HS_BASE_RETRIES + 1, (long long)(D2K_HS_INCONCLUSIVE_MS / 60000));
-            finish(hs, now);
+            finish(hs,now,"inconclusive","baseline-local-failure");
             return;
         }
         say(hs, "HTTP %s: база — %s%s%s: %s с роутера не воспроизводится, поиск HTTP "
                 "не начат (подозрение не равно блокировке)", hs->cur.host,
             d2k_hs_answer_name(r->answer), r->status[0] ? ", " : "", r->status,
             hs->cur.cut ? "обрыв" : "вставка");
-        finish(hs, now);
+        finish(hs,now,r->answer==D2K_HS_REAL && r->complete_responses>=2 ?
+            "probe-direct":"inconclusive","baseline-not-reproduced");
         return;
     }
     if (hs->cur.phase != PH_RUN) { return; }
@@ -1318,7 +1346,7 @@ void d2k_httpsearch_tick(d2k_httpsearch *hs, int64_t now) {
         /* Сокет у зонда: его закроет опоздавший ответ, не мы (ревью M-7). */
         hs->cur.fd = -1;
         hs->cur.job_seq = 0;
-        finish(hs, now);
+        finish(hs,now,"local-abort","worker-timeout");
         break;
     default:
         break;

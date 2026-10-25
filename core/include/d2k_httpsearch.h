@@ -147,7 +147,10 @@ typedef struct {
     void *ctx;
 } d2k_hs_ops;
 
+#include "d2k_diagnostics.h"
 typedef struct d2k_httpsearch d2k_httpsearch;
+void d2k_httpsearch_diagnostic_counts(d2k_httpsearch *,d2k_diag_counts *);
+void d2k_httpsearch_diagnostics(d2k_httpsearch *,d2k_diag_observer,void *);
 
 d2k_httpsearch *d2k_httpsearch_new(const d2k_hs_ops *ops);
 void d2k_httpsearch_free(d2k_httpsearch *hs);

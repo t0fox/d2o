@@ -5,6 +5,7 @@
 
 typedef struct {
     const char *live_path;
+    const char *diagnostics_dir; /* По умолчанию — закрытый каталог в /tmp. */
     const char *asset_dir;
     const char *version;
     const char *commit;

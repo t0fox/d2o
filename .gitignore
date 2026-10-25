@@ -88,3 +88,8 @@ detect/*
 
 # Python bytecode from release tooling; a release checkout must stay clean.
 __pycache__/
+
+# Исполняемые файлы тестов диагностики
+/core/test_diagnostics
+/core/test_diagnostics_runtime
+/panel/test_diagnostics

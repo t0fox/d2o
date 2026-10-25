@@ -1101,3 +1101,38 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
   .ask-actions { flex-direction: column; }
   .ask-actions .btn { width: 100%; justify-content: center; }
 }
+
+/* Ограниченная история диагностики с отдельными от настроек движка показателями. */
+.diag-history { margin-bottom: 40px; padding: 24px 0 28px; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+.diag-history-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
+.diag-history-head h3 { font-size: 1.25rem; font-weight: 700; letter-spacing: -.02em; }
+.diag-history-head p, .diag-history-note { font-size: .8125rem; line-height: 1.55; color: var(--ink-2); }
+.diag-history-head p { margin-top: 4px; }
+.diag-collection-state { flex-shrink: 0; padding: 5px 10px; border-radius: 999px; background: var(--paper-2); font-size: .75rem; font-weight: 600; }
+.diag-collection-state[data-enabled="true"] { color: var(--ok); background: var(--ok-wash); }
+.diag-history-data { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 48px; margin-top: 24px; }
+.diag-history-data h4 { font-size: .9375rem; font-weight: 650; margin-bottom: 12px; }
+.diag-memory { width: 100%; border-collapse: collapse; font-size: .875rem; }
+.diag-memory th { color: var(--ink-2); font-size: .75rem; font-weight: 500; padding: 0 0 10px; text-align: left; }
+.diag-memory td { padding: 10px 0; border-top: 1px solid var(--rule); }
+.diag-memory td small { color: var(--ink-3); font-size: .6875rem; margin-left: 8px; }
+.diag-memory th:not(:first-child), .diag-memory td:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.diag-memory td:not(:first-child), .diag-history-counts dd { font-family: var(--mono); font-size: .8125rem; }
+.diag-history-data .diag-history-note { margin-top: 12px; max-width: 60ch; }
+.diag-history-counts { margin: 0; }
+.diag-history-counts > div { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--rule); font-size: .875rem; }
+.diag-history-counts > div:first-child { padding-top: 0; }
+.diag-history-counts dd { margin: 0; white-space: nowrap; }
+.diag-history-footer { margin-top: 24px; display: flex; flex-wrap: wrap; align-items: start; justify-content: space-between; gap: 20px; }
+.diag-history-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.diag-history-actions a { text-decoration: none; }
+.diag-history-help { max-width: 48ch; font-size: .8125rem; color: var(--ink-2); }
+.diag-history-help summary { cursor: pointer; min-height: 44px; display: list-item; padding-top: 12px; text-decoration: underline; text-underline-offset: 4px; }
+.diag-history-help p { margin-top: 8px; line-height: 1.6; }
+@media (max-width: 700px) {
+  .diag-history-data { grid-template-columns: minmax(0, 1fr); gap: 28px; }
+  .diag-memory td small { display: block; margin: 2px 0 0; }
+  .diag-history-head { flex-wrap: wrap; }
+  .diag-history-actions { width: 100%; }
+  .diag-history-actions .btn { flex: 1 1 auto; }
+}

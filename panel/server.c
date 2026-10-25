@@ -2,6 +2,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "server.h"
+#include "../runtime/d2k_diagnostics_files.h"
 
 #include <errno.h>
 #include <ctype.h>
@@ -1357,6 +1358,42 @@ static int static_file(int fd, const d2k_panel_config *cfg, const char *req,
     return rc;
 }
 
+static int diagnostic_response(int fd,int code,const char *reason,const char *type,const char *body,size_t len) {
+    return response_ex(fd,code,reason,type,"Cache-Control: no-store\r\n",body,len);
+}
+static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
+                           const char *method,const char *action) {
+    const char *dir=cfg&&cfg->diagnostics_dir?cfg->diagnostics_dir:D2K_DIAG_DIR;
+    if(!strcmp(method,"POST")) {
+        if(!cfg||!cfg->control_enabled||!d2k_panel_same_origin(req))
+            return diagnostic_response(fd,403,"Forbidden","application/json","{\"error\":\"требуется запрос с того же источника\"}",sizeof "{\"error\":\"требуется запрос с того же источника\"}"-1);
+        if(strcmp(action,"enable")&&strcmp(action,"disable"))
+            return diagnostic_response(fd,400,"Bad Request","application/json","{}",2);
+        if(d2k_diag_toggle(dir,!strcmp(action,"enable")))
+            return diagnostic_response(fd,500,"Internal Server Error","application/json","{\"error\":\"не удалось изменить состояние диагностики\"}",sizeof "{\"error\":\"не удалось изменить состояние диагностики\"}"-1);
+        const char *body=d2k_diag_enabled(dir)?"{\"enabled\":true}":"{\"enabled\":false}";
+        return diagnostic_response(fd,200,"OK","application/json",body,strlen(body));
+    }
+    if(strcmp(method,"GET"))return diagnostic_response(fd,405,"Method Not Allowed","text/plain","",0);
+    if(!d2k_diag_enabled(dir))return diagnostic_response(fd,200,"OK","application/json","{\"enabled\":false}",17);
+    if(!strcmp(action,"status"))return diagnostic_response(fd,200,"OK","application/json","{\"enabled\":true}",16);
+    char path[512];struct stat st;
+    if(d2k_diag_path(path,sizeof path,dir,"report.json"))return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
+    int in=open(path,O_RDONLY|O_NOFOLLOW);
+    if(in<0)return diagnostic_response(fd,503,"Service Unavailable","application/json","{\"enabled\":true,\"pending\":true}",31);
+    if(fstat(in,&st)||!S_ISREG(st.st_mode)||st.st_size<0||(uint64_t)st.st_size>D2K_DIAG_REPORT_MAX) {
+        close(in);return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
+    }
+    size_t len=(size_t)st.st_size,off=0;char *body=malloc(len+1);
+    if(!body){close(in);return diagnostic_response(fd,503,"Service Unavailable","text/plain","",0);}
+    while(off<len){ssize_t n=read(in,body+off,len-off);if(n<0&&errno==EINTR)continue;if(n<=0)break;off+=(size_t)n;}
+    close(in);
+    int rc=off==len?response_ex(fd,200,"OK","application/json; charset=utf-8",
+        !strcmp(action,"download")?"Cache-Control: no-store\r\nContent-Disposition: attachment; filename=\"d2k-diagnostics.json\"\r\n":"Cache-Control: no-store\r\n",body,len):
+        diagnostic_response(fd,503,"Service Unavailable","text/plain","",0);
+    free(body);return rc;
+}
+
 int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     char req[REQUEST_MAX + 1];
     size_t used = 0;
@@ -1389,6 +1426,8 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
         }
         return api_telegram_workers(fd, cfg, req, used, method);
     }
+    if (!strcmp(path,"/api/diagnostics"))
+        return api_diagnostics(fd,cfg,req,method,query?query:"status");
     if (strcmp(path, "/api/update") == 0) {
         if (strcmp(method, "GET") != 0) {
             return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8",
@@ -1416,6 +1455,8 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     if (strcmp(path, "/assets/panel.css") == 0) {
         return static_file(fd, cfg, req, "panel.css", "text/css; charset=utf-8");
     }
+    if (!strcmp(path,"/assets/diagnostics.js"))
+        return static_file(fd,cfg,req,"diagnostics.js","application/javascript; charset=utf-8");
     if (strcmp(path, "/assets/panel.js") == 0) {
         return static_file(fd, cfg, req, "panel.js", "application/javascript; charset=utf-8");
     }

@@ -765,8 +765,30 @@ static void test_disconnected_client_cannot_sigpipe_server(void) {
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static void test_diagnostic_history_controls_and_download(void) {
+    char dir[128],path[256],reply[8192];
+    snprintf(dir,sizeof dir,"/tmp/d2k-panel-diag-api-%ld",(long)getpid());assert(mkdir(dir,0700)==0);
+    d2k_panel_config cfg={.control_enabled=1,.diagnostics_dir=dir};
+    request(&cfg,"GET /api/diagnostics HTTP/1.1\r\nHost: localhost\r\n\r\n",reply,sizeof reply);
+    assert(strstr(reply,"\"enabled\":false"));assert(strstr(reply,"Cache-Control: no-store"));
+    const char *enable="POST /api/diagnostics?enable HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: 0\r\n\r\n";
+    request(&cfg,enable,reply,sizeof reply);assert(strstr(reply,"200 OK"));assert(strstr(reply,"\"enabled\":true"));
+    request(&cfg,"GET /api/diagnostics?download HTTP/1.1\r\nHost: localhost\r\n\r\n",reply,sizeof reply);
+    assert(strstr(reply,"503 Service Unavailable"));assert(strstr(reply,"\"pending\":true"));
+    snprintf(path,sizeof path,"%s/report.json",dir);FILE *f=fopen(path,"w");assert(f);fputs("{\"schema\":1,\"enabled\":true,\"samples\":[]}",f);fclose(f);
+    request(&cfg,"GET /api/diagnostics?download HTTP/1.1\r\nHost: localhost\r\n\r\n",reply,sizeof reply);
+    assert(strstr(reply,"200 OK"));assert(strstr(reply,"Content-Disposition: attachment"));assert(strstr(reply,"\"samples\":[]"));
+    assert(truncate(path,256*1024+1)==0);
+    request(&cfg,"GET /api/diagnostics?download HTTP/1.1\r\nHost: localhost\r\n\r\n",reply,sizeof reply);assert(strstr(reply,"500 Internal Server Error"));
+    request(&cfg,"POST /api/diagnostics?disable HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.invalid\r\nContent-Length: 0\r\n\r\n",reply,sizeof reply);assert(strstr(reply,"403 Forbidden"));
+    snprintf(path,sizeof path,"%s/report.new",dir);f=fopen(path,"w");assert(f);fputs("partial",f);fclose(f);
+    request(&cfg,"POST /api/diagnostics?disable HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: 0\r\n\r\n",reply,sizeof reply);assert(strstr(reply,"\"enabled\":false"));assert(access(path,F_OK)!=0);
+    assert(rmdir(dir)==0);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    test_diagnostic_history_controls_and_download();
     test_api_exposes_live_knowledge();
     test_invalid_live_json_is_not_reported_as_empty_knowledge();
     test_telegram_status_is_dynamic_and_never_exposes_secret();

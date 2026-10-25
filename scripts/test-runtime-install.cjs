@@ -47,7 +47,7 @@ exit 1
   fixture('files/d2k-log-maintenance.sh', fs.readFileSync(path.join(root, 'files/d2k-log-maintenance.sh')));
   fixture('files/d2k-update.sh', fs.readFileSync(path.join(root, 'files/d2k-update.sh')));
   for (const name of ['meta-ranges.txt', 'tg-roots.pem', 'fake/stun.bin', 'fake/quic_initial_dbankcloud_ru.bin']) fixture(`files/${name}`, 'fixture\n');
-  for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'telegram-flow.js', 'telegram-flow-prototype.js', 'gsap.js', 'fonts/onest.woff2', 'fonts/OFL-onest.txt', 'fonts/jbmono.woff2', 'fonts/OFL-jbmono.txt']) fixture(`internal/web/assets/${name}`, 'fixture\n');
+  for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'telegram-flow.js', 'telegram-flow-prototype.js', 'diagnostics.js', 'gsap.js', 'fonts/onest.woff2', 'fonts/OFL-onest.txt', 'fonts/jbmono.woff2', 'fonts/OFL-jbmono.txt']) fixture(`internal/web/assets/${name}`, 'fixture\n');
   fs.mkdirSync(path.join(tmp, 'proc/net/netfilter'), { recursive: true });
   fs.writeFileSync(path.join(tmp, 'proc/net/netfilter/nfnetlink_queue'), '');
   fs.writeFileSync(path.join(tmp, 'proc/net/ip_tables_targets'), 'NFQUEUE\n');
@@ -219,6 +219,9 @@ exit 1
   fs.writeFileSync(path.join(tmp, 'opt/d2k/run/d2k-instagram-dns-scheduler.pid'), '999999');
   // Init may already be missing: uninstall still stops its owned helper.
   fs.unlinkSync(path.join(tmp, 'opt/etc/init.d/S99d2k'));
+  const diagnosticRuntime = runtime + '-diagnostics';
+  fs.mkdirSync(diagnosticRuntime);
+  for (const name of ['enabled','report.json','report.new']) fs.writeFileSync(path.join(diagnosticRuntime,name),'stale');
   fs.mkdirSync(runtime); fs.writeFileSync(path.join(runtime, 'live.json'), '{}');
   for (const binary of ['d2kd','d2kc','d2kpanel','d2ktg']) fs.writeFileSync(path.join(runtime, `${binary}.health`), 'stale');
   fs.writeFileSync(path.join(runtime, 'log-tail.ABCDEF'), 'stale');
@@ -254,6 +257,7 @@ exit 1
   assert(calls().includes('dns-remove'), 'uninstall must remove the owned DNS pins through the manifest helper');
   const sched = calls().indexOf('d2k-instagram-dns-scheduler.pid');
   assert(sched >= 0 && sched < calls().indexOf('dns-remove'), 'uninstall must stop the DNS scheduler before removing its pins');
+  assert(!fs.existsSync(diagnosticRuntime), 'при удалении очищаются история диагностики и флаг сбора');
   assert(!fs.existsSync(installed), 'uninstall must remove helper even when persistent state is kept');
   assert(!fs.existsSync(ppe), 'uninstall must remove the PPE de-offload helper');
   assert(fs.readFileSync(path.join(tmp, 'calls'), 'utf8').includes('ppe-remove'), 'uninstall must remove own PPE rules even without init');
