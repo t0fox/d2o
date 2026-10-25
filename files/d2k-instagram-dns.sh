@@ -14,7 +14,7 @@ TGBIN=${TGBIN:-d2ktg}
 META_RANGES=${D2K_META_RANGES:-$DIR/files/meta-ranges.txt}
 MANIFEST=${D2K_INSTAGRAM_MANIFEST:-$DIR/state/instagram-ip-hosts.tsv}
 LOG=${D2K_INSTAGRAM_LOG:-$DIR/log/instagram-dns.log}
-RELAY_URL=${D2K_RELAY_URL:-https://213.176.74.63.nip.io:9443/resolve}
+RELAY_URL=${D2K_RELAY_URL:-}
 # The only list: d2ktg --check-instagram-ip and the VPS allowlist carry the
 # same names (scripts/test-instagram-dns.sh compares them).
 HOSTS='instagram.com www.instagram.com graph.instagram.com api.instagram.com i.instagram.com instagram.c10r.instagram.com static.cdninstagram.com scontent.cdninstagram.com static.xx.fbcdn.net scontent.xx.fbcdn.net web.whatsapp.com www.whatsapp.com scontent.whatsapp.net graph.whatsapp.com v.whatsapp.com static.whatsapp.net mmg.whatsapp.net pps.whatsapp.net'
@@ -184,7 +184,9 @@ refresh() {
     # Owned pins are checked first, from here: if the VPS is gone, a pin to a
     # retired edge must still go away.
     recheck_owned || return 1
-    # No credential: the VPS answers public DNS data for this fixed list only.
+    # Без явно заданного резолвера не обращаться к устаревшему VPS.
+    [ -n "$RELAY_URL" ] || { log 'DNS-резолвер не настроен (D2K_RELAY_URL); обновление пропущено'; return 0; }
+    # Optional explicitly configured resolver for this fixed list.
     RELAY_AUTHORITY=${RELAY_URL#*://}; RELAY_AUTHORITY=${RELAY_AUTHORITY%%/*}
     RELAY_HOST=${RELAY_AUTHORITY%%:*}
     RELAY_PORT=443
