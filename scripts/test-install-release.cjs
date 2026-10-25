@@ -158,7 +158,7 @@ exit 0`));
     PATH: `${bin}:${sys}`, HOME: tmp, CALLS: calls, D2K_KEEP_STATE: '1',
     D2K_BASE: 'http://fixture.test',
     D2K_UPDATE_LATEST: 'http://fixture.test/latest', D2K_UPDATE_DOWNLOAD: 'http://fixture.test',
-    D2K_UPDATE_KEY: pub, D2K_GATE: 'http://192.0.2.44:9444',
+    D2K_UPDATE_KEY: pub, D2K_GATE: 'http://192.0.2.44:9444', D2K_GATE: 'http://192.0.2.44:9444',
     D2K_OPENWRT_APK: path.join(bin, 'apk'), D2K_OPENWRT_OPKG: path.join(tmp, 'no-opkg'),
   };
   const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
