@@ -147,9 +147,9 @@ DEF="$TMP/default"
 mkdir -p "$DEF/d2k/state" "$DEF/d2k/files" "$DEF/d2k/log"
 : > "$DEF/d2k/config"; cp "$TMP/d2k/files/meta-ranges.txt" "$DEF/d2k/files/"
 printf 'system name test-router\n' > "$DEF/ndmc-state"
-env D2K_RELAY_URL= D2K_STUB_PATH="$TMP/bin" D2K_DIR="$DEF/d2k" D2K_CONFIG="$DEF/d2k/config" \\
- D2K_META_RANGES="$DEF/d2k/files/meta-ranges.txt" NDMC_STATE="$DEF/ndmc-state" NDMC_CALLS="$DEF/ndmc-calls" \\
- CURL_CALLS="$DEF/curl-calls" OPENSSL_KEY="$DEF/openssl-key" D2K_INSTAGRAM_LOG="$DEF/refresh.log" \\
+env D2K_RELAY_URL= D2K_STUB_PATH="$TMP/bin" D2K_DIR="$DEF/d2k" D2K_CONFIG="$DEF/d2k/config" \
+ D2K_META_RANGES="$DEF/d2k/files/meta-ranges.txt" NDMC_STATE="$DEF/ndmc-state" NDMC_CALLS="$DEF/ndmc-calls" \
+ CURL_CALLS="$DEF/curl-calls" OPENSSL_KEY="$DEF/openssl-key" D2K_INSTAGRAM_LOG="$DEF/refresh.log" \
  sh "$SCRIPT" refresh || fail "missing resolver should skip"
 [ ! -s "$DEF/curl-calls" ] || fail "unconfigured resolver sent a network request"
 ok "empty default resolver never contacts the old server"
