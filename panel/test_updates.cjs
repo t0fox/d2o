@@ -22,6 +22,56 @@ function state(over={}) {
 const json = (data, status=200) => ({ok:status<300,status,json:async()=>data});
 
 (async () => {
+  // В простое — один запрос в минуту; действия и восстановление остаются быстрыми.
+  {
+    const realNow = Date.now;
+    let clock = 100000, busy = '', down = false;
+    Date.now = () => clock;
+    try {
+      const {app,requests} = fixture(() => {
+        if (down) throw Error('панель недоступна');
+        return json(state({busy}));
+      });
+      await app.pollUpdates();
+      for (let i = 0; i < 29; i++) { clock += 2000; await app.pollUpdates(true); }
+      assert.equal(requests.length, 1, 'в простое таймер не загружает неизменившееся состояние');
+      clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 2, 'состояние в простое обновляется через минуту');
+      await app.pollUpdates();
+      assert.equal(requests.length, 3, 'ручное обновление не ждёт интервал простоя');
+      busy = 'checking'; await app.pollUpdates();
+      clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 5, 'во время фоновой проверки сохраняется частый опрос');
+      busy = 'installing'; await app.pollUpdates();
+      clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 7, 'во время установки сохраняется частый опрос');
+      busy = ''; await app.pollUpdates();
+      app.updatePending = {action:'check',at:clock};
+      clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 9, 'ожидающая команда сохраняет частый опрос до смены busy');
+      app.updatePending = null;
+      down = true; await app.pollUpdates();
+      down = false; clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 11, 'после ошибки следующий быстрый опрос восстанавливает связь');
+      clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 11, 'после восстановления опрос возвращается в режим простоя');
+      app.doc.hidden = true; clock += 60000; await app.pollUpdates(true);
+      assert.equal(requests.length, 11, 'скрытая вкладка не опрашивает состояние');
+      app.doc.hidden = false; await app.pollUpdates();
+      assert.equal(requests.length, 12, 'видимая вкладка может обновить состояние сразу');
+      app.updateInflight = true; await app.pollUpdates();
+      assert.equal(requests.length, 12, 'ожидающий запрос нельзя продублировать');
+    } finally { Date.now = realNow; }
+  }
+  // Отсутствующая утилита и ещё не проверявшееся состояние тоже не требуют частого опроса.
+  for (const reply of [{absent:true}, {never:true}]) {
+    const {app,requests} = fixture(() => json(reply));
+    await app.pollUpdates();
+    await app.pollUpdates(true);
+    assert.equal(requests.length, 1, 'отсутствующее или ещё не проверенное состояние остаётся в простое');
+    await app.pollUpdates();
+    assert.equal(requests.length, 2, 'ручное обновление работает и без истории обновлений');
+  }
   // Новый выпуск: кнопка, заметки как текст, тумблер по состоянию.
   {
     const {app,nodes} = fixture(() => json(state()));
