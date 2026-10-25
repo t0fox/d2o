@@ -117,7 +117,7 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   fixture('files/d2k-openwrt-init', fs.readFileSync(path.join(root, 'files/d2k-openwrt-init'), 'utf8').replace(/\r\n/g, '\n')
     .replaceAll('/etc/rc.common', path.join(tmp, 'etc/rc.common')));
   for (const name of ['meta-ranges.txt', 'tg-roots.pem', 'fake/stun.bin', 'fake/quic_initial_dbankcloud_ru.bin']) fixture(`files/${name}`, 'fixture\n');
-  for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'telegram-flow.js', 'telegram-flow-prototype.js', 'gsap.js', 'fonts/onest.woff2',
+  for (const name of ['index.html', 'favicon.svg', 'panel.css', 'panel.js', 'telegram-flow.js', 'telegram-flow-prototype.js', 'diagnostics.js', 'gsap.js', 'fonts/onest.woff2',
     'fonts/OFL-onest.txt', 'fonts/jbmono.woff2', 'fonts/OFL-jbmono.txt']) fixture(`internal/web/assets/${name}`, 'fixture\n');
 
   // A stock image: nfnetlink_queue present, no /proc/net/ip_tables_* at all.
