@@ -67,7 +67,7 @@ exit ${installOk ? 0 : 1}
 
 const env = {
   ...process.env, D2K_STUB_PATH: stub, D2K_DIR: dir, D2K_SBIN: sbin, D2K_INIT: init,
-  D2K_NDM_HOOK: path.join(tmp, 'ndm-hook'), D2K_UPDATE_KEY: pub, D2K_UPDATE_HEALTH_WAIT: '0', D2K_GATE: 'http://192.0.2.44:9444',
+  D2K_NDM_HOOK: path.join(tmp, 'ndm-hook'), D2K_UPDATE_KEY: pub, D2K_UPDATE_HEALTH_WAIT: '0', D2K_GATE: 'http://192.0.2.44:9444', D2K_GATE: 'http://192.0.2.44:9444',
   D2K_UPDATE_LATEST: 'https://example.test/latest', D2K_UPDATE_DOWNLOAD: 'https://example.test',
 };
 const run = (...args) => spawnSync('/bin/sh', [updater, ...args], { env, encoding: 'utf8' });
