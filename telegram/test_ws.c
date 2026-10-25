@@ -7,8 +7,8 @@
 
 static void test_nip_host_to_ipv4(void) {
     char ip[16];
-    assert(tg_nip_host_to_ipv4("213.176.74.63.nip.io", ip) == 1);
-    assert(strcmp(ip, "213.176.74.63") == 0);
+    assert(tg_nip_host_to_ipv4("192.0.2.44.nip.io", ip) == 1);
+    assert(strcmp(ip, "192.0.2.44") == 0);
     assert(tg_nip_host_to_ipv4("1.2.3.4.nip.io.", ip) == 1);
     assert(strcmp(ip, "1.2.3.4") == 0);
     assert(tg_nip_host_to_ipv4("relay.example", ip) == 0);
