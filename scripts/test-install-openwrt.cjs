@@ -143,7 +143,7 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   const env = {
     // Файлы ветки, а не выпуск: здесь проверяется поведение установщика на
     // чистой 25.12, а не канал выпуска (его проверяет test-install-release.cjs).
-    D2K_SOURCE: 'ref',
+    D2K_SOURCE: 'ref', D2K_GATE: 'http://192.0.2.44:9444',
     PATH: `${bin}:${sys}`, HOME: tmp, CALLS: calls, SRC: src, D2K_BASE: 'http://fixture.test',
     D2K_OPENWRT_APK: path.join(bin, 'apk'), D2K_OPENWRT_OPKG: path.join(tmp, 'no-opkg'), D2K_KEEP_STATE: '1',
   };
@@ -290,8 +290,8 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   fs.rmSync(path.join(bin, 'openssl'));
   reset();
   ok(run('install', { ...opkgEnv, D2K_OPENWRT_OPKG_ETC: opkgEtc }));
-  assert.match(read(log('opkg-gate')), /^http:\/\/213\.176\.74\.63:9444 update$/m, 'opkg list update via the gate');
-  assert.match(read(log('opkg-gate')), /^http:\/\/213\.176\.74\.63:9444 install$/m, 'opkg install via the gate');
+  assert.match(read(log('opkg-gate')), /^http:\/\/192\.0\.2\.44:9444 update$/m, 'opkg list update via the gate');
+  assert.match(read(log('opkg-gate')), /^http:\/\/192\.0\.2\.44:9444 install$/m, 'opkg install via the gate');
   assert.equal(read(log('opkg-gate-conf')),
     'dest root /\nlists_dir ext /var/opkg-lists\noption check_signature\n' +
     'src/gz openwrt_core http://downloads.openwrt.org/releases/24.10.8/targets/x86/64/packages\n' +
