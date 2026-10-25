@@ -4,7 +4,7 @@ Both the router runtime and this separate VPS enrollment service are C. The
 service enables public self-service installation without
 shipping the fleet bootstrap credential in source, artifacts or router config.
 
-`POST https://213.176.74.63.nip.io:9443/register` accepts exactly 120 bytes:
+`POST https://192.0.2.44.nip.io:9443/register` accepts exactly 120 bytes:
 installation ID (16), Ed25519 public key (32), big-endian work nonce (8), and
 Ed25519 signature (64). The signed message is `d2k-enroll-v1\0` followed by the
 first 56 bytes. Its SHA-256 must start with 18 zero bits. Proofs bind work and
