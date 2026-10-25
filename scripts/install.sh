@@ -46,16 +46,9 @@ OPENWRT_RELEASE=${D2K_OPENWRT_RELEASE:-/etc/openwrt_release}
 # Штатный менеджер пакетов OpenWrt: apk с 25.12, opkg до неё. Entware-opkg
 # для системных пакетов не годится никогда — у него свои пакеты и своя арка.
 OPENWRT_APK=${D2K_OPENWRT_APK:-/usr/bin/apk}
-# ПРОВОДНИК УСТАНОВКИ ЧЕРЕЗ VPS — свой C-сервис D2K (relay-gate/). Каждая
-# загрузка сперва идёт через него и только потом напрямую: с части линий
-# GitHub, Entware и сервер пакетов OpenWrt не доходят.
-#   - GitHub — через CONNECT: TLS остаётся между роутером и GitHub, сервис
-#     ответ не видит и подменить не может;
-#   - пакеты OpenWrt — штатными зеркалами downloads.openwrt.org по http://
-#     через тот же сервис: apk и opkg сами сверяют подписи индексов и
-#     пакетов, открытый отрезок их не подменит.
-# D2K_GATE= (пусто) — без проводника, только напрямую.
-GATE=${D2K_GATE-http://213.176.74.63:9444}
+# Прямой HTTPS по умолчанию. D2K_GATE — только добровольно указанный
+# владельцем прокси; старый VPS в сборке не задан.
+GATE=${D2K_GATE:-}
 # Где лежат источники пакетов OpenWrt (тесты подставляют свои).
 OPENWRT_APK_ETC=${D2K_OPENWRT_APK_ETC:-/etc/apk}
 OPENWRT_OPKG_ETC=${D2K_OPENWRT_OPKG_ETC:-/etc}
