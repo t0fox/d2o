@@ -49,6 +49,7 @@ core/*
 !core/*.h
 !core/Makefile
 !core/include/
+!core/test_diagnostics_json.py
 # Профили холодного старта ОБЯЗАНЫ попасть в репозиторий: без них на другой
 # машине холодный старт не соберётся (core/hello_profiles.inc, который из
 # .hex делает core/Makefile, — вывод сборки, в git не идёт, и без исходных
