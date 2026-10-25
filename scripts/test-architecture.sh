@@ -18,6 +18,11 @@ check x86_64 x64-3.2 amd64
 check aarch64 aarch64-3.10_kn arm64
 check armv7l armv7-3.2_kn arm
 check mips mipsel-3.4_kn mipsel
+# В Entware Keenetic та же little-endian ABI с soft-float называется mipselsf.
+# uname при этом сообщает mips: нельзя выбирать big-endian архив только по нему.
+check mips mipselsf-k3.4_kn mipsel
+check mips mipselsf-k4.9 mipsel
+check mips mipselsf mipsel
 check x86_64 i686 x86
 check i686 '' x86
 check ppc64 '' ppc64
