@@ -158,7 +158,7 @@ exit 0`));
     PATH: `${bin}:${sys}`, HOME: tmp, CALLS: calls, D2K_KEEP_STATE: '1',
     D2K_BASE: 'http://fixture.test',
     D2K_UPDATE_LATEST: 'http://fixture.test/latest', D2K_UPDATE_DOWNLOAD: 'http://fixture.test',
-    D2K_UPDATE_KEY: pub,
+    D2K_UPDATE_KEY: pub, D2K_GATE: 'http://192.0.2.44:9444',
     D2K_OPENWRT_APK: path.join(bin, 'apk'), D2K_OPENWRT_OPKG: path.join(tmp, 'no-opkg'),
   };
   const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
@@ -185,7 +185,7 @@ exit 0`));
       `http://fixture.test/${rid}/d2k-amd64.tar.gz`],
     'выпуск берётся перечнем, подписью и архивом — в этом порядке');
   // Каждая загрузка выпуска сперва идёт через проводник на VPS (CONNECT).
-  const GATE = 'http://213.176.74.63:9444';
+  const GATE = 'http://192.0.2.44:9444';
   const releaseUrls = ['http://fixture.test/latest/latest.json', 'http://fixture.test/latest/latest.json.sig',
     `http://fixture.test/${rid}/d2k-amd64.tar.gz`];
   assert.deepEqual(read(log('curl-gate')).trim().split('\n'), releaseUrls.map((u) => `${GATE} ${u}`),
