@@ -142,21 +142,17 @@ grep -q -- '--check-instagram-ip instagram.com 157.240.9.174' "$TMP/curl-calls" 
 grep -q 'повтор TLS-пробы 1/2' "$TMP/refresh.log" || fail "transient IP probe failure was not retried"
 ok "refresh pins VPS-verified Instagram, fbcdn and WhatsApp IPs and records only D2K-owned pairs"
 
-# Without an override the router asks d2k's own C resolver on the enrollment
-# port, pinning the nip.io name to its literal address on that same port.
+# No network calls when the resolver is not configured.
 DEF="$TMP/default"
 mkdir -p "$DEF/d2k/state" "$DEF/d2k/files" "$DEF/d2k/log"
 : > "$DEF/d2k/config"; cp "$TMP/d2k/files/meta-ranges.txt" "$DEF/d2k/files/"
 printf 'system name test-router\n' > "$DEF/ndmc-state"
-env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$DEF/d2k" D2K_CONFIG="$DEF/d2k/config" \
-    D2K_META_RANGES="$DEF/d2k/files/meta-ranges.txt" \
-    NDMC_STATE="$DEF/ndmc-state" NDMC_CALLS="$DEF/ndmc-calls" \
-    CURL_CALLS="$DEF/curl-calls" OPENSSL_KEY="$DEF/openssl-key" \
-    D2K_INSTAGRAM_LOG="$DEF/refresh.log" sh "$SCRIPT" refresh || { cat "$DEF/refresh.log" >&2; fail "refresh against the default resolver failed"; }
-grep -q -- '--resolve 213.176.74.63.nip.io:9443:213.176.74.63 -X POST https://213.176.74.63.nip.io:9443/resolve' "$DEF/curl-calls" \
-    || { cat "$DEF/curl-calls" >&2; fail "default resolver is not d2k's own https://213.176.74.63.nip.io:9443/resolve"; }
-! grep -q 'nip.io/resolve\|:443:' "$DEF/curl-calls" || fail "refresh still calls the z2k relay /resolve on 443"
-ok "default resolver is d2k's own C /resolve on port 9443 without authentication"
+env D2K_RELAY_URL= D2K_STUB_PATH="$TMP/bin" D2K_DIR="$DEF/d2k" D2K_CONFIG="$DEF/d2k/config" \\
+ D2K_META_RANGES="$DEF/d2k/files/meta-ranges.txt" NDMC_STATE="$DEF/ndmc-state" NDMC_CALLS="$DEF/ndmc-calls" \\
+ CURL_CALLS="$DEF/curl-calls" OPENSSL_KEY="$DEF/openssl-key" D2K_INSTAGRAM_LOG="$DEF/refresh.log" \\
+ sh "$SCRIPT" refresh || fail "missing resolver should skip"
+[ ! -s "$DEF/curl-calls" ] || fail "unconfigured resolver sent a network request"
+ok "empty default resolver never contacts the old server"
 
 : > "$TMP/curl-calls"
 env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$TMP/d2k" D2K_CONFIG="$TMP/d2k/config" \
