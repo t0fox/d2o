@@ -6,7 +6,7 @@ set +x
 bundle=${1:?usage: install-server.sh BUNDLE_DIRECTORY}
 [ "$(id -u)" = 0 ] || { echo 'root required' >&2; exit 1; }
 [ -s /etc/z2k/secrets.env ] || { echo 'existing relay credential file missing' >&2; exit 1; }
-[ -s /var/lib/z2k-relay/acme/213.176.74.63.nip.io ] || { echo 'relay TLS certificate missing' >&2; exit 1; }
+[ -s /var/lib/z2k-relay/acme/192.0.2.44.nip.io ] || { echo 'relay TLS certificate missing' >&2; exit 1; }
 umask 077
 mkdir -p /etc/d2k-enroll
 # shellcheck disable=SC1091
