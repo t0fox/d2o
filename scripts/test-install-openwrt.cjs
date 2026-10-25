@@ -143,7 +143,7 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   const env = {
     // Файлы ветки, а не выпуск: здесь проверяется поведение установщика на
     // чистой 25.12, а не канал выпуска (его проверяет test-install-release.cjs).
-    D2K_SOURCE: 'ref', D2K_GATE: 'http://192.0.2.44:9444',
+    D2K_SOURCE: 'ref', D2K_GATE: 'http://192.0.2.44:9444', D2K_GATE: 'http://192.0.2.44:9444',
     PATH: `${bin}:${sys}`, HOME: tmp, CALLS: calls, SRC: src, D2K_BASE: 'http://fixture.test',
     D2K_OPENWRT_APK: path.join(bin, 'apk'), D2K_OPENWRT_OPKG: path.join(tmp, 'no-opkg'), D2K_KEEP_STATE: '1',
   };
