@@ -11,7 +11,7 @@ static void test_config_values_and_legacy_fields(void) {
     char path[]="/tmp/d2k-tg-config-XXXXXX";int fd=mkstemp(path);assert(fd>=0);
     FILE *f=fdopen(fd,"w");assert(f);
     fputs("MODE=apply\nTG_ENABLED=1\nTG_MODE=local\n"
-          "TG_RELAY_URL='wss://213.176.74.63.nip.io/ws'\n"
+          "TG_RELAY_URL='wss://192.0.2.44.nip.io/ws'\n"
           "TG_RELAY_SECRET='old-secret'\nTG_IDENTITY=/opt/d2k/state/tg.identity\n"
           "TG_CA_BUNDLE=/opt/d2k/files/tg-roots.pem\n"
           "TG_STATUS=/opt/d2k/state/telegram.status\nTG_PORT=1443\n"
