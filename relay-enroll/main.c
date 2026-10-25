@@ -659,7 +659,7 @@ static void stop_server(int signal_number){(void)signal_number;stopping=1;}
 static void child_exited(int signal_number){(void)signal_number;}
 
 int main(int argc,char **argv) {
-    const char *certificate="/var/lib/z2k-relay/acme/213.176.74.63.nip.io",*key=NULL,*bootstrap=NULL;
+    const char *certificate="/var/lib/z2k-relay/acme/192.0.2.44.nip.io",*key=NULL,*bootstrap=NULL;
     uint16_t port=9443,upstream=8080;
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--certificate")==0&&i+1<argc)certificate=argv[++i];
