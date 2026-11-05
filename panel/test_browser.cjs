@@ -427,7 +427,7 @@ async function main(){
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
   await until('document.querySelector("#telegram-body").dataset.state==="idle"','an old route failure expires from current status');
   assert.equal(await evaluate('document.querySelector("[data-tg-state-title]").textContent'),'Нет активных сессий');
-  assert.match(await evaluate('document.querySelector("[data-tg-last-warning]").textContent'),/2 мин 0 с назад/,
+  assert.match(await evaluate('document.querySelector("[data-tg-last-warning]").textContent'),/2 мин 00 с назад/,
    'expired failures remain visible with their age as history');
   panel.telegram('connected');
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
