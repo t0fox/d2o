@@ -18,6 +18,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef D2K_HS_TESTING
+#define D2K_HS_TESTING
+#endif
 #include "d2k_httpsearch.h"
 #include "d2k_plantlv.h"
 #include "d2k_plan.h"
