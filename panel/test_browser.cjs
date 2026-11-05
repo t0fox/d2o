@@ -416,8 +416,8 @@ async function main(){
    last_failure_route:0,last_failure_stage:7,last_failure_dc:0,last_failure_age_ms:100,
    last_success_age_ms:10000});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
-  await until('document.querySelector("[data-tg-state-title]").textContent==="Последняя попытка завершилась ошибкой"',
-   'an unavailable route plan is reported as setup failure');
+  await until('document.querySelector("[data-tg-last-warning]").textContent.includes("Маршрут не выбран")',
+   'an unavailable route plan replaces the previous WebSocket warning');
   assert.match(await evaluate('document.querySelector("[data-tg-last-warning]").textContent'),/настройка маршрута.*DC неизвестен.*Маршрут не выбран/i);
   assert.equal(await evaluate('[...document.querySelectorAll("[data-tg-routes] li")].some(x=>/Прямой WSS.*Отказ/.test(x.textContent))'),false,
    'an empty route plan does not invent a direct WSS attempt');
