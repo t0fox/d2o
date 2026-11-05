@@ -138,28 +138,78 @@
           </div>
           <p id="diagnostic-status" class="diag-history-note" role="status">Проверяем состояние сбора…</p>
           <div id="diagnostic-data" class="diag-history-data" hidden>
-            <div>
-              <h4>Память процессов</h4>
-              <table class="diag-memory"><thead><tr><th scope="col">Процесс</th><th scope="col">RAM, МиБ</th><th scope="col">Изменение</th></tr></thead><tbody id="diagnostic-processes"></tbody></table>
-              <p class="diag-history-note">Изменение с первого снимка этого процесса. Рост памяти сам по себе не означает утечку.</p>
-            </div>
-            <div>
-              <h4>История подбора</h4>
+            <section class="diag-card diag-memory-panel" aria-labelledby="diagnostic-memory-title">
+              <div class="diag-card-head"><div><h4 id="diagnostic-memory-title">Память d2kc</h4><p id="diagnostic-memory-interval">Интервал указан в отчёте · значения в МиБ</p></div>
+                <div class="diag-range" role="group" aria-label="Период графика памяти">
+                  <button type="button" data-memory-range="2" aria-pressed="true">2 часа</button>
+                  <button type="button" data-memory-range="24" aria-pressed="false">24 часа</button>
+                </div>
+              </div>
+              <div class="diag-series" aria-label="Показатели графика">
+                <label data-series-option="rss"><input type="checkbox" data-memory-series="rss" checked><span>RSS</span></label>
+                <label data-series-option="vm_data"><input type="checkbox" data-memory-series="vm_data" checked><span>VmData</span></label>
+                <label data-series-option="anonymous"><input type="checkbox" data-memory-series="anonymous" checked><span>Anonymous</span></label>
+                <label data-series-option="private_dirty"><input type="checkbox" data-memory-series="private_dirty" checked><span>Private_Dirty</span></label>
+              </div>
+              <svg id="diagnostic-memory-chart" class="diag-memory-chart" viewBox="0 0 960 260" role="img" aria-label="Память процесса d2kc"></svg>
+              <p id="diagnostic-memory-empty" class="diag-empty" hidden>Для выбранного периода нет доступных снимков памяти.</p>
+              <p id="diagnostic-memory-caption" class="diag-history-note">Рост RSS сам по себе не подтверждает утечку.</p>
+            </section>
+            <section class="diag-card diag-process-panel" aria-labelledby="diagnostic-process-title">
+              <h4 id="diagnostic-process-title">Память процессов</h4>
+              <table class="diag-memory"><thead><tr><th scope="col">Процесс</th><th scope="col">RSS, МиБ</th><th scope="col">Изменение</th></tr></thead><tbody id="diagnostic-processes"></tbody></table>
+              <p class="diag-history-note">Изменение считается от первого сохранённого снимка того же PID.</p>
+            </section>
+            <section class="diag-card diag-workers-panel" aria-labelledby="diagnostic-workers-title">
+              <h4 id="diagnostic-workers-title">Workers</h4>
+              <dl class="diag-history-counts">
+                <div><dt>Активные</dt><dd id="diagnostic-workers-running">—</dd></div>
+                <div><dt>Ожидают результат</dt><dd id="diagnostic-workers-result">—</dd></div>
+                <div><dt>Ожидают join</dt><dd id="diagnostic-workers-join">—</dd></div>
+                <div><dt>Старейший worker</dt><dd id="diagnostic-workers-oldest">—</dd></div>
+                <div><dt>Ошибки запуска / join</dt><dd id="diagnostic-workers-errors">—</dd></div>
+              </dl>
+            </section>
+            <section class="diag-card diag-catalog-panel" aria-labelledby="diagnostic-catalog-title">
+              <h4 id="diagnostic-catalog-title">Каталог</h4>
+              <dl class="diag-history-counts">
+                <div><dt>Занято каталогом</dt><dd id="diagnostic-catalog-bytes">—</dd></div>
+                <div><dt>Снимки</dt><dd id="diagnostic-snapshot-bytes">—</dd></div>
+                <div><dt>Коробки / привязки / планы</dt><dd id="diagnostic-catalog-counts">—</dd></div>
+              </dl>
+            </section>
+            <section class="diag-card diag-http-panel" aria-labelledby="diagnostic-http-title">
+              <h4 id="diagnostic-http-title">HTTP-хранилище</h4>
+              <dl class="diag-history-counts">
+                <div><dt>Занято всего</dt><dd id="diagnostic-http-bytes">—</dd></div>
+                <div><dt>Записи</dt><dd id="diagnostic-http-records">—</dd></div>
+                <div><dt>Очередь</dt><dd id="diagnostic-http-queue">—</dd></div>
+                <div><dt>Ошибки: всего / на сайт</dt><dd id="diagnostic-http-evidence">—</dd></div>
+                <div><dt>Переполнения лимитов</dt><dd id="diagnostic-http-overflows">—</dd></div>
+              </dl>
+            </section>
+            <section class="diag-card diag-limiter-panel" aria-labelledby="diagnostic-limiter-title">
+              <h4 id="diagnostic-limiter-title">Переходы AIMD</h4>
+              <p id="diagnostic-aimd-current" class="diag-history-note">—</p>
+              <ol id="diagnostic-aimd-history" class="diag-transition-list"></ol>
+            </section>
+            <section class="diag-card diag-search-panel" aria-labelledby="diagnostic-search-title">
+              <h4 id="diagnostic-search-title">История подбора</h4>
               <dl class="diag-history-counts">
                 <div><dt>Завершений поиска</dt><dd id="diagnostic-events">—</dd></div>
                 <div><dt>Без подтверждённого результата</dt><dd id="diagnostic-unconfirmed">—</dd></div>
-                <div><dt>Привязок / планов</dt><dd id="diagnostic-catalog">—</dd></div>
                 <div><dt>Снимков памяти</dt><dd id="diagnostic-samples">—</dd></div>
               </dl>
               <p class="diag-history-note">Неподтверждённый результат поиска не равен недоступности сайта.</p>
-            </div>
+            </section>
+            <div id="diagnostic-warnings" class="diag-warning-list" role="status" aria-live="polite" hidden></div>
           </div>
           <div class="diag-history-footer">
             <div class="diag-history-actions">
               <a class="btn" data-variant="primary" id="diagnostic-download" href="/api/diagnostics?download" download="d2k-diagnostics.json" hidden>Скачать отчёт</a>
               <button type="button" class="btn" id="diagnostic-toggle">Включить сбор</button>
             </div>
-            <details class="diag-history-help"><summary>Что сохраняется</summary><p>Последние 120 минутных снимков и 64 завершения поиска, только в оперативной памяти. Для разбора роста RAM также сохраняются первый и последний подробные снимки памяти процессов. Включите сбор, воспроизведите проблему и скачайте отчёт для issue — дополнительные команды на роутере не нужны. Отчёт содержит домены и IP-адреса; автоматически никуда не отправляется. Сбор по умолчанию выключен и отключается после перезагрузки. Перед выключением скачайте отчёт — история будет удалена.</p></details>
+            <details class="diag-history-help"><summary>Что сохраняется</summary><p>В оперативной памяти хранится история памяти d2kc с интервалом и ёмкостью, указанными в отчёте, включая RSS, VmData и доступные показатели smaps_rollup. Также сохраняются ограниченные журналы завершений поиска и переходов AIMD и первый/последний подробные снимки процессов. График позволяет посмотреть последние 2 или 24 часа. Данные не отправляются автоматически. Отчёт содержит домены и IP-адреса: скачайте его перед отправкой в issue. Сбор по умолчанию выключен и отключается после перезагрузки; выключение удаляет историю.</p></details>
           </div>
         </section>
         <div id="diagnostics-body"></div>

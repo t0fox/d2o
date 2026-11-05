@@ -935,6 +935,11 @@ static void test_live_failure_memory_cap(void) {
     CHECK(counts.http_records_bytes<=D2K_HS_RECORD_MAX_BYTES&&
           counts.http_queue_bytes<=D2K_HS_QUEUE_MAX_BYTES&&counts.http_bytes>=counts.http_failure_bytes,
           "HTTP-search record, queue and evidence allocations are separately bounded and accounted");
+    CHECK(counts.http_records_limit_bytes==D2K_HS_RECORD_MAX_BYTES&&
+          counts.http_queue_limit_bytes==D2K_HS_QUEUE_MAX_BYTES&&
+          counts.http_failure_limit_bytes==D2K_HS_FAILURE_MAX_BYTES&&
+          counts.http_failure_record_limit_bytes==D2K_HS_FAILURE_RECORD_MAX_BYTES,
+          "HTTP diagnostic reports the current storage limits");
     printf("256 distinct live failures: retained=%llu entries, storage=%llu/%u bytes, overflow=%llu\n",
         (unsigned long long)counts.http_failures,(unsigned long long)counts.http_failure_bytes,
         MAX_FAILURE_BYTES,(unsigned long long)counts.http_failure_limit_hits);

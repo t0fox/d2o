@@ -32,6 +32,8 @@ with tempfile.TemporaryDirectory() as directory:
     assert sample['processes'][0]['rss_kib'] == 4096
     assert sample['processes'][1]['rss_kib'] is None
     assert sample['datapath_flows'] is None
+    assert sample['http_records_limit_bytes'] == 262144
+    assert sample['http_failure_record_limit_bytes'] == 8192
     assert sample['system_conntrack'] is None
     assert sample['catalog_bytes'] == 8192
     assert sample['snapshot_bytes'] == 4096

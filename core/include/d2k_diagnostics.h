@@ -24,6 +24,8 @@ typedef struct {
     int64_t worker_oldest_age_ms, last_measurement_age_ms;
     uint64_t workers_started, workers_joined, worker_start_failures, worker_join_failures;
     uint64_t http_failures, http_bytes, http_records_bytes, http_queue_bytes, http_failure_bytes;
+    uint64_t http_records_limit_bytes, http_queue_limit_bytes;
+    uint64_t http_failure_limit_bytes, http_failure_record_limit_bytes;
     uint64_t http_failure_limit_hits, http_failure_record_limit_hits, http_failure_alloc_failures;
     uint64_t http_record_limit_hits, http_record_alloc_failures;
     uint64_t http_queue_limit_hits, http_queue_alloc_failures;

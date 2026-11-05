@@ -393,6 +393,7 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         number(f,c->last_measurement_age_ms);
         fprintf(f,",\"workers_started\":%llu,\"workers_joined\":%llu,\"worker_start_failures\":%llu,\"worker_join_failures\":%llu,"
                   "\"http_failures\":%llu,\"http_bytes\":%llu,\"http_records_bytes\":%llu,\"http_queue_bytes\":%llu,\"http_failure_bytes\":%llu,"
+                  "\"http_records_limit_bytes\":%llu,\"http_queue_limit_bytes\":%llu,\"http_failure_limit_bytes\":%llu,\"http_failure_record_limit_bytes\":%llu,"
                   "\"http_failure_limit_hits\":%llu,\"http_failure_record_limit_hits\":%llu,\"http_failure_alloc_failures\":%llu,"
                   "\"http_record_limit_hits\":%llu,\"http_record_alloc_failures\":%llu,\"http_queue_limit_hits\":%llu,\"http_queue_alloc_failures\":%llu,"
                   "\"measurement_limit\":%llu,\"measurement_slots\":%llu,"
@@ -401,7 +402,9 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
           (unsigned long long)c->worker_start_failures,(unsigned long long)c->worker_join_failures,
           (unsigned long long)c->http_failures,(unsigned long long)c->http_bytes,
           (unsigned long long)c->http_records_bytes,(unsigned long long)c->http_queue_bytes,
-          (unsigned long long)c->http_failure_bytes,(unsigned long long)c->http_failure_limit_hits,
+          (unsigned long long)c->http_failure_bytes,(unsigned long long)c->http_records_limit_bytes,
+          (unsigned long long)c->http_queue_limit_bytes,(unsigned long long)c->http_failure_limit_bytes,
+          (unsigned long long)c->http_failure_record_limit_bytes,(unsigned long long)c->http_failure_limit_hits,
           (unsigned long long)c->http_failure_record_limit_hits,(unsigned long long)c->http_failure_alloc_failures,
           (unsigned long long)c->http_record_limit_hits,(unsigned long long)c->http_record_alloc_failures,
           (unsigned long long)c->http_queue_limit_hits,(unsigned long long)c->http_queue_alloc_failures,

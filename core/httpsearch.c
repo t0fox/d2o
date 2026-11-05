@@ -693,6 +693,10 @@ void d2k_httpsearch_diagnostic_counts(d2k_httpsearch *hs,d2k_diag_counts *c) {
     c->http_records_bytes=(uint64_t)hs->cap_recs*sizeof *hs->recs;
     c->http_queue_bytes=(uint64_t)hs->cap_q*sizeof *hs->q;
     c->http_failure_bytes=hs->live_failure_bytes;
+    c->http_records_limit_bytes=D2K_HS_RECORD_MAX_BYTES;
+    c->http_queue_limit_bytes=D2K_HS_QUEUE_MAX_BYTES;
+    c->http_failure_limit_bytes=D2K_HS_FAILURE_MAX_BYTES;
+    c->http_failure_record_limit_bytes=D2K_HS_FAILURE_RECORD_MAX_BYTES;
     c->http_failure_limit_hits=hs->failure_limit_hits;
     c->http_failure_record_limit_hits=hs->failure_record_limit_hits;
     c->http_failure_alloc_failures=hs->failure_alloc_failures;

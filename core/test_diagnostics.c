@@ -25,6 +25,8 @@ int main(void) {
     c.workers_started=12;c.workers_joined=9;c.worker_start_failures=1;c.worker_join_failures=2;
     c.http_failures=3;c.http_bytes=16384;c.http_records_bytes=4096;c.http_queue_bytes=1024;
     c.http_failure_bytes=2048;c.http_failure_limit_hits=4;c.http_failure_record_limit_hits=2;
+    c.http_records_limit_bytes=262144;c.http_queue_limit_bytes=32768;
+    c.http_failure_limit_bytes=65536;c.http_failure_record_limit_bytes=8192;
     c.http_record_limit_hits=1;c.http_queue_limit_hits=5;c.measurement_limit=1;c.measurement_slots=64;
     c.resources_valid=c.cpu_valid=c.mem_valid=c.conntrack_valid=1;c.cpu_free_pct=75;
     c.mem_avail_kb=8192;c.mem_total_kb=65536;c.mem_reserve_kb=32768;
@@ -55,6 +57,8 @@ int main(void) {
         assert(strstr(buf,"\"worker_join_failures\":2"));
         assert(strstr(buf,"\"http_failure_limit_hits\":4"));
         assert(strstr(buf,"\"http_failure_bytes\":2048"));
+        assert(strstr(buf,"\"http_records_limit_bytes\":262144"));
+        assert(strstr(buf,"\"http_failure_record_limit_bytes\":8192"));
         assert(strstr(buf,"\"task_states\":{\"free\":62"));
         assert(strstr(buf,"\"limit_reason\":[\"memory\",\"conntrack\"]"));
         assert(!strstr(buf,"\"id\":935,")); assert(strstr(buf,"\"id\":936,"));
