@@ -907,6 +907,36 @@ static void test_live_failure_history(void) {
     d2k_httpsearch_free(hs);
 }
 
+static void test_live_failure_memory_cap(void) {
+    enum { HOSTS=256, MAX_FAILURE_BYTES=64*1024 };
+    fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);
+    int64_t now=1;uint8_t id[16];
+    for(unsigned i=0;i<HOSTS;i++) {
+        char host[64];uint8_t addr[16]={198,51,(uint8_t)(i>>8),(uint8_t)i};
+        snprintf(host,sizeof host,"failure-%u.example",i);
+        d2k_httpsearch_portal(hs,host,4,addr,now);
+        base_injected(hs,&f,&now);
+        trial(hs,&f,&now,1,D2K_HS_REAL);
+        trial(hs,&f,&now,1,D2K_HS_REAL);
+        permanent_id(&f,id);
+        CHECK(d2k_httpsearch_bound_failure(hs,host,4,addr,id,&f.binding,
+            1000+i,now+1,"",now+2)==1,"distinct confirmed live failure is revoked");
+    }
+    d2k_diag_counts counts={0};d2k_httpsearch_diagnostic_counts(hs,&counts);
+    CHECK(counts.http_failure_bytes<=MAX_FAILURE_BYTES,
+          "live failure arrays stay under their global byte budget");
+    CHECK(counts.http_failures>0&&counts.http_failure_limit_hits>0,
+          "overflow is counted while older failure evidence remains retained");
+    printf("256 distinct live failures: retained=%llu entries, storage=%llu/%u bytes, overflow=%llu\n",
+        (unsigned long long)counts.http_failures,(unsigned long long)counts.http_failure_bytes,
+        MAX_FAILURE_BYTES,(unsigned long long)counts.http_failure_limit_hits);
+    int starts=f.start_n;
+    d2k_httpsearch_portal(hs,"failure-255.example",4,IP,now+1000);
+    CHECK(f.start_n==starts&&!d2k_httpsearch_busy(hs),
+          "a record whose evidence could not be retained fails closed");
+    d2k_httpsearch_free(hs);
+}
+
 static void test_live_failure_alias(void) {
     const char *keys[][2]={{"fake-badsum","fake:badsum"},
                            {"fake:ttl=03+badsum","fake:ttl=3+badsum"}};
@@ -1265,6 +1295,7 @@ int main(void) {
     test_bound_failure();
     test_live_failure_outweighs_probe();
     test_live_failure_history();
+    test_live_failure_memory_cap();
     test_live_failure_alias();
     test_single_response_not_confirmation();
 #endif
