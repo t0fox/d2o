@@ -18,6 +18,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef D2K_HS_TESTING
+#define D2K_HS_TESTING
+#endif
 #include "d2k_httpsearch.h"
 #include "d2k_plantlv.h"
 #include "d2k_plan.h"
@@ -907,6 +910,88 @@ static void test_live_failure_history(void) {
     d2k_httpsearch_free(hs);
 }
 
+static void test_live_failure_memory_cap(void) {
+    enum { HOSTS=256, MAX_FAILURE_BYTES=64*1024 };
+    fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);
+    int64_t now=1;uint8_t id[16];char overflow_host[64]="";
+    for(unsigned i=0;i<HOSTS;i++) {
+        char host[64];uint8_t addr[16]={198,51,(uint8_t)(i>>8),(uint8_t)i};
+        snprintf(host,sizeof host,"failure-%u.example",i);
+        d2k_httpsearch_portal(hs,host,4,addr,now);
+        base_injected(hs,&f,&now);
+        trial(hs,&f,&now,1,D2K_HS_REAL);
+        trial(hs,&f,&now,1,D2K_HS_REAL);
+        permanent_id(&f,id);
+        if(!d2k_httpsearch_bound_failure(hs,host,4,addr,id,&f.binding,
+            1000+i,now+1,"",now+2))break;
+        d2k_diag_counts current={0};d2k_httpsearch_diagnostic_counts(hs,&current);
+        if(current.http_failure_limit_hits) { snprintf(overflow_host,sizeof overflow_host,"%s",host);break; }
+    }
+    d2k_diag_counts counts={0};d2k_httpsearch_diagnostic_counts(hs,&counts);
+    CHECK(counts.http_failure_bytes<=MAX_FAILURE_BYTES,
+          "live failure arrays stay under their global byte budget");
+    CHECK(counts.http_failures>0&&counts.http_failure_limit_hits>0,
+          "overflow is counted while older failure evidence remains retained");
+    CHECK(counts.http_records_bytes<=D2K_HS_RECORD_MAX_BYTES&&
+          counts.http_queue_bytes<=D2K_HS_QUEUE_MAX_BYTES&&counts.http_bytes>=counts.http_failure_bytes,
+          "HTTP-search record, queue and evidence allocations are separately bounded and accounted");
+    CHECK(counts.http_records_limit_bytes==D2K_HS_RECORD_MAX_BYTES&&
+          counts.http_queue_limit_bytes==D2K_HS_QUEUE_MAX_BYTES&&
+          counts.http_failure_limit_bytes==D2K_HS_FAILURE_MAX_BYTES&&
+          counts.http_failure_record_limit_bytes==D2K_HS_FAILURE_RECORD_MAX_BYTES,
+          "HTTP diagnostic reports the current storage limits");
+    printf("256 distinct live failures: retained=%llu entries, storage=%llu/%u bytes, overflow=%llu\n",
+        (unsigned long long)counts.http_failures,(unsigned long long)counts.http_failure_bytes,
+        MAX_FAILURE_BYTES,(unsigned long long)counts.http_failure_limit_hits);
+    int starts=f.start_n;
+    if(overflow_host[0])d2k_httpsearch_portal(hs,overflow_host,4,IP,now+1000);
+    CHECK(f.start_n==starts&&!d2k_httpsearch_busy(hs),
+          "a record whose evidence could not be retained fails closed");
+    d2k_httpsearch_free(hs);
+}
+
+static void test_httpsearch_bounded_state_isolation(void) {
+    fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);
+    size_t n=d2k_httpsearch_test_add_records(hs,1024);
+    d2k_diag_counts counts={0};d2k_httpsearch_diagnostic_counts(hs,&counts);
+    CHECK(n>0&&counts.http_records_bytes<=D2K_HS_RECORD_MAX_BYTES&&counts.http_record_limit_hits>0,
+          "unbounded recs vector is capped and limit hits are observable");
+    d2k_httpsearch_free(hs);
+
+    memset(&f,0,sizeof f);ops=ops_of(&f);hs=d2k_httpsearch_new(&ops);
+    d2k_httpsearch_portal(hs,"queue-root.example",4,IP,1);
+    for(unsigned i=0;i<512;i++) {
+        char host[64];uint8_t addr[16]={203,0,113,(uint8_t)i};
+        snprintf(host,sizeof host,"queue-%u.example",i);
+        d2k_httpsearch_portal(hs,host,4,addr,2+i);
+    }
+    memset(&counts,0,sizeof counts);d2k_httpsearch_diagnostic_counts(hs,&counts);
+    CHECK(counts.http_queue_bytes<=D2K_HS_QUEUE_MAX_BYTES&&counts.http_queue_limit_hits>0,
+          "pending HTTP sites have a fixed byte ceiling while the active search is retained");
+    d2k_httpsearch_free(hs);
+
+    memset(&f,0,sizeof f);ops=ops_of(&f);hs=d2k_httpsearch_new(&ops);
+    for(unsigned i=0;i<16;i++) {
+        char host[64];snprintf(host,sizeof host,"evidence-%u.example",i);
+        (void)d2k_httpsearch_test_add_failures(hs,host,4,1024);
+    }
+    memset(&counts,0,sizeof counts);d2k_httpsearch_diagnostic_counts(hs,&counts);
+    CHECK(counts.http_failure_bytes<=D2K_HS_FAILURE_MAX_BYTES&&counts.http_failure_limit_hits>0,
+          "global failure-evidence budget saturates without exceeding its cap");
+    int64_t now=100;
+    d2k_httpsearch_portal(hs,"unaffected.example",4,IP,now);
+    base_injected(hs,&f,&now);
+    trial(hs,&f,&now,1,D2K_HS_REAL);
+    trial(hs,&f,&now,1,D2K_HS_REAL);
+    CHECK(d2k_httpsearch_plan_of(hs,"unaffected.example",4)!=NULL,
+          "a different site can still complete a successful plan search after global evidence saturation");
+    CHECK(d2k_httpsearch_test_add_failures(hs,"overflow.example",4,1)==0,
+          "a site beyond the global evidence budget is marked without overwriting retained proof");
+    CHECK(d2k_httpsearch_plan_of(hs,"unaffected.example",4)!=NULL,
+          "one site's evidence overflow does not revoke another site's accepted plan");
+    d2k_httpsearch_free(hs);
+}
+
 static void test_live_failure_alias(void) {
     const char *keys[][2]={{"fake-badsum","fake:badsum"},
                            {"fake:ttl=03+badsum","fake:ttl=3+badsum"}};
@@ -994,7 +1079,14 @@ static void test_bound_failure(void) {
     CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",6,IP,id,&f.binding,1,now+1,"/False/",now+2)&&!f.del_plan_n,"other family cannot revoke own plan");
     CHECK(d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,&f.binding,1,now+1,"/False/",now+2)==1,"bound live portal must revoke confirmed success");
     CHECK(f.del_plan_n==1&&!d2k_httpsearch_plan_of(hs,"bound.example",4)&&d2k_httpsearch_busy(hs),"revoked plan hidden and remeasurement started immediately");
+    d2k_diag_counts diag={0};d2k_httpsearch_diagnostic_counts(hs,&diag);
+    CHECK(diag.http_records==1&&diag.http_failures==1&&diag.http_bytes>0,
+          "diagnostics count retained live-failure memory, not just names");
+    uint64_t failure_bytes=diag.http_bytes;
     CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,&f.binding,1,now+1,"/False/",now+2)&&f.del_plan_n==1,"duplicate failure cannot delete again");
+    memset(&diag,0,sizeof diag);d2k_httpsearch_diagnostic_counts(hs,&diag);
+    CHECK(diag.http_failures==1&&diag.http_bytes==failure_bytes,
+          "duplicate live failure does not inflate retained evidence");
     CHECK(!strcmp(f.job.repeat_path,"/False/"),"bound observed path must reach baseline probe");
     base_injected(hs,&f,&now);
     d2k_httpsearch_ack(hs,f.trial,1,now+=10);
@@ -1258,6 +1350,8 @@ int main(void) {
     test_bound_failure();
     test_live_failure_outweighs_probe();
     test_live_failure_history();
+    test_live_failure_memory_cap();
+    test_httpsearch_bounded_state_isolation();
     test_live_failure_alias();
     test_single_response_not_confirmation();
 #endif

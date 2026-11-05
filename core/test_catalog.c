@@ -764,7 +764,26 @@ static void check_network_whitelist_roundtrip(void) {
     }
 }
 
+static void check_catalog_memory_estimate(void) {
+    char text[] = "plan";
+    d2k_cat_plan plan = {0};
+    d2k_cat_binding bind = {0};
+    d2k_cat_box box = {0};
+    d2k_catalog cat = {0};
+    plan.text = text;
+    box.plans = &plan; box.n_plans = 1;
+    box.binds = &bind; box.n_binds = 1;
+    cat.boxes = &box; cat.n_boxes = 1;
+
+    uint64_t expected = sizeof box + sizeof plan + sizeof bind + sizeof text;
+    CHECK(d2k_catalog_memory_bytes(&cat) == expected,
+          "оценка памяти каталога не включает массивы и текст плана");
+    CHECK(d2k_catalog_memory_bytes(NULL) == 0,
+          "оценка памяти NULL каталога не равна нулю");
+}
+
 int main(void) {
+    check_catalog_memory_estimate();
     check_network_whitelist_roundtrip();
     check_volume_box_fingerprint_persistence();
     check_binding_family_persistence();

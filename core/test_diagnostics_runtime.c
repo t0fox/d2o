@@ -8,6 +8,11 @@ static char diagnostic_test_dir[]="/tmp/d2k-diag-runtime-XXXXXX";
 int main(void) {
     assert(mkdtemp(diagnostic_test_dir));
     d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0);assert(s);
+    d2k_diag_counts counts;
+    d2k_sched_diagnostic_counts(s,&counts);
+    assert(counts.tasks==0 && counts.task_states[0]==64);
+    assert(counts.workers_running==0 && counts.workers_join_pending==0);
+    assert(counts.workers_started==0 && counts.workers_joined==0);
     diagnostic_tick(s,1000);assert(!diagnostics);
     for(int i=0;i<10;i++) {
         int64_t now=2000+(int64_t)i*4000;

@@ -9,7 +9,7 @@
 #ifndef D2K_DIAG_DIR
 #define D2K_DIAG_DIR "/tmp/d2k-diagnostics"
 #endif
-#define D2K_DIAG_REPORT_MAX (256u*1024u)
+#define D2K_DIAG_REPORT_MAX (384u*1024u)
 /* Временный закрытый каталог: запрещаем ссылки и доступ для других пользователей. */
 static inline int d2k_diag_dir(const char *dir,int create) {
     struct stat st;

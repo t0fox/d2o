@@ -34,7 +34,6 @@ int d2k_hs_probe_ms = 6000;
 /* Подтверждение — два опыта подряд; каждый проверяет два полных ответа
    на одной TCP-связи. Одиночный ответ не доказывает keep-alive. */
 #define HS_CONFIRM    2
-
 static int64_t mono_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -377,7 +376,7 @@ typedef struct {
     int cut;               /* поиск идёт по обрыву ответа, не по порталу */
     int repro_gap, evidence_lost;
     live_failure *failures;
-    size_t n_failures;
+    size_t n_failures, cap_failures;
     int64_t installed_ms; /* diagnostic timestamp, never installation identity */
     uint8_t install_id[16], pending_plan_id[16], installed_plan_id[16];
     d2k_binding_context binding;
@@ -398,6 +397,9 @@ struct d2k_httpsearch {
     uint64_t diagnostic_seq;
     d2k_hs_ops ops;
     rec *recs; size_t n_recs, cap_recs;
+    uint64_t live_failure_count, live_failure_bytes, failure_limit_hits;
+    uint64_t failure_record_limit_hits, failure_alloc_failures;
+    uint64_t record_limit_hits, record_alloc_failures, queue_limit_hits, queue_alloc_failures;
     char measured[8][40]; size_t n_measured;   /* ключи измеренной порчи */
     uint32_t job_seq;
     pend *q; size_t n_q, cap_q;
@@ -477,10 +479,14 @@ static rec *rec_find(const d2k_httpsearch *hs, const char *host, uint8_t family)
 static rec *rec_get(d2k_httpsearch *hs, const char *host, uint8_t family) {
     rec *r = rec_find(hs, host, family);
     if (r) { return r; }
+    size_t max_records=D2K_HS_RECORD_MAX_BYTES/sizeof *hs->recs;
+    if(hs->n_recs>=max_records) { hs->record_limit_hits++;return NULL; }
     if (hs->n_recs == hs->cap_recs) {
         size_t nc = hs->cap_recs ? hs->cap_recs * 2 : 16;
+        if(nc>max_records)nc=max_records;
+        if(nc<=hs->n_recs) { hs->record_limit_hits++;return NULL; }
         rec *nv = realloc(hs->recs, nc * sizeof *nv);
-        if (!nv) { return NULL; }
+        if (!nv) { hs->record_alloc_failures++;return NULL; }
         hs->recs = nv;
         hs->cap_recs = nc;
     }
@@ -513,19 +519,64 @@ static const live_failure *failed_live(rec *r,const char *key,const uint8_t *add
     }
     return NULL;
 }
-static int remember_live_failure(rec *r,const uint8_t *addr,
+static int remember_live_failure(d2k_httpsearch *hs,rec *r,const uint8_t *addr,
     const d2k_binding_context *binding,uint64_t execution,int64_t request_ms) {
+    if(r->evidence_lost)return -1;
     if(failed_live(r,r->key,addr))return 0;
     if(r->evidence_lost)return -1;
-    live_failure *v=realloc(r->failures,(r->n_failures+1)*sizeof *v);
-    if(!v)return -1;
-    r->failures=v;
-    live_failure *f=&v[r->n_failures++];memset(f,0,sizeof *f);
+    if(r->n_failures==r->cap_failures) {
+        size_t max_record_slots=D2K_HS_FAILURE_RECORD_MAX_BYTES/sizeof *r->failures;
+        size_t want=r->cap_failures?r->cap_failures*2:4;
+        if(want<r->n_failures+1)want=r->n_failures+1;
+        if(want>max_record_slots)want=max_record_slots;
+        if(want<r->n_failures+1) {
+            r->evidence_lost=1;r->repro_gap=1;hs->failure_record_limit_hits++;return -1;
+        }
+        size_t free_slots=(size_t)((D2K_HS_FAILURE_MAX_BYTES-hs->live_failure_bytes)/sizeof *r->failures);
+        if(want>r->cap_failures+free_slots)want=r->cap_failures+free_slots;
+        if(want<r->n_failures+1) {
+            r->evidence_lost=1;r->repro_gap=1;hs->failure_limit_hits++;return -1;
+        }
+        live_failure *v=realloc(r->failures,want*sizeof *v);
+        if(!v){hs->failure_alloc_failures++;r->evidence_lost=1;r->repro_gap=1;return -1;}
+        hs->live_failure_bytes+=(uint64_t)(want-r->cap_failures)*sizeof *v;
+        r->failures=v;r->cap_failures=want;
+    }
+    live_failure *f=&r->failures[r->n_failures++];memset(f,0,sizeof *f);
     snprintf(f->key,sizeof f->key,"%s",r->key);
     memcpy(f->addr,addr,r->family==6?16:4);f->binding=*binding;
     f->execution=execution;f->request_ms=request_ms;
+    /* Keep the minute-level memory sample O(1), even if evidence grows. */
+    hs->live_failure_count++;
     return 0;
 }
+
+#ifdef D2K_HS_TESTING
+size_t d2k_httpsearch_test_add_failures(d2k_httpsearch *hs,const char *host,
+    uint8_t family,size_t count) {
+    rec *r=rec_get(hs,host,family);
+    if(!r)return 0;
+    snprintf(r->key,sizeof r->key,"fake-badsum");
+    d2k_binding_context binding={0};
+    size_t before=r->n_failures;
+    for(size_t i=0;i<count;i++) {
+        uint8_t addr[16]={0};size_t n=family==6?16:4;
+        for(size_t k=0;k<n;k++)addr[k]=(uint8_t)(i>>(k*8));
+        if(remember_live_failure(hs,r,addr,&binding,(uint64_t)i+1,(int64_t)i+1))break;
+    }
+    return r->n_failures-before;
+}
+size_t d2k_httpsearch_test_add_records(d2k_httpsearch *hs,size_t count) {
+    if(!hs)return 0;
+    size_t added=0;
+    for(size_t i=0;i<count;i++) {
+        char host[64];snprintf(host,sizeof host,"record-%zu.example",i);
+        if(!rec_get(hs,host,4))break;
+        added++;
+    }
+    return added;
+}
+#endif
 
 int d2k_httpsearch_measured_poison(d2k_httpsearch *hs, const char *spec) {
     if (!hs || !spec) { return -1; }
@@ -636,7 +687,24 @@ const char *d2k_httpsearch_plan_of(const d2k_httpsearch *hs, const char *host, u
 static void start_next(d2k_httpsearch *hs, int64_t now);
 
 void d2k_httpsearch_diagnostic_counts(d2k_httpsearch *hs,d2k_diag_counts *c) {
-    if(hs && c){c->http_records=hs->n_recs;c->http_queued=hs->n_q;}
+    if(!hs||!c)return;
+    c->http_records=hs->n_recs;c->http_queued=hs->n_q;
+    c->http_failures=hs->live_failure_count;
+    c->http_records_bytes=(uint64_t)hs->cap_recs*sizeof *hs->recs;
+    c->http_queue_bytes=(uint64_t)hs->cap_q*sizeof *hs->q;
+    c->http_failure_bytes=hs->live_failure_bytes;
+    c->http_records_limit_bytes=D2K_HS_RECORD_MAX_BYTES;
+    c->http_queue_limit_bytes=D2K_HS_QUEUE_MAX_BYTES;
+    c->http_failure_limit_bytes=D2K_HS_FAILURE_MAX_BYTES;
+    c->http_failure_record_limit_bytes=D2K_HS_FAILURE_RECORD_MAX_BYTES;
+    c->http_failure_limit_hits=hs->failure_limit_hits;
+    c->http_failure_record_limit_hits=hs->failure_record_limit_hits;
+    c->http_failure_alloc_failures=hs->failure_alloc_failures;
+    c->http_record_limit_hits=hs->record_limit_hits;
+    c->http_record_alloc_failures=hs->record_alloc_failures;
+    c->http_queue_limit_hits=hs->queue_limit_hits;
+    c->http_queue_alloc_failures=hs->queue_alloc_failures;
+    c->http_bytes=sizeof *hs+c->http_records_bytes+c->http_queue_bytes+hs->live_failure_bytes;
 }
 void d2k_httpsearch_diagnostics(d2k_httpsearch *hs,d2k_diag_observer fn,void *ctx) {
     if(hs){hs->diagnostic=fn;hs->diagnostic_ctx=ctx;}
@@ -1049,7 +1117,7 @@ int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t f
     if(!addr)return 0;
     rec *r=live_owner(hs,host,family,plan_id,binding,execution_id,request_ms);
     if(!r)return 0;
-    if(remember_live_failure(r,addr,binding,execution_id,request_ms))r->evidence_lost=1;
+    if(remember_live_failure(hs,r,addr,binding,execution_id,request_ms))r->evidence_lost=1;
     r->revoked=1;r->no_before_ms=0;
     r->repro_gap=!hs_path_ok(path) || r->evidence_lost;
     r->repeat_path[0]=0;
@@ -1136,13 +1204,20 @@ void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
     }
     if (r && (!r->key[0] || r->revoked) && now < r->no_before_ms) { return; }
     if (hs->cur.phase == PH_IDLE) {
+        if(!r)r=rec_get(hs,host,family);
+        if(!r)return;
         start(hs, host, family, addr, r && r->key[0], now);
         return;
     }
+    size_t max_queue=D2K_HS_QUEUE_MAX_BYTES/sizeof *hs->q;
+    if(hs->n_q>=max_queue) { hs->queue_limit_hits++;return; }
+    if(!r&&!rec_get(hs,host,family))return;
     if (hs->n_q == hs->cap_q) {
         size_t nc = hs->cap_q ? hs->cap_q * 2 : 8;
+        if(nc>max_queue)nc=max_queue;
+        if(nc<=hs->n_q) { hs->queue_limit_hits++;return; }
         pend *nv = realloc(hs->q, nc * sizeof *nv);
-        if (!nv) { return; }
+        if (!nv) { hs->queue_alloc_failures++;return; }
         hs->q = nv;
         hs->cap_q = nc;
     }

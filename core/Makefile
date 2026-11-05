@@ -116,7 +116,7 @@ TESTS += test_httpsearch
 check: test-httpsearch
 .PHONY: test-httpsearch
 test_httpsearch: $(HTTP_READ_OBJ) test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c include/d2k_httpsearch.h
-	$(CC) $(CFLAGS) -o $@ test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
+	$(CC) $(CFLAGS) -DD2K_HS_TESTING -o $@ test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
 test-httpsearch: test_httpsearch
 	./test_httpsearch
 
@@ -124,7 +124,7 @@ TESTS += test_http_compare_failure
 check: test-http-compare-failure
 .PHONY: test-http-compare-failure
 httpsearch_compare_test.o: httpsearch.c include/d2k_httpsearch.h include/d2k_httpup.h $(HDR)
-	$(CC) $(CFLAGS) -Dd2k_plan_text_to_tlv=d2k_test_compare_tlv -c httpsearch.c -o $@
+	$(CC) $(CFLAGS) -DD2K_HS_TESTING -Dd2k_plan_text_to_tlv=d2k_test_compare_tlv -c httpsearch.c -o $@
 test_http_compare_failure: $(HTTP_READ_OBJ) test_http_compare_failure.c test_httpsearch.c httpsearch_compare_test.o httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c include/d2k_httpsearch.h include/d2k_httpup.h $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_http_compare_failure.c httpsearch_compare_test.o httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
 test-http-compare-failure: test_http_compare_failure
@@ -673,7 +673,7 @@ san-measured: hello_profiles.inc
 # test_httpsearch, как и test_measured, берёт исполнитель плана датапата:
 # общий цикл ниже его не слинкует.
 san-httpsearch:
-	$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-test_httpsearch test_httpsearch.c httpsearch.c httpup_logic.c plantlv.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_SRC) -lpthread
+	$(CC) $(SANFLAGS) -DD2K_HS_TESTING -o /tmp/d2k-core-san-test_httpsearch test_httpsearch.c httpsearch.c httpup_logic.c plantlv.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_SRC) -lpthread
 	/tmp/d2k-core-san-test_httpsearch
 
 # test_volume_context подставляет свои заглушки verify/tls12 вместо
@@ -715,7 +715,7 @@ san: san-http-compare-failure
 san-http-compare-failure:
 	@set -eu; compare_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/d2k-http-compare-san.XXXXXX"); \
 		trap 'rm -rf "$$compare_dir"' EXIT HUP INT TERM; \
-		$(CC) $(SANFLAGS) -Dd2k_plan_text_to_tlv=d2k_test_compare_tlv -c httpsearch.c -o "$$compare_dir/httpsearch.o"; \
+		$(CC) $(SANFLAGS) -DD2K_HS_TESTING -Dd2k_plan_text_to_tlv=d2k_test_compare_tlv -c httpsearch.c -o "$$compare_dir/httpsearch.o"; \
 		$(CC) $(SANFLAGS) -o "$$compare_dir/test" test_http_compare_failure.c "$$compare_dir/httpsearch.o" httpup_logic.c plantlv.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_SRC) -lpthread; \
 		"$$compare_dir/test"
 
@@ -1273,7 +1273,7 @@ TESTS += test_http_runtime
 check: test-http-runtime
 .PHONY: test-http-runtime
 test_http_runtime: $(HTTP_READ_OBJ) ../datapath/test_runtime_trace.h test_http_runtime.c test_httpsearch.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c libd2k_udp.a tls13core.o x25519.o
-	$(CC) $(CFLAGS) -o $@ test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
+	$(CC) $(CFLAGS) -DD2K_HS_TESTING -o $@ test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
 test-http-runtime: test_http_runtime
 	./test_http_runtime
 
@@ -1281,7 +1281,7 @@ TESTS += test_http_live
 check: test-http-live
 .PHONY: test-http-live
 test_http_live: $(HTTP_READ_OBJ) test_http_live.c test_httpsearch.c ../datapath/test_runtime_trace.h d2kc httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c libd2k_udp.a tls13core.o x25519.o link.o
-	$(CC) $(CFLAGS) -o $@ test_http_live.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
+	$(CC) $(CFLAGS) -DD2K_HS_TESTING -o $@ test_http_live.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
 test-http-live: test_http_live
 	./test_http_live
 
@@ -1304,12 +1304,12 @@ san-udp-runtime: hello_profiles.inc
 	/tmp/d2k-san-udp-runtime
 	$(CC) $(SANFLAGS) -o /tmp/d2k-san-quic-sink test_quic_sink.c $(UDP_SESSION_SRC) $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c quicconn.c h3.c net4.c props.c quicsnap_reseal.c -lpthread
 	/tmp/d2k-san-quic-sink
-	$(CC) $(SANFLAGS) -o /tmp/d2k-san-http-runtime test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
+	$(CC) $(SANFLAGS) -DD2K_HS_TESTING -o /tmp/d2k-san-http-runtime test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
 	/tmp/d2k-san-http-runtime
 .PHONY: san-http-live
 san: san-http-live
 san-http-live: hello_profiles.inc d2kc
-	$(CC) $(SANFLAGS) -o /tmp/d2k-san-http-live test_http_live.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
+	$(CC) $(SANFLAGS) -DD2K_HS_TESTING -o /tmp/d2k-san-http-live test_http_live.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
 	/tmp/d2k-san-http-live
 .PHONY: cross-runtime-gates
 cross: cross-runtime-gates
@@ -1319,8 +1319,8 @@ cross-runtime-gates: hello_profiles.inc
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-$$t-a64 $$t.c $(UDP_SESSION_SRC) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c $$extra $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1; \
 		$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-$$t-mipsel $$t.c $(UDP_SESSION_SRC) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c $$extra $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1; \
 	done
-	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-http-runtime-a64 test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
-	$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-http-runtime-mipsel test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
+	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -DD2K_HS_TESTING -o /tmp/d2k-http-runtime-a64 test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
+	$(MIPSEL_CC) $(CFLAGS) -DD2K_HS_TESTING -o /tmp/d2k-http-runtime-mipsel test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
 
 # TLS record progress is observable independently of successful decryption.
 TESTS += test_tls_rx12
@@ -1348,6 +1348,13 @@ test-sched-quic-yield: test_sched_quic_yield
 	./test_sched_quic_yield
 check: test-sched-quic-yield
 TESTS += test_sched_quic_yield
+.PHONY: test-sched-worker-lifecycle
+test-sched-worker-lifecycle: test_sched_worker_lifecycle
+	./test_sched_worker_lifecycle
+check: test-sched-worker-lifecycle
+TESTS += test_sched_worker_lifecycle
+test_sched_worker_lifecycle: test_sched_worker_lifecycle.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 .PHONY: san-sched-quic-yield
 san: san-sched-quic-yield
 san-sched-quic-yield: hello_profiles.inc tcp1620_whitelist.inc
@@ -1374,6 +1381,10 @@ clean: clean-diagnostics
 .PHONY: clean-diagnostics
 clean-diagnostics:
 	$(RM) test_diagnostics
+clean-sched-worker-lifecycle:
+	$(RM) test_sched_worker_lifecycle
+.PHONY: clean-sched-worker-lifecycle
+clean: clean-sched-worker-lifecycle
 
 .PHONY: test-diagnostics-runtime
 check: test-diagnostics-runtime

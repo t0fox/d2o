@@ -393,6 +393,11 @@ int d2k_catalog_save_atomic(const d2k_catalog *cat, const char *path,
  * оба случая no-op, а не отказ. */
 void d2k_catalog_free(d2k_catalog *c);
 
+/* Logical bytes owned by the in-memory catalog: live array elements, plan
+   text and the optional fixed-size groups state. Excludes allocator metadata
+   and any spare array capacity retained after parsing. */
+uint64_t d2k_catalog_memory_bytes(const d2k_catalog *c);
+
 /* ---------------------------------------------------------------------
  * Узнавание коробки по примете (задача 2).
  *

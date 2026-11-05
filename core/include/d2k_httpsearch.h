@@ -49,6 +49,13 @@
  */
 #ifndef D2K_HTTPSEARCH_H
 #define D2K_HTTPSEARCH_H
+/* Persistent live-failure evidence is fail-closed, with per-site fairness.
+   Record metadata and queued sites have independent ceilings so neither can
+   consume the failure-evidence budget or grow without bound. */
+#define D2K_HS_FAILURE_MAX_BYTES (64u*1024u)
+#define D2K_HS_FAILURE_RECORD_MAX_BYTES (8u*1024u)
+#define D2K_HS_RECORD_MAX_BYTES (256u*1024u)
+#define D2K_HS_QUEUE_MAX_BYTES (32u*1024u)
 #define D2K_HS_KEEPALIVE_PROOF 1
 
 #include <stddef.h>
@@ -151,6 +158,10 @@ typedef struct {
 typedef struct d2k_httpsearch d2k_httpsearch;
 void d2k_httpsearch_diagnostic_counts(d2k_httpsearch *,d2k_diag_counts *);
 void d2k_httpsearch_diagnostics(d2k_httpsearch *,d2k_diag_observer,void *);
+#ifdef D2K_HS_TESTING
+size_t d2k_httpsearch_test_add_failures(d2k_httpsearch *,const char *,uint8_t,size_t);
+size_t d2k_httpsearch_test_add_records(d2k_httpsearch *,size_t);
+#endif
 
 d2k_httpsearch *d2k_httpsearch_new(const d2k_hs_ops *ops);
 void d2k_httpsearch_free(d2k_httpsearch *hs);
