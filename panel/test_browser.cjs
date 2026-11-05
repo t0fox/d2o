@@ -101,11 +101,9 @@ async function main(){
  ws.onmessage=e=>{const x=JSON.parse(e.data);if(x.id){const p=pending.get(x.id);pending.delete(x.id);x.error?p.reject(x.error):p.resolve(x.result)}
  else if(x.method==='Page.javascriptDialogOpening'){dialogs.push(x.params.message);call('Page.handleJavaScriptDialog',{accept:true})}
  else if(x.method==='Runtime.exceptionThrown')exceptions.push(x.params.exceptionDetails)
- else if(x.method==='Fetch.requestPaused'){
-  if(x.params.request.url.includes('/api/diagnostics?report'))call('Fetch.fulfillRequest',{requestId:x.params.requestId,responseCode:200,
-   responseHeaders:[{name:'Content-Type',value:'application/json; charset=utf-8'}],
-   body:Buffer.from(JSON.stringify(diagnosticsReply||{enabled:false})).toString('base64')});
-  else call('Fetch.continueRequest',{requestId:x.params.requestId});}};
+ else if(x.method==='Fetch.requestPaused')call('Fetch.fulfillRequest',{requestId:x.params.requestId,responseCode:200,
+  responseHeaders:[{name:'Content-Type',value:'application/json; charset=utf-8'}],
+  body:Buffer.from(JSON.stringify(diagnosticsReply||{enabled:false})).toString('base64')});};
  const call=(method,params={})=>new Promise((resolve,reject)=>{pending.set(++id,{resolve,reject});ws.send(JSON.stringify({id,method,params}))});
  const evaluate=async(expression)=>{try{const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw Error(JSON.stringify(r.exceptionDetails));return r.result.value}catch(e){throw Error('Runtime.evaluate failed for '+expression+': '+(e?.message||JSON.stringify(e)))}};
  const wait=ms=>new Promise(r=>setTimeout(r,ms));
@@ -611,9 +609,11 @@ async function main(){
    const s=await call('Page.captureScreenshot',{format:'png',clip:{...b,scale:2}});fs.writeFileSync(path.join(process.env.D2K_TUNNEL_SHOTS,'9-reduced-motion-connected.png'),Buffer.from(s.data,'base64'))}
   await call('Emulation.setEmulatedMedia',{features:[]});
   await call('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});
-  await call('Fetch.enable',{patterns:[{url:'*',requestStage:'Request'}]});
+  await call('Fetch.enable',{patterns:[{url:'*api/diagnostics*',requestStage:'Request'}]});
   diagnosticsReply=diagnosticFixture('full');
   await call('Page.reload');
+  await until('document.querySelector("#diagnostic-memory-chart")?.dataset.points==="121"','two-hour diagnostics history renders');
+  await evaluate('document.querySelector("[data-memory-range=\\"24\\"]").click()');
   await until('document.querySelector("#diagnostic-memory-chart")?.dataset.points==="1440"','1440 compact memory samples render in the 24-hour view');
   await evaluate('document.querySelector("#diagnostics").scrollIntoView({block:"start"})');
   assert.equal(await evaluate('document.querySelector("#diagnostic-data").hidden'),false,'enabled report content is visible');
