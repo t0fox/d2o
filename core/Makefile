@@ -124,7 +124,7 @@ TESTS += test_http_compare_failure
 check: test-http-compare-failure
 .PHONY: test-http-compare-failure
 httpsearch_compare_test.o: httpsearch.c include/d2k_httpsearch.h include/d2k_httpup.h $(HDR)
-	$(CC) $(CFLAGS) -Dd2k_plan_text_to_tlv=d2k_test_compare_tlv -c httpsearch.c -o $@
+	$(CC) $(CFLAGS) -DD2K_HS_TESTING -Dd2k_plan_text_to_tlv=d2k_test_compare_tlv -c httpsearch.c -o $@
 test_http_compare_failure: $(HTTP_READ_OBJ) test_http_compare_failure.c test_httpsearch.c httpsearch_compare_test.o httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c include/d2k_httpsearch.h include/d2k_httpup.h $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_http_compare_failure.c httpsearch_compare_test.o httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
 test-http-compare-failure: test_http_compare_failure
