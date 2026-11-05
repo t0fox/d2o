@@ -8,6 +8,25 @@
 
 ## 0. Фактическое состояние — читать первым
 
+### PR #2: UI диагностики по компактной истории, 05.11.2026
+
+Реализация находится в `codex/fix-d2kc-memory-diagnostics`, базовая ревизия PR
+`9dfb3d6`, кодовая ревизия `9f2bd2d`. Панель использует `/api/diagnostics?report`:
+график d2kc за 2/24 часа строится из компактных 1440 снимков; добавлены показатели
+workers, память каталога и HTTP-хранилища с лимитами/переполнениями, текущие и
+исторические переходы AIMD, предупреждения о росте RSS, вытеснении записей и
+недоступном `smaps_rollup`. Полный JSON download и чтение старой схемы сохранены.
+
+Локально прошли `node --check internal/web/assets/diagnostics.js`,
+`node --check panel/test_browser.cjs`, `node panel/test_diagnostics.cjs` и
+`git diff --check`. В Playwright проверены новые/пустые/недоступные/старые данные,
+1440 снимков, диапазоны 2/24 часа и мобильная ширина; скриншот десктопа сохранён
+вне репозитория в `C:\Users\Kirill\.codex\visualizations\2026\11\05\01a1ac9b-873e-7392-b6df-89dd8a5fab2a\diagnostics-desktop.png`.
+`make -C core check` и `make -C panel test` локально недоступны: Windows shell не
+имеет `make`; C/browser harness поэтому локально не исполнен. Полевых проверок и
+изменений на роутере не было. Проверить GitHub CI на итоговой ревизии PR; после
+зелёного CI оставить PR в Draft.
+
 ### Telegram: достоверность статусов и мобильная панель, 05.11.2026
 
 Работа от `main`/`fd4e262f33b699f02db00b2fb3153262cfbdfa7f`; GitHub `main`
