@@ -630,9 +630,9 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#diagnostic-aimd-current").textContent'),/1\/1.*память, conntrack/,'current 1/1 limiter and its causes are shown');
   assert.match(await evaluate('document.querySelector("#diagnostic-aimd-history").textContent'),/1 \/ 1.*память/,'AIMD transition history includes the 1/1 cause');
   assert.equal(await evaluate('document.querySelector("#diagnostic-download").getAttribute("href")'),'/api/diagnostics?download','the complete JSON download endpoint stays linked');
-  await evaluate('document.querySelector("[data-memory-range=\"2\"]").click()');
+  await evaluate(`document.querySelector('[data-memory-range="2"]').click()`);
   assert.equal(await evaluate('document.querySelector("#diagnostic-memory-chart").dataset.points'),'121','two-hour view filters the minute samples');
-  await evaluate('document.querySelector("[data-memory-range=\"24\"]").click()');
+  await evaluate(`document.querySelector('[data-memory-range="24"]').click()`);
   await until('document.querySelector("#diagnostic-memory-chart").dataset.points==="1440"','24-hour view restores the full history');
   for(const width of [320,390]){
    await call('Emulation.setDeviceMetricsOverride',{width,height:844,deviceScaleFactor:1,mobile:true});
