@@ -116,7 +116,7 @@ TESTS += test_httpsearch
 check: test-httpsearch
 .PHONY: test-httpsearch
 test_httpsearch: $(HTTP_READ_OBJ) test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c include/d2k_httpsearch.h
-	$(CC) $(CFLAGS) -o $@ test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
+	$(CC) $(CFLAGS) -DD2K_HS_TESTING -o $@ test_httpsearch.c httpsearch.c httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
 test-httpsearch: test_httpsearch
 	./test_httpsearch
 
@@ -673,7 +673,7 @@ san-measured: hello_profiles.inc
 # test_httpsearch, как и test_measured, берёт исполнитель плана датапата:
 # общий цикл ниже его не слинкует.
 san-httpsearch:
-	$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-test_httpsearch test_httpsearch.c httpsearch.c httpup_logic.c plantlv.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_SRC) -lpthread
+	$(CC) $(SANFLAGS) -DD2K_HS_TESTING -o /tmp/d2k-core-san-test_httpsearch test_httpsearch.c httpsearch.c httpup_logic.c plantlv.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_SRC) -lpthread
 	/tmp/d2k-core-san-test_httpsearch
 
 # test_volume_context подставляет свои заглушки verify/tls12 вместо
