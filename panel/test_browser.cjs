@@ -612,7 +612,7 @@ async function main(){
   await call('Fetch.enable',{patterns:[{url:'*api/diagnostics*',requestStage:'Request'}]});
   diagnosticsReply=diagnosticFixture('full');
   await call('Page.reload');
-  await until('document.querySelector("#diagnostic-memory-chart").dataset.points==="1440"','1440 compact memory samples render in the 24-hour view');
+  await until('document.querySelector("#diagnostic-memory-chart")?.dataset.points==="1440"','1440 compact memory samples render in the 24-hour view');
   await evaluate('document.querySelector("#diagnostics").scrollIntoView({block:"start"})');
   assert.equal(await evaluate('document.querySelector("#diagnostic-data").hidden'),false,'enabled report content is visible');
   assert.equal(await evaluate('document.querySelectorAll("#diagnostic-memory-chart path[data-series]").length'),4,'RSS, VmData, Anonymous and Private_Dirty are plotted when available');
