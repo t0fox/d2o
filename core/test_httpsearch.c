@@ -994,7 +994,14 @@ static void test_bound_failure(void) {
     CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",6,IP,id,&f.binding,1,now+1,"/False/",now+2)&&!f.del_plan_n,"other family cannot revoke own plan");
     CHECK(d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,&f.binding,1,now+1,"/False/",now+2)==1,"bound live portal must revoke confirmed success");
     CHECK(f.del_plan_n==1&&!d2k_httpsearch_plan_of(hs,"bound.example",4)&&d2k_httpsearch_busy(hs),"revoked plan hidden and remeasurement started immediately");
+    d2k_diag_counts diag={0};d2k_httpsearch_diagnostic_counts(hs,&diag);
+    CHECK(diag.http_records==1&&diag.http_failures==1&&diag.http_bytes>0,
+          "diagnostics count retained live-failure memory, not just names");
+    uint64_t failure_bytes=diag.http_bytes;
     CHECK(!d2k_httpsearch_bound_failure(hs,"bound.example",4,IP,id,&f.binding,1,now+1,"/False/",now+2)&&f.del_plan_n==1,"duplicate failure cannot delete again");
+    memset(&diag,0,sizeof diag);d2k_httpsearch_diagnostic_counts(hs,&diag);
+    CHECK(diag.http_failures==1&&diag.http_bytes==failure_bytes,
+          "duplicate live failure does not inflate retained evidence");
     CHECK(!strcmp(f.job.repeat_path,"/False/"),"bound observed path must reach baseline probe");
     base_injected(hs,&f,&now);
     d2k_httpsearch_ack(hs,f.trial,1,now+=10);

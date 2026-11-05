@@ -17,6 +17,20 @@ with tempfile.TemporaryDirectory() as directory:
     assert sample['processes'][1]['rss_kib'] is None
     assert sample['datapath_flows'] is None
     assert sample['system_conntrack'] is None
+    assert sample['catalog_bytes'] == 8192
+    assert sample['snapshot_bytes'] == 4096
+    assert sample['workers_running'] == 2
+    assert sample['workers_join_pending'] == 1
+    assert sample['http_failures'] == 3
+    assert sample['http_bytes'] == 16384
+    assert sample['measurement_limit'] == 1
+    assert sample['measurement_slots'] == 64
+    assert sample['scheduler_mem_avail_kib'] == 8192
+    assert sample['scheduler_mem_total_kib'] == 65536
+    assert sample['scheduler_mem_reserve_kib'] == 32768
+    assert sample['limit_reason'] == ['memory', 'conntrack']
+    assert sample['task_states']['free'] == 62
+    assert sample['task_states']['watching'] == 2
 print('JSON диагностики: сериализатор прошёл')
 
 details = report['memory_details'][0]

@@ -1072,6 +1072,21 @@ void d2k_catalog_free(d2k_catalog *c) {
     c->n_boxes = 0;
 }
 
+uint64_t d2k_catalog_memory_bytes(const d2k_catalog *c) {
+    if (!c) return 0;
+    uint64_t bytes = (uint64_t)c->n_boxes * sizeof *c->boxes;
+    for (size_t i = 0; i < c->n_boxes; i++) {
+        const d2k_cat_box *b = &c->boxes[i];
+        bytes += (uint64_t)b->n_plans * sizeof *b->plans;
+        bytes += (uint64_t)b->n_binds * sizeof *b->binds;
+        for (size_t j = 0; j < b->n_plans; j++) {
+            if (b->plans[j].text) bytes += (uint64_t)strlen(b->plans[j].text) + 1;
+        }
+    }
+    if (c->groups) bytes += sizeof *c->groups;
+    return bytes;
+}
+
 /* --------------------------------------------------------------------
  * Чтение файла и публичная точка входа.
  * -------------------------------------------------------------------- */

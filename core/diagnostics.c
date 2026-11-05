@@ -23,6 +23,11 @@ typedef struct {
 typedef struct {
     int64_t at,mono,total,available,conntrack;d2k_diag_counts counts;proc_mem procs[PROCESS_COUNT];
 } sample;
+static const char *const task_state_names[D2K_DIAG_TASK_STATE_COUNT]={
+    "free","queued","asking","shape_wait","props_contact","props_wait",
+    "planning","trial_settle","verify","verify_wait","watching","resting",
+    "voice_measure","voice_trial","voice_watch"
+};
 /* Два снимка на процесс; сырые карты и имена файлов не сохраняются.
  * Группы следуют меткам ядра, а не владельцам аллокатора: безымянные стеки
  * потоков и отображения malloc могут попасть в anonymous. */
@@ -162,6 +167,19 @@ static void write_detail(FILE *f,const memory_detail *m) {
         }fputc('}',f);
     }fputc('}',f);
 }
+static void write_limit_reason(FILE *f,const d2k_diag_counts *c) {
+    fputs(",\"limit_reason\":[",f);
+    if(!c->resources_valid) js(f,"resource-data-unavailable");
+    else if(!c->limiter_mask) js(f,"no-current-resource-limit");
+    else {
+        int comma=0;
+        if(c->limiter_mask&D2K_DIAG_LIMIT_CPU){js(f,"cpu");comma=1;}
+        if(c->limiter_mask&D2K_DIAG_LIMIT_MEMORY){if(comma)fputc(',',f);js(f,"memory");comma=1;}
+        if(c->limiter_mask&D2K_DIAG_LIMIT_CONNTRACK){if(comma)fputc(',',f);js(f,"conntrack");comma=1;}
+        if(c->limiter_mask&D2K_DIAG_LIMIT_SLOTS){if(comma)fputc(',',f);js(f,"slots");}
+    }
+    fputc(']',f);
+}
 void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char *proc,const char *run) {
     if(!d||!c||(d->sampled&&ms>=d->last_ms&&ms-d->last_ms<60000))return;
     d->last_ms=ms;d->sampled=1;
@@ -210,9 +228,42 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         fputs(",\"mem_available_kib\":",f);number(f,s->available);
         fputs(",\"system_conntrack\":",f);number(f,s->conntrack);
         fprintf(f,",\"datapath_flows\":null,\"http_records\":%llu,\"http_queued\":%llu",(unsigned long long)c->http_records,(unsigned long long)c->http_queued);
-        fprintf(f,",\"boxes\":%llu,\"bindings\":%llu,\"plans\":%llu,\"observations\":%llu,\"active\":%llu,\"queued\":%llu,\"tasks\":%llu,\"snapshots\":%llu,\"processes\":[",
+        fprintf(f,",\"boxes\":%llu,\"bindings\":%llu,\"plans\":%llu,\"observations\":%llu,\"active\":%llu,\"queued\":%llu,\"tasks\":%llu,\"snapshots\":%llu",
           (unsigned long long)c->boxes,(unsigned long long)c->bindings,(unsigned long long)c->plans,(unsigned long long)c->observations,
           (unsigned long long)c->active,(unsigned long long)c->queued,(unsigned long long)c->tasks,(unsigned long long)c->snapshots);
+        /* Scheduler ownership and limiter state are sampled once per minute;
+           these fixed-size counters add no per-event allocation. */
+        fprintf(f,",\"snapshot_bytes\":%llu,\"catalog_bytes\":%llu,\"workers_running\":%llu,\"workers_join_pending\":%llu,"
+                  "\"workers_started\":%llu,\"workers_joined\":%llu,\"worker_start_failures\":%llu,"
+                  "\"http_failures\":%llu,\"http_bytes\":%llu,\"measurement_limit\":%llu,\"measurement_slots\":%llu,"
+                  "\"resources_valid\":%s,\"cpu_valid\":%s,\"cpu_free_pct\":",
+          (unsigned long long)c->snapshot_bytes,(unsigned long long)c->catalog_bytes,
+          (unsigned long long)c->workers_running,(unsigned long long)c->workers_join_pending,
+          (unsigned long long)c->workers_started,(unsigned long long)c->workers_joined,
+          (unsigned long long)c->worker_start_failures,(unsigned long long)c->http_failures,
+          (unsigned long long)c->http_bytes,(unsigned long long)c->measurement_limit,
+          (unsigned long long)c->measurement_slots,c->resources_valid?"true":"false",
+          c->cpu_valid?"true":"false");
+        number(f,c->cpu_free_pct);
+        fprintf(f,",\"mem_valid\":%s,\"scheduler_mem_avail_kib\":",c->mem_valid?"true":"false");
+        if(c->mem_valid)fprintf(f,"%llu",(unsigned long long)c->mem_avail_kb);else fputs("null",f);
+        fputs(",\"scheduler_mem_total_kib\":",f);
+        if(c->mem_valid)fprintf(f,"%llu",(unsigned long long)c->mem_total_kb);else fputs("null",f);
+        fputs(",\"scheduler_mem_reserve_kib\":",f);
+        if(c->mem_valid)fprintf(f,"%llu",(unsigned long long)c->mem_reserve_kb);else fputs("null",f);
+        fprintf(f,",\"conntrack_valid\":%s,\"conntrack_count\":",c->conntrack_valid?"true":"false");
+        if(c->conntrack_valid)fprintf(f,"%llu",(unsigned long long)c->conntrack_count);else fputs("null",f);
+        fputs(",\"conntrack_max\":",f);
+        if(c->conntrack_valid)fprintf(f,"%llu",(unsigned long long)c->conntrack_max);else fputs("null",f);
+        fprintf(f,",\"limiter_mask\":%u,\"grow_pending\":%s,\"resource_sequence\":%llu,\"limit_sequence\":%llu,\"limit_age_ms\":%llu,\"task_states\":{",
+          c->limiter_mask,c->grow_pending?"true":"false",(unsigned long long)c->resource_sequence,
+          (unsigned long long)c->limit_sequence,(unsigned long long)c->limit_age_ms);
+        for(size_t state=0;state<D2K_DIAG_TASK_STATE_COUNT;state++) {
+            if(state) fputc(',',f);
+            js(f,task_state_names[state]);
+            fprintf(f,":%llu",(unsigned long long)c->task_states[state]);
+        }
+        fputc('}',f);write_limit_reason(f,c);fputs(",\"processes\":[",f);
         for(size_t j=0;j<PROCESS_COUNT;j++) {
             const proc_mem *p=&s->procs[j];if(j)fputc(',',f);fputs("{\"name\":",f);js(f,names[j]);
             fprintf(f,",\"pid\":%ld,\"rss_kib\":",p->pid);number(f,p->rss);fputs(",\"hwm_kib\":",f);number(f,p->hwm);

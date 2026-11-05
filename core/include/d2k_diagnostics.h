@@ -3,6 +3,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#define D2K_DIAG_TASK_STATE_COUNT 15
+#define D2K_DIAG_LIMIT_CPU 1u
+#define D2K_DIAG_LIMIT_MEMORY 2u
+#define D2K_DIAG_LIMIT_CONNTRACK 4u
+#define D2K_DIAG_LIMIT_SLOTS 8u
 /* Callback выполняется в потоке контроллера и не влияет на результаты поиска. */
 typedef struct {
     uint64_t id;
@@ -13,6 +18,18 @@ typedef struct {
 typedef void (*d2k_diag_observer)(void *, const d2k_diag_event *);
 typedef struct {
     uint64_t boxes, bindings, plans, observations, active, queued, tasks, snapshots, http_records, http_queued;
+    uint64_t task_states[D2K_DIAG_TASK_STATE_COUNT];
+    uint64_t snapshot_bytes, catalog_bytes;
+    uint64_t workers_running, workers_join_pending;
+    uint64_t workers_started, workers_joined, worker_start_failures;
+    uint64_t http_failures, http_bytes;
+    uint64_t measurement_limit, measurement_slots;
+    uint64_t resource_sequence, limit_sequence, limit_age_ms;
+    uint64_t mem_avail_kb, mem_total_kb, mem_reserve_kb;
+    uint64_t conntrack_count, conntrack_max;
+    int64_t cpu_free_pct;
+    unsigned limiter_mask;
+    int resources_valid, cpu_valid, mem_valid, conntrack_valid, grow_pending;
 } d2k_diag_counts;
 typedef struct d2k_diag d2k_diag;
 d2k_diag *d2k_diag_new(void);

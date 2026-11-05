@@ -18,6 +18,13 @@ static char *report(d2k_diag *d) {
 int main(void) {
     d2k_diag *d=NULL;
     d2k_diag_counts c={0};
+    c.task_states[0]=62;c.task_states[10]=2;c.snapshot_bytes=4096;c.catalog_bytes=8192;
+    c.workers_running=2;c.workers_join_pending=1;c.workers_started=12;c.workers_joined=9;c.worker_start_failures=1;
+    c.http_failures=3;c.http_bytes=16384;c.measurement_limit=1;c.measurement_slots=64;
+    c.resources_valid=c.cpu_valid=c.mem_valid=c.conntrack_valid=1;c.cpu_free_pct=75;
+    c.mem_avail_kb=8192;c.mem_total_kb=65536;c.mem_reserve_kb=32768;
+    c.conntrack_count=100;c.conntrack_max=1000;c.limiter_mask=D2K_DIAG_LIMIT_MEMORY|D2K_DIAG_LIMIT_CONNTRACK;
+    c.grow_pending=1;c.resource_sequence=14;c.limit_sequence=12;c.limit_age_ms=3000;
     d2k_diag_event e={.target="a\".example",.protocol="quic",.outcome="failed",.reason="local\nerror"};
     assert(d2k_diag_bytes(d)==0);
     d2k_diag_record(d,&e);
@@ -35,6 +42,10 @@ int main(void) {
         assert(fread(buf,1,(size_t)size,f)==(size_t)size);buf[size]=0;
         assert(strstr(buf,"a\\\".example")); assert(strstr(buf,"local\\nerror"));
         assert(strstr(buf,"\"rss_kib\":null"));
+        assert(strstr(buf,"\"catalog_bytes\":8192"));
+        assert(strstr(buf,"\"workers_running\":2"));
+        assert(strstr(buf,"\"task_states\":{\"free\":62"));
+        assert(strstr(buf,"\"limit_reason\":[\"memory\",\"conntrack\"]"));
         assert(!strstr(buf,"\"id\":935,")); assert(strstr(buf,"\"id\":936,"));
         free(buf);fclose(f);
         char full[256];memset(full,'"',sizeof full-1);full[255]=0;

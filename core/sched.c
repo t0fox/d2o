@@ -629,6 +629,8 @@ typedef enum {
        молчания. */
     T_VOICE_WATCH
 } task_state;
+typedef char diagnostic_task_state_count_must_match[
+    (T_VOICE_WATCH + 1 == D2K_DIAG_TASK_STATE_COUNT) ? 1 : -1];
 
 /* Что делает рабочий поток задачи. Потоки заводятся только под сетевые
    оракулы; управляющего сокета они не касаются (см. шапку d2k_sched.h). */
@@ -1342,6 +1344,7 @@ struct d2k_sched {
     unsigned     limiter_logged;    /* и причина */
     size_t       meas_limit;
     uint64_t     report_sequence;
+    uint64_t     workers_started, workers_joined, worker_start_failures;
 
     /* Проход по каталогу, разложенный на порции (см. d2k_sched_sync_step):
        где остановились и просили ли начать заново. */
@@ -3215,6 +3218,7 @@ static unsigned task_budget(const d2k_sched *s, task *t) {
 }
 
 static void note_worker_start_failure(d2k_sched *s, task *t) {
+    s->worker_start_failures++;
     t->local_error = 1;
     s->last_local_error_suspect = s->suspect_events;
     snprintf(s->last_local_error_target, sizeof s->last_local_error_target,
@@ -3273,6 +3277,7 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
         return -1;
     }
     t->th_live = 1;
+    s->workers_started++;
     if (job == JOB_CLASSIFY || job == JOB_VOICE) { t->search_started = 1; }
     return 0;
 }
@@ -3291,6 +3296,7 @@ static void join_worker(task *t) {
         if(s){pthread_cond_broadcast(&s->question_cv);pthread_mutex_unlock(&s->mu);}
         pthread_join(t->th, NULL);
         t->th_live = 0;
+        if(s)s->workers_joined++;
         t->quic_parked=t->quic_yield_request=0;
         t->worker_owner=NULL;
     }
@@ -5381,6 +5387,8 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
 
 static size_t measurements_in_flight(const d2k_sched *s);
 static size_t queued_measurements(const d2k_sched *s);
+static size_t measure_slots(const d2k_sched *s);
+static int res_valid(const d2k_sched *s);
 static int cpu_free_pct(const d2k_sched *s);
 static uint64_t mem_reserve_kb(const d2k_sched *s);
 static int ct_pct(const d2k_sched *s);
@@ -5641,10 +5649,33 @@ void d2k_sched_diagnostic_counts(d2k_sched *s,d2k_diag_counts *c) {
     }
     if(s->cat->groups)c->observations=s->cat->groups->n_observations;
     c->active=measurements_in_flight(s);c->queued=queued_measurements(s);
+    c->catalog_bytes=d2k_catalog_memory_bytes(s->cat);
+    c->measurement_limit=s->meas_limit;c->measurement_slots=measure_slots(s);
+    c->limiter_mask=s->limiter;c->resources_valid=res_valid(s);
+    c->cpu_valid=s->cpu_valid;c->cpu_free_pct=s->cpu_valid?cpu_free_pct(s):-1;
+    c->mem_valid=s->mem_valid;c->mem_avail_kb=s->mem_avail_kb;c->mem_total_kb=s->mem_total_kb;
+    c->mem_reserve_kb=s->mem_valid?mem_reserve_kb(s):0;
+    c->conntrack_valid=s->ct_valid;c->conntrack_count=s->ct_count;c->conntrack_max=s->ct_max;
+    c->grow_pending=s->grow_pending;c->resource_sequence=s->res_seq;c->limit_sequence=s->limit_seq;
+    if(s->limit_seq && s->now_ms>=s->limit_since_ms)
+        c->limit_age_ms=(uint64_t)(s->now_ms-s->limit_since_ms);
+    c->workers_started=s->workers_started;c->workers_joined=s->workers_joined;
+    c->worker_start_failures=s->worker_start_failures;
+    pthread_mutex_lock(&s->mu);
     for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
         const task *t=&s->tasks[i];
-        if(t->state!=T_FREE){c->tasks++;if(t->trig_len||t->snap_len)c->snapshots++;}
+        if((unsigned)t->state<D2K_DIAG_TASK_STATE_COUNT)c->task_states[t->state]++;
+        if(t->state!=T_FREE){
+            c->tasks++;
+            if(t->trig_len||t->snap_len)c->snapshots++;
+            c->snapshot_bytes+=(uint64_t)t->trig_len+t->ctrl_len+t->snap_len;
+        }
+        if(t->th_live) {
+            if(t->res_ready)c->workers_join_pending++;
+            else c->workers_running++;
+        }
     }
+    pthread_mutex_unlock(&s->mu);
 }
 
 int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_path) {
@@ -7210,7 +7241,12 @@ static int res_sample(d2k_sched *s, int64_t now_ms) {
     return 1;
 }
 
-enum { MEAS_LIM_CPU = 1u, MEAS_LIM_MEM = 2u, MEAS_LIM_CT = 4u, MEAS_LIM_SLOTS = 8u };
+enum {
+    MEAS_LIM_CPU = D2K_DIAG_LIMIT_CPU,
+    MEAS_LIM_MEM = D2K_DIAG_LIMIT_MEMORY,
+    MEAS_LIM_CT = D2K_DIAG_LIMIT_CONNTRACK,
+    MEAS_LIM_SLOTS = D2K_DIAG_LIMIT_SLOTS
+};
 
 /* Подстройка возможна, только когда измерены процессор И память. */
 static int res_valid(const d2k_sched *s) { return s->cpu_valid && s->mem_valid; }
@@ -7321,6 +7357,7 @@ static void measure_limit_update(d2k_sched *s, int fresh) {
         s->meas_limit = lim;
         s->limiter = lm;
         s->limit_since_ms = s->now_ms;
+        s->limit_seq = s->res_seq;
     }
     /* Журнал с мёртвой зоной (задача 29): смена наличия данных — сразу;
        смена предела или причины — только когда продержалась

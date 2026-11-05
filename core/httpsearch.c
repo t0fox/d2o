@@ -398,6 +398,7 @@ struct d2k_httpsearch {
     uint64_t diagnostic_seq;
     d2k_hs_ops ops;
     rec *recs; size_t n_recs, cap_recs;
+    uint64_t live_failure_count, live_failure_bytes;
     char measured[8][40]; size_t n_measured;   /* ключи измеренной порчи */
     uint32_t job_seq;
     pend *q; size_t n_q, cap_q;
@@ -513,7 +514,7 @@ static const live_failure *failed_live(rec *r,const char *key,const uint8_t *add
     }
     return NULL;
 }
-static int remember_live_failure(rec *r,const uint8_t *addr,
+static int remember_live_failure(d2k_httpsearch *hs,rec *r,const uint8_t *addr,
     const d2k_binding_context *binding,uint64_t execution,int64_t request_ms) {
     if(failed_live(r,r->key,addr))return 0;
     if(r->evidence_lost)return -1;
@@ -524,6 +525,9 @@ static int remember_live_failure(rec *r,const uint8_t *addr,
     snprintf(f->key,sizeof f->key,"%s",r->key);
     memcpy(f->addr,addr,r->family==6?16:4);f->binding=*binding;
     f->execution=execution;f->request_ms=request_ms;
+    /* Keep the minute-level memory sample O(1), even if evidence grows. */
+    hs->live_failure_count++;
+    hs->live_failure_bytes+=sizeof *f;
     return 0;
 }
 
@@ -636,7 +640,11 @@ const char *d2k_httpsearch_plan_of(const d2k_httpsearch *hs, const char *host, u
 static void start_next(d2k_httpsearch *hs, int64_t now);
 
 void d2k_httpsearch_diagnostic_counts(d2k_httpsearch *hs,d2k_diag_counts *c) {
-    if(hs && c){c->http_records=hs->n_recs;c->http_queued=hs->n_q;}
+    if(!hs||!c)return;
+    c->http_records=hs->n_recs;c->http_queued=hs->n_q;
+    c->http_failures=hs->live_failure_count;
+    c->http_bytes=sizeof *hs+(uint64_t)hs->cap_recs*sizeof *hs->recs+
+                  (uint64_t)hs->cap_q*sizeof *hs->q+hs->live_failure_bytes;
 }
 void d2k_httpsearch_diagnostics(d2k_httpsearch *hs,d2k_diag_observer fn,void *ctx) {
     if(hs){hs->diagnostic=fn;hs->diagnostic_ctx=ctx;}
@@ -1049,7 +1057,7 @@ int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t f
     if(!addr)return 0;
     rec *r=live_owner(hs,host,family,plan_id,binding,execution_id,request_ms);
     if(!r)return 0;
-    if(remember_live_failure(r,addr,binding,execution_id,request_ms))r->evidence_lost=1;
+    if(remember_live_failure(hs,r,addr,binding,execution_id,request_ms))r->evidence_lost=1;
     r->revoked=1;r->no_before_ms=0;
     r->repro_gap=!hs_path_ok(path) || r->evidence_lost;
     r->repeat_path[0]=0;
