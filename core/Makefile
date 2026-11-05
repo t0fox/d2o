@@ -1348,6 +1348,13 @@ test-sched-quic-yield: test_sched_quic_yield
 	./test_sched_quic_yield
 check: test-sched-quic-yield
 TESTS += test_sched_quic_yield
+.PHONY: test-sched-worker-lifecycle
+test-sched-worker-lifecycle: test_sched_worker_lifecycle
+	./test_sched_worker_lifecycle
+check: test-sched-worker-lifecycle
+TESTS += test_sched_worker_lifecycle
+test_sched_worker_lifecycle: test_sched_worker_lifecycle.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 .PHONY: san-sched-quic-yield
 san: san-sched-quic-yield
 san-sched-quic-yield: hello_profiles.inc tcp1620_whitelist.inc
@@ -1374,6 +1381,10 @@ clean: clean-diagnostics
 .PHONY: clean-diagnostics
 clean-diagnostics:
 	$(RM) test_diagnostics
+clean-sched-worker-lifecycle:
+	$(RM) test_sched_worker_lifecycle
+.PHONY: clean-sched-worker-lifecycle
+clean: clean-sched-worker-lifecycle
 
 .PHONY: test-diagnostics-runtime
 check: test-diagnostics-runtime
