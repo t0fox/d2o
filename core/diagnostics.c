@@ -13,6 +13,7 @@
 #define EVENTS 64
 #define LIMIT_EVENTS 32
 #define SAMPLES 120
+#define MEMORY_HISTORY 1440
 #define PROCESS_COUNT 3
 static const char *const names[PROCESS_COUNT]={"d2kc","d2kd","d2kpanel"};
 static const char *const pidfiles[PROCESS_COUNT]={"d2k.pid","d2kd.pid","d2k-panel.pid"};
@@ -29,6 +30,14 @@ typedef struct {
 typedef struct {
     int64_t at,mono,total,available,conntrack;d2k_diag_counts counts;proc_mem procs[PROCESS_COUNT];
 } sample;
+/* 24-hour d2kc memory trend: compact KiB counters, with rollup read by the
+   existing once-per-minute procfs pass. Negative values mean unavailable. */
+typedef struct {
+    uint32_t at_s,mono_s;
+    int32_t rss,vm_data,vm_swap,rollup[5];
+    int32_t rollup_errno;
+    uint8_t rollup_status;
+} memory_sample;
 static const char *const task_state_names[D2K_DIAG_TASK_STATE_COUNT]={
     "free","queued","asking","shape_wait","props_contact","props_wait",
     "planning","trial_settle","verify","verify_wait","watching","resting",
@@ -45,9 +54,10 @@ typedef struct {
 struct d2k_diag {
     memory_detail first[PROCESS_COUNT],latest[PROCESS_COUNT];
     event events[EVENTS];limit_event limits[LIMIT_EVENTS];sample samples[SAMPLES];
-    size_t ne,nl,ns;uint64_t event_total,limit_total,sample_total;int64_t last_ms;int sampled;
+    memory_sample memory_history[MEMORY_HISTORY];
+    size_t ne,nl,ns,nm;uint64_t event_total,limit_total,sample_total,memory_total;int64_t last_ms;int sampled;
 };
-typedef char bounded_ring[(sizeof(struct d2k_diag)<=128*1024)?1:-1];
+typedef char bounded_ring[(sizeof(struct d2k_diag)<=256*1024)?1:-1];
 static void copy(char *to,size_t cap,const char *s) {
     if(!s)s="";
     size_t n=strlen(s);if(n>=cap)n=cap-1;
@@ -87,6 +97,7 @@ void d2k_diag_free(d2k_diag *d){free(d);}
 size_t d2k_diag_bytes(const d2k_diag *d){return d?sizeof *d:0;}
 size_t d2k_diag_event_count(const d2k_diag *d){return d?d->ne:0;}
 size_t d2k_diag_sample_count(const d2k_diag *d){return d?d->ns:0;}
+size_t d2k_diag_memory_history_count(const d2k_diag *d){return d?d->nm:0;}
 void d2k_diag_record(d2k_diag *d,const d2k_diag_event *v) {
     if(!d||!v)return;
     event *e=&d->events[d->event_total++%EVENTS];memset(e,0,sizeof *e);
@@ -112,6 +123,9 @@ static int64_t value(const char *line,const char *key) {
     size_t n=strlen(key);long long x;
     if(strncmp(line,key,n)||sscanf(line+n,"%lld",&x)!=1||x<0)return -1;
     return (int64_t)x;
+}
+static int32_t compact_kib(int64_t v) {
+    return v<0||v>INT32_MAX?-1:(int32_t)v;
 }
 static void read_proc(proc_mem *m,const char *proc,const char *run,size_t i) {
     char path[512],line[256];FILE *f;long pid=0;
@@ -292,13 +306,24 @@ void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char 
            (m->start_ticks>=0 && d->first[i].start_ticks!=m->start_ticks)))d->first[i]=*m;
     }
     if(d->ns<SAMPLES)d->ns++;
+    const proc_mem *p=&s->procs[0];
+    const memory_detail *m=&d->latest[0];
+    memory_sample *h=&d->memory_history[d->memory_total++%MEMORY_HISTORY];
+    memset(h,0,sizeof *h);
+    h->at_s=s->at<0?0:(uint32_t)(uint64_t)s->at;
+    h->mono_s=ms<0?0:(uint32_t)((uint64_t)ms/1000u);
+    h->rss=compact_kib(p->rss);h->vm_data=compact_kib(p->vm_data);h->vm_swap=compact_kib(p->vm_swap);
+    h->rollup_status=(uint8_t)m->rollup_status;h->rollup_errno=m->rollup_errno;
+    for(size_t k=0;k<5;k++)h->rollup[k]=compact_kib(m->rollup[k]);
+    if(d->nm<MEMORY_HISTORY)d->nm++;
 }
 int d2k_diag_write(const d2k_diag *d,FILE *f) {
     if(!d||!f)return -1;
     fprintf(f,"{\"schema\":1,\"enabled\":true,\"controller_pid\":%ld,\"release\":",(long)getpid());js(f,D2K_RELEASE_ID);
-    fprintf(f,",\"ring_bytes\":%zu,\"event_capacity\":64,\"limit_transition_capacity\":32,\"sample_capacity\":120,\"sample_interval_ms\":60000,\"events_overwritten\":%llu,\"limit_transitions_overwritten\":%llu,\"samples_overwritten\":%llu,\"events\":[",sizeof *d,
+    fprintf(f,",\"ring_bytes\":%zu,\"event_capacity\":64,\"limit_transition_capacity\":32,\"sample_capacity\":120,\"sample_interval_ms\":60000,\"memory_history_capacity\":1440,\"memory_history_interval_ms\":60000,\"events_overwritten\":%llu,\"limit_transitions_overwritten\":%llu,\"samples_overwritten\":%llu,\"memory_history_overwritten\":%llu,\"events\":[",sizeof *d,
         (unsigned long long)(d->event_total-d->ne),(unsigned long long)(d->limit_total-d->nl),
-        (unsigned long long)(d->sample_total-d->ns));
+        (unsigned long long)(d->sample_total-d->ns),
+        (unsigned long long)(d->memory_total-d->nm));
     for(size_t i=0;i<d->ne;i++) {
         const event *e=&d->events[(d->event_total-d->ne+i)%EVENTS];if(i)fputc(',',f);
         fprintf(f,"{\"id\":%llu,\"at\":%lld,\"family\":%u,\"trigger\":%u,\"elapsed_ms\":",
@@ -329,7 +354,24 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         fputs(",\"conntrack_max\":",f);if(e->flags&8u)fprintf(f,"%llu",(unsigned long long)e->ct_max);else fputs("null",f);
         write_limit_reason_state(f,e->flags,e->mask);fputc('}',f);
     }
-    fputs("],\"samples\":[",f);
+    const memory_sample *base=d->nm?&d->memory_history[(d->memory_total-d->nm)%MEMORY_HISTORY]:NULL;
+    fputs("],\"memory_history\":{\"capacity\":1440,\"sample_interval_ms\":60000,\"time_base\":[",f);
+    if(base)fprintf(f,"%u,%u",base->at_s,base->mono_s);else fputs("null,null",f);
+    fputs("],\"smaps_rollup_status_codes\":[\"not-read\",\"unavailable\",\"ok\",\"parse-error\"],\"fields\":[\"at_delta_s\",\"mono_delta_s\",\"rss_kib\",\"vm_data_kib\",\"vm_swap_kib\",\"smaps_rollup_status_code\",\"smaps_rollup_errno\",\"smaps_rollup_kib\"],\"samples\":[",f);
+    for(size_t i=0;i<d->nm;i++) {
+        const memory_sample *h=&d->memory_history[(d->memory_total-d->nm+i)%MEMORY_HISTORY];
+        if(i)fputc(',',f);
+        fprintf(f,"[%lld,%lld,",(long long)h->at_s-(base?(long long)base->at_s:0),
+                (long long)h->mono_s-(base?(long long)base->mono_s:0));number(f,h->rss);fputc(',',f);
+        number(f,h->vm_data);fputc(',',f);number(f,h->vm_swap);fputc(',',f);
+        fprintf(f,"%u,",(unsigned)h->rollup_status);
+        if(h->rollup_errno)fprintf(f,"%d",h->rollup_errno);else fputs("null",f);
+        fputc(',',f);
+        if(h->rollup_status!=2)fputs("null",f);
+        else {fputc('[',f);for(size_t k=0;k<5;k++){if(k)fputc(',',f);number(f,h->rollup[k]);}fputc(']',f);}
+        fputc(']',f);
+    }
+    fputs("]},\"samples\":[",f);
     for(size_t i=0;i<d->ns;i++) {
         const sample *s=&d->samples[(d->sample_total-d->ns+i)%SAMPLES];const d2k_diag_counts *c=&s->counts;if(i)fputc(',',f);
         fprintf(f,"{\"at\":%lld,\"mono_ms\":%lld,\"mem_total_kib\":",(long long)s->at,(long long)s->mono);number(f,s->total);
@@ -350,12 +392,19 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         fprintf(f,",\"worker_oldest_type\":\"%s\",\"last_measurement_age_ms\":",c->worker_oldest_type);
         number(f,c->last_measurement_age_ms);
         fprintf(f,",\"workers_started\":%llu,\"workers_joined\":%llu,\"worker_start_failures\":%llu,\"worker_join_failures\":%llu,"
-                  "\"http_failures\":%llu,\"http_bytes\":%llu,\"http_failure_bytes\":%llu,\"http_failure_limit_hits\":%llu,\"measurement_limit\":%llu,\"measurement_slots\":%llu,"
+                  "\"http_failures\":%llu,\"http_bytes\":%llu,\"http_records_bytes\":%llu,\"http_queue_bytes\":%llu,\"http_failure_bytes\":%llu,"
+                  "\"http_failure_limit_hits\":%llu,\"http_failure_record_limit_hits\":%llu,\"http_failure_alloc_failures\":%llu,"
+                  "\"http_record_limit_hits\":%llu,\"http_record_alloc_failures\":%llu,\"http_queue_limit_hits\":%llu,\"http_queue_alloc_failures\":%llu,"
+                  "\"measurement_limit\":%llu,\"measurement_slots\":%llu,"
                   "\"resources_valid\":%s,\"cpu_valid\":%s,\"cpu_free_pct\":",
           (unsigned long long)c->workers_started,(unsigned long long)c->workers_joined,
           (unsigned long long)c->worker_start_failures,(unsigned long long)c->worker_join_failures,
           (unsigned long long)c->http_failures,(unsigned long long)c->http_bytes,
+          (unsigned long long)c->http_records_bytes,(unsigned long long)c->http_queue_bytes,
           (unsigned long long)c->http_failure_bytes,(unsigned long long)c->http_failure_limit_hits,
+          (unsigned long long)c->http_failure_record_limit_hits,(unsigned long long)c->http_failure_alloc_failures,
+          (unsigned long long)c->http_record_limit_hits,(unsigned long long)c->http_record_alloc_failures,
+          (unsigned long long)c->http_queue_limit_hits,(unsigned long long)c->http_queue_alloc_failures,
           (unsigned long long)c->measurement_limit,
           (unsigned long long)c->measurement_slots,c->resources_valid?"true":"false",
           c->cpu_valid?"true":"false");

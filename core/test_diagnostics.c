@@ -23,7 +23,9 @@ int main(void) {
     c.workers_running=2;c.workers_live=3;c.workers_result_pending=1;c.workers_join_pending=1;
     c.worker_oldest_age_ms=600;c.last_measurement_age_ms=1250;strcpy(c.worker_oldest_type,"TCP");
     c.workers_started=12;c.workers_joined=9;c.worker_start_failures=1;c.worker_join_failures=2;
-    c.http_failures=3;c.http_bytes=16384;c.http_failure_bytes=2048;c.http_failure_limit_hits=4;c.measurement_limit=1;c.measurement_slots=64;
+    c.http_failures=3;c.http_bytes=16384;c.http_records_bytes=4096;c.http_queue_bytes=1024;
+    c.http_failure_bytes=2048;c.http_failure_limit_hits=4;c.http_failure_record_limit_hits=2;
+    c.http_record_limit_hits=1;c.http_queue_limit_hits=5;c.measurement_limit=1;c.measurement_slots=64;
     c.resources_valid=c.cpu_valid=c.mem_valid=c.conntrack_valid=1;c.cpu_free_pct=75;
     c.mem_avail_kb=8192;c.mem_total_kb=65536;c.mem_reserve_kb=32768;
     c.conntrack_count=100;c.conntrack_max=1000;c.limiter_mask=D2K_DIAG_LIMIT_MEMORY|D2K_DIAG_LIMIT_CONNTRACK;
@@ -33,7 +35,7 @@ int main(void) {
     assert(d2k_diag_bytes(d)==0);
     d2k_diag_record(d,&e);
     for(int round=0;round<10;round++) {
-        d=d2k_diag_new(); assert(d && d2k_diag_bytes(d)<=128*1024);
+        d=d2k_diag_new(); assert(d && d2k_diag_bytes(d)<=256*1024);
         for(int i=0;i<1000;i++) {e.id=(unsigned)i; d2k_diag_record(d,&e);}
         assert(d2k_diag_event_count(d)==64);
         for(int i=0;i<200;i++) d2k_diag_sample(d,(int64_t)i*60000,&c,"/nonexistent", "/nonexistent");
@@ -66,6 +68,10 @@ int main(void) {
         char full[256];memset(full,'"',sizeof full-1);full[255]=0;
         e.target=full;e.reason=full;
         for(int i=0;i<100000;i++)d2k_diag_record(d,&e);
+        if(round==0)for(int i=200;i<=1440;i++)
+            d2k_diag_sample(d,(int64_t)i*60000,&c,"/nonexistent","/nonexistent");
+        if(round==0)assert(d2k_diag_memory_history_count(d)==1440);
+        assert(d2k_diag_sample_count(d)==120);
         f=tmpfile();assert(f);assert(!d2k_diag_write(d,f));assert(ftell(f)<D2K_DIAG_REPORT_MAX);fclose(f);
         e.target="a\".example";e.reason="local\nerror";
         d2k_diag_free(d);d=NULL;
@@ -88,9 +94,8 @@ int main(void) {
     assert(strstr(json,"bad\\ufffdname"));
     assert(strstr(json,"\"vm_data_kib\":4096"));assert(strstr(json,"\"vm_swap_kib\":0"));
     assert(strstr(json,"\"smaps_rollup_status\":\"unavailable\""));
+    assert(strstr(json,"\"smaps_rollup_errno\":2"));
     assert(strstr(json,"\"smaps_status\":\"ok\""));
-    const char *export_path=getenv("D2K_TEST_DIAG_JSON");
-    if(export_path){FILE *out=fopen(export_path,"w");assert(out);assert(fwrite(json,1,n,out)==n);assert(!fclose(out));}
     fclose(f);
     /* Переполнение кольца не должно терять исходный снимок памяти. */
     for(int i=2;i<125;i++)d2k_diag_sample(d,(int64_t)i*60000,&c,dir,dir);
@@ -106,6 +111,7 @@ int main(void) {
     d2k_diag_sample(d,7560000,&c,dir,dir);all=report(d);detail=strstr(all,"\"latest\":");
     assert(detail&&strstr(detail,"\"smaps_status\":\"unavailable\"")&&
         strstr(detail,"\"smaps_errno\":2"));free(all);
+    all=report(d);assert(strstr(all,",7560,4096,4096,0,1,2,null]"));free(all);
     put(dir,"123/smaps_rollup","Rss: 120 kB\nPss: 100 kB\nAnonymous: 80 kB\nPrivate_Dirty: 64 kB\nSwap: 2 kB\n");
     put(dir,"123/smaps","1000-2000 rw-p 00000000 00:00 0 [heap]\nSize: 64 kB\nRss: 32 kB\nAnonymous: 32 kB\nPrivate_Dirty: 24 kB\n");
     /* Повторное использование PID новым процессом должно сбросить исходный снимок. */
@@ -118,6 +124,16 @@ int main(void) {
     assert(strstr(detail,"\"smaps_status\":\"ok\""));
     assert(strstr(detail,"\"private_dirty_kib\":64"));
     assert(strstr(detail,"\"heap\":{\"maps\":1,\"size_kib\":64,\"rss_kib\":32"));free(all);
+    for(int i=128;i<=1440;i++)d2k_diag_sample(d,(int64_t)i*60000,&c,dir,dir);
+    assert(d2k_diag_memory_history_count(d)==1440);
+    all=report(d);
+    assert(strstr(all,"\"memory_history_capacity\":1440"));
+    assert(strstr(all,"\"memory_history_overwritten\":1"));
+    assert(strstr(all,"\"memory_history\":{\"capacity\":1440"));
+    const char *export_path=getenv("D2K_TEST_DIAG_JSON");
+    if(export_path){FILE *out=fopen(export_path,"w");assert(out);
+        assert(fwrite(all,1,strlen(all),out)==strlen(all));assert(!fclose(out));}
+    free(all);
     printf("размер кольца: %zu байт\n",d2k_diag_bytes(d));d2k_diag_free(d);
     const char *files[]={"d2k.pid","123/comm","123/status","123/smaps","123/smaps_rollup","123/stat","123/fd/0","123/fd/1","meminfo"};
     for(size_t i=0;i<sizeof files/sizeof files[0];i++){snprintf(path,sizeof path,"%s/%s",dir,files[i]);assert(!unlink(path));}
