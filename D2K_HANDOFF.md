@@ -10,22 +10,27 @@
 
 ### PR #2: UI диагностики по компактной истории, 05.11.2026
 
-Реализация находится в `codex/fix-d2kc-memory-diagnostics`, базовая ревизия PR
-`9dfb3d6`, кодовая ревизия `9f2bd2d`. Панель использует `/api/diagnostics?report`:
-график d2kc за 2/24 часа строится из компактных 1440 снимков; добавлены показатели
-workers, память каталога и HTTP-хранилища с лимитами/переполнениями, текущие и
-исторические переходы AIMD, предупреждения о росте RSS, вытеснении записей и
-недоступном `smaps_rollup`. Полный JSON download и чтение старой схемы сохранены.
+Реализация находится в `codex/fix-d2kc-memory-diagnostics`, ответвление от PR
+head `9dfb3d6`; кодовая ревизия `58516b9`. Панель использует
+`/api/diagnostics?report`: график d2kc за 2/24 часа строится из компактных 1440
+снимков; добавлены показатели workers, память каталога и HTTP-хранилища с
+лимитами/переполнениями, текущие и исторические переходы AIMD, предупреждения
+о росте RSS, вытеснении записей и недоступном `smaps_rollup`. Лимиты HTTP-хранилища
+передаются один раз на верхнем уровне JSON, чтобы выдержать предел размера
+отчёта. Полный JSON download и чтение старой схемы сохранены.
 
-Локально прошли `node --check internal/web/assets/diagnostics.js`,
-`node --check panel/test_browser.cjs`, `node panel/test_diagnostics.cjs` и
-`git diff --check`. В Playwright проверены новые/пустые/недоступные/старые данные,
-1440 снимков, диапазоны 2/24 часа и мобильная ширина; скриншот десктопа сохранён
-вне репозитория в `C:\Users\Kirill\.codex\visualizations\2026\11\05\01a1ac9b-873e-7392-b6df-89dd8a5fab2a\diagnostics-desktop.png`.
-`make -C core check` и `make -C panel test` локально недоступны: Windows shell не
-имеет `make`; C/browser harness поэтому локально не исполнен. Полевых проверок и
-изменений на роутере не было. Проверить GitHub CI на итоговой ревизии PR; после
-зелёного CI оставить PR в Draft.
+GitHub Actions run `42081231794` для ревизии `58516b9` завершился успешно: все
+обязательные unit, sanitizer, build и integration jobs зелёные, включая Chrome
+сценарий и проверку размера полного diagnostics JSON. Локально прошли
+`node --check internal/web/assets/diagnostics.js`, `node --check
+panel/test_browser.cjs`, `node panel/test_diagnostics.cjs` и `git diff --check`.
+В Playwright проверены новые/пустые/недоступные/старые данные, 1440 снимков,
+диапазоны 2/24 часа и мобильная ширина. Скриншот десктопа сохранён вне репозитория
+в `C:\Users\Kirill\.codex\visualizations\2026\11\05\01a1ac9b-873e-7392-b6df-89dd8a5fab2a\diagnostics-desktop.png`.
+`make -C core check` и `make -C panel test` локально не запускались: Windows
+shell не имеет `make`; соответствующие проверки прошли в CI. Полевых проверок и
+изменений на роутере не было. PR #2 оставлен открытым в Draft; рабочее дерево
+после handoff-коммита чистое.
 
 ### Telegram: достоверность статусов и мобильная панель, 05.11.2026
 
