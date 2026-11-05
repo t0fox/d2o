@@ -11,15 +11,21 @@
 #define D2K_RELEASE_ID "dev"
 #endif
 #define EVENTS 64
+#define LIMIT_EVENTS 32
 #define SAMPLES 120
 #define PROCESS_COUNT 3
 static const char *const names[PROCESS_COUNT]={"d2kc","d2kd","d2kpanel"};
 static const char *const pidfiles[PROCESS_COUNT]={"d2k.pid","d2kd.pid","d2k-panel.pid"};
-typedef struct {long pid;int64_t rss,hwm,anon,threads;} proc_mem;
+typedef struct {long pid;int64_t rss,hwm,anon,threads,vm_data,vm_swap;} proc_mem;
 typedef struct {
     uint64_t id; int64_t at,elapsed,queued,units;unsigned family,trigger,shape;
     char target[256],protocol[16],outcome[32],reason[256],ip[48],path[16],kind[8];
 } event;
+typedef struct {
+    int64_t at,mono,cpu_free_pct;
+    uint64_t limit,slots,resource_seq,limit_seq,mem_avail,mem_total,mem_reserve,ct_count,ct_max;
+    unsigned mask,flags;
+} limit_event;
 typedef struct {
     int64_t at,mono,total,available,conntrack;d2k_diag_counts counts;proc_mem procs[PROCESS_COUNT];
 } sample;
@@ -33,12 +39,13 @@ static const char *const task_state_names[D2K_DIAG_TASK_STATE_COUNT]={
  * потоков и отображения malloc могут попасть в anonymous. */
 typedef struct {
     long pid; int64_t at,mono,rss,start_ticks,vm[4],fds;
-    int smaps_ok; int64_t groups[4][5];
+    int rollup_status,rollup_errno,smaps_status,smaps_errno;
+    int64_t rollup[5],groups[4][5];
 } memory_detail;
 struct d2k_diag {
     memory_detail first[PROCESS_COUNT],latest[PROCESS_COUNT];
-    event events[EVENTS];sample samples[SAMPLES];
-    size_t ne,ns;uint64_t event_total,sample_total;int64_t last_ms;int sampled;
+    event events[EVENTS];limit_event limits[LIMIT_EVENTS];sample samples[SAMPLES];
+    size_t ne,nl,ns;uint64_t event_total,limit_total,sample_total;int64_t last_ms;int sampled;
 };
 typedef char bounded_ring[(sizeof(struct d2k_diag)<=128*1024)?1:-1];
 static void copy(char *to,size_t cap,const char *s) {
@@ -50,12 +57,29 @@ static void copy(char *to,size_t cap,const char *s) {
 }
 static void js(FILE *f,const char *s) {
     fputc('"',f);
-    for(const unsigned char *p=(const unsigned char *)s;*p;p++) {
+    const unsigned char *p=(const unsigned char *)s;
+    while(*p) {
         if(*p=='"'||*p=='\\'){fputc('\\',f);fputc(*p,f);}
         else if(*p=='\n') fputs("\\n",f);
         else if(*p<32)fputc('?',f);
-        else fputc(*p,f);
-    }fputc('"',f);
+        else if(*p<0x80)fputc(*p,f);
+        else {
+            unsigned need=0;uint32_t cp=0,min=0;
+            if(*p>=0xc2&&*p<=0xdf){need=1;cp=*p&0x1f;min=0x80;}
+            else if(*p>=0xe0&&*p<=0xef){need=2;cp=*p&0x0f;min=0x800;}
+            else if(*p>=0xf0&&*p<=0xf4){need=3;cp=*p&0x07;min=0x10000;}
+            int valid=need!=0;
+            for(unsigned i=1;valid&&i<=need;i++) {
+                if(!p[i]||(p[i]&0xc0)!=0x80)valid=0;
+                else cp=(cp<<6)|(p[i]&0x3f);
+            }
+            if(valid&&(cp<min||cp>0x10ffff||(cp>=0xd800&&cp<=0xdfff)))valid=0;
+            if(valid){for(unsigned i=0;i<=need;i++)fputc(p[i],f);p+=need;}
+            else fputs("\\ufffd",f);
+        }
+        p++;
+    }
+    fputc('"',f);
 }
 static void number(FILE *f,int64_t v) {if(v<0)fputs("null",f);else fprintf(f,"%lld",(long long)v);}
 d2k_diag *d2k_diag_new(void){return calloc(1,sizeof(d2k_diag));}
@@ -73,6 +97,17 @@ void d2k_diag_record(d2k_diag *d,const d2k_diag_event *v) {
     copy(e->outcome,sizeof e->outcome,v->outcome);copy(e->reason,sizeof e->reason,v->reason);
     if(d->ne<EVENTS)d->ne++;
 }
+void d2k_diag_record_limit(d2k_diag *d,int64_t ms,const d2k_diag_counts *c) {
+    if(!d||!c)return;
+    limit_event *e=&d->limits[d->limit_total++%LIMIT_EVENTS];
+    e->at=(int64_t)time(NULL);e->mono=ms;e->limit=c->measurement_limit;e->slots=c->measurement_slots;
+    e->resource_seq=c->resource_sequence;e->limit_seq=c->limit_sequence;e->mem_avail=c->mem_avail_kb;
+    e->mem_total=c->mem_total_kb;e->mem_reserve=c->mem_reserve_kb;e->ct_count=c->conntrack_count;
+    e->ct_max=c->conntrack_max;e->cpu_free_pct=c->cpu_free_pct;e->mask=c->limiter_mask;
+    e->flags=(c->resources_valid?1u:0u)|(c->cpu_valid?2u:0u)|(c->mem_valid?4u:0u)|
+             (c->conntrack_valid?8u:0u)|(c->grow_pending?16u:0u);
+    if(d->nl<LIMIT_EVENTS)d->nl++;
+}
 static int64_t value(const char *line,const char *key) {
     size_t n=strlen(key);long long x;
     if(strncmp(line,key,n)||sscanf(line+n,"%lld",&x)!=1||x<0)return -1;
@@ -80,7 +115,7 @@ static int64_t value(const char *line,const char *key) {
 }
 static void read_proc(proc_mem *m,const char *proc,const char *run,size_t i) {
     char path[512],line[256];FILE *f;long pid=0;
-    *m=(proc_mem){.pid=0,.rss=-1,.hwm=-1,.anon=-1,.threads=-1};
+    *m=(proc_mem){.pid=0,.rss=-1,.hwm=-1,.anon=-1,.threads=-1,.vm_data=-1,.vm_swap=-1};
     if(snprintf(path,sizeof path,"%s/%s",run,pidfiles[i])>=(int)sizeof path)return;
     f=fopen(path,"r");if(!f)return;int ok=fscanf(f,"%ld",&pid)==1&&pid>0&&pid<=INT_MAX;fclose(f);if(!ok)return;
     if(snprintf(path,sizeof path,"%s/%ld/comm",proc,pid)>=(int)sizeof path)return;
@@ -96,11 +131,14 @@ static void read_proc(proc_mem *m,const char *proc,const char *run,size_t i) {
         if((v=value(line,"VmHWM:"))>=0)m->hwm=v;
         if((v=value(line,"RssAnon:"))>=0)m->anon=v;
         if((v=value(line,"Threads:"))>=0)m->threads=v;
+        if((v=value(line,"VmData:"))>=0)m->vm_data=v;
+        if((v=value(line,"VmSwap:"))>=0)m->vm_swap=v;
     }fclose(f);
 }
 static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms,const char *proc) {
     memset(m,0,sizeof *m);m->pid=p->pid;m->rss=p->rss;m->at=at;m->mono=ms;
     m->start_ticks=m->fds=-1;for(size_t k=0;k<4;k++)m->vm[k]=-1;
+    for(size_t k=0;k<5;k++)m->rollup[k]=-1;
     if(!p->pid)return;
     char path[512],line[512];FILE *f;
     if(snprintf(path,sizeof path,"%s/%ld/stat",proc,p->pid)>=(int)sizeof path)return;
@@ -126,10 +164,28 @@ static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms
         if(errno)m->fds=-1;
         closedir(dir);
     }
+    snprintf(path,sizeof path,"%s/%ld/smaps_rollup",proc,p->pid);
+    errno=0;f=fopen(path,"r");
+    if(!f){m->rollup_status=1;m->rollup_errno=errno;}
+    else {
+        const char *keys[]={"Rss:","Pss:","Anonymous:","Private_Dirty:","Swap:"};
+        unsigned seen=0;
+        errno=0;
+        while(fgets(line,sizeof line,f))for(size_t k=0;k<5;k++){
+            int64_t n=value(line,keys[k]);if(n>=0){m->rollup[k]=n;seen|=1u<<k;}
+        }
+        int read_error=ferror(f),read_errno=errno;fclose(f);
+        if(read_error)m->rollup_errno=read_errno;
+        if(!read_error&&seen==31)m->rollup_status=2;
+        else m->rollup_status=3;
+    }
+    /* Keep the existing mapping-group breakdown even when rollup is present;
+       rollup supplements it and remains useful if full smaps is restricted. */
     snprintf(path,sizeof path,"%s/%ld/smaps",proc,p->pid);
-    f=fopen(path,"r");if(!f)return;
+    errno=0;f=fopen(path,"r");if(!f){m->smaps_status=1;m->smaps_errno=errno;return;}
     int group=-1,valid=1;int64_t maps=0,fields=0;
     const char *metrics[]={"Size:","Rss:","Anonymous:","Private_Dirty:"};
+    errno=0;
     while(fgets(line,sizeof line,f)) {
         unsigned long long a,b,off,inode;unsigned major,minor;char perms[5];int n=0;
         if(sscanf(line,"%llx-%llx %4s %llx %x:%x %llu %n",&a,&b,perms,&off,&major,&minor,&inode,&n)==7 && n>0){
@@ -145,8 +201,14 @@ static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms
             fields++;
         }
     }
-    m->smaps_ok=valid && maps>0 && fields==maps*4 && !ferror(f);
+    int read_error=ferror(f);
+    if(read_error)m->smaps_errno=errno;
+    m->smaps_status=valid && maps>0 && fields==maps*4 && !read_error?2:3;
     fclose(f);
+}
+static const char *read_status(int status) {
+    switch(status){case 1:return "unavailable";case 2:return "ok";case 3:return "parse-error";
+        default:return "not-read";}
 }
 static void write_detail(FILE *f,const memory_detail *m) {
     if(!m->pid){fputs("null",f);return;}
@@ -154,8 +216,19 @@ static void write_detail(FILE *f,const memory_detail *m) {
     number(f,m->rss);fputs(",\"start_ticks\":",f);number(f,m->start_ticks);
     const char *keys[]={"vm_size_kib","vm_data_kib","vm_stack_kib","vm_swap_kib"};
     for(size_t k=0;k<4;k++){fprintf(f,",\"%s\":",keys[k]);number(f,m->vm[k]);}
-    fputs(",\"fd_count\":",f);number(f,m->fds);fputs(",\"smaps\":",f);
-    if(!m->smaps_ok)fputs("null",f);
+    fputs(",\"fd_count\":",f);number(f,m->fds);
+    fputs(",\"smaps_rollup_status\":",f);js(f,read_status(m->rollup_status));
+    fputs(",\"smaps_rollup_errno\":",f);if(m->rollup_errno)fprintf(f,"%d",m->rollup_errno);else fputs("null",f);
+    fputs(",\"smaps_rollup\":",f);
+    if(m->rollup_status!=2)fputs("null",f);
+    else {
+        const char *keys[]={"rss_kib","pss_kib","anonymous_kib","private_dirty_kib","swap_kib"};
+        fputc('{',f);for(size_t k=0;k<5;k++){fprintf(f,"%s\"%s\":",k?",":"",keys[k]);number(f,m->rollup[k]);}fputc('}',f);
+    }
+    fputs(",\"smaps_status\":",f);js(f,read_status(m->smaps_status));
+    fputs(",\"smaps_errno\":",f);if(m->smaps_errno)fprintf(f,"%d",m->smaps_errno);else fputs("null",f);
+    fputs(",\"smaps\":",f);
+    if(m->smaps_status!=2)fputs("null",f);
     else {
         const char *groups[]={"anonymous","heap","stack","other"};
         const char *metrics[]={"maps","size_kib","rss_kib","anonymous_kib","private_dirty_kib"};
@@ -168,15 +241,30 @@ static void write_detail(FILE *f,const memory_detail *m) {
     }fputc('}',f);
 }
 static void write_limit_reason(FILE *f,const d2k_diag_counts *c) {
+    unsigned flags=(c->resources_valid?1u:0u);
+    unsigned mask=c->limiter_mask;
     fputs(",\"limit_reason\":[",f);
-    if(!c->resources_valid) js(f,"resource-data-unavailable");
-    else if(!c->limiter_mask) js(f,"no-current-resource-limit");
+    if(!(flags&1)) js(f,"resource-data-unavailable");
+    else if(!mask) js(f,"no-current-resource-limit");
     else {
         int comma=0;
-        if(c->limiter_mask&D2K_DIAG_LIMIT_CPU){js(f,"cpu");comma=1;}
-        if(c->limiter_mask&D2K_DIAG_LIMIT_MEMORY){if(comma)fputc(',',f);js(f,"memory");comma=1;}
-        if(c->limiter_mask&D2K_DIAG_LIMIT_CONNTRACK){if(comma)fputc(',',f);js(f,"conntrack");comma=1;}
-        if(c->limiter_mask&D2K_DIAG_LIMIT_SLOTS){if(comma)fputc(',',f);js(f,"slots");}
+        if(mask&D2K_DIAG_LIMIT_CPU){js(f,"cpu");comma=1;}
+        if(mask&D2K_DIAG_LIMIT_MEMORY){if(comma)fputc(',',f);js(f,"memory");comma=1;}
+        if(mask&D2K_DIAG_LIMIT_CONNTRACK){if(comma)fputc(',',f);js(f,"conntrack");comma=1;}
+        if(mask&D2K_DIAG_LIMIT_SLOTS){if(comma)fputc(',',f);js(f,"slots");}
+    }
+    fputc(']',f);
+}
+static void write_limit_reason_state(FILE *f,unsigned flags,unsigned mask) {
+    fputs(",\"limit_reason\":[",f);
+    if(!(flags&1u)) js(f,"resource-data-unavailable");
+    else if(!mask) js(f,"no-current-resource-limit");
+    else {
+        int comma=0;
+        if(mask&D2K_DIAG_LIMIT_CPU){js(f,"cpu");comma=1;}
+        if(mask&D2K_DIAG_LIMIT_MEMORY){if(comma)fputc(',',f);js(f,"memory");comma=1;}
+        if(mask&D2K_DIAG_LIMIT_CONNTRACK){if(comma)fputc(',',f);js(f,"conntrack");comma=1;}
+        if(mask&D2K_DIAG_LIMIT_SLOTS){if(comma)fputc(',',f);js(f,"slots");}
     }
     fputc(']',f);
 }
@@ -208,8 +296,9 @@ void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char 
 int d2k_diag_write(const d2k_diag *d,FILE *f) {
     if(!d||!f)return -1;
     fprintf(f,"{\"schema\":1,\"enabled\":true,\"controller_pid\":%ld,\"release\":",(long)getpid());js(f,D2K_RELEASE_ID);
-    fprintf(f,",\"ring_bytes\":%zu,\"event_capacity\":64,\"sample_capacity\":120,\"sample_interval_ms\":60000,\"events_overwritten\":%llu,\"samples_overwritten\":%llu,\"events\":[",sizeof *d,
-        (unsigned long long)(d->event_total-d->ne),(unsigned long long)(d->sample_total-d->ns));
+    fprintf(f,",\"ring_bytes\":%zu,\"event_capacity\":64,\"limit_transition_capacity\":32,\"sample_capacity\":120,\"sample_interval_ms\":60000,\"events_overwritten\":%llu,\"limit_transitions_overwritten\":%llu,\"samples_overwritten\":%llu,\"events\":[",sizeof *d,
+        (unsigned long long)(d->event_total-d->ne),(unsigned long long)(d->limit_total-d->nl),
+        (unsigned long long)(d->sample_total-d->ns));
     for(size_t i=0;i<d->ne;i++) {
         const event *e=&d->events[(d->event_total-d->ne+i)%EVENTS];if(i)fputc(',',f);
         fprintf(f,"{\"id\":%llu,\"at\":%lld,\"family\":%u,\"trigger\":%u,\"elapsed_ms\":",
@@ -220,6 +309,25 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         fputs(",\"ip\":",f);js(f,e->ip);fputs(",\"path\":",f);js(f,e->path);fputs(",\"kind\":",f);js(f,e->kind);
         fprintf(f,",\"shape\":%u",e->shape);
         fputs(",\"protocol\":",f);js(f,e->protocol);fputs(",\"outcome\":",f);js(f,e->outcome);fputs(",\"reason\":",f);js(f,e->reason);fputs(",\"reason_source\":",f);js(f,!strcmp(e->protocol,"http")?"terminal-code":"last-classifier-context");fputc('}',f);
+    }
+    fputs("],\"limit_transitions\":[",f);
+    for(size_t i=0;i<d->nl;i++) {
+        const limit_event *e=&d->limits[(d->limit_total-d->nl+i)%LIMIT_EVENTS];
+        if(i)fputc(',',f);
+        fprintf(f,"{\"at\":%lld,\"mono_ms\":%lld,\"measurement_limit\":%llu,\"measurement_slots\":%llu,\"limiter_mask\":%u,\"grow_pending\":%s,\"resource_sequence\":%llu,\"limit_sequence\":%llu,\"resources_valid\":%s,\"cpu_valid\":%s,\"cpu_free_pct\":",
+            (long long)e->at,(long long)e->mono,(unsigned long long)e->limit,
+            (unsigned long long)e->slots,e->mask,(e->flags&16u)?"true":"false",
+            (unsigned long long)e->resource_seq,(unsigned long long)e->limit_seq,
+            (e->flags&1u)?"true":"false",(e->flags&2u)?"true":"false");
+        number(f,e->cpu_free_pct);
+        fputs(",\"mem_valid\":",f);fputs((e->flags&4u)?"true":"false",f);
+        fputs(",\"mem_available_kib\":",f);if(e->flags&4u)fprintf(f,"%llu",(unsigned long long)e->mem_avail);else fputs("null",f);
+        fputs(",\"mem_total_kib\":",f);if(e->flags&4u)fprintf(f,"%llu",(unsigned long long)e->mem_total);else fputs("null",f);
+        fputs(",\"mem_reserve_kib\":",f);if(e->flags&4u)fprintf(f,"%llu",(unsigned long long)e->mem_reserve);else fputs("null",f);
+        fputs(",\"conntrack_valid\":",f);fputs((e->flags&8u)?"true":"false",f);
+        fputs(",\"conntrack_count\":",f);if(e->flags&8u)fprintf(f,"%llu",(unsigned long long)e->ct_count);else fputs("null",f);
+        fputs(",\"conntrack_max\":",f);if(e->flags&8u)fprintf(f,"%llu",(unsigned long long)e->ct_max);else fputs("null",f);
+        write_limit_reason_state(f,e->flags,e->mask);fputc('}',f);
     }
     fputs("],\"samples\":[",f);
     for(size_t i=0;i<d->ns;i++) {
@@ -233,15 +341,22 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
           (unsigned long long)c->active,(unsigned long long)c->queued,(unsigned long long)c->tasks,(unsigned long long)c->snapshots);
         /* Scheduler ownership and limiter state are sampled once per minute;
            these fixed-size counters add no per-event allocation. */
-        fprintf(f,",\"snapshot_bytes\":%llu,\"catalog_bytes\":%llu,\"workers_running\":%llu,\"workers_join_pending\":%llu,"
-                  "\"workers_started\":%llu,\"workers_joined\":%llu,\"worker_start_failures\":%llu,"
-                  "\"http_failures\":%llu,\"http_bytes\":%llu,\"measurement_limit\":%llu,\"measurement_slots\":%llu,"
-                  "\"resources_valid\":%s,\"cpu_valid\":%s,\"cpu_free_pct\":",
+        fprintf(f,",\"snapshot_bytes\":%llu,\"catalog_bytes\":%llu,\"workers_running\":%llu,\"workers_live\":%llu,\"workers_result_pending\":%llu,\"workers_join_pending\":%llu,"
+                  "\"worker_oldest_age_ms\":",
           (unsigned long long)c->snapshot_bytes,(unsigned long long)c->catalog_bytes,
-          (unsigned long long)c->workers_running,(unsigned long long)c->workers_join_pending,
+          (unsigned long long)c->workers_running,(unsigned long long)c->workers_live,
+          (unsigned long long)c->workers_result_pending,(unsigned long long)c->workers_join_pending);
+        number(f,c->worker_oldest_age_ms);
+        fprintf(f,",\"worker_oldest_type\":\"%s\",\"last_measurement_age_ms\":",c->worker_oldest_type);
+        number(f,c->last_measurement_age_ms);
+        fprintf(f,",\"workers_started\":%llu,\"workers_joined\":%llu,\"worker_start_failures\":%llu,\"worker_join_failures\":%llu,"
+                  "\"http_failures\":%llu,\"http_bytes\":%llu,\"http_failure_bytes\":%llu,\"http_failure_limit_hits\":%llu,\"measurement_limit\":%llu,\"measurement_slots\":%llu,"
+                  "\"resources_valid\":%s,\"cpu_valid\":%s,\"cpu_free_pct\":",
           (unsigned long long)c->workers_started,(unsigned long long)c->workers_joined,
-          (unsigned long long)c->worker_start_failures,(unsigned long long)c->http_failures,
-          (unsigned long long)c->http_bytes,(unsigned long long)c->measurement_limit,
+          (unsigned long long)c->worker_start_failures,(unsigned long long)c->worker_join_failures,
+          (unsigned long long)c->http_failures,(unsigned long long)c->http_bytes,
+          (unsigned long long)c->http_failure_bytes,(unsigned long long)c->http_failure_limit_hits,
+          (unsigned long long)c->measurement_limit,
           (unsigned long long)c->measurement_slots,c->resources_valid?"true":"false",
           c->cpu_valid?"true":"false");
         number(f,c->cpu_free_pct);
@@ -267,7 +382,8 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         for(size_t j=0;j<PROCESS_COUNT;j++) {
             const proc_mem *p=&s->procs[j];if(j)fputc(',',f);fputs("{\"name\":",f);js(f,names[j]);
             fprintf(f,",\"pid\":%ld,\"rss_kib\":",p->pid);number(f,p->rss);fputs(",\"hwm_kib\":",f);number(f,p->hwm);
-            fputs(",\"anon_kib\":",f);number(f,p->anon);fputs(",\"threads\":",f);number(f,p->threads);fputc('}',f);
+            fputs(",\"anon_kib\":",f);number(f,p->anon);fputs(",\"vm_data_kib\":",f);number(f,p->vm_data);
+            fputs(",\"vm_swap_kib\":",f);number(f,p->vm_swap);fputs(",\"threads\":",f);number(f,p->threads);fputc('}',f);
         }fputs("]}",f);
     }fputs("],\"memory_details\":[",f);
     for(size_t i=0;i<PROCESS_COUNT;i++){

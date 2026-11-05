@@ -415,6 +415,9 @@ static d2k_diag *diagnostics;
 static void diagnostic_event(void *ctx,const d2k_diag_event *e) {
     (void)ctx;d2k_diag_record(diagnostics,e);
 }
+static void diagnostic_limit(void *ctx,int64_t mono,const d2k_diag_counts *c) {
+    (void)ctx;d2k_diag_record_limit(diagnostics,mono,c);
+}
 static void diagnostic_tick(d2k_sched *s,int64_t now) {
     static int64_t checked=-1000,written=-60000;
     if(now>=checked && now-checked<1000)return;
@@ -424,12 +427,14 @@ static void diagnostic_tick(d2k_sched *s,int64_t now) {
         if(diagnostics) (void)d2k_diag_toggle(D2K_DIAG_DIR,0);
         d2k_diag_free(diagnostics);diagnostics=NULL;
         d2k_sched_diagnostics(s,NULL,NULL);
+        d2k_sched_limit_diagnostics(s,NULL,NULL);
         d2k_httpsearch_diagnostics(g_hs,NULL,NULL);
         return;
     }
     if(!diagnostics) {
         diagnostics=d2k_diag_new();if(!diagnostics)return;
         d2k_sched_diagnostics(s,diagnostic_event,NULL);
+        d2k_sched_limit_diagnostics(s,diagnostic_limit,NULL);
         d2k_httpsearch_diagnostics(g_hs,diagnostic_event,NULL);
         written=now-60000;
     }

@@ -4,6 +4,10 @@
 #include <assert.h>
 
 static unsigned synthetic_calls;
+typedef struct { unsigned calls; d2k_diag_counts last; int64_t last_ms; } limit_capture;
+static void capture_limit(void *ctx,int64_t now,const d2k_diag_counts *counts) {
+    limit_capture *capture=ctx;capture->calls++;capture->last=*counts;capture->last_ms=now;
+}
 static d2k_vres synthetic_tcp(const char *ip, uint16_t port,
     d2k_hello trigger, d2k_hello control, uint32_t mark, int repeats,
     uint32_t gap_us, uint32_t wait_ms, const volatile sig_atomic_t *stop) {
@@ -42,6 +46,34 @@ int main(void) {
     d2k_sched *sched = d2k_sched_new(&catalog, -1, 0);
     assert(sched);
     d2k_sched_tcp_hook = synthetic_tcp;
+    limit_capture limits={0};
+    d2k_sched_limit_diagnostics(sched,capture_limit,&limits);
+    sched->meas_limit=SCHED_MAX_TASKS;sched->limiter=MEAS_LIM_MEM;sched->now_ms=1000;
+    measure_limit_update(sched,0);
+    assert(limits.calls==1&&limits.last.measurement_limit==SCHED_DEFAULT_ACTIVE_MEASUREMENTS);
+    assert(limits.last_ms==1000&&!limits.last.resources_valid);
+    sched->limiter=MEAS_LIM_SLOTS;sched->now_ms=1010;measure_limit_update(sched,0);
+    assert(limits.calls==2&&limits.last_ms==1010);
+
+    /* Self-join is specified to fail with EDEADLK. Check that a failed join
+       is counted separately and leaves the thread handle/task intact. */
+    task *probe=&sched->tasks[0];
+    const task_job jobs[]={JOB_CLASSIFY,JOB_CLASSIFY,JOB_VERIFY};
+    const uint8_t transports[]={6,17,6};
+    const char *types[]={"TCP","QUIC","VERIFY"};
+    for(size_t i=0;i<3;i++) {
+        probe->th=pthread_self();probe->th_live=1;probe->worker_owner=sched;
+        probe->worker_started_ms=sched_mono_ms()-9000;probe->worker_executing=1;
+        probe->job=jobs[i];probe->transport=transports[i];probe->res_ready=0;
+        d2k_diag_counts failed_join;
+        d2k_sched_diagnostic_counts(sched,&failed_join);
+        assert(failed_join.workers_live==1&&failed_join.workers_running==1);
+        assert(failed_join.workers_result_pending==1&&failed_join.worker_oldest_age_ms>=9000);
+        assert(!strcmp(failed_join.worker_oldest_type,types[i]));
+        assert(join_worker(probe)!=0&&probe->th_live&&probe->worker_owner==sched);
+    }
+    probe->th_live=0;probe->worker_owner=NULL;probe->worker_executing=0;
+    probe->worker_started_ms=-1;probe->stop=0;
 
     long rss_before = proc_kib("VmRSS");
     long data_before = proc_kib("VmData");
@@ -66,9 +98,11 @@ int main(void) {
     d2k_diag_counts counts;
     d2k_sched_diagnostic_counts(sched, &counts);
     assert(counts.tasks == 0 && counts.task_states[T_FREE] == SCHED_MAX_TASKS);
-    assert(counts.workers_running == 0 && counts.workers_join_pending == 0);
+    assert(counts.workers_running == 0 && counts.workers_live == 0 &&
+           counts.workers_result_pending == 0 && counts.workers_join_pending == 0);
     assert(counts.workers_started == CYCLES && counts.workers_joined == CYCLES);
-    assert(counts.worker_start_failures == 0);
+    assert(counts.worker_start_failures == 0 && counts.worker_join_failures == 3);
+    assert(counts.last_measurement_age_ms >= 0);
     assert(synthetic_calls == CYCLES);
 
     long rss_after = proc_kib("VmRSS");
