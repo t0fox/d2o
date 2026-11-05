@@ -270,6 +270,7 @@
   }
   function render(report, enabled, range) {
     var doc = root.document, samples = list(report.samples), events = list(report.events), last = samples[samples.length - 1];
+    var httpLimits = report.http_storage_limits || {};
     var state = doc.getElementById("diagnostic-state"), data = doc.getElementById("diagnostic-data");
     state.textContent = enabled ? "Сбор включён" : "Сбор выключен";
     state.dataset.enabled = String(enabled);
@@ -299,10 +300,10 @@
     setText(doc, "diagnostic-snapshot-bytes", formatBytes(last && last.snapshot_bytes));
     setText(doc, "diagnostic-catalog-counts", last ? [last.boxes, last.bindings, last.plans].map(function (value) { return number(value) === null ? "—" : value; }).join(" / ") : "—");
     setText(doc, "diagnostic-http-bytes", formatBytes(last && last.http_bytes));
-    setText(doc, "diagnostic-http-records", last ? storageRow(last.http_records_bytes, last.http_records_limit_bytes) : "—");
-    setText(doc, "diagnostic-http-queue", last ? storageRow(last.http_queue_bytes, last.http_queue_limit_bytes) : "—");
-    setText(doc, "diagnostic-http-evidence", last ? storageRow(last.http_failure_bytes, last.http_failure_limit_bytes) +
-      (number(last.http_failure_record_limit_bytes) !== null ? " · до " + formatBytes(last.http_failure_record_limit_bytes) + " на сайт" : "") : "—");
+    setText(doc, "diagnostic-http-records", last ? storageRow(last.http_records_bytes, firstDefined([last.http_records_limit_bytes, httpLimits.records_bytes])) : "—");
+    setText(doc, "diagnostic-http-queue", last ? storageRow(last.http_queue_bytes, firstDefined([last.http_queue_limit_bytes, httpLimits.queue_bytes])) : "—");
+    setText(doc, "diagnostic-http-evidence", last ? storageRow(last.http_failure_bytes, firstDefined([last.http_failure_limit_bytes, httpLimits.failures_bytes])) +
+      (firstDefined([last.http_failure_record_limit_bytes, httpLimits.failure_record_bytes]) !== null ? " · до " + formatBytes(firstDefined([last.http_failure_record_limit_bytes, httpLimits.failure_record_bytes])) + " на сайт" : "") : "—");
     setText(doc, "diagnostic-http-overflows", last ? overflowText(last) : "—");
     renderAimd(doc, report, last);
     var chart = drawMemory(doc, report, range);

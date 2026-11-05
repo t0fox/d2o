@@ -84,10 +84,10 @@ function diagnosticFixture(kind='full'){
    snapshot_bytes:4096,catalog_bytes:32768,workers_running:3,workers_live:4,workers_result_pending:1,workers_join_pending:1,
    worker_oldest_age_ms:12500,worker_oldest_type:'TCP',workers_started:40,workers_joined:36,
    worker_start_failures:2,worker_join_failures:1,http_failures:7,http_bytes:16384,http_records_bytes:8192,
-   http_queue_bytes:2048,http_failure_bytes:4096,http_records_limit_bytes:262144,http_queue_limit_bytes:32768,
-   http_failure_limit_bytes:65536,http_failure_record_limit_bytes:8192,http_record_limit_hits:2,http_queue_limit_hits:3,
+   http_queue_bytes:2048,http_failure_bytes:4096,http_record_limit_hits:2,http_queue_limit_hits:3,
    http_failure_limit_hits:1,http_failure_record_limit_hits:4,measurement_limit:1,measurement_slots:1,
    limit_reason:['memory','conntrack'],grow_pending:false,processes:[{name:'d2kc',pid:123,rss_kib:42399,vm_data_kib:71439,anon_kib:23439,threads:5}]}],
+  http_storage_limits:{records_bytes:262144,queue_bytes:32768,failures_bytes:65536,failure_record_bytes:8192},
   memory_details:[{name:'d2kc',latest:{smaps_rollup_status:'ok',smaps_rollup:{rss_kib:42399,anonymous_kib:23439,private_dirty_kib:13439}}}]};
 }
 let ws,diagnosticsReply=null;

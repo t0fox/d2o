@@ -320,10 +320,17 @@ void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char 
 int d2k_diag_write(const d2k_diag *d,FILE *f) {
     if(!d||!f)return -1;
     fprintf(f,"{\"schema\":1,\"enabled\":true,\"controller_pid\":%ld,\"release\":",(long)getpid());js(f,D2K_RELEASE_ID);
-    fprintf(f,",\"ring_bytes\":%zu,\"event_capacity\":64,\"limit_transition_capacity\":32,\"sample_capacity\":120,\"sample_interval_ms\":60000,\"memory_history_capacity\":1440,\"memory_history_interval_ms\":60000,\"events_overwritten\":%llu,\"limit_transitions_overwritten\":%llu,\"samples_overwritten\":%llu,\"memory_history_overwritten\":%llu,\"events\":[",sizeof *d,
+    fprintf(f,",\"ring_bytes\":%zu,\"event_capacity\":64,\"limit_transition_capacity\":32,\"sample_capacity\":120,\"sample_interval_ms\":60000,\"memory_history_capacity\":1440,\"memory_history_interval_ms\":60000,\"events_overwritten\":%llu,\"limit_transitions_overwritten\":%llu,\"samples_overwritten\":%llu,\"memory_history_overwritten\":%llu",sizeof *d,
         (unsigned long long)(d->event_total-d->ne),(unsigned long long)(d->limit_total-d->nl),
         (unsigned long long)(d->sample_total-d->ns),
         (unsigned long long)(d->memory_total-d->nm));
+    if(d->ns) {
+        const d2k_diag_counts *c=&d->samples[(d->sample_total-1)%SAMPLES].counts;
+        fprintf(f,",\"http_storage_limits\":{\"records_bytes\":%llu,\"queue_bytes\":%llu,\"failures_bytes\":%llu,\"failure_record_bytes\":%llu}",
+            (unsigned long long)c->http_records_limit_bytes,(unsigned long long)c->http_queue_limit_bytes,
+            (unsigned long long)c->http_failure_limit_bytes,(unsigned long long)c->http_failure_record_limit_bytes);
+    }
+    fputs(",\"events\":[",f);
     for(size_t i=0;i<d->ne;i++) {
         const event *e=&d->events[(d->event_total-d->ne+i)%EVENTS];if(i)fputc(',',f);
         fprintf(f,"{\"id\":%llu,\"at\":%lld,\"family\":%u,\"trigger\":%u,\"elapsed_ms\":",
@@ -393,7 +400,6 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         number(f,c->last_measurement_age_ms);
         fprintf(f,",\"workers_started\":%llu,\"workers_joined\":%llu,\"worker_start_failures\":%llu,\"worker_join_failures\":%llu,"
                   "\"http_failures\":%llu,\"http_bytes\":%llu,\"http_records_bytes\":%llu,\"http_queue_bytes\":%llu,\"http_failure_bytes\":%llu,"
-                  "\"http_records_limit_bytes\":%llu,\"http_queue_limit_bytes\":%llu,\"http_failure_limit_bytes\":%llu,\"http_failure_record_limit_bytes\":%llu,"
                   "\"http_failure_limit_hits\":%llu,\"http_failure_record_limit_hits\":%llu,\"http_failure_alloc_failures\":%llu,"
                   "\"http_record_limit_hits\":%llu,\"http_record_alloc_failures\":%llu,\"http_queue_limit_hits\":%llu,\"http_queue_alloc_failures\":%llu,"
                   "\"measurement_limit\":%llu,\"measurement_slots\":%llu,"
@@ -402,9 +408,7 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
           (unsigned long long)c->worker_start_failures,(unsigned long long)c->worker_join_failures,
           (unsigned long long)c->http_failures,(unsigned long long)c->http_bytes,
           (unsigned long long)c->http_records_bytes,(unsigned long long)c->http_queue_bytes,
-          (unsigned long long)c->http_failure_bytes,(unsigned long long)c->http_records_limit_bytes,
-          (unsigned long long)c->http_queue_limit_bytes,(unsigned long long)c->http_failure_limit_bytes,
-          (unsigned long long)c->http_failure_record_limit_bytes,(unsigned long long)c->http_failure_limit_hits,
+          (unsigned long long)c->http_failure_bytes,(unsigned long long)c->http_failure_limit_hits,
           (unsigned long long)c->http_failure_record_limit_hits,(unsigned long long)c->http_failure_alloc_failures,
           (unsigned long long)c->http_record_limit_hits,(unsigned long long)c->http_record_alloc_failures,
           (unsigned long long)c->http_queue_limit_hits,(unsigned long long)c->http_queue_alloc_failures,

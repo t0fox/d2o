@@ -57,8 +57,7 @@ int main(void) {
         assert(strstr(buf,"\"worker_join_failures\":2"));
         assert(strstr(buf,"\"http_failure_limit_hits\":4"));
         assert(strstr(buf,"\"http_failure_bytes\":2048"));
-        assert(strstr(buf,"\"http_records_limit_bytes\":262144"));
-        assert(strstr(buf,"\"http_failure_record_limit_bytes\":8192"));
+        assert(strstr(buf,"\"http_storage_limits\":{\"records_bytes\":262144,\"queue_bytes\":32768,\"failures_bytes\":65536,\"failure_record_bytes\":8192}"));
         assert(strstr(buf,"\"task_states\":{\"free\":62"));
         assert(strstr(buf,"\"limit_reason\":[\"memory\",\"conntrack\"]"));
         assert(!strstr(buf,"\"id\":935,")); assert(strstr(buf,"\"id\":936,"));
