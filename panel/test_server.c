@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "server.h"
+#include "../runtime/d2k_diagnostics_files.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -782,7 +783,10 @@ static void test_diagnostic_history_controls_and_download(void) {
     snprintf(path,sizeof path,"%s/report.json",dir);FILE *f=fopen(path,"w");assert(f);fputs("{\"schema\":1,\"enabled\":true,\"samples\":[]}",f);fclose(f);
     request(&cfg,"GET /api/diagnostics?download HTTP/1.1\r\nHost: localhost\r\n\r\n",reply,sizeof reply);
     assert(strstr(reply,"200 OK"));assert(strstr(reply,"Content-Disposition: attachment"));assert(strstr(reply,"\"samples\":[]"));
-    assert(truncate(path,256*1024+1)==0);
+    assert(truncate(path,(off_t)D2K_DIAG_REPORT_MAX)==0);
+    request(&cfg,"GET /api/diagnostics?download HTTP/1.1\r\nHost: localhost\r\n\r\n",reply,sizeof reply);
+    assert(strstr(reply,"200 OK"));
+    assert(truncate(path,(off_t)D2K_DIAG_REPORT_MAX+1)==0);
     request(&cfg,"GET /api/diagnostics?download HTTP/1.1\r\nHost: localhost\r\n\r\n",reply,sizeof reply);assert(strstr(reply,"500 Internal Server Error"));
     request(&cfg,"POST /api/diagnostics?disable HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.invalid\r\nContent-Length: 0\r\n\r\n",reply,sizeof reply);assert(strstr(reply,"403 Forbidden"));
     snprintf(path,sizeof path,"%s/report.new",dir);f=fopen(path,"w");assert(f);fputs("partial",f);fclose(f);

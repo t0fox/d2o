@@ -1,8 +1,26 @@
 /* Repeated scheduler worker creation and task cleanup without network I/O. */
 #define _POSIX_C_SOURCE 200809L
+#include <errno.h>
+#include <pthread.h>
+static unsigned fail_next_join;
+static int test_pthread_join(pthread_t thread,void **retval);
+static int (*native_pthread_join)(pthread_t,void **)=pthread_join;
+#define pthread_join test_pthread_join
 #include "sched.c"
 #include <assert.h>
+#if defined(__has_feature)
+# if __has_feature(address_sanitizer)
+#  define D2K_TEST_WITH_ASAN 1
+# endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+# define D2K_TEST_WITH_ASAN 1
+#endif
 
+static int test_pthread_join(pthread_t thread,void **retval) {
+    if(fail_next_join) { fail_next_join=0;return EDEADLK; }
+    return native_pthread_join(thread,retval);
+}
 static unsigned synthetic_calls;
 typedef struct { unsigned calls; d2k_diag_counts last; int64_t last_ms; } limit_capture;
 static void capture_limit(void *ctx,int64_t now,const d2k_diag_counts *counts) {
@@ -55,14 +73,14 @@ int main(void) {
     sched->limiter=MEAS_LIM_SLOTS;sched->now_ms=1010;measure_limit_update(sched,0);
     assert(limits.calls==2&&limits.last_ms==1010);
 
-    /* Self-join is specified to fail with EDEADLK. Check that a failed join
-       is counted separately and leaves the thread handle/task intact. */
+    /* Simulate a pthread_join failure without passing a self/fake handle
+       through the ASan pthread interceptor. */
     task *probe=&sched->tasks[0];
     const task_job jobs[]={JOB_CLASSIFY,JOB_CLASSIFY,JOB_VERIFY};
     const uint8_t transports[]={6,17,6};
     const char *types[]={"TCP","QUIC","VERIFY"};
     for(size_t i=0;i<3;i++) {
-        probe->th=pthread_self();probe->th_live=1;probe->worker_owner=sched;
+        probe->th_live=1;probe->worker_owner=sched;
         probe->worker_started_ms=sched_mono_ms()-9000;probe->worker_executing=1;
         probe->job=jobs[i];probe->transport=transports[i];probe->res_ready=0;
         d2k_diag_counts failed_join;
@@ -70,8 +88,10 @@ int main(void) {
         assert(failed_join.workers_live==1&&failed_join.workers_running==1);
         assert(failed_join.workers_result_pending==1&&failed_join.worker_oldest_age_ms>=9000);
         assert(!strcmp(failed_join.worker_oldest_type,types[i]));
+        fail_next_join=1;
         assert(join_worker(probe)!=0&&probe->th_live&&probe->worker_owner==sched);
     }
+    assert(sched->workers_joined==0&&sched->worker_join_failures==3);
     probe->th_live=0;probe->worker_owner=NULL;probe->worker_executing=0;
     probe->worker_started_ms=-1;probe->stop=0;
 
@@ -110,10 +130,17 @@ int main(void) {
     printf("1500 mock TCP measurements: VmRSS %ld -> %ld -> %ld KiB, "
            "VmData %ld -> %ld -> %ld KiB (start/warm/end)\n",
            rss_before, rss_warm, rss_after, data_before, data_warm, data_after);
+#if !defined(D2K_TEST_WITH_ASAN)
     if (rss_warm >= 0 && rss_after >= 0)
         assert(rss_after <= rss_warm + MEMORY_GROWTH_LIMIT_KIB);
     if (data_warm >= 0 && data_after >= 0)
         assert(data_after <= data_warm + MEMORY_GROWTH_LIMIT_KIB);
+#else
+    /* ASan quarantines joined pthread stacks, so process RSS is allocator
+       retention rather than live worker ownership. Leak and memory-safety
+       instrumentation remains enabled for all 1500 cycles. */
+    puts("ASan active: RSS delta omitted because joined thread stacks are quarantined");
+#endif
 
     d2k_sched_free(sched);
     d2k_catalog_free(&catalog);
