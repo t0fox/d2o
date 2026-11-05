@@ -118,10 +118,10 @@ assert.equal(ui.plural(3, 'поиск', 'поиска', 'поисков'), 'по
 assert.equal(ui.plural(11, 'поиск', 'поиска', 'поисков'), 'поисков');
 assert.equal(ui.plural(22, 'поиск', 'поиска', 'поисков'), 'поиска');
 assert.equal(ui.duration(3725000), '1 ч 2 мин');
-assert.equal(ui.telegramRouteName(1), 'прямой WSS');
-assert.equal(ui.telegramRouteName(2), 'Worker Cloudflare');
-assert.equal(ui.telegramRouteName(3), 'CF proxy');
-assert.equal(ui.telegramRouteName(4), 'прямой TCP');
+assert.equal(ui.telegramRouteName(1), 'Прямой WSS');
+assert.equal(ui.telegramRouteName(2), 'Cloudflare Worker');
+assert.equal(ui.telegramRouteName(3), 'Прокси Cloudflare');
+assert.equal(ui.telegramRouteName(4), 'Прямой TCP (диагностика)');
 assert.equal(ui.telegramFailureStage(5), 'MTProto');
 
 // Предел замеров — живой, от 1 до десятков: клетки до 16, дальше шкала; подпись честно говорит, откуда предел.

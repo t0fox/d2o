@@ -1306,7 +1306,7 @@ static int start_next_route(proxy_connection *connection) {
         clear_route_attempt(connection, 1);
     }
     if (!connection->route_failure_recorded)
-        route_failure_record(connection, TG_ROUTE_DIRECT_WSS,
+        route_failure_record(connection, TG_ROUTE_NONE,
                              TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE);
     return -1;
 }
@@ -1688,7 +1688,7 @@ static int route_after_handshake(proxy_connection *connection) {
                             &connection->route_plan) != 0)
         return -1;
     if (!connection->route_plan.count) {
-        route_failure_record(connection, TG_ROUTE_DIRECT_WSS,
+        route_failure_record(connection, TG_ROUTE_NONE,
                              TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE);
         return -1;
     }

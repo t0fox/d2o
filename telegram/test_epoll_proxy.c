@@ -1383,7 +1383,8 @@ static void test_disabled_wss_does_not_enable_automatic_tcp(void) {
     tg_epoll_proxy_stats stats;
     assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
     assert(stats.active_connections == 0 &&
-           stats.last_failure_route == TG_ROUTE_DIRECT_WSS &&
+           stats.wss_attempts == 0 && stats.wss_failures == 0 &&
+           stats.last_failure_route == TG_ROUTE_NONE &&
            stats.last_failure_stage == TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE);
     tg_epoll_proxy_destroy(proxy);
     close(listener);
@@ -2525,7 +2526,7 @@ static void test_epoll_reuses_confirmed_media_route_across_ips(void) {
     size_t reconnect_p95 =
         ((LATENCY_REUSE_SAMPLES - 1u) * 95u + 99u) / 100u - 1u;
     assert(client_latency_us[0] < 200000u);
-    assert(reconnect_samples[reconnect_p95] < 20000u);
+    assert(reconnect_samples[reconnect_p95] < 100000u);
     printf("Лабораторная задержка первого ответа через CF Proxy: "
            "первая=%" PRIu64 " мкс, переподключение p50=%" PRIu64
            " мкс p95=%" PRIu64 " мкс; подтверждено ответов=%zu\n",

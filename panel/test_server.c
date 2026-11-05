@@ -309,6 +309,10 @@ static void test_telegram_stats_socket_is_normalized_for_status_api(void) {
                   "\"last_success_latency_ms\":126,\"last_success_age_ms\":500,"
                   "\"last_failure_dc\":3,\"last_failure_route\":2,"
                   "\"last_failure_stage\":4,\"last_failure_age_ms\":9000,") != NULL);
+    (void)request(&cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                  response, sizeof response);
+    assert(strstr(response, "\"telegram_stats\":null") != NULL &&
+           "недоступный stats socket не выдаёт нулевые метрики");
     unlink(socket_path);
     unlink(live);
     unlink(status);

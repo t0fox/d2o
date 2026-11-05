@@ -8,6 +8,7 @@
                            2u * TG_CF_POOL_MAX + 1u)
 
 typedef enum {
+    TG_ROUTE_NONE = 0,
     TG_ROUTE_DIRECT_WSS = 1,
     TG_ROUTE_CF_WORKER = 2,
     TG_ROUTE_CF_PROXY = 3,

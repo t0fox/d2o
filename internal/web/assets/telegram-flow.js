@@ -158,13 +158,15 @@ function routeDescription(transport, lane) {
   return ROUTES[lane]?.label || "WSS-транспорт не определён";
 }
 
+function metricNumber(snapshot, key) {
+  const value = snapshot?.[key];
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 function latestRouteFailure(snapshot) {
-  const stage = Number(snapshot?.last_failure_stage) || 0;
-  const successDc = Number(snapshot?.last_success_dc) || 0;
-  const failureAge = Number(snapshot?.last_failure_age_ms);
-  const successAge = Number(snapshot?.last_success_age_ms);
-  if (!stage || !Number.isFinite(failureAge) ||
-      (successDc && Number.isFinite(successAge) && failureAge > successAge)) return null;
+  const stage = metricNumber(snapshot, "last_failure_stage");
+  const failureAge = metricNumber(snapshot, "last_failure_age_ms");
+  if (!stage || failureAge === null) return null;
   const routes = {
     1: [0, "Прямой WSS"],
     2: [1, "Cloudflare Worker"],
@@ -178,19 +180,27 @@ function latestRouteFailure(snapshot) {
     4: "WebSocket",
     5: "MTProto",
     6: "Настройка маршрута",
-    7: "WSS-маршрут недоступен",
+    7: "Настройка маршрута",
   };
-  const route = routes[Number(snapshot?.last_failure_route)] || [-1, "WSS-маршрут"];
-  const dc = Number(snapshot?.last_failure_dc) || 0;
+  const routeNumber = metricNumber(snapshot, "last_failure_route");
+  const route = routeNumber === 0 || stage === 7 ? [-1, "Маршрут не выбран"]
+    : routes[routeNumber] || [-1, "Маршрут не определён"];
+  const dcNumber = telegramDcNumber(snapshot?.last_failure_dc);
+  const successDc = telegramDcNumber(snapshot?.last_success_dc);
+  const successAge = metricNumber(snapshot, "last_success_age_ms");
+  const cooldown = metricNumber(snapshot, "route_cooldown_ms");
+  const superseded = successDc !== null && successAge !== null && successAge < failureAge;
   return {
     lane: route[0], route: route[1], stage: stages[stage] || "Ошибка соединения",
-    dc: dc ? `DC${dc}` : "DC неизвестен",
+    dc: dcNumber !== null ? `DC${dcNumber}` : "DC неизвестен",
+    ageMs: failureAge,
+    current: !superseded && cooldown !== null && cooldown > 0 && failureAge <= cooldown,
   };
 }
 
 function hasCurrentRouteFailure(snapshot) {
-  return Math.max(0, Number(snapshot?.active_connections) || 0) === 0
-    && latestRouteFailure(snapshot) !== null;
+  return metricNumber(snapshot, "active_connections") === 0
+    && latestRouteFailure(snapshot)?.current === true;
 }
 
 function selectedLaneFor(session) {
@@ -261,60 +271,80 @@ function laneStatesForSession(session) {
 function summarize(snapshot, error) {
   if (error === "stale" && snapshot) {
     const current = summarize(snapshot);
-    return { ...current, state: "stale", caption: `Данные маршрутов устарели · ${current.caption}` };
+    return { ...current, state: "stale", statusLabel: "Данные API устарели",
+      caption: `Данные маршрутов устарели · ${current.caption}` };
   }
   if (error || !snapshot) {
     return {
-      state: "unavailable", caption: "Статистика маршрутов недоступна", transportLabel: "Недоступно",
+      state: "unavailable", statusLabel: "Статистика маршрутов недоступна",
+      caption: "Статистика маршрутов недоступна", transportLabel: "Недоступно",
       dcLabel: "DC неизвестен", lanes: ROUTES.map(route => ({ ...route, status: "idle", counts: {} })),
-      sessions: [], truncated: false, hedged: [], activeConnections: 0,
-      acceptedConnections: 0, mediaSessions: 0, cooldowns: [], cooldownDurationMs: 0,
-      dcActivity: telegramDcActivity([]),
+      sessions: [], truncated: false, hedged: [], activeConnections: null,
+      acceptedConnections: null, mediaSessions: null, confirmedSessions: null,
+      hasConfirmedResponse: false, latestFailure: null, cooldowns: [], cooldownDurationMs: null,
+      dcActivity: [],
     };
   }
 
-  const activeConnections = Math.max(0, Number(snapshot?.active_connections) || 0);
+  const activeConnections = metricNumber(snapshot, "active_connections");
+  const acceptedConnections = metricNumber(snapshot, "accepted_connections");
+  const latestFailure = latestRouteFailure(snapshot);
+  const cooldownDurationMs = metricNumber(snapshot, "route_cooldown_ms");
+  if (activeConnections === null || !Array.isArray(snapshot.active_sessions)) {
+    return {
+      state: "unavailable", statusLabel: "Статистика маршрутов неполная",
+      caption: "Статистика маршрутов неполная", transportLabel: "Недоступно",
+      dcLabel: "DC неизвестен", lanes: ROUTES.map(route => ({ ...route, status: "idle", counts: {} })),
+      sessions: [], truncated: Boolean(snapshot.route_sessions_truncated), hedged: [],
+      activeConnections, acceptedConnections, mediaSessions: null, confirmedSessions: null,
+      hasConfirmedResponse: false, latestFailure, cooldowns: [], cooldownDurationMs,
+      dcActivity: [],
+    };
+  }
   const sessions = Array.isArray(snapshot?.active_sessions) ? snapshot.active_sessions.slice(0, 64) : [];
   const cooldowns = normalizeCooldowns(snapshot);
-  const cooldownDurationMs = Math.max(0, Number(snapshot?.route_cooldown_ms) || 0);
   const emptyLanes = ROUTES.map(route => ({ ...route, status: "idle", counts: {} }));
   if (activeConnections === 0) {
-    const failure = latestRouteFailure(snapshot);
     const lanes = applyCooldowns(emptyLanes, cooldowns);
-    if (failure) {
-      if (failure.lane >= 0) {
-        lanes[failure.lane].status = "failed";
-        lanes[failure.lane].counts.failed = (lanes[failure.lane].counts.failed || 0) + 1;
-        lanes[failure.lane].failureStage = Number(snapshot?.last_failure_stage) || 0;
-        lanes[failure.lane].failureAgeMs = Number(snapshot?.last_failure_age_ms) || 0;
+    if (latestFailure?.current && !cooldowns.length) {
+      if (latestFailure.lane >= 0) {
+        lanes[latestFailure.lane].status = "failed";
+        lanes[latestFailure.lane].counts.failed = 1;
+        lanes[latestFailure.lane].failureStage = Number(snapshot?.last_failure_stage) || 0;
+        lanes[latestFailure.lane].failureAgeMs = latestFailure.ageMs;
       }
       return {
-        state: "unavailable",
-        caption: `Последняя ошибка: ${failure.stage} · ${failure.dc} · ${failure.route}`,
-        transportLabel: "Недоступно", dcLabel: failure.dc, lanes, sessions: [],
+        state: "unavailable", statusLabel: "Последняя попытка завершилась ошибкой",
+        caption: `Последняя ошибка: ${latestFailure.stage} · ${latestFailure.dc} · ${latestFailure.route}`,
+        transportLabel: "Недоступно", dcLabel: latestFailure.dc, lanes, sessions: [],
         truncated: Boolean(snapshot?.route_sessions_truncated), hedged: [], activeConnections,
-        acceptedConnections: Number(snapshot?.accepted_connections) || 0, mediaSessions: 0,
+        acceptedConnections, mediaSessions: 0, confirmedSessions: 0,
+        hasConfirmedResponse: false, latestFailure,
         cooldowns, cooldownDurationMs, dcActivity: telegramDcActivity([]),
       };
     }
     return {
       state: cooldowns.length ? "cooling" : "idle",
+      statusLabel: cooldowns.length ? "Маршрут на паузе (cooldown)" : "Нет активных сессий",
       caption: cooldowns.length ? "Нет активных сессий · часть маршрутов на паузе" : "Нет активных соединений",
       transportLabel: cooldowns.length ? "Маршруты на паузе" : "Нет подключений",
       dcLabel: "DC неизвестен", lanes, sessions: [],
       truncated: Boolean(snapshot?.route_sessions_truncated), hedged: [], activeConnections,
-      acceptedConnections: Number(snapshot?.accepted_connections) || 0, mediaSessions: 0,
+      acceptedConnections, mediaSessions: 0, confirmedSessions: 0,
+      hasConfirmedResponse: false, latestFailure,
       cooldowns, cooldownDurationMs, dcActivity: telegramDcActivity([]),
     };
   }
-  if (!Array.isArray(snapshot?.active_sessions) || !sessions.length) {
+  if (!sessions.length) {
     applyCooldowns(emptyLanes, cooldowns);
     return {
-      state: "unavailable", caption: "Активные соединения есть, маршрут пока не определён", transportLabel: "Определяется",
+      state: "searching", statusLabel: "Соединение устанавливается",
+      caption: "Активные соединения есть, маршрут пока не определён", transportLabel: "Определяется",
       dcLabel: "DC неизвестен", lanes: emptyLanes, sessions: [],
       truncated: Boolean(snapshot?.route_sessions_truncated), hedged: [], activeConnections,
-      acceptedConnections: Number(snapshot?.accepted_connections) || 0, mediaSessions: 0,
-      cooldowns, cooldownDurationMs, dcActivity: telegramDcActivity([]),
+      acceptedConnections, mediaSessions: null, confirmedSessions: null,
+      hasConfirmedResponse: false, latestFailure,
+      cooldowns, cooldownDurationMs, dcActivity: [],
     };
   }
 
@@ -389,9 +419,15 @@ function summarize(snapshot, error) {
   const anySelected = selectedLanes.length > 0;
   const allFailed = !anySelected && !anyConnecting && failedLanes.length > 0
     && lanes.every(lane => ["idle", "failed", "cooldown", "cancelled", "skipped"].includes(lane.status));
+  const confirmedSessions = sessions.filter(session => session.telegram_response_seen === true).length;
+  const hasConfirmedResponse = confirmedSessions > 0;
   const state = anySelected ? (mixedRoutes ? "mixed" : "active")
     : anyConnecting ? (sessionViews.some(view => view.connecting) ? "race" : "searching")
       : allFailed ? "unavailable" : "searching";
+  const statusLabel = hasConfirmedResponse ? "Ответ Telegram подтверждён"
+    : anyConnecting ? "Соединение устанавливается"
+      : anySelected ? "Маршрут выбран · ожидается ответ Telegram"
+        : allFailed ? "Последняя попытка завершилась ошибкой" : "Соединение устанавливается";
   const caption = hedged.length
     ? `Параллельная гонка: победил ${hedged[0].winner}, остальные попытки отменены · ${dcLabel}`
     : mixedRoutes ? `Сессии используют разные маршруты · ${dcLabel}`
@@ -403,10 +439,10 @@ function summarize(snapshot, error) {
               : `Маршрут определяется · ${dcLabel}`;
 
   return {
-    state, caption, transportLabel, dcLabel, lanes, sessions,
+    state, statusLabel, caption, transportLabel, dcLabel, lanes, sessions,
     truncated: Boolean(snapshot.route_sessions_truncated), hedged, activeConnections,
-    acceptedConnections: Number(snapshot.accepted_connections) || 0, mediaSessions,
-    cooldowns, cooldownDurationMs, dcActivity: telegramDcActivity(sessions),
+    acceptedConnections, confirmedSessions, hasConfirmedResponse, latestFailure,
+    mediaSessions, cooldowns, cooldownDurationMs, dcActivity: telegramDcActivity(sessions),
   };
 }
 

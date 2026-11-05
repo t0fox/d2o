@@ -20,6 +20,7 @@ const session = (values = {}) => ({
 const snapshot = (values = {}) => ({
   active_connections: 0,
   accepted_connections: 0,
+  route_cooldown_ms: 30000,
   active_sessions: [],
   route_sessions_truncated: false,
   ...values,
@@ -246,8 +247,83 @@ assert.deepEqual(flow.prototypeGeometry, {
 
 {
   const view = flow.summarizeTelegramFlow(snapshot({ active_connections: 1 }));
-  assert.equal(view.state, "unavailable");
+  assert.equal(view.state, "searching");
+  assert.equal(view.statusLabel, "Соединение устанавливается");
   assert.match(view.caption, /маршрут пока не определён/);
+}
+
+{
+  const oldFailure = snapshot({
+    route_cooldown_ms: 30000,
+    last_failure_dc: 4, last_failure_route: 3, last_failure_stage: 3,
+    last_failure_age_ms: 120000,
+    last_success_dc: 0, last_success_age_ms: 0,
+  });
+  const view = flow.summarizeTelegramFlow(oldFailure);
+  assert.equal(flow.hasCurrentRouteFailure(oldFailure), false,
+    "ошибка старше cooldown остаётся историей без нового успеха");
+  assert.equal(view.state, "idle", "старая ошибка не заменяет текущий статус простоя");
+  assert.match(view.statusLabel, /Нет активных сессий/);
+  assert.equal(view.latestFailure.ageMs, 120000,
+    "историческое предупреждение сохраняет возраст");
+  assert.equal(view.latestFailure.stage, "TLS");
+}
+
+{
+  const noRoute = snapshot({
+    route_cooldown_ms: 30000,
+    last_failure_dc: 0, last_failure_route: 0, last_failure_stage: 7,
+    last_failure_age_ms: 100,
+    last_success_dc: 0, last_success_age_ms: 0,
+  });
+  const view = flow.summarizeTelegramFlow(noRoute);
+  assert.equal(view.state, "unavailable");
+  assert.equal(view.latestFailure.route, "Маршрут не выбран");
+  assert.equal(view.latestFailure.stage, "Настройка маршрута");
+  assert.equal(view.latestFailure.dc, "DC неизвестен");
+  assert.equal(view.latestFailure.lane, -1);
+  assert.equal(view.lanes.every(lane => lane.status === "idle"), true,
+    "нет плана — ни одна WSS-линия не помечается отказавшей");
+  assert.doesNotMatch(view.caption, /Прямой WSS|WSS-маршрут/);
+}
+
+{
+  const legacyNoPlan = snapshot({ last_failure_route: 1, last_failure_stage: 7,
+    last_failure_age_ms: 100, last_success_age_ms: 10000 });
+  const view = flow.summarizeTelegramFlow(legacyNoPlan);
+  assert.equal(view.state, "unavailable");
+  assert.equal(view.latestFailure.lane, -1,
+    "legacy route-unavailable snapshots do not invent a direct WSS attempt");
+  assert.match(view.caption, /Маршрут не выбран/);
+  assert.doesNotMatch(view.caption, /Прямой WSS/);
+}
+
+{
+  const connecting = snapshot({
+    active_connections: 1,
+    active_sessions: [session({ selected_transport: "cloudflare_worker",
+      direct_state: "selected", direct_transport: "cloudflare_worker",
+      stage: "upstream_ready" })],
+  });
+  const pending = flow.summarizeTelegramFlow(connecting);
+  assert.equal(pending.hasConfirmedResponse, false);
+  assert.match(pending.statusLabel, /ожидается ответ Telegram/,
+    "выбранный upstream без ответа ещё не считается подтверждённым");
+  const confirmed = flow.summarizeTelegramFlow(snapshot({
+    active_connections: 1,
+    active_sessions: [session({ selected_transport: "cloudflare_worker",
+      direct_state: "selected", direct_transport: "cloudflare_worker",
+      stage: "first_wss_binary_response", telegram_response_seen: true })],
+  }));
+  assert.equal(confirmed.hasConfirmedResponse, true);
+  assert.match(confirmed.statusLabel, /Ответ Telegram подтверждён/);
+}
+
+{
+  const unavailable = flow.summarizeTelegramFlow(null);
+  assert.equal(unavailable.activeConnections, null,
+    "отсутствующая статистика не превращается в ноль сессий");
+  assert.equal(unavailable.acceptedConnections, null);
 }
 
 assert.deepEqual(flow.motionProfile, {

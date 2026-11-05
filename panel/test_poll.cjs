@@ -6,6 +6,7 @@ const vm = require('node:vm');
 
 async function main() {
   let visibility, calls = 0, aborted = 0, updateCalls = 0;
+  const statusUrls = [];
   const intervals = [], timers = new Map(); let next = 0;
   const stub = () => ({
     get ownerDocument() { return document; },
@@ -26,7 +27,7 @@ async function main() {
     setInterval(fn, ms) { intervals.push({ fn, ms }); },
     fetch(url, options) {
       if (url.startsWith("/api/update")) { updateCalls++; return Promise.resolve({ ok:true, status:200, json:async()=>({state:"unchecked"}) }); }
-      calls++;
+      statusUrls.push(url); calls++;
       return new Promise((resolve, reject) => {
         options.signal.addEventListener('abort', () => { aborted++; reject(new Error('aborted')); });
       });
@@ -56,6 +57,8 @@ async function main() {
   visibility();
   assert.equal(calls, 2, 'после возврата на панель опрос сразу возобновляется');
   assert.equal(updateCalls, 2, 'после возврата панель сразу проверяет обновления');
+  assert.deepEqual(statusUrls.map(url => new URL(url, 'http://panel').pathname),
+    ['/api/status', '/api/status'], 'Telegram-метрики обновляются тем же /api/status без второго цикла');
   console.log('опрос панели: параллельные запросы, срок ожидания и видимость проверены');
 }
 main().catch(e => { console.error(e); process.exitCode = 1; });

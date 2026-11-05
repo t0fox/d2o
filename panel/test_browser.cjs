@@ -14,7 +14,7 @@ chrome.on('error',e=>{chromeError+=e.message;});
 chrome.stderr.on('data',data=>{chromeError=(chromeError+data.toString()).slice(-4000);});
 const now=Date.now(),iso=s=>new Date(now-s*1000).toISOString();
 const fixture={telegramStats:{
- active_connections:4,process_started_at:100,accepted_connections:77,max_connections:256,
+ active_connections:4,process_started_at:Math.floor(now/1000)-3600,accepted_connections:77,max_connections:256,
  connections_started:77,bytes_from_clients:1200,bytes_from_upstreams:980,wss_attempts:12,
  wss_failures:2,wss_responses:5,cf_wss_responses:1,last_success_dc:2,last_success_route:1,
  last_success_latency_ms:42,last_success_age_ms:100,last_failure_dc:4,last_failure_route:3,
@@ -185,10 +185,11 @@ async function main(){
   }
   async function checkLayout(){
   // Раскладка на ширинах содержимого.
-  for(const [name,width,height] of [['narrow',320,740],['phone',390,844],['compact-boundary',640,1020],['overlap-regression',649,1020],['small-tablet',650,1020],['chrome-report',678,1020],['mid-tablet',700,1020],['tablet',768,1024],['tablet-boundary',820,1020],['full-label-boundary',821,1020],['status-regression',854,1020],['large-tablet',971,1020],['nav-boundary',1080,1020],['laptop',1280,800],['wide',1920,1080]]){
+  for(const [name,width,height] of [['narrow',320,740],['phone-360',360,800],['phone',390,844],['compact-boundary',640,1020],['overlap-regression',649,1020],['small-tablet',650,1020],['chrome-report',678,1020],['mid-tablet',700,1020],['tablet',768,1024],['tablet-boundary',820,1020],['full-label-boundary',821,1020],['status-regression',854,1020],['large-tablet',971,1020],['nav-boundary',1080,1020],['laptop',1280,800],['wide',1920,1080]]){
    if(process.env.D2K_BASELINE_OVERLAP==='1'&&width!==649)continue;
    await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width<600});
    await evaluate('scrollTo(0,0)');await wait(120);
+   const mapDefaultOpen=await evaluate('(()=>{const m=document.querySelector(".tg-flow-map"),open=m.open;m.open=true;return open})()');
    const state=await evaluate(`(()=>{
     const buttons=[...document.querySelectorAll("#engine-actions [data-control]")];
     const brand=[...document.querySelectorAll(".mast-id .mark, .mast-id .wordmark")].map(x=>x.getBoundingClientRect());
@@ -202,8 +203,10 @@ async function main(){
    })()`);
    console.log('layout',name,JSON.stringify(state));
    if(state.overflow)console.log('overflow by',await evaluate('[...document.body.querySelectorAll("*")].filter(x=>{const r=x.getBoundingClientRect();return r.width&&r.right>innerWidth+1}).map(x=>x.tagName+"."+(x.getAttribute("class")||"")+" right="+Math.round(x.getBoundingClientRect().right)+" style="+(x.getAttribute("style")||"")).slice(0,8)'));
-   if(out){const s=await call('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(out,'panel-'+name+'.png'),Buffer.from(s.data,'base64'))}
    assert.equal(state.overflow,false,name+' horizontal overflow');
+   assert.equal(mapDefaultOpen,width>640,name+' full route map disclosure matches the viewport');
+   assert.equal(await evaluate('(()=>{const e=document.querySelector(".tg-flow");return e.scrollWidth<=e.clientWidth})()'),true,
+    name+' Telegram card fits its viewport');
    const sourceRatio=state.telegramCanvas&&state.telegramCanvas.width<420?420/900:900/420;
    assert(state.telegramCanvas&&Math.abs(state.telegramCanvas.ratio-sourceRatio)<0.02,
     name+' Telegram diagram keeps the undistorted mobile or desktop composition');
@@ -217,6 +220,8 @@ async function main(){
     assert(labels.title&&labels.state&&Math.abs(labels.title.y-labels.state.y)>=10,
      'название мобильного маршрута и его состояние стоят в разных строках');
    }
+   await evaluate('document.querySelector(".tg-flow-map").open='+String(mapDefaultOpen));
+   if(out){const s=await call('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(out,'panel-'+name+'.png'),Buffer.from(s.data,'base64'))}
    assert.deepEqual(state.bad,[],name+' engine controls must be visible 44px targets in the masthead');
    assert.deepEqual(state.overlaps,[],name+' controls must not overlap the brand, engine status or one another');
    await evaluate('scrollTo(0,400)');await wait(120);
@@ -251,6 +256,16 @@ async function main(){
   await until('document.querySelector("#telegram-body").dataset.state==="connected"','C11 connected status renders in Telegram panel');
   assert.equal(await evaluate('document.querySelector("#telegram-body").dataset.state'),'connected');
   assert.equal(await evaluate('!!document.querySelector("#telegram-body .tg-flow-canvas")'),true,'C11 route canvas is present');
+  assert.equal(await evaluate('document.querySelector("[data-tg-state-title]").textContent'),'Ответ Telegram подтверждён');
+  assert.match(await evaluate('document.querySelector("[data-tg-last-success]").textContent'),/DC2 · Прямой WSS/);
+  assert.match(await evaluate('document.querySelector("[data-tg-last-warning]").textContent'),/WebSocket · DC4 · Прокси Cloudflare/);
+  assert.equal(await evaluate('document.querySelectorAll("[data-tg-routes] li").length'),4,
+   'the compact route summary keeps all configured route states visible');
+  assert.equal(await evaluate('document.querySelectorAll("[data-tg-dcs] li").length'),6,
+   'the compact DC summary includes five DCs and the unknown session');
+  assert.equal(await evaluate('document.querySelector(".tg-flow-map").open'),true,'desktop keeps the full route map open');
+  assert.equal(await evaluate('document.querySelector(".tg-flow-metrics").compareDocumentPosition(document.querySelector(".tg-route-diagnostics"))&Node.DOCUMENT_POSITION_FOLLOWING ? true : false'),true,
+   'metrics follow the status rows before the route and DC summary');
 
   // Telegram: маршруты, DC, media и состояния совпадают со снимком C11.
   await evaluate('document.querySelector("#telegram").scrollIntoView({block:"center"})');
@@ -273,8 +288,18 @@ async function main(){
   assert.equal(await evaluate('document.querySelector("[data-tg-accepted-count]").textContent'),'77');
   assert.equal(await evaluate('document.querySelector("[data-tg-confirmed-count]").textContent'),'5');
   assert.equal(await evaluate('document.querySelector("[data-tg-active-count]").textContent'),'4');
+  assert.match(await evaluate('document.querySelector("[data-tg-process-start]").textContent'),/Процесс с/);
   assert.equal(await evaluate('document.querySelector("[data-tg-latency]").textContent'),'43 / 187 мс',
     'C11 microseconds are shown as milliseconds');
+  panel.telegramStats({...fixture.telegramStats,client_response_latency_samples:0,
+   client_response_latency_p50_us:0,client_response_latency_p95_us:0});
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("[data-tg-latency]").textContent==="—"',
+    'latency without samples is unavailable, not zero');
+  panel.telegramStats(fixture.telegramStats);
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("[data-tg-latency]").textContent==="43 / 187 мс"',
+    'latency returns when samples are available');
   assert.equal(await evaluate('document.querySelector("[data-tg-wss]").textContent'),'2 / 12');
   assert.equal(await evaluate('document.querySelector("[data-tg-traffic]").textContent'),'1,2 КБ / 980 Б');
   assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Клиент → d2o.*Ответ Telegram подтверждён/);
@@ -285,6 +310,15 @@ async function main(){
   assert.doesNotMatch(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/d2ktg C11/);
   assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Прямой TCP passthrough/);
   assert.equal(await evaluate('window.tgFlowCanvas===document.querySelector("#telegram-body .tg-flow-canvas")'),true,'route canvas is mounted once');
+  await evaluate('document.querySelector("[data-control=telegram-workers]").focus()');
+  panel.telegramStats({...fixture.telegramStats,accepted_connections:78,connections_started:78});
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("[data-tg-accepted-count]").textContent==="78"','Telegram metrics refresh from the existing status poll');
+  assert.equal(await evaluate('document.activeElement.getAttribute("data-control")'),'telegram-workers',
+   'a stats refresh keeps focus on the same Telegram action');
+  panel.telegramStats(fixture.telegramStats);
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("[data-tg-accepted-count]").textContent==="77"','original Telegram metrics return');
   await wait(700);
   await tunnelShot('1-connected');
   if(shots){
@@ -361,12 +395,40 @@ async function main(){
   await wait(50);
   assert.equal(await evaluate('window.__tgIncomingPathDraws'),0,'при нуле активных соединений схема не рисует линию клиент → d2o');
   await evaluate('CanvasRenderingContext2D.prototype.moveTo=window.__tgOriginalMoveTo;delete window.__tgOriginalMoveTo');
-  assert.equal(await evaluate('document.querySelector("[data-tg-state-title]").textContent'),'Локальный прокси');
+  assert.equal(await evaluate('document.querySelector("[data-tg-state-title]").textContent'),'Последняя попытка завершилась ошибкой');
   assert.equal(await evaluate('document.querySelector("[data-tg-state-lamp]").dataset.tone'),'bad');
   assert.match(await evaluate('document.querySelector("#tg-flow-caption").textContent'),/Последняя ошибка: WebSocket · DC4 · Прокси Cloudflare/);
   assert.match(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Прокси Cloudflare — отказ: 1/);
   assert.doesNotMatch(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label")'),/Прямой WSS|Cloudflare Worker|Резервный TCP/,
     'failure view names only the route that actually failed');
+
+  panel.telegram('connecting');
+  panel.telegramStats({...fixture.telegramStats,active_connections:0,active_sessions:[],route_cooldowns:[],
+   last_failure_age_ms:100,last_success_age_ms:10000});
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("#telegram-body").dataset.state==="unavailable"',
+   'a recent route failure stays visible while the service status is connecting');
+  assert.equal(await evaluate('document.querySelector("[data-tg-state-lamp]").dataset.tone'),'bad');
+
+  // Сбой выбора маршрута не приписывает отказ прямому WSS и старый сбой остаётся историей.
+  panel.telegram('local');
+  panel.telegramStats({...fixture.telegramStats,active_connections:0,active_sessions:[],route_cooldowns:[],
+   last_failure_route:0,last_failure_stage:7,last_failure_dc:0,last_failure_age_ms:100,
+   last_success_age_ms:10000});
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("[data-tg-state-title]").textContent==="Последняя попытка завершилась ошибкой"',
+   'an unavailable route plan is reported as setup failure');
+  assert.match(await evaluate('document.querySelector("[data-tg-last-warning]").textContent'),/настройка маршрута.*DC неизвестен.*Маршрут не выбран/i);
+  assert.equal(await evaluate('[...document.querySelectorAll("[data-tg-routes] li")].some(x=>/Прямой WSS.*Отказ/.test(x.textContent))'),false,
+   'an empty route plan does not invent a direct WSS attempt');
+  panel.telegramStats({...fixture.telegramStats,active_connections:0,active_sessions:[],route_cooldowns:[],
+   last_failure_route:0,last_failure_stage:7,last_failure_dc:0,last_failure_age_ms:120000,
+   last_success_age_ms:10000});
+  await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
+  await until('document.querySelector("#telegram-body").dataset.state==="idle"','an old route failure expires from current status');
+  assert.equal(await evaluate('document.querySelector("[data-tg-state-title]").textContent'),'Нет активных сессий');
+  assert.match(await evaluate('document.querySelector("[data-tg-last-warning]").textContent'),/2 мин 0 с назад/,
+   'expired failures remain visible with their age as history');
   panel.telegram('connected');
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
   await until('document.querySelector("#telegram-body").dataset.state==="connected"','new confirmed C11 snapshot restores connected state');
@@ -490,6 +552,8 @@ async function main(){
   await call('Network.setBlockedURLs',{urls:[panel.url+'api/status']});
   await wait(11500);
   assert.equal(await evaluate('document.body.dataset.stale'),'true','lost API must mark the snapshot stale');
+  assert.equal(await evaluate('document.querySelector("[data-tg-state-title]").textContent'),'Данные API устарели',
+   'stale API status is visible beside the route summary');
   assert.match(await evaluate('document.querySelector("#notice").textContent'),/Нет ответа от панели/);
   await call('Network.setBlockedURLs',{urls:[]});
   await until('document.body.dataset.stale==="false"','recovered API must clear the stale mark');
