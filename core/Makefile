@@ -1281,7 +1281,7 @@ TESTS += test_http_live
 check: test-http-live
 .PHONY: test-http-live
 test_http_live: $(HTTP_READ_OBJ) test_http_live.c test_httpsearch.c ../datapath/test_runtime_trace.h d2kc httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c libd2k_udp.a tls13core.o x25519.o link.o
-	$(CC) $(CFLAGS) -o $@ test_http_live.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
+	$(CC) $(CFLAGS) -DD2K_HS_TESTING -o $@ test_http_live.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
 test-http-live: test_http_live
 	./test_http_live
 
