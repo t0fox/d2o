@@ -733,7 +733,7 @@ async function main(){
   assert.doesNotMatch(await evaluate('document.querySelector("[data-series-option=rss] small").textContent'),/· [+-−]/,'RSS delta is not joined across a PID change');
   diagnosticsReply=diagnosticFixture('short');await call('Page.reload');
   await until('document.querySelector("#diagnostic-memory-chart").dataset.points==="11"','short history renders');
-  await evaluate('document.querySelector("[data-memory-range=24]").click()');
+  await evaluate(`document.querySelector('[data-memory-range="24"]').click()`);
   assert.match(await evaluate('document.querySelector("#diagnostic-history-coverage").textContent'),/Доступно 10 мин из 24 часа/,'24-hour view reports only ten available minutes');
   for(const kind of ['legacy_history','legacy_no_fields']){
    diagnosticsReply=diagnosticFixture(kind);await call('Page.reload');
