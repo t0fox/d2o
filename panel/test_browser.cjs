@@ -749,9 +749,7 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/Подробная карта памяти недоступна на этом устройстве/,'unsupported rollup stays informational');
   assert.doesNotMatch(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/errno 2/,'fallback does not report the expected absent optional procfs path as an error');
   await evaluate(`document.querySelector('[data-memory-range="2"]').click()`);
-  assert.equal(await evaluate('document.querySelector("#diagnostic-memory-chart").dataset.points'),'121','two-hour view filters the minute samples');
-  await evaluate(`document.querySelector('[data-memory-range="24"]').click()`);
-  await until('document.querySelector("#diagnostic-memory-chart").dataset.points==="1440"','24-hour view restores the full history');
+  assert.equal(await evaluate('document.querySelector("#diagnostic-memory-chart").dataset.points'),'1','range selection does not synthesize unavailable fallback samples');
   for(const width of [320,390]){
    await call('Emulation.setDeviceMetricsOverride',{width,height:844,deviceScaleFactor:1,mobile:true});
    await wait(100);
