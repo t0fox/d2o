@@ -698,7 +698,7 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#diagnostic-history-coverage").textContent'),/Доступно 23 ч 59 мин из 24 часа/,
    'selected 24-hour range shows the duration actually retained');
   assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/RSS вырос/,'positive RSS growth is visible as a qualified information notice');
-  assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/вытеснили записи/,'overwritten diagnostic records are reported');
+  assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/Часть истории вытеснена/,'overwritten diagnostic records are reported');
   assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/Подробная карта памяти недоступна на этом устройстве/,'optional smaps data is a calm information notice');
   assert.doesNotMatch(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/errno 2/,'expected unsupported procfs capability is described instead of shown as an operational errno');
   assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/без сопоставимого роста/,'unattributed RSS anomaly is reported without calling it a leak');
