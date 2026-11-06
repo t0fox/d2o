@@ -9,7 +9,8 @@
 #ifndef D2K_DIAG_DIR
 #define D2K_DIAG_DIR "/tmp/d2k-diagnostics"
 #endif
-#define D2K_DIAG_REPORT_MAX (384u*1024u)
+/* 24h ownership metrics extend the lossless 1440-row report. */
+#define D2K_DIAG_REPORT_MAX (448u*1024u)
 /* Временный закрытый каталог: запрещаем ссылки и доступ для других пользователей. */
 static inline int d2k_diag_dir(const char *dir,int create) {
     struct stat st;
@@ -18,7 +19,10 @@ static inline int d2k_diag_dir(const char *dir,int create) {
     return 0;
 }
 static inline int d2k_diag_path(char *out,size_t n,const char *dir,const char *name) {
-    int z=snprintf(out,n,"%s/%s",dir,name);return z<0||(size_t)z>=n?-1:0;
+    int z=snprintf(out,n,"%s/%s",dir,name);
+    if(z<0)return -1;
+    if((size_t)z>=n){errno=ENAMETOOLONG;return -1;}
+    return 0;
 }
 static inline int d2k_diag_enabled(const char *dir) {
     char p[512];struct stat st;

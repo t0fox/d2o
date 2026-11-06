@@ -45,7 +45,9 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #if defined(__linux__)
-#define _DEFAULT_SOURCE   /* madvise: ячейка задачи отдаёт страницы (задача 60) */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE      /* musl otherwise hides MADV_DONTNEED under strict POSIX */
+#endif
 #include <sys/mman.h>
 #endif
 #include <arpa/inet.h>
@@ -1350,6 +1352,7 @@ struct d2k_sched {
     uint64_t     report_sequence;
     int64_t      last_measurement_done_ms;
     uint64_t     workers_started, workers_joined, worker_start_failures, worker_join_failures;
+    d2k_diag_madvise madvise;
 
     /* Проход по каталогу, разложенный на порции (см. d2k_sched_sync_step):
        где остановились и просили ли начать заново. */
@@ -2455,6 +2458,7 @@ typedef struct {
     int trig_snapped; /* вход снят с провода: приманка строится клоном */
     int split_unfit; /* решено главным потоком (quic_split_unfit) */
     unsigned budget; /* бюджет потока испытания (JOB_VERIFY), 0 — без проверки */
+    int diag_memory_tracked;
 } worker_arg;
 
 d2k_vres d2k_sched_ech_baseline_result(const d2k_ver_result *baseline,
@@ -2679,6 +2683,7 @@ static void *worker_run_body(void *vp) {
     d2k_hello trig = {trigger_bytes, a->trig_len, opts_bytes, a->client_opts_len,
                       a->client_opts_known, a->trig_snapped};
     d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len, NULL, 0, 0, 0};
+    d2k_diag_memory_release(D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG,sizeof *a,a->diag_memory_tracked);
     free(a);
     /* Ход сообщает только прогон измерителя (JOB_CLASSIFY); поток живёт ровно
        одну задачу, поэтому снимать приёмник не нужно. */
@@ -3255,7 +3260,8 @@ static void note_worker_start_failure(d2k_sched *s, task *t) {
 
 static int start_worker(d2k_sched *s, task *t, task_job job) {
     worker_arg *a = malloc(sizeof *a);
-    if (!a) { note_worker_start_failure(s, t); return -1; }
+    if (!a) { d2k_diag_memory_alloc_failure(D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG);note_worker_start_failure(s, t); return -1; }
+    a->diag_memory_tracked=d2k_diag_memory_acquire(D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG,sizeof *a);
     a->s = s; a->t = t;
     a->trig_len = t->trig_len; a->ctrl_len = t->ctrl_len;
     a->split_unfit = quic_split_unfit(s, t);
@@ -3302,6 +3308,7 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     if (have_attr) { pthread_attr_destroy(&attr); }
     if (!created) {
         if (a->use_fd >= 0) { close(a->use_fd); }
+        d2k_diag_memory_release(D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG,sizeof *a,a->diag_memory_tracked);
         free(a);
         note_worker_start_failure(s, t);
         return -1;
@@ -3680,10 +3687,27 @@ static void task_reset(d2k_sched *s, task *t) {
        внутри ячейки возвращаются ядру; частная анонимная память при следующем
        касании приходит нулями — то же, что записал memset. */
     {
-        uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
-        uintptr_t a = ((uintptr_t)t + pg - 1) & ~(pg - 1);
-        uintptr_t b = ((uintptr_t)t + sizeof *t) & ~(pg - 1);
-        if (pg && b > a) { (void)madvise((void *)a, (size_t)(b - a), MADV_DONTNEED); }
+        long page_size=sysconf(_SC_PAGESIZE);
+        if(page_size>0&&(page_size&(page_size-1))==0){
+            uintptr_t pg=(uintptr_t)page_size,start=(uintptr_t)t;
+            uintptr_t a=(start+pg-1)&~(pg-1),b=(start+sizeof *t)&~(pg-1);
+            if(b>a){
+                size_t bytes=(size_t)(b-a);int rc=madvise((void *)a,bytes,MADV_DONTNEED);
+                if(d2k_diag_memory_active()){
+                    s->madvise.requested_bytes+=bytes;
+                    if(rc==0)s->madvise.successes++;
+                    else {
+                        int error=errno;s->madvise.failures++;s->madvise.failed_requested_bytes+=bytes;s->madvise.last_errno=error;
+                        size_t slot=D2K_DIAG_MADVISE_ERRNO_SLOTS;
+                        for(size_t i=0;i<D2K_DIAG_MADVISE_ERRNO_SLOTS;i++)
+                            if(s->madvise.errno_hist[i].error==error){slot=i;break;}
+                            else if(!s->madvise.errno_hist[i].error&&slot==D2K_DIAG_MADVISE_ERRNO_SLOTS)slot=i;
+                        if(slot<D2K_DIAG_MADVISE_ERRNO_SLOTS){s->madvise.errno_hist[slot].error=error;s->madvise.errno_hist[slot].count++;}
+                        else s->madvise.other_errno_count++;
+                    }
+                }
+            }
+        }
     }
 #endif
     t->prop_fd = -1;
@@ -5744,6 +5768,8 @@ void d2k_sched_diagnostic_counts(d2k_sched *s,d2k_diag_counts *c) {
     }
     pthread_mutex_unlock(&s->mu);
 }
+void d2k_sched_diagnostic_madvise(d2k_sched *s,d2k_diag_madvise *stats){if(s&&stats)*stats=s->madvise;}
+void d2k_sched_diagnostic_madvise_reset(d2k_sched *s){if(s)memset(&s->madvise,0,sizeof s->madvise);}
 
 int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_path) {
     if (!s || !path) { return -1; }

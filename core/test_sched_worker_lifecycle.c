@@ -1,7 +1,15 @@
 /* Repeated scheduler worker creation and task cleanup without network I/O. */
+#define _GNU_SOURCE 1
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <pthread.h>
+#if defined(__linux__)
+static unsigned madvise_calls;
+static size_t madvise_bytes;
+static int madvise_errno_next;
+static int test_madvise(void *addr,size_t length,int advice);
+#define madvise test_madvise
+#endif
 static unsigned fail_next_join;
 static int test_pthread_join(pthread_t thread,void **retval);
 static int (*native_pthread_join)(pthread_t,void **)=pthread_join;
@@ -95,6 +103,29 @@ int main(void) {
     probe->th_live=0;probe->worker_owner=NULL;probe->worker_executing=0;
     probe->worker_started_ms=-1;probe->stop=0;
 
+    int diagnostic_memory = getenv("D2K_TEST_DIAG_MEMORY") != NULL;
+    d2k_diag_memory_enable(1);
+#if defined(__linux__)
+    task *memory_reset=&sched->tasks[SCHED_MAX_TASKS-1];
+    task_reset(sched,memory_reset);
+    assert(madvise_calls==1 && madvise_bytes>0);
+    madvise_errno_next=ENOMEM;
+    task_reset(sched,memory_reset);
+    d2k_diag_madvise madvise_counts;
+    d2k_sched_diagnostic_madvise(sched,&madvise_counts);
+    assert(madvise_calls==2 && madvise_counts.successes==1 &&
+           madvise_counts.failures==1 &&
+           madvise_counts.requested_bytes==2*madvise_bytes &&
+           madvise_counts.failed_requested_bytes==madvise_bytes &&
+           madvise_counts.last_errno==ENOMEM &&
+           madvise_counts.errno_hist[0].error==ENOMEM &&
+           madvise_counts.errno_hist[0].count==1);
+    d2k_sched_diagnostic_madvise_reset(sched);
+    d2k_sched_diagnostic_madvise(sched,&madvise_counts);
+    assert(madvise_counts.successes==0 && madvise_counts.failures==0 &&
+           madvise_counts.requested_bytes==0 && madvise_counts.last_errno==0);
+#endif
+    d2k_diag_memory_enable(diagnostic_memory);
     long rss_before = proc_kib("VmRSS");
     long data_before = proc_kib("VmData");
     long rss_warm = -1, data_warm = -1;
@@ -124,6 +155,13 @@ int main(void) {
     assert(counts.worker_start_failures == 0 && counts.worker_join_failures == 3);
     assert(counts.last_measurement_age_ms >= 0);
     assert(synthetic_calls == CYCLES);
+    d2k_diag_mem_site memory_sites[D2K_DIAG_MEMORY_SITE_COUNT];
+    d2k_diag_memory_snapshot(memory_sites);
+    assert(memory_sites[D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG].live_objects==0);
+    assert(memory_sites[D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG].created==
+           (diagnostic_memory?CYCLES:0));
+    assert(memory_sites[D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG].destroyed==
+           (diagnostic_memory?CYCLES:0));
 
     long rss_after = proc_kib("VmRSS");
     long data_after = proc_kib("VmData");
@@ -147,3 +185,11 @@ int main(void) {
     puts("scheduler TCP worker lifecycle: 1500 mock measurements passed");
     return 0;
 }
+#if defined(__linux__)
+static int test_madvise(void *addr,size_t length,int advice) {
+    (void)addr;assert(length>0&&advice==MADV_DONTNEED);
+    madvise_calls++;madvise_bytes=length;
+    if(madvise_errno_next){int e=madvise_errno_next;madvise_errno_next=0;errno=e;return -1;}
+    return 0;
+}
+#endif

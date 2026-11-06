@@ -43,6 +43,7 @@
 #include "d2k_quicconn.h"
 #include "d2k_quicprobe.h" /* D2K_QUIC_ARM_DATA_BYTES, d2k_quic_arm_data_judge */
 #include "d2k_tls13.h"
+#include "d2k_diagnostics.h"
 #include "d2k_tls12.h"
 #include "d2k_verify.h"
 #include "d2k_meas.h"
@@ -708,18 +709,20 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
     size_t capacity = D2K_VERIFY_HEADER_LIMIT + 1;
     uint8_t *buf = malloc(capacity);
     if (!buf) {
+        d2k_diag_memory_alloc_failure(D2K_DIAG_MEM_TCP_TLS_RX);
         *http_reply = (d2k_http_reply_result){D2K_HTTP_NEUTRAL, ""};
         if (n_resources) *n_resources = 0;
         if (local_limit) *local_limit = 1;
         snprintf(err, errcap, "не хватило памяти под заголовки ответа");
         return 0;
     }
+    int memory_tracked=d2k_diag_memory_acquire(D2K_DIAG_MEM_TCP_TLS_RX,capacity);
     int code_out = read_status_buf(buf, capacity, rd, sess, wait_ms,
         cloudflare_challenge, body_bytes, body_expected, body_complete,
         body_has_length, body_chunked, body_framing_valid, body_encoding,
         location, location_cap, resources, n_resources, http_reply,
         local_limit, conn_close, err, errcap);
-    free(buf);
+    d2k_diag_memory_release(D2K_DIAG_MEM_TCP_TLS_RX,capacity,memory_tracked);free(buf);
     return code_out;
 }
 
@@ -1798,11 +1801,13 @@ d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, ui
        а d2k_h3_status берёт кадр HEADERS только целиком (задача 44). */
     uint8_t *rx = malloc(D2K_VERIFY_HEADER_LIMIT);
     if (!rx) {
+        d2k_diag_memory_alloc_failure(D2K_DIAG_MEM_QUIC_HEADER);
         r.local_limit = 1;
         snprintf(r.reason, sizeof r.reason, "не хватило памяти под заголовки ответа HTTP/3");
         r.fd = d2k_qc_release(c);
         return r;
     }
+    int memory_tracked=d2k_diag_memory_acquire(D2K_DIAG_MEM_QUIC_HEADER,D2K_VERIFY_HEADER_LIMIT);
     size_t got = 0;
     int closed = 0;
     uint64_t wire_before = d2k_qc_rx_wire_bytes(c);
@@ -1811,7 +1816,7 @@ d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, ui
     int h3_status = 0;
     int headers_too_long = h3_read_headers(quic_recv_chunk, &rctx, rx,
         D2K_VERIFY_HEADER_LIMIT, until, &got, &h3_status, &closed, err, sizeof err);
-    free(rx);
+    d2k_diag_memory_release(D2K_DIAG_MEM_QUIC_HEADER,D2K_VERIFY_HEADER_LIMIT,memory_tracked);free(rx);
     if (h3_status != 0) {
         r.status = h3_status;
         if (h3_status == 451) {

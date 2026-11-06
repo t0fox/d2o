@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <errno.h>
 #ifndef D2K_RELEASE_ID
 #define D2K_RELEASE_ID "dev"
@@ -14,9 +15,29 @@
 #define LIMIT_EVENTS 32
 #define SAMPLES 120
 #define MEMORY_HISTORY 1440
+#define ANOMALIES 8
+#define GROWTH_POINTS 10
 #define PROCESS_COUNT 3
 static const char *const names[PROCESS_COUNT]={"d2kc","d2kd","d2kpanel"};
 static const char *const pidfiles[PROCESS_COUNT]={"d2k.pid","d2kd.pid","d2k-panel.pid"};
+static const char *const memory_site_names[D2K_DIAG_MEMORY_SITE_COUNT]={
+    "TCP worker argument", "TLS 1.2 session", "TLS 1.3 session",
+    "TCP/TLS receive buffer", "QUIC connection", "QUIC response header"
+};
+static const char *const memory_site_ids[D2K_DIAG_MEMORY_SITE_COUNT]={
+    "tcp.worker_arg", "tls12.session", "tls13.session", "tcp.tls_rx_buffer",
+    "quic.connection", "quic.response_header"
+};
+static const char *const memory_site_locations[D2K_DIAG_MEMORY_SITE_COUNT]={
+    "core/sched.c:start_worker", "core/tls12.c:d2k_tls12_connect/resume",
+    "core/tls13.c:tls_connect_internal", "core/verify.c:TCP/TLS response buffer",
+    "core/quicconn.c:d2k_qc_first_initial/connect", "core/verify.c and quicprobe.c:HTTP/3 response buffers"
+};
+typedef struct {
+    volatile uint32_t live_bytes,peak_bytes,live_objects,created,destroyed,alloc_failures;
+} mem_counter;
+static mem_counter memory_counters[D2K_DIAG_MEMORY_SITE_COUNT];
+static volatile int memory_collection;
 typedef struct {long pid;int64_t rss,hwm,anon,threads,vm_data,vm_swap;} proc_mem;
 typedef struct {
     uint64_t id; int64_t at,elapsed,queued,units;unsigned family,trigger,shape;
@@ -33,29 +54,45 @@ typedef struct {
 /* 24-hour d2kc memory trend: compact KiB counters, with rollup read by the
    existing once-per-minute procfs pass. Negative values mean unavailable. */
 typedef struct {
-    uint32_t at_s,mono_s;
+    uint32_t at_s;
+    uint32_t mono_s;
     int32_t rss,vm_data,vm_swap,rollup[5];
     int32_t rollup_errno;
     uint8_t rollup_status;
+    uint16_t d2kc_epoch;
+    int32_t rss_anon_kib,catalog_bytes,http_bytes,snapshot_bytes,tracked_tcp_bytes,tracked_quic_bytes,tracked_tls_bytes;
+    uint8_t tasks,workers_live,workers_result_pending,workers_join_pending;
 } memory_sample;
+typedef struct {
+    int64_t mono;
+    int32_t rss,accounted;
+} growth_point;
+typedef struct {
+    uint64_t at;
+    int32_t code,rss_delta,accounted_delta;
+    uint8_t kind;
+    char stage[24];
+} anomaly;
 static const char *const task_state_names[D2K_DIAG_TASK_STATE_COUNT]={
     "free","queued","asking","shape_wait","props_contact","props_wait",
     "planning","trial_settle","verify","verify_wait","watching","resting",
     "voice_measure","voice_trial","voice_watch"
 };
-/* Два снимка на процесс; сырые карты и имена файлов не сохраняются.
- * Группы следуют меткам ядра, а не владельцам аллокатора: безымянные стеки
- * потоков и отображения malloc могут попасть в anonymous. */
+/* Два снимка на процесс; сырые карты памяти и имена файлов не сохраняются. */
 typedef struct {
     long pid; int64_t at,mono,rss,start_ticks,vm[4],fds;
-    int rollup_status,rollup_errno,smaps_status,smaps_errno;
-    int64_t rollup[5],groups[4][5];
+    int rollup_status,rollup_errno,rollup_source;
+    int64_t rollup[5];
 } memory_detail;
 struct d2k_diag {
     memory_detail first[PROCESS_COUNT],latest[PROCESS_COUNT];
     event events[EVENTS];limit_event limits[LIMIT_EVENTS];sample samples[SAMPLES];
     memory_sample memory_history[MEMORY_HISTORY];
-    size_t ne,nl,ns,nm;uint64_t event_total,limit_total,sample_total,memory_total;int64_t last_ms;int sampled;
+    anomaly anomalies[ANOMALIES];growth_point growth[GROWTH_POINTS];d2k_diag_madvise madvise;
+    size_t ne,nl,ns,nm,na,ng,growth_next;uint64_t event_total,limit_total,sample_total,memory_total,anomaly_total,write_failures;
+    int32_t growth_pid;long memory_pid;int64_t memory_start_ticks,last_unattributed_ms,last_ms;
+    /* One generation change per retained row fits in this 16-bit value. */
+    uint16_t d2kc_epoch;int memory_pid_seen,sampled;
 };
 typedef char bounded_ring[(sizeof(struct d2k_diag)<=256*1024)?1:-1];
 static void copy(char *to,size_t cap,const char *s) {
@@ -98,6 +135,60 @@ size_t d2k_diag_bytes(const d2k_diag *d){return d?sizeof *d:0;}
 size_t d2k_diag_event_count(const d2k_diag *d){return d?d->ne:0;}
 size_t d2k_diag_sample_count(const d2k_diag *d){return d?d->ns:0;}
 size_t d2k_diag_memory_history_count(const d2k_diag *d){return d?d->nm:0;}
+void d2k_diag_memory_enable(int enabled){__atomic_store_n(&memory_collection,enabled!=0,__ATOMIC_RELEASE);}
+int d2k_diag_memory_active(void){return __atomic_load_n(&memory_collection,__ATOMIC_RELAXED)!=0;}
+static uint32_t atomic_read(const volatile uint32_t *value){return __sync_fetch_and_add((volatile uint32_t *)value,0);}
+static void atomic_peak(volatile uint32_t *peak,uint32_t value){
+    uint32_t old=atomic_read(peak);
+    while(value>old){uint32_t seen=__sync_val_compare_and_swap(peak,old,value);if(seen==old)break;old=seen;}
+}
+int d2k_diag_memory_acquire(unsigned site,size_t bytes){
+    if(site>=D2K_DIAG_MEMORY_SITE_COUNT||!d2k_diag_memory_active()||bytes>UINT32_MAX)return 0;
+    mem_counter *c=&memory_counters[site];uint32_t size=(uint32_t)bytes;
+    uint32_t live=__sync_add_and_fetch(&c->live_bytes,size);
+    __sync_add_and_fetch(&c->live_objects,1);__sync_add_and_fetch(&c->created,1);atomic_peak(&c->peak_bytes,live);
+    return 1;
+}
+void d2k_diag_memory_release(unsigned site,size_t bytes,int tracked){
+    if(!tracked||site>=D2K_DIAG_MEMORY_SITE_COUNT||bytes>UINT32_MAX)return;
+    mem_counter *c=&memory_counters[site];__sync_sub_and_fetch(&c->live_bytes,(uint32_t)bytes);
+    __sync_sub_and_fetch(&c->live_objects,1);__sync_add_and_fetch(&c->destroyed,1);
+}
+void d2k_diag_memory_alloc_failure(unsigned site){
+    if(site<D2K_DIAG_MEMORY_SITE_COUNT&&d2k_diag_memory_active())
+        __sync_add_and_fetch(&memory_counters[site].alloc_failures,1);
+}
+void d2k_diag_memory_snapshot(d2k_diag_mem_site out[D2K_DIAG_MEMORY_SITE_COUNT]){
+    if(!out)return;
+    for(unsigned i=0;i<D2K_DIAG_MEMORY_SITE_COUNT;i++){
+        mem_counter *c=&memory_counters[i];
+        out[i]=(d2k_diag_mem_site){atomic_read(&c->live_bytes),atomic_read(&c->peak_bytes),
+            atomic_read(&c->live_objects),atomic_read(&c->created),atomic_read(&c->destroyed),
+            atomic_read(&c->alloc_failures)};
+    }
+}
+void d2k_diag_memory_counts(d2k_diag_counts *c){
+    if(!c)return;
+    d2k_diag_mem_site sites[D2K_DIAG_MEMORY_SITE_COUNT];d2k_diag_memory_snapshot(sites);
+    c->tracked_tcp_bytes=(uint64_t)sites[D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG].live_bytes+
+                         sites[D2K_DIAG_MEM_TCP_TLS_RX].live_bytes;
+    c->tracked_tls_bytes=(uint64_t)sites[D2K_DIAG_MEM_TLS12_SESSION].live_bytes+
+                         sites[D2K_DIAG_MEM_TLS13_SESSION].live_bytes;
+    c->tracked_quic_bytes=(uint64_t)sites[D2K_DIAG_MEM_QUIC_CONNECTION].live_bytes+
+                           sites[D2K_DIAG_MEM_QUIC_HEADER].live_bytes;
+}
+void d2k_diag_set_madvise(d2k_diag *d,const d2k_diag_madvise *stats){if(d&&stats)d->madvise=*stats;}
+static void record_anomaly(d2k_diag *d,unsigned kind,const char *stage,int code,int32_t rss,int32_t accounted){
+    if(!d)return;
+    anomaly *a=&d->anomalies[d->anomaly_total++%ANOMALIES];memset(a,0,sizeof *a);
+    a->at=(uint64_t)time(NULL);a->kind=(uint8_t)kind;a->code=code;a->rss_delta=rss;a->accounted_delta=accounted;
+    copy(a->stage,sizeof a->stage,stage);
+    if(d->na<ANOMALIES)d->na++;
+}
+void d2k_diag_record_write_error(d2k_diag *d,const char *stage,int error){
+    if(!d)return;
+    d->write_failures++;record_anomaly(d,2,stage,error,0,0);
+}
 void d2k_diag_record(d2k_diag *d,const d2k_diag_event *v) {
     if(!d||!v)return;
     event *e=&d->events[d->event_total++%EVENTS];memset(e,0,sizeof *e);
@@ -126,6 +217,23 @@ static int64_t value(const char *line,const char *key) {
 }
 static int32_t compact_kib(int64_t v) {
     return v<0||v>INT32_MAX?-1:(int32_t)v;
+}
+static int32_t compact_bytes_kib(uint64_t bytes){uint64_t kib=bytes/1024u+(bytes%1024u!=0);return kib>INT32_MAX?-1:(int32_t)kib;}
+static int32_t compact_bytes(uint64_t bytes){return bytes>INT32_MAX?-1:(int32_t)bytes;}
+static uint8_t compact_count(uint64_t n){return n>UINT8_MAX?UINT8_MAX:(uint8_t)n;}
+/* A missing optional proc file is unsupported only while its PID still exists. */
+static int proc_pid_dir_present(const char *proc,long pid) {
+    char path[512];struct stat st;
+    int n=snprintf(path,sizeof path,"%s/%ld",proc,pid);
+    return n>=0&&(size_t)n<sizeof path&&stat(path,&st)==0&&S_ISDIR(st.st_mode);
+}
+static int optional_proc_status(const char *proc,long pid,int error,int *reported_error) {
+    if(error==ENOENT&&proc_pid_dir_present(proc,pid)) {
+        *reported_error=0;
+        return 4;
+    }
+    *reported_error=error;
+    return 1;
 }
 static void read_proc(proc_mem *m,const char *proc,const char *run,size_t i) {
     char path[512],line[256];FILE *f;long pid=0;
@@ -180,7 +288,7 @@ static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms
     }
     snprintf(path,sizeof path,"%s/%ld/smaps_rollup",proc,p->pid);
     errno=0;f=fopen(path,"r");
-    if(!f){m->rollup_status=1;m->rollup_errno=errno;}
+    if(!f){int error=errno;m->rollup_status=optional_proc_status(proc,p->pid,error,&m->rollup_errno);}
     else {
         const char *keys[]={"Rss:","Pss:","Anonymous:","Private_Dirty:","Swap:"};
         unsigned seen=0;
@@ -190,38 +298,13 @@ static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms
         }
         int read_error=ferror(f),read_errno=errno;fclose(f);
         if(read_error)m->rollup_errno=read_errno;
-        if(!read_error&&seen==31)m->rollup_status=2;
+        if(!read_error&&seen==31){m->rollup_status=2;m->rollup_source=1;}
         else m->rollup_status=3;
     }
-    /* Keep the existing mapping-group breakdown even when rollup is present;
-       rollup supplements it and remains useful if full smaps is restricted. */
-    snprintf(path,sizeof path,"%s/%ld/smaps",proc,p->pid);
-    errno=0;f=fopen(path,"r");if(!f){m->smaps_status=1;m->smaps_errno=errno;return;}
-    int group=-1,valid=1;int64_t maps=0,fields=0;
-    const char *metrics[]={"Size:","Rss:","Anonymous:","Private_Dirty:"};
-    errno=0;
-    while(fgets(line,sizeof line,f)) {
-        unsigned long long a,b,off,inode;unsigned major,minor;char perms[5];int n=0;
-        if(sscanf(line,"%llx-%llx %4s %llx %x:%x %llu %n",&a,&b,perms,&off,&major,&minor,&inode,&n)==7 && n>0){
-            char *label=line+n;label[strcspn(label,"\r\n")]=0;
-            group=!label[0]?0:!strcmp(label,"[heap]")?1:!strncmp(label,"[stack",6)?2:3;
-            m->groups[group][0]++;maps++;continue;
-        }
-        if(group<0)continue;
-        for(size_t k=0;k<4;k++){
-            int64_t v=value(line,metrics[k]);if(v<0)continue;
-            if(v>INT64_MAX-m->groups[group][k+1])valid=0;
-            else m->groups[group][k+1]+=v;
-            fields++;
-        }
-    }
-    int read_error=ferror(f);
-    if(read_error)m->smaps_errno=errno;
-    m->smaps_status=valid && maps>0 && fields==maps*4 && !read_error?2:3;
-    fclose(f);
 }
 static const char *read_status(int status) {
     switch(status){case 1:return "unavailable";case 2:return "ok";case 3:return "parse-error";
+        case 4:return "unsupported";
         default:return "not-read";}
 }
 static void write_detail(FILE *f,const memory_detail *m) {
@@ -232,27 +315,16 @@ static void write_detail(FILE *f,const memory_detail *m) {
     for(size_t k=0;k<4;k++){fprintf(f,",\"%s\":",keys[k]);number(f,m->vm[k]);}
     fputs(",\"fd_count\":",f);number(f,m->fds);
     fputs(",\"smaps_rollup_status\":",f);js(f,read_status(m->rollup_status));
+    fputs(",\"smaps_rollup_source\":",f);js(f,m->rollup_source==1?"smaps_rollup":m->rollup_source==2?"smaps-fallback":"unavailable");
     fputs(",\"smaps_rollup_errno\":",f);if(m->rollup_errno)fprintf(f,"%d",m->rollup_errno);else fputs("null",f);
     fputs(",\"smaps_rollup\":",f);
-    if(m->rollup_status!=2)fputs("null",f);
+    if(m->rollup_status!=2&&m->rollup_source!=2)fputs("null",f);
     else {
         const char *keys[]={"rss_kib","pss_kib","anonymous_kib","private_dirty_kib","swap_kib"};
         fputc('{',f);for(size_t k=0;k<5;k++){fprintf(f,"%s\"%s\":",k?",":"",keys[k]);number(f,m->rollup[k]);}fputc('}',f);
     }
-    fputs(",\"smaps_status\":",f);js(f,read_status(m->smaps_status));
-    fputs(",\"smaps_errno\":",f);if(m->smaps_errno)fprintf(f,"%d",m->smaps_errno);else fputs("null",f);
-    fputs(",\"smaps\":",f);
-    if(m->smaps_status!=2)fputs("null",f);
-    else {
-        const char *groups[]={"anonymous","heap","stack","other"};
-        const char *metrics[]={"maps","size_kib","rss_kib","anonymous_kib","private_dirty_kib"};
-        fputc('{',f);
-        for(size_t g=0;g<4;g++){
-            fprintf(f,"%s\"%s\":{",g?",":"",groups[g]);
-            for(size_t k=0;k<5;k++){fprintf(f,"%s\"%s\":",k?",":"",metrics[k]);number(f,m->groups[g][k]);}
-            fputc('}',f);
-        }fputc('}',f);
-    }fputc('}',f);
+    /* Never walk every mapping as a fallback: smaps is optional and more expensive. */
+    fputs(",\"smaps_status\":\"not-read\",\"smaps_errno\":null,\"smaps\":null}",f);
 }
 static void write_limit_reason(FILE *f,const d2k_diag_counts *c) {
     unsigned flags=(c->resources_valid?1u:0u);
@@ -281,6 +353,44 @@ static void write_limit_reason_state(FILE *f,unsigned flags,unsigned mask) {
         if(mask&D2K_DIAG_LIMIT_SLOTS){if(comma)fputc(',',f);js(f,"slots");}
     }
     fputc(']',f);
+}
+static void write_memory_tracking(FILE *f){
+    d2k_diag_mem_site sites[D2K_DIAG_MEMORY_SITE_COUNT];d2k_diag_memory_snapshot(sites);
+    fputs(",\"memory_tracking\":{\"enabled\":",f);fputs(d2k_diag_memory_active()?"true":"false",f);
+    fputs(",\"coverage\":\"учитываются объекты, выделенные при включённом сборе; уже существующие объекты задним числом не учитываются\",\"sites\":[",f);
+    for(unsigned i=0;i<D2K_DIAG_MEMORY_SITE_COUNT;i++){
+        if(i)fputc(',',f);
+        fputs("{\"id\":",f);js(f,memory_site_ids[i]);fputs(",\"name\":",f);js(f,memory_site_names[i]);
+        fputs(",\"location\":",f);js(f,memory_site_locations[i]);
+        fprintf(f,",\"live_bytes\":%u,\"peak_bytes\":%u,\"live_objects\":%u,\"created\":%u,\"destroyed\":%u,\"alloc_failures\":%u}",
+            sites[i].live_bytes,sites[i].peak_bytes,sites[i].live_objects,sites[i].created,sites[i].destroyed,sites[i].alloc_failures);
+    }
+    fputs("]}",f);
+}
+static void write_madvise(FILE *f,const d2k_diag_madvise *m){
+    fprintf(f,",\"madvise\":{\"successes\":%llu,\"failures\":%llu,\"requested_bytes\":%llu,\"failed_requested_bytes\":%llu,\"last_errno\":",
+        (unsigned long long)m->successes,(unsigned long long)m->failures,
+        (unsigned long long)m->requested_bytes,(unsigned long long)m->failed_requested_bytes);
+    if(m->last_errno)fprintf(f,"%d",m->last_errno);else fputs("null",f);
+    fprintf(f,",\"other_errno_count\":%llu,\"errno\":[",(unsigned long long)m->other_errno_count);
+    int comma=0;
+    for(size_t i=0;i<D2K_DIAG_MADVISE_ERRNO_SLOTS;i++)if(m->errno_hist[i].error){
+        fprintf(f,"%s{\"code\":%d,\"count\":%llu}",comma?",":"",m->errno_hist[i].error,(unsigned long long)m->errno_hist[i].count);comma=1;
+    }
+    fputs("]}",f);
+}
+static void write_anomalies(FILE *f,const d2k_diag *d){
+    fprintf(f,",\"anomalies_overwritten\":%llu,\"diagnostic_write_failures\":%llu,\"anomalies\":[",
+        (unsigned long long)(d->anomaly_total-d->na),(unsigned long long)d->write_failures);
+    for(size_t i=0;i<d->na;i++){
+        const anomaly *a=&d->anomalies[(d->anomaly_total-d->na+i)%ANOMALIES];if(i)fputc(',',f);
+        fputs("{\"kind\":",f);js(f,a->kind==1?"unattributed-rss-growth":"diagnostic-json-write-error");
+        fprintf(f,",\"at\":%llu,\"error_code\":",(unsigned long long)a->at);if(a->code)fprintf(f,"%d",a->code);else fputs("null",f);
+        fputs(",\"stage\":",f);js(f,a->stage);fputs(",\"rss_delta_kib\":",f);
+        if(a->kind==1)fprintf(f,"%d",a->rss_delta);else fputs("null",f);
+        fputs(",\"accounted_delta_kib\":",f);if(a->kind==1)fprintf(f,"%d",a->accounted_delta);else fputs("null",f);
+        fprintf(f,",\"window_samples\":%u}",a->kind==1?GROWTH_POINTS:0);
+    }fputc(']',f);
 }
 void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char *proc,const char *run) {
     if(!d||!c||(d->sampled&&ms>=d->last_ms&&ms-d->last_ms<60000))return;
@@ -314,8 +424,47 @@ void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char 
     h->mono_s=ms<0?0:(uint32_t)((uint64_t)ms/1000u);
     h->rss=compact_kib(p->rss);h->vm_data=compact_kib(p->vm_data);h->vm_swap=compact_kib(p->vm_swap);
     h->rollup_status=(uint8_t)m->rollup_status;h->rollup_errno=m->rollup_errno;
+    if(p->pid>0) {
+        if(d->memory_pid_seen && (d->memory_pid!=p->pid ||
+           (m->start_ticks>=0 && d->memory_start_ticks>=0 && m->start_ticks!=d->memory_start_ticks)))d->d2kc_epoch++;
+        d->memory_pid=p->pid;d->memory_start_ticks=m->start_ticks;d->memory_pid_seen=1;
+    } else {d->memory_pid=0;d->memory_start_ticks=-1;d->memory_pid_seen=0;}
+    h->d2kc_epoch=d->d2kc_epoch;
     for(size_t k=0;k<5;k++)h->rollup[k]=compact_kib(m->rollup[k]);
+    h->rss_anon_kib=compact_kib(p->anon);h->catalog_bytes=compact_bytes(c->catalog_bytes);
+    h->http_bytes=compact_bytes(c->http_bytes);h->snapshot_bytes=compact_bytes(c->snapshot_bytes);
+    h->tracked_tcp_bytes=compact_bytes(c->tracked_tcp_bytes);h->tracked_quic_bytes=compact_bytes(c->tracked_quic_bytes);
+    h->tracked_tls_bytes=compact_bytes(c->tracked_tls_bytes);h->tasks=compact_count(c->tasks);
+    h->workers_live=compact_count(c->workers_live);h->workers_result_pending=compact_count(c->workers_result_pending);
+    h->workers_join_pending=compact_count(c->workers_join_pending);
     if(d->nm<MEMORY_HISTORY)d->nm++;
+    if(p->pid>0&&p->pid<=INT32_MAX&&p->rss>=0){
+        if(d->growth_pid!=(int32_t)p->pid){d->growth_pid=(int32_t)p->pid;d->ng=0;d->growth_next=0;d->last_unattributed_ms=0;}
+        uint64_t accounted_bytes=c->tracked_tcp_bytes+c->tracked_quic_bytes+c->tracked_tls_bytes+
+            c->catalog_bytes+c->http_bytes+c->snapshot_bytes;
+        int32_t accounted=compact_bytes_kib(accounted_bytes);
+        if(accounted>=0){
+            d->growth[d->growth_next]=(growth_point){ms,compact_kib(p->rss),accounted};
+            d->growth_next=(d->growth_next+1)%GROWTH_POINTS;if(d->ng<GROWTH_POINTS)d->ng++;
+            if(d->ng==GROWTH_POINTS){
+                const growth_point *base=&d->growth[d->growth_next];int rising=0;
+                for(size_t k=1;k<GROWTH_POINTS;k++){
+                    const growth_point *prev=&d->growth[(d->growth_next+k-1)%GROWTH_POINTS];
+                    const growth_point *cur=&d->growth[(d->growth_next+k)%GROWTH_POINTS];
+                    if(cur->rss>prev->rss)rising++;
+                }
+                const growth_point *last=&d->growth[(d->growth_next+GROWTH_POINTS-1)%GROWTH_POINTS];
+                int64_t rss_delta=(int64_t)last->rss-base->rss;
+                int64_t accounted_delta=(int64_t)last->accounted-base->accounted;
+                if(last->mono-base->mono>=9*60000&&rising>=7&&rss_delta>=1024&&
+                   accounted_delta<rss_delta/4&&(!d->last_unattributed_ms||ms-d->last_unattributed_ms>=30*60000)){
+                    int32_t rd=rss_delta>INT32_MAX?INT32_MAX:(int32_t)rss_delta;
+                    int32_t ad=accounted_delta>INT32_MAX?INT32_MAX:accounted_delta<INT32_MIN?INT32_MIN:(int32_t)accounted_delta;
+                    record_anomaly(d,1,"",10,rd,ad);d->last_unattributed_ms=ms;
+                }
+            }
+        }
+    }
 }
 int d2k_diag_write(const d2k_diag *d,FILE *f) {
     if(!d||!f)return -1;
@@ -330,6 +479,7 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
             (unsigned long long)c->http_records_limit_bytes,(unsigned long long)c->http_queue_limit_bytes,
             (unsigned long long)c->http_failure_limit_bytes,(unsigned long long)c->http_failure_record_limit_bytes);
     }
+    write_memory_tracking(f);write_madvise(f,&d->madvise);write_anomalies(f,d);
     fputs(",\"events\":[",f);
     for(size_t i=0;i<d->ne;i++) {
         const event *e=&d->events[(d->event_total-d->ne+i)%EVENTS];if(i)fputc(',',f);
@@ -364,19 +514,24 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
     const memory_sample *base=d->nm?&d->memory_history[(d->memory_total-d->nm)%MEMORY_HISTORY]:NULL;
     fputs("],\"memory_history\":{\"capacity\":1440,\"sample_interval_ms\":60000,\"time_base\":[",f);
     if(base)fprintf(f,"%u,%u",base->at_s,base->mono_s);else fputs("null,null",f);
-    fputs("],\"smaps_rollup_status_codes\":[\"not-read\",\"unavailable\",\"ok\",\"parse-error\"],\"fields\":[\"at_delta_s\",\"mono_delta_s\",\"rss_kib\",\"vm_data_kib\",\"vm_swap_kib\",\"smaps_rollup_status_code\",\"smaps_rollup_errno\",\"smaps_rollup_kib\"],\"samples\":[",f);
+    fputs("],\"smaps_rollup_status_codes\":[\"not-read\",\"unavailable\",\"ok\",\"parse-error\",\"unsupported\"],\"fields\":[\"at_delta_s\",\"mono_delta_s\",\"rss_kib\",\"vm_data_kib\",\"vm_swap_kib\",\"smaps_rollup_status_code\",\"smaps_rollup_errno\",\"smaps_rollup_kib\",\"rss_anon_kib\",\"catalog_bytes\",\"http_bytes\",\"snapshot_bytes\",\"tracked_tcp_bytes\",\"tracked_quic_bytes\",\"tracked_tls_bytes\",\"tasks\",\"workers_live\",\"workers_result_pending\",\"workers_join_pending\",\"d2kc_epoch\"],\"samples\":[",f);
     for(size_t i=0;i<d->nm;i++) {
         const memory_sample *h=&d->memory_history[(d->memory_total-d->nm+i)%MEMORY_HISTORY];
         if(i)fputc(',',f);
-        fprintf(f,"[%lld,%lld,",(long long)h->at_s-(base?(long long)base->at_s:0),
-                (long long)h->mono_s-(base?(long long)base->mono_s:0));number(f,h->rss);fputc(',',f);
+        /* shortcut: deltas wrap safely within 2^32 seconds; widen if retention grows beyond that. */
+        fprintf(f,"[%lld,%u,",(long long)h->at_s-(base?(long long)base->at_s:0),
+                (unsigned)(h->mono_s-(base?base->mono_s:0)));number(f,h->rss);fputc(',',f);
         number(f,h->vm_data);fputc(',',f);number(f,h->vm_swap);fputc(',',f);
         fprintf(f,"%u,",(unsigned)h->rollup_status);
         if(h->rollup_errno)fprintf(f,"%d",h->rollup_errno);else fputs("null",f);
         fputc(',',f);
-        if(h->rollup_status!=2)fputs("null",f);
+        if(h->rollup_status!=2&&h->rollup[0]<0)fputs("null",f);
         else {fputc('[',f);for(size_t k=0;k<5;k++){if(k)fputc(',',f);number(f,h->rollup[k]);}fputc(']',f);}
-        fputc(']',f);
+        fputc(',',f);number(f,h->rss_anon_kib);fputc(',',f);number(f,h->catalog_bytes);fputc(',',f);number(f,h->http_bytes);
+        fputc(',',f);number(f,h->snapshot_bytes);fputc(',',f);number(f,h->tracked_tcp_bytes);fputc(',',f);number(f,h->tracked_quic_bytes);
+        fputc(',',f);number(f,h->tracked_tls_bytes);fprintf(f,",%u,%u,%u,%u",(unsigned)h->tasks,(unsigned)h->workers_live,
+            (unsigned)h->workers_result_pending,(unsigned)h->workers_join_pending);
+        fprintf(f,",%u]",(unsigned)h->d2kc_epoch);
     }
     fputs("]},\"samples\":[",f);
     for(size_t i=0;i<d->ns;i++) {

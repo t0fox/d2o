@@ -26,6 +26,7 @@
 #include "d2k_quicconn.h"
 #include "d2k_quicwire.h"
 #include "d2k_tls13core.h"
+#include "d2k_diagnostics.h"
 
 /* Типы кадров, которые этот модуль умеет назвать (RFC 9000 §19). Остальные
  * пропускаются по длине либо честно валят разбор — см. frames_in. */
@@ -203,7 +204,11 @@ struct d2k_qc {
     uint8_t  local_addr[16];
     uint8_t  family;
     uint16_t local_port;
+    int      diag_memory_tracked;
 };
+static void qc_dispose(d2k_qc *c){
+    if(c){d2k_diag_memory_release(D2K_DIAG_MEM_QUIC_CONNECTION,sizeof *c,c->diag_memory_tracked);free(c);}
+}
 
 /* --- мелочи --------------------------------------------------------------- */
 
@@ -924,7 +929,8 @@ int d2k_qc_first_initial(const char *sni, uint8_t *out, size_t cap, size_t *out_
     if (!sni || !out || !out_len) { return -1; }
     *out_len = 0;
     d2k_qc *c = calloc(1, sizeof *c);
-    if (!c) { return -1; }
+    if (!c) { d2k_diag_memory_alloc_failure(D2K_DIAG_MEM_QUIC_CONNECTION);return -1; }
+    c->diag_memory_tracked=d2k_diag_memory_acquire(D2K_DIAG_MEM_QUIC_CONNECTION,sizeof *c);
     c->fd = -1;
     c->version = D2K_QW_V1;
     uint8_t priv[32];
@@ -943,7 +949,7 @@ int d2k_qc_first_initial(const char *sni, uint8_t *out, size_t cap, size_t *out_
         }
     }
     memset(priv, 0, sizeof priv);
-    free(c);
+    qc_dispose(c);
     return rc;
 }
 
@@ -963,7 +969,8 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
     *out = NULL;
 
     d2k_qc *c = calloc(1, sizeof *c);
-    if (!c) { say(err, errcap, "не хватило памяти"); return -1; }
+    if (!c) { d2k_diag_memory_alloc_failure(D2K_DIAG_MEM_QUIC_CONNECTION);say(err, errcap, "не хватило памяти"); return -1; }
+    c->diag_memory_tracked=d2k_diag_memory_acquire(D2K_DIAG_MEM_QUIC_CONNECTION,sizeof *c);
     c->fd = -1;
     c->peer_name = -1;
     c->version = D2K_QW_V1;
@@ -999,7 +1006,7 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
     }
     if (strchr(o->ip, '%') || inet_pton(af, o->ip, dst) != 1) {
         say(err, errcap, "адрес не разбирается");
-        if (c->fd < 0) { free(c); return -1; }
+        if (c->fd < 0) { qc_dispose(c); return -1; }
         d2k_qc_close(c); return -1;
     }
     if (c->fd >= 0) {
@@ -1046,8 +1053,8 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
             held[n_held++] = fd;
         }
         for (int i = 0; i < n_held; i++) { close(held[i]); }
-        if (local_failed) { free(c); return -2; }
-        if (c->fd < 0) { free(c); return -1; }
+        if (local_failed) { qc_dispose(c); return -2; }
+        if (c->fd < 0) { qc_dispose(c); return -1; }
     }
     struct sockaddr_storage me;
     socklen_t ml = sizeof me;
@@ -1472,12 +1479,12 @@ int d2k_qc_release(d2k_qc *c) {
     if (!c) { return -1; }
     int fd = c->fd;
     c->fd = -1;      /* чтобы close не тронул чужой теперь дескриптор */
-    free(c);
+    qc_dispose(c);
     return fd;
 }
 
 void d2k_qc_close(d2k_qc *c) {
     if (!c) { return; }
     if (c->fd >= 0) { close(c->fd); }
-    free(c);
+    qc_dispose(c);
 }

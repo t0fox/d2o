@@ -1135,7 +1135,7 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
 .diag-card { min-width: 0; padding: 18px; border: 1px solid var(--rule); border-radius: 12px; background: var(--paper); }
 .diag-card h4 { font-size: .9375rem; font-weight: 650; margin: 0 0 12px; }
 .diag-memory-panel { grid-column: span 8; }
-.diag-process-panel, .diag-workers-panel, .diag-catalog-panel, .diag-http-panel, .diag-search-panel { grid-column: span 4; }
+.diag-process-panel, .diag-workers-panel, .diag-subsystems-panel, .diag-catalog-panel, .diag-http-panel, .diag-madvise-panel, .diag-search-panel { grid-column: span 4; }
 .diag-limiter-panel { grid-column: span 8; }
 .diag-card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
 .diag-card-head h4 { margin-bottom: 4px; }
@@ -1154,9 +1154,16 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
 .diag-memory-chart .diag-axis { stroke: var(--rule-strong); stroke-width: 1; }
 .diag-memory-chart .diag-line { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
 .diag-memory-chart .diag-line-rss { stroke: var(--signal); }
+.diag-memory-chart .diag-line-rss_anon { stroke: #8c62b5; }
 .diag-memory-chart .diag-line-vm_data { stroke: #4577c5; }
 .diag-memory-chart .diag-line-anonymous { stroke: var(--ok); }
 .diag-memory-chart .diag-line-private_dirty { stroke: var(--warn); }
+.diag-memory-chart .diag-line-catalog { stroke: #d26a28; }
+.diag-memory-chart .diag-line-http { stroke: #208f83; }
+.diag-memory-chart .diag-line-snapshot { stroke: #b84f66; }
+.diag-memory-chart .diag-line-tracked_tcp { stroke: #4d70ba; }
+.diag-memory-chart .diag-line-tracked_quic { stroke: #768c38; }
+.diag-memory-chart .diag-line-tracked_tls { stroke: #9a6c42; }
 .diag-empty { min-height: 120px; display: grid; place-items: center; color: var(--ink-3); font-size: .875rem; text-align: center; }
 .diag-empty[hidden] { display: none; }
 .diag-history-data .diag-history-note { margin-top: 12px; max-width: 60ch; }
@@ -1170,6 +1177,10 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
 .diag-history-counts > div { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--rule); font-size: .875rem; }
 .diag-history-counts > div:first-child { padding-top: 0; }
 .diag-history-counts dd { margin: 0; text-align: right; white-space: nowrap; }
+.diag-memory-sites { margin: 8px 0 0; padding: 0; list-style: none; }
+.diag-memory-sites li { padding: 9px 0; border-top: 1px solid var(--rule); font-size: .8125rem; overflow-wrap: anywhere; }
+.diag-memory-sites strong { display: block; font-weight: 600; }
+.diag-memory-sites small { display: block; margin-top: 3px; color: var(--ink-3); font: .6875rem var(--mono); }
 .diag-http-panel .diag-history-counts > div { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; }
 .diag-http-panel .diag-history-counts dd { text-align: left; white-space: normal; overflow-wrap: anywhere; }
 .diag-transition-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
@@ -1177,9 +1188,15 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
 .diag-transition-list strong { display: block; margin-bottom: 4px; font-family: var(--mono); font-size: .875rem; }
 .diag-transition-list small { display: block; margin-top: 4px; color: var(--ink-3); }
 .diag-transition-empty { color: var(--ink-3); font-size: .8125rem; }
-.diag-warning-list { grid-column: 1 / -1; display: grid; gap: 6px; padding: 12px 16px; border: 1px solid var(--warn); border-radius: 10px; background: var(--warn-wash); color: var(--warn); font-size: .8125rem; }
+.diag-warning-list { grid-column: 1 / -1; display: grid; gap: 8px; padding: 0; border: 0; background: transparent; color: var(--ink); font-size: .8125rem; }
 .diag-warning-list[hidden] { display: none; }
-.diag-warning-list p { margin: 0; }
+.diag-notice { min-width: 0; padding: 10px 14px; border: 1px solid var(--rule); border-radius: 9px; background: var(--paper-2); color: var(--ink-2); }
+.diag-notice--warning { border-color: var(--warn); border-left-width: 4px; background: var(--warn-wash); color: var(--warn); }
+.diag-notice-title { display: block; color: var(--ink); font-size: .8125rem; font-weight: 650; }
+.diag-notice-text, .diag-notice details p { margin: 3px 0 0; line-height: 1.5; overflow-wrap: anywhere; }
+.diag-notice details { margin-top: 4px; font-size: .75rem; }
+.diag-notice details summary { display: inline-block; min-height: 28px; padding-top: 5px; color: var(--ink-3); cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.diag-notice details p { max-width: 90ch; color: var(--ink-3); }
 .diag-history-footer { margin-top: 24px; display: flex; flex-wrap: wrap; align-items: start; justify-content: space-between; gap: 20px; }
 .diag-history-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .diag-history-actions a { text-decoration: none; }
@@ -1189,11 +1206,11 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
 @media (max-width: 1050px) {
   .diag-history-data { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .diag-memory-panel, .diag-limiter-panel { grid-column: span 6; }
-  .diag-process-panel, .diag-workers-panel, .diag-catalog-panel, .diag-http-panel, .diag-search-panel { grid-column: span 3; }
+  .diag-process-panel, .diag-workers-panel, .diag-subsystems-panel, .diag-catalog-panel, .diag-http-panel, .diag-madvise-panel, .diag-search-panel { grid-column: span 3; }
 }
 @media (max-width: 700px) {
   .diag-history-data { grid-template-columns: minmax(0, 1fr); gap: 12px; }
-  .diag-card, .diag-memory-panel, .diag-process-panel, .diag-workers-panel, .diag-catalog-panel, .diag-http-panel, .diag-limiter-panel, .diag-search-panel { grid-column: 1; padding: 14px; }
+  .diag-card, .diag-memory-panel, .diag-process-panel, .diag-workers-panel, .diag-subsystems-panel, .diag-catalog-panel, .diag-http-panel, .diag-madvise-panel, .diag-limiter-panel, .diag-search-panel { grid-column: 1; padding: 14px; }
   .diag-card-head { flex-wrap: wrap; }
   .diag-history-counts > div { align-items: flex-start; }
   .diag-history-counts dd { max-width: 60%; white-space: normal; overflow-wrap: anywhere; }

@@ -3,10 +3,144 @@
 Архитектура, принципы и передача работы следующему разработчику.
 
 Репозиторий: `https://github.com/necronicle/d2k`, публичный, ветка `main`.
-Дата последней правки: 2026-11-05.
+Дата последней правки: 2026-11-06.
 Донор кода и опыта: `https://github.com/necronicle/z2k`, версия `f4221c4`, ветка `z2k-staging`, релиз z2k r-82.7, лицензия MIT.
 
 ## 0. Фактическое состояние — читать первым
+
+### OpenWrt: procfs памяти, 06.11.2026
+
+Основание: `main` на `c5485a73c5c83da54386af6bf897e9bd98aa673b`; дерево
+изменено, не закоммичено. В upstream Linux Kconfig символ включён по умолчанию
+только если его явно не выключили и включены `PROC_FS` и `MMU`. Но generic
+конфигурации OpenWrt явно выключают `CONFIG_PROC_PAGE_MONITOR` в
+21.02/5.4, 22.03/5.10, 23.05/5.15, 24.10/6.6 и 25.12/6.12 ([21.02](https://raw.githubusercontent.com/openwrt/openwrt/openwrt-21.02/target/linux/generic/config-5.4),
+[22.03](https://raw.githubusercontent.com/openwrt/openwrt/openwrt-22.03/target/linux/generic/config-5.10),
+[23.05](https://raw.githubusercontent.com/openwrt/openwrt/openwrt-23.05/target/linux/generic/config-5.15),
+[24.10](https://raw.githubusercontent.com/openwrt/openwrt/openwrt-24.10/target/linux/generic/config-6.6),
+[25.12](https://raw.githubusercontent.com/openwrt/openwrt/openwrt-25.12/target/linux/generic/config-6.12)).
+Linux Kconfig задаёт зависимость и default ([источник](https://github.com/torvalds/linux/blob/v6.12/fs/proc/Kconfig));
+OpenWrt предоставляет настройку сборки `KERNEL_PROC_PAGE_MONITOR` ([24.10](https://raw.githubusercontent.com/openwrt/openwrt/openwrt-24.10/config/Config-kernel.in),
+[25.12](https://raw.githubusercontent.com/openwrt/openwrt/openwrt-25.12/config/Config-kernel.in)).
+Поэтому отсутствие `/proc/PID/smaps_rollup` ожидаемо на generic-образах этих
+релизов независимо от MIPS/MIPSel. `smaps_rollup` и `smaps` — интерфейсы
+kernel procfs, не пакеты. `RssAnon`, `VmRSS` и `VmData` остаются в
+`/proc/PID/status` ([документация procfs](https://docs.kernel.org/6.13/filesystems/proc.html)).
+`Anonymous` и `Private_Dirty` доступны только в прошивке, собранной с
+`KERNEL_PROC_PAGE_MONITOR` / `CONFIG_PROC_PAGE_MONITOR=y`. Если `/proc/PID`
+исчезает между чтением статуса и rollup, сборщик отмечает снимок как
+`unavailable`; если PID-каталог всё ещё есть, но необязательного файла нет,
+он записывает `unsupported` без errno: это штатное отсутствие kernel
+procfs-интерфейса, не ошибка чтения. Другие ошибки чтения сохраняются.
+Userspace-пакет не может создать этот файл.
+Набор OpenWrt target/kernel version менялся от старых ядер 3.x/4.x до 6.x;
+release-кросс-матрица проверяет ABI/ISA бинарников, но не может доказать
+конфигурацию procfs конкретной прошивки. Поэтому сборщик не считает
+`smaps_rollup` обязательной функцией устройства.
+
+Точечная сверка для MIPS targets OpenWrt 25.12: `ath79` задаёт `ARCH=mips`,
+`CPU_TYPE=24kc`, kernel 6.12; `ramips` задаёт `ARCH=mipsel` и kernel 6.12
+([ath79 Makefile](https://raw.githubusercontent.com/openwrt/openwrt/openwrt-25.12/target/linux/ath79/Makefile),
+[ramips Makefile](https://raw.githubusercontent.com/openwrt/openwrt/openwrt-25.12/target/linux/ramips/Makefile)).
+В Linux 6.12 `fs/proc/Makefile` собирает `task_mmu.o` при `CONFIG_MMU`, а
+отдельный `page.o` — только при `CONFIG_PROC_PAGE_MONITOR`; функция `task_mem`
+в `task_mmu.c` продолжает выдавать `VmRSS`, `RssAnon` и `VmData` для
+`/proc/PID/status`. Значит, отключение page monitor выключает `smaps`-семейство,
+но не базовые поля, нужные истории D2O. Zig musl targets из
+`scripts/build-target.sh` проверяют MIPS/MIPSel ISA/ABI; OpenWrt SDK и физический
+MIPS роутер здесь недоступны, поэтому это не заменяет полевую проверку конкретной
+vendor-прошивки.
+Отдельная `CONFIG_PROC_STRIPPED` не отключает эту историю: generic-конфигурация
+25.12 её выключает, а OpenWrt `902-debloat_proc.patch` не меняет `fs/proc/array.c`
+или `task_mmu.c`; он вырезает другие procfs-интерфейсы. Частные vendor-ядра могут
+отличаться, поэтому отчёт продолжает проверять наличие каждого источника.
+
+Проверка musl-кросс-сборкой нашла отдельную OpenWrt-совместимость: glibc
+понимает `_DEFAULT_SOURCE`, но musl не открывает через него `MADV_DONTNEED`
+при `_POSIX_C_SOURCE`. В `core/sched.c` feature-макрос заменён на
+`_GNU_SOURCE`, после чего в MIPS и MIPSel препроцессированном коде присутствует
+вызов `madvise`. Это включает уже добавленный возврат целых страниц в musl-
+сборках; выравнивание и runtime-условие вызова не менялись. Из-за этого новый
+путь реально меняет RSS/page-fault поведение на OpenWrt musl и требует замера на
+устройстве до выпуска.
+
+Сборщик оставляет RSS, RssAnon и VmData из `/proc/PID/status`; подробный
+`smaps_rollup` читается только если procfs его предоставляет. Полный `smaps`
+не обходится: это исключает дорогой проход по mappings при отключённом
+`CONFIG_PROC_PAGE_MONITOR`. При существующем PID и отсутствии необязательного
+файла состояние JSON — `unsupported`, errno отсутствует, а панель объясняет
+ограничение procfs. Другие ошибки чтения и errno сохраняются в полном отчёте.
+Если исчез сам PID, состояние остаётся `unavailable`. RSS, RssAnon, VmData и
+внутренние учётные счётчики продолжают попадать в историю без rollup;
+Anonymous и Private_Dirty не подменяются оценками. Панель объясняет, что
+generic-конфигурации OpenWrt выключают эту возможность по умолчанию.
+Коррекция ENOENT: если `/proc/PID` существует, но `smaps_rollup` отсутствует,
+снимок получает `unsupported`, `smaps_rollup_errno=null`; базовые поля статуса
+собираются дальше. Это классификация отсутствующей kernel-функции, а не скрытие
+ошибок: `EACCES`, ошибки чтения и исчезновение самого PID сохраняют свои коды.
+Проверки ниже повторены на текущем дереве после этой коррекции.
+Аномалия RSS сравнивается с суммой учтённых TCP/QUIC/TLS объектов, каталога,
+HTTP-хранилища и snapshot-буферов; JSON называет эту дельту
+`accounted_delta_kib`. Инструментирование покрывает шесть фиксированных точек
+выделений (аргумент TCP-worker, TLS 1.2/1.3 объекты, TCP/TLS receive buffer,
+QUIC connection и HTTP/3 headers), без глобального перехвата allocator; другие
+heap-объекты, libc/pthread и kernel socket buffers остаются вне покрытия.
+### Сверка единиц и времени в UI диагностики, 06.11.2026
+
+Стартовая ревизия — `main`/`c5485a73c5c83da54386af6bf897e9bd98aa673b`.
+В `/api/diagnostics?report` история `catalog_kib`/`http_kib` и верхние
+`catalog_bytes`/`http_bytes` использовали разные единицы; карточки также могли
+показывать более новый общий снимок, чем график. Новые строки истории теперь
+сохраняют точные байты и перечисляют единицы в `memory_history.fields`; старые
+отчёты с `_kib` и без `fields` продолжают читаться как прежний позиционный формат.
+Карточки объёма берут последнюю доступную точку той же истории, а лимиты и
+счётчики общего снимка показывают разницу времени, если точки не совпали.
+Дублирующийся DOM id смешивал длительность истории и покрытие memory hooks; эти
+подписи разделены. RSS в таблице процесса использует дельту того же диапазона,
+что график, только если снимки и PID согласованы. Без PID generation RSS-дельта
+не выводится. Поля с `null` не заменяются нулями.
+
+Наблюдавшиеся одинаковые дельты были свойством синтетического preview-fixture:
+он задавал одинаковый прирост строкам и отправлял байты в старом неименованном
+поле `_kib`. Fixture теперь имеет валидный `fields`, точные `catalog_bytes=9625`
+и `http_bytes=5529`, независимые изменения показателей и совпадающие либо явно
+разведённые monotonic-времена. Интерфейс сообщает фактическую длину сохранённой
+истории (10 минут при выборе 24 часов). Отсутствие `smaps`/`smaps_rollup` при
+живом PID — нейтральная информация; errno и настройки ядра находятся в закрытых
+`details`; действительные ошибки чтения остаются предупреждениями.
+
+Проверки этого изменения: `node --check internal/web/assets/diagnostics.js`,
+`node --check panel/test_diagnostics.cjs`, `node --check panel/test_browser.cjs`,
+`node panel/test_diagnostics.cjs` и `git diff --check` прошли. C-регрессия
+`test_diagnostics` собрана/запущена с `-Werror`, отдельно ASan+UBSan, через
+временный Windows POSIX shim; ring — 258264 байта. JSON из неё разобран Node:
+1440 строк, точные 9625/5529 байт, `ring_bytes <= 256 KiB`, полный JSON — 365312
+байт. `test_diagnostics_json.py` отдельно не запускался: Python отсутствует.
+Кросс-линковка диагностического теста прошла для 9 target ABI из
+`scripts/build-target.sh`; полный `d2kc` пересобран статически для MIPS и
+MIPSel: 1317444 и 1319780 байт.
+
+Playwright CLI открыл текущую панель на C-сервере (SHA-256 `/assets/diagnostics.js`
+совпал с исходником) и подставил контролируемый ответ `/api/diagnostics?report`.
+Проверены 1440 точек, 23 ч 59 мин фактической истории, одинаковое форматирование
+9,4 КиБ и 5,4 КиБ в карточках/легенде, независимые дельты RSS/RssAnon/VmData/TCP/
+QUIC/TLS, смещение времени на минуту, граница PID, 10 минут из выбранных 24 часов,
+старый формат и нейтральный unsupported. Отдельный same-time конфликт 9625/10649
+байт показал согласованную карточку/график и обе величины в раскрываемой детали.
+В сессии Playwright — 0 ошибок и 0 предупреждений; при 390 px горизонтального
+overflow нет. Скриншоты desktop: `C:\t\d2o-diagnostics-desktop-current.png`
+и нижнего блока предупреждений `C:\t\d2o-diagnostics-warning-desktop-current.png`.
+Тестовый файл `panel/test_browser.cjs` синтаксически проверен, но его C-fixture
+не может локально открыть Unix-domain socket на Windows (`listen EACCES`).
+Браузерные assertions остаются в CI Linux.
+
+Сравнение allocation-hook overhead (1 млн пар, медиана 5 прогонов, Windows
+x86-64): 256 B — 24/26/29 нс на пару (база/сбор выключен/включён), 16 KiB —
+141/143/155 нс. Это microbenchmark, не end-to-end d2kc и не измерение на
+OpenWrt/MIPS. В этой среде отсутствуют GNU make, WSL, QEMU и OpenWrt SDK;
+`make -C core check`, полный sanitizer loop и полевой замер не выполнены.
+Изменений на роутере нет. GitHub Actions этого изменения ожидает push; релиз
+допустим только после зелёного CI.
 
 ### PR #2: UI диагностики по компактной истории, 05.11.2026
 

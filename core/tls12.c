@@ -40,6 +40,7 @@
 #include "d2k_p256.h"
 #include "d2k_tls12.h"
 #include "d2k_tls13core.h"
+#include "d2k_diagnostics.h"
 
 #define REC_CCS       20
 #define REC_ALERT     21
@@ -92,7 +93,11 @@ struct d2k_tls12 {
     uint8_t  raw[REC_MAX], wire[REC_MAX + 5];
     uint8_t  plain[REC_MAX];
     size_t   plain_len, plain_off;
+    int      diag_memory_tracked;
 };
+static void tls12_dispose(d2k_tls12 *t){
+    if(t){d2k_diag_memory_release(D2K_DIAG_MEM_TLS12_SESSION,sizeof *t,t->diag_memory_tracked);free(t);}
+}
 
 static void say(char *err, size_t cap, const char *fmt, ...) {
     if (!err || cap == 0) { return; }
@@ -488,7 +493,8 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
                       d2k_tls12 **out, char *err, size_t errcap) {
     if (!out) { say(err, errcap, "некуда положить сессию"); return -1; }
     d2k_tls12 *t = calloc(1, sizeof *t);
-    if (!t) { say(err, errcap, "нет памяти"); return -1; }
+    if (!t) { d2k_diag_memory_alloc_failure(D2K_DIAG_MEM_TLS12_SESSION);say(err, errcap, "нет памяти"); return -1; }
+    t->diag_memory_tracked=d2k_diag_memory_acquire(D2K_DIAG_MEM_TLS12_SESSION,sizeof *t);
     t->fd = fd;
     t->peer_name = -1;
     int64_t deadline = now_ms() + (deadline_ms > 0 ? deadline_ms : 5000);
@@ -498,17 +504,17 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
     uint8_t *ch = t->wire;
     if (d2k_t13_random(t->c_random, 32) != 0) {
         say(err, errcap, "нет случайных байт");
-        free(t);
+        tls12_dispose(t);
         return -1;
     }
     size_t hello_len = ch12_build(sni, t->c_random, want_wire, ch, sizeof t->wire);
     if (hello_len == 0) {
         say(err, errcap, "приветствие не собралось");
-        free(t);
+        tls12_dispose(t);
         return -1;
     }
     if (d2k_tls12_test_barrier) { d2k_tls12_test_barrier(); }
-    if (write_all(fd, ch, hello_len, err, errcap) != 0) { free(t); return -1; }
+    if (write_all(fd, ch, hello_len, err, errcap) != 0) { tls12_dispose(t); return -1; }
     tr_add(t, ch + 5, hello_len - 5);
     hs_stream hs;
     memset(&hs, 0, sizeof hs);
@@ -529,11 +535,12 @@ int d2k_tls12_resume(int fd, const char *sni, int deadline_ms,
                      d2k_tls12 **out, char *err, size_t errcap) {
     if (!out || !c_random || !ch_msg || !srv) { say(err, errcap, "нечем продолжать"); return -1; }
     d2k_tls12 *t = calloc(1, sizeof *t);
-    if (!t) { say(err, errcap, "нет памяти"); return -1; }
+    if (!t) { d2k_diag_memory_alloc_failure(D2K_DIAG_MEM_TLS12_SESSION);say(err, errcap, "нет памяти"); return -1; }
+    t->diag_memory_tracked=d2k_diag_memory_acquire(D2K_DIAG_MEM_TLS12_SESSION,sizeof *t);
     t->fd = fd;
     t->peer_name = -1;
     memcpy(t->c_random, c_random, 32);
-    if (ch_len > TR_MAX || srv_len > TR_MAX) { say(err, errcap, "рукопожатие длиннее предела"); free(t); return -1; }
+    if (ch_len > TR_MAX || srv_len > TR_MAX) { say(err, errcap, "рукопожатие длиннее предела"); tls12_dispose(t); return -1; }
     tr_add(t, ch_msg, ch_len);
     int64_t deadline = now_ms() + (deadline_ms > 0 ? deadline_ms : 5000);
     hs_stream hs;
@@ -557,23 +564,23 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
         const uint8_t *msg;
         size_t mlen;
         if (hs_next(t, hs_in, 0, &type, &msg, &mlen, deadline, err, errcap) != 0) {
-            free(t);
+            tls12_dispose(t);
             return -1;
         }
         if (type == HS_PSEUDO_CCS) {
             say(err, errcap, "смена шифра раньше ServerHelloDone");
-            free(t);
+            tls12_dispose(t);
             return -1;
         }
         tr_add(t, msg, mlen);
         const uint8_t *b = msg + 4;
         size_t n = mlen - 4;
         if (type == HS_SERVER_HELLO) {
-            if (n < 2 + 32 + 1) { say(err, errcap, "ServerHello обрезан"); free(t); return -1; }
+            if (n < 2 + 32 + 1) { say(err, errcap, "ServerHello обрезан"); tls12_dispose(t); return -1; }
             memcpy(t->s_random, b + 2, 32);
             size_t i = 2 + 32;
             i += 1 + b[i];
-            if (i + 2 > n) { say(err, errcap, "ServerHello обрезан на шифре"); free(t); return -1; }
+            if (i + 2 > n) { say(err, errcap, "ServerHello обрезан на шифре"); tls12_dispose(t); return -1; }
             suite = get16(b + i);
             if (suite != CS_ECDHE_RSA_AES128_GCM_SHA256 &&
                 suite != CS_ECDHE_ECDSA_AES128_GCM_SHA256) {
@@ -581,7 +588,7 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
                    что угодно из предложенного клиентом, а зонд умеет одно. */
                 say(err, errcap, "сервер выбрал шифрнабор 0x%04x — зонд умеет только "
                                  "ECDHE+AES128-GCM-SHA256", (unsigned)suite);
-                free(t);
+                tls12_dispose(t);
                 return -1;
             }
         } else if (type == HS_CERTIFICATE) {
@@ -589,10 +596,10 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
                 t->peer_name = d2k_t13_cert_name_ok12(b, n, sni);
             }
         } else if (type == HS_SKE) {
-            if (n < 4) { say(err, errcap, "ServerKeyExchange обрезан"); free(t); return -1; }
+            if (n < 4) { say(err, errcap, "ServerKeyExchange обрезан"); tls12_dispose(t); return -1; }
             if (b[0] != 3) {
                 say(err, errcap, "сервер предложил не именованную кривую (%u)", b[0]);
-                free(t);
+                tls12_dispose(t);
                 return -1;
             }
             /* X25519 и secp256r1. Поле 07.10.2026 (KN-1811): graph.facebook.com
@@ -604,12 +611,12 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
             if (want == 0) {
                 say(err, errcap, "сервер выбрал группу 0x%04x — зонд умеет X25519 и secp256r1",
                     (unsigned)group);
-                free(t);
+                tls12_dispose(t);
                 return -1;
             }
             if (b[3] != want || n < 4 + want) {
                 say(err, errcap, "открытый ключ сервера длиной %u вместо %zu", b[3], want);
-                free(t);
+                tls12_dispose(t);
                 return -1;
             }
             memcpy(peer_pub, b + 4, want);
@@ -618,7 +625,7 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
             /* Клиентский сертификат зонду взять негде, а слать пустой значит
                менять форму обмена. Честный отказ. */
             say(err, errcap, "сервер требует клиентский сертификат — зонду его негде взять");
-            free(t);
+            tls12_dispose(t);
             return -1;
         } else if (type == HS_DONE) {
             have_done = 1;
@@ -627,7 +634,7 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
     }
     if (!have_peer || !have_done || suite == 0) {
         say(err, errcap, "флайт сервера неполон");
-        free(t);
+        tls12_dispose(t);
         return -1;
     }
 
@@ -637,19 +644,19 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
     if (group == GROUP_X25519) {
         if (d2k_t13_random(priv, 32) != 0) {
             say(err, errcap, "нет случайных байт");
-            free(t);
+            tls12_dispose(t);
             return -1;
         }
         if (d2k_x25519_base(pub, priv) != 0 || d2k_x25519(shared, priv, peer_pub) != 0) {
             say(err, errcap, "X25519 не сошёлся");
-            free(t);
+            tls12_dispose(t);
             return -1;
         }
     } else if (d2k_p256_keypair(priv, pub) != 0 || d2k_p256_ecdh(priv, peer_pub, shared) != 0) {
         /* Точка сервера не на кривой — тоже сюда: это утверждение о сервере,
            не о коробке, и в каталог по нему не идёт ничего. */
         say(err, errcap, "secp256r1 не сошёлся");
-        free(t);
+        tls12_dispose(t);
         return -1;
     }
     {
@@ -677,14 +684,14 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
         cke[4] = (uint8_t)pub_len;
         memcpy(cke + 5, pub, pub_len);
         if (send_plain(t, REC_HANDSHAKE, cke, cke_len, err, errcap) != 0) {
-            free(t);
+            tls12_dispose(t);
             return -1;
         }
         tr_add(t, cke, cke_len);
     }
     {
         uint8_t ccs = 1;
-        if (send_plain(t, REC_CCS, &ccs, 1, err, errcap) != 0) { free(t); return -1; }
+        if (send_plain(t, REC_CCS, &ccs, 1, err, errcap) != 0) { tls12_dispose(t); return -1; }
     }
     {
         uint8_t hash[32], fin[4 + 12];
@@ -693,7 +700,7 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
         fin[1] = 0; fin[2] = 0; fin[3] = 12;
         prf(t->master, 48, "client finished", hash, 32, fin + 4, 12);
         if (send_sealed(t, REC_HANDSHAKE, fin, sizeof fin, err, errcap) != 0) {
-            free(t);
+            tls12_dispose(t);
             return -1;
         }
         tr_add(t, fin, sizeof fin);
@@ -709,7 +716,7 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
             const uint8_t *msg;
             size_t mlen;
             if (hs_next(t, &shs, seen_ccs, &type, &msg, &mlen, deadline, err, errcap) != 0) {
-                free(t);
+                tls12_dispose(t);
                 return -1;
             }
             if (type == HS_PSEUDO_CCS) {
@@ -728,7 +735,7 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
                    проверяем по построению (см. шапку). */
                 if (mlen != 4 + 12) {
                     say(err, errcap, "Finished сервера длиной %zu вместо 16", mlen);
-                    free(t);
+                    tls12_dispose(t);
                     return -1;
                 }
                 break;
@@ -787,7 +794,7 @@ long d2k_tls12_read(d2k_tls12 *t, uint8_t *buf, size_t cap, int wait_ms,
 
 int d2k_tls12_peer_name(const d2k_tls12 *t) { return t ? t->peer_name : -1; }
 
-void d2k_tls12_free(d2k_tls12 *t) { free(t); }
+void d2k_tls12_free(d2k_tls12 *t) { tls12_dispose(t); }
 
 uint64_t d2k_tls12_rx_wire_bytes(const d2k_tls12 *t) { return t ? t->rx_wire_bytes : 0; }
 uint32_t d2k_tls12_rx_record_missing(const d2k_tls12 *t) { return t ? (t->rx_record_missing) : 0; }

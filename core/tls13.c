@@ -41,6 +41,7 @@
 #include "d2k_tls13.h"
 #include "d2k_tls13core.h"
 #include "d2k_tls12.h"
+#include "d2k_diagnostics.h"
 
 #define REC_CCS       20
 #define REC_ALERT     21
@@ -77,7 +78,11 @@ struct d2k_tls {
     /* Сервер выбрал TLS 1.2 на наше приветствие с обеими версиями: сессию
        ведёт клиент 1.2, чтение и запись идут через него. */
     d2k_tls12 *v12;
+    int diag_memory_tracked;
 };
+static void tls_dispose(d2k_tls *t){
+    if(t){d2k_diag_memory_release(D2K_DIAG_MEM_TLS13_SESSION,sizeof *t,t->diag_memory_tracked);free(t);}
+}
 
 static void say(char *err, size_t cap, const char *fmt, ...) {
     if (!err || cap == 0) { return; }
@@ -278,7 +283,8 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
 
     /* Транскрипт: сообщения рукопожатия подряд, без заголовков записей. */
     d2k_tls *t = calloc(1, sizeof *t);
-    if (!t) { say(err, errcap, "не хватило памяти"); return -1; }
+    if (!t) { d2k_diag_memory_alloc_failure(D2K_DIAG_MEM_TLS13_SESSION);say(err, errcap, "не хватило памяти"); return -1; }
+    t->diag_memory_tracked=d2k_diag_memory_acquire(D2K_DIAG_MEM_TLS13_SESSION,sizeof *t);
     t->fd = fd;
     t->peer_name = -1;   /* пока не смотрели — «сказать нечего», а не «нет» */
     uint8_t *tr = t->transcript;
@@ -316,20 +322,20 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
     if (ech) {
         uint8_t hpke_priv[32], outer_random[32];
         if (d2k_t13_random(hpke_priv, 32) || d2k_t13_random(outer_random, 32)) {
-            say(err, errcap, "нет случайности для ECH"); free(t); return -1;
+            say(err, errcap, "нет случайности для ECH"); tls_dispose(t); return -1;
         }
         ch_len = d2k_t13_ech_build(&cho, ech, hpke_priv, outer_random,
             ch, sizeof ch, inner, sizeof inner, &inner_len);
         memset(hpke_priv, 0, sizeof hpke_priv);
     } else ch_len = d2k_t13_ch_build(&cho, ch, sizeof ch);
-    if (ch_len == 0) { say(err, errcap, "приветствие не собралось"); free(t); return -1; }
+    if (ch_len == 0) { say(err, errcap, "приветствие не собралось"); tls_dispose(t); return -1; }
 
     uint8_t rec[5 + sizeof ch];
     rec[0] = REC_HANDSHAKE;
     put16(rec + 1, 0x0301);                        /* legacy_record_version */
     put16(rec + 3, (uint16_t)ch_len);
     memcpy(rec + 5, ch, ch_len);
-    if (write_all(fd, rec, 5 + ch_len, err, errcap) != 0) { free(t); return -1; }
+    if (write_all(fd, rec, 5 + ch_len, err, errcap) != 0) { tls_dispose(t); return -1; }
     memcpy(tr, ech ? inner : ch, ech ? inner_len : ch_len);
     tr_len = ech ? inner_len : ch_len;
 
@@ -339,19 +345,19 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
     uint8_t type = 0;
     for (;;) {
         if (read_record(t, 0, &type, sh, sizeof sh, &sh_len, deadline, err, errcap) != 0) {
-            free(t);
+            tls_dispose(t);
             return -1;
         }
         if (type == REC_CCS) { continue; }
         if (type == REC_ALERT) {
             say(err, errcap, "сервер прервал рукопожатие тревогой %u",
                 sh_len >= 2 ? (unsigned)sh[1] : 0u);
-            free(t);
+            tls_dispose(t);
             return -1;
         }
         if (type != REC_HANDSHAKE || sh_len < 4 || sh[0] != HS_SERVER_HELLO) {
             say(err, errcap, "вместо ServerHello пришло другое (тип %u)", (unsigned)type);
-            free(t);
+            tls_dispose(t);
             return -1;
         }
         break;
@@ -363,7 +369,7 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
         d2k_tls12 *v = NULL;
         if (d2k_tls12_resume(fd, sni, left > 0 ? (int)left : 1, rnd, ch, ch_len,
                              sh, sh_len, &v, err, errcap) != 0) {
-            free(t);
+            tls_dispose(t);
             return -1;
         }
         t->v12 = v;
@@ -373,7 +379,7 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
     }
     if (ech && !d2k_t13_ech_accepted(inner, inner_len, sh, sh_len)) {
         say(err, errcap, "ECH не принят сервером: публичное имя не подтверждает origin");
-        free(t); return -1;
+        tls_dispose(t); return -1;
     }
     t->ech_accepted = ech != NULL;
     memcpy(tr + tr_len, sh, sh_len);
@@ -381,14 +387,14 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
 
     const uint8_t *peer = NULL;
     if (d2k_t13_sh_parse(sh, sh_len, &peer, err, errcap) != 0) {
-        free(t);
+        tls_dispose(t);
         return -1;
     }
 
     uint8_t shared[32];
     if (d2k_x25519(shared, priv, peer) != 0) {
         say(err, errcap, "общий секрет не посчитался (точка малого порядка)");
-        free(t);
+        tls_dispose(t);
         return -1;
     }
 
@@ -396,7 +402,7 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
     if (d2k_t13_schedule_hs(shared, tr, tr_len, c_hs, s_hs, hs) != 0 ||
         traffic_keys(c_hs, t->c_key, t->c_iv) != 0 ||
         traffic_keys(s_hs, t->s_key, t->s_iv) != 0) {
-        say(err, errcap, "ключи рукопожатия не собрались"); free(t); return -1;
+        say(err, errcap, "ключи рукопожатия не собрались"); tls_dispose(t); return -1;
     }
     t->c_seq = t->s_seq = 0;
 
@@ -407,24 +413,24 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
         uint8_t msg[REC_MAX];
         size_t mlen = 0;
         if (read_record(t, 1, &type, msg, sizeof msg, &mlen, deadline, err, errcap) != 0) {
-            free(t);
+            tls_dispose(t);
             return -1;
         }
         if (type == REC_CCS) { continue; }
         if (type == REC_ALERT) {
             say(err, errcap, "сервер прервал рукопожатие тревогой %u",
                 mlen >= 2 ? (unsigned)msg[1] : 0u);
-            free(t);
+            tls_dispose(t);
             return -1;
         }
         if (type != REC_HANDSHAKE) {
             say(err, errcap, "в рукопожатии запись типа %u", (unsigned)type);
-            free(t);
+            tls_dispose(t);
             return -1;
         }
         if (tr_len + mlen > sizeof t->transcript) {
             say(err, errcap, "транскрипт рукопожатия длиннее предела");
-            free(t);
+            tls_dispose(t);
             return -1;
         }
         memcpy(tr + tr_len, msg, mlen);
@@ -459,7 +465,7 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
             previous = at;
         }
         if (!finished_ok) {
-            say(err, errcap, "ECH: серверный Finished не подтверждён"); free(t); return -1;
+            say(err, errcap, "ECH: серверный Finished не подтверждён"); tls_dispose(t); return -1;
         }
     }
 
@@ -483,13 +489,13 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
     /* Прикладные ключи считаются от транскрипта ДО нашего Finished. */
     uint8_t c_ap[32], s_ap[32];
     if (d2k_t13_schedule_ap(hs, tr, tr_len, c_ap, s_ap) != 0) {
-        say(err, errcap, "прикладные ключи не собрались"); free(t); return -1;
+        say(err, errcap, "прикладные ключи не собрались"); tls_dispose(t); return -1;
     }
 
     /* Наш Finished — под ключами РУКОПОЖАТИЯ, поэтому шлём до смены ключей. */
     uint8_t verify[32];
     if (d2k_t13_finished_mac(c_hs, tr, tr_len, verify) != 0) {
-        say(err, errcap, "ключ подтверждения не собрался"); free(t); return -1;
+        say(err, errcap, "ключ подтверждения не собрался"); tls_dispose(t); return -1;
     }
     uint8_t fin[4 + 32];
     fin[0] = D2K_T13_FINISHED; fin[1] = 0; fin[2] = 0; fin[3] = 32;
@@ -499,16 +505,16 @@ static int tls_connect_internal(int fd, const char *sni, int deadline_ms,
        (RFC 8446 §D.4). Ровно то, что шлёт браузер; без неё часть сетевого
        оборудования рвёт сессию, и мы измеряли бы это вместо блока по объёму. */
     uint8_t ccs[6] = { REC_CCS, 0x03, 0x03, 0x00, 0x01, 0x01 };
-    if (write_all(fd, ccs, sizeof ccs, err, errcap) != 0) { free(t); return -1; }
+    if (write_all(fd, ccs, sizeof ccs, err, errcap) != 0) { tls_dispose(t); return -1; }
     if (write_record(t, REC_HANDSHAKE, fin, sizeof fin, err, errcap) != 0) {
-        free(t);
+        tls_dispose(t);
         return -1;
     }
 
     /* Смена на прикладные ключи — в обе стороны, счётчики с нуля (§5.3). */
     if (traffic_keys(c_ap, t->c_key, t->c_iv) != 0 ||
         traffic_keys(s_ap, t->s_key, t->s_iv) != 0) {
-        say(err, errcap, "прикладные ключи не развернулись"); free(t); return -1;
+        say(err, errcap, "прикладные ключи не развернулись"); tls_dispose(t); return -1;
     }
     t->c_seq = t->s_seq = 0;
 
@@ -598,7 +604,7 @@ int d2k_tls_peer_name(const d2k_tls *t) { return t ? t->peer_name : -1; }
 
 void d2k_tls_free(d2k_tls *t) {
     if (t && t->v12) { d2k_tls12_free(t->v12); }
-    free(t);
+    tls_dispose(t);
 }
 
 uint64_t d2k_tls_rx_wire_bytes(const d2k_tls *t) { return t ? t->rx_wire_bytes + (t->v12 ? d2k_tls12_rx_wire_bytes(t->v12) : 0) : 0; }
