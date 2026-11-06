@@ -5,16 +5,13 @@ static char diagnostic_test_dir[]="/tmp/d2k-diag-runtime-XXXXXX";
 #include "d2kc.c"
 #undef main
 #include <assert.h>
-/* Keep GCC from folding this deliberate short-buffer case into snprintf. */
-#if defined(__GNUC__)
-__attribute__((noinline))
-#endif
-static int path_overflows(char *out,size_t cap,const char *dir,const char *name) {
+static int path_overflows(const char *dir,const char *name) {
+    char out[2];volatile size_t cap=sizeof out;
     return d2k_diag_path(out,cap,dir,name);
 }
 int main(void) {
     assert(mkdtemp(diagnostic_test_dir));
-    char short_path[2];errno=0;assert(path_overflows(short_path,sizeof short_path,D2K_DIAG_DIR,"report.json")<0);
+    errno=0;assert(path_overflows(D2K_DIAG_DIR,"report.json")<0);
     assert(errno==ENAMETOOLONG);
     d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0);assert(s);
     d2k_diag_counts counts;

@@ -4,7 +4,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
-#include <stdio.h>
 #include <string.h>
 #ifndef D2K_DIAG_DIR
 #define D2K_DIAG_DIR "/tmp/d2k-diagnostics"
@@ -19,9 +18,11 @@ static inline int d2k_diag_dir(const char *dir,int create) {
     return 0;
 }
 static inline int d2k_diag_path(char *out,size_t n,const char *dir,const char *name) {
-    int z=snprintf(out,n,"%s/%s",dir,name);
-    if(z<0)return -1;
-    if((size_t)z>=n){errno=ENAMETOOLONG;return -1;}
+    size_t dir_len=strlen(dir),name_len=strlen(name);
+    if(n<2||dir_len>n-2||name_len>n-2-dir_len){errno=ENAMETOOLONG;return -1;}
+    memcpy(out,dir,dir_len);
+    out[dir_len]='/';
+    memcpy(out+dir_len+1,name,name_len+1);
     return 0;
 }
 static inline int d2k_diag_enabled(const char *dir) {
