@@ -392,7 +392,8 @@
     if ((number(delta) !== null && delta > 0) || growth) {
       var growthText = number(delta) !== null && delta > 0 ? "RSS вырос на " + formatBytes(delta) + " за фактически доступную часть выбранных " + rangeText(hours) :
         "За " + pretty(number(growth.window_samples)) + " снимков RSS вырос на " + formatKib(growth.rss_delta_kib);
-      if (growth) growthText += "; за последние " + pretty(number(growth.window_samples)) + " снимков учтённая память изменилась на " +
+    if (growth) growthText += "; без сопоставимого роста учтённых объектов: за последние " +
+      pretty(number(growth.window_samples)) + " снимков учтённая память изменилась на " +
         formatKib(number(growth.accounted_delta_kib));
       add("info", "Рост RSS", growthText + ". Рост сам по себе не подтверждает утечку.");
     }
