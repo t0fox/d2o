@@ -780,7 +780,7 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/в 2 снимках/,'two unsupported rollup samples are counted');
   assert.doesNotMatch(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/гонкой при остановке процесса/,'unsupported means the PID exists but the kernel interface is absent');
   assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/KERNEL_PROC_PAGE_MONITOR и CONFIG_PROC_PAGE_MONITOR=y/,'firmware option needed for optional smaps metrics is explicit');
-  assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/VmRSS, RssAnon, VmData и учтённые D2O объекты продолжают собираться/,'OpenWrt baseline metrics stay available without smaps');
+  assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/RSS, RssAnon, VmData и учтённые D2O объекты продолжают собираться/,'OpenWrt baseline metrics stay available without smaps');
   assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/CONFIG_PROC_PAGE_MONITOR/,'OpenWrt guidance points to the kernel setting behind optional rollup metrics');
   assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/unsupported без errno; реальные ошибки чтения сохраняют errno в JSON/,'expected absence is classified as unsupported while real read errors remain in the report');
   assert.equal(diagnosticsReply.memory_details[0].latest.smaps_rollup_errno,null,'OpenWrt procfs feature absence is not serialized as a syscall error');
