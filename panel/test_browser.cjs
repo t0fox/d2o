@@ -702,7 +702,7 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/Подробная карта памяти недоступна на этом устройстве/,'optional smaps data is a calm information notice');
   assert.doesNotMatch(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/errno 2/,'expected unsupported procfs capability is described instead of shown as an operational errno');
   assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/без сопоставимого роста/,'unattributed RSS anomaly is reported without calling it a leak');
-  assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/Не удалось записать диагностический JSON/,'JSON write failures are visible');
+  assert.match(await evaluate('document.querySelector("#diagnostic-warnings").textContent'),/Не удалось сохранить диагностический JSON/,'JSON write failures are visible');
   assert.match(await evaluate('document.querySelector("#diagnostic-memory-tracking-coverage").textContent'),/выделенные при включённом сборе/,'tracking coverage is separate from history duration');
   assert.match(await evaluate('document.querySelector("#diagnostic-madvise-results").textContent'),/10 \/ 1/,'madvise outcomes are visible');
   assert.equal(await evaluate('document.querySelector("#diagnostic-workers-running").textContent'),'3','active workers are shown');
