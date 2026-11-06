@@ -4,6 +4,17 @@
 #include <errno.h>
 #include <pthread.h>
 #if defined(__linux__)
+#include <sys/mman.h>
+static unsigned worker_mmap_calls, worker_munmap_calls;
+static size_t worker_mmap_bytes, worker_munmap_bytes;
+static void *test_worker_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off);
+static int test_worker_munmap(void *addr, size_t len);
+static void *(*native_mmap)(void *,size_t,int,int,int,off_t)=mmap;
+static int (*native_munmap)(void *,size_t)=munmap;
+#define mmap test_worker_mmap
+#define munmap test_worker_munmap
+#endif
+#if defined(__linux__)
 static unsigned madvise_calls;
 static size_t madvise_bytes;
 static int madvise_errno_next;
@@ -155,6 +166,10 @@ int main(void) {
     assert(counts.worker_start_failures == 0 && counts.worker_join_failures == 3);
     assert(counts.last_measurement_age_ms >= 0);
     assert(synthetic_calls == CYCLES);
+#if defined(__linux__) && defined(MAP_ANONYMOUS)
+    assert(worker_mmap_calls == CYCLES && worker_munmap_calls == CYCLES);
+    assert(worker_mmap_bytes == worker_munmap_bytes);
+#endif
     d2k_diag_mem_site memory_sites[D2K_DIAG_MEMORY_SITE_COUNT];
     d2k_diag_memory_snapshot(memory_sites);
     assert(memory_sites[D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG].live_objects==0);
@@ -186,6 +201,16 @@ int main(void) {
     return 0;
 }
 #if defined(__linux__)
+static void *test_worker_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    void *p=native_mmap(addr,length,prot,flags,fd,offset);
+    if(p!=MAP_FAILED && length==sizeof(worker_arg)) {worker_mmap_calls++;worker_mmap_bytes+=length;}
+    return p;
+}
+static int test_worker_munmap(void *addr, size_t length) {
+    int rc=native_munmap(addr,length);
+    if(rc==0 && length==sizeof(worker_arg)) {worker_munmap_calls++;worker_munmap_bytes+=length;}
+    return rc;
+}
 static int test_madvise(void *addr,size_t length,int advice) {
     (void)addr;assert(length>0&&advice==MADV_DONTNEED);
     madvise_calls++;madvise_bytes=length;
