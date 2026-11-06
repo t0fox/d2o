@@ -2461,6 +2461,32 @@ typedef struct {
     int diag_memory_tracked;
 } worker_arg;
 
+/* Worker arguments hold two copied ClientHello buffers (~8 KiB). They are
+ * allocated by the scheduler thread and released by another thread. Repeated
+ * cross-thread malloc/free on the router's static musl build is a candidate
+ * for persistent RSS retention despite successful joins and task madvise.
+ *
+ * Anonymous mappings have exact ownership and munmap releases their pages
+ * directly to the kernel. Do not change worker/task lifetimes or stack size. */
+static worker_arg *worker_arg_alloc(void) {
+#if defined(__linux__) && defined(MAP_ANONYMOUS)
+    void *memory = mmap(NULL, sizeof(worker_arg), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return memory == MAP_FAILED ? NULL : memory;
+#else
+    return malloc(sizeof(worker_arg));
+#endif
+}
+
+static void worker_arg_free(worker_arg *a) {
+    if (!a) return;
+#if defined(__linux__) && defined(MAP_ANONYMOUS)
+    (void)munmap(a, sizeof(*a));
+#else
+    free(a);
+#endif
+}
+
 d2k_vres d2k_sched_ech_baseline_result(const d2k_ver_result *baseline,
     d2k_vol_result *volume, const char *origin) {
     d2k_vres result = {0}; result.verdict = D2K_V_INCONCLUSIVE;
@@ -2684,7 +2710,7 @@ static void *worker_run_body(void *vp) {
                       a->client_opts_known, a->trig_snapped};
     d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len, NULL, 0, 0, 0};
     d2k_diag_memory_release(D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG,sizeof *a,a->diag_memory_tracked);
-    free(a);
+    worker_arg_free(a);
     /* Ход сообщает только прогон измерителя (JOB_CLASSIFY); поток живёт ровно
        одну задачу, поэтому снимать приёмник не нужно. */
     if (t->job == JOB_CLASSIFY) {
@@ -3259,7 +3285,7 @@ static void note_worker_start_failure(d2k_sched *s, task *t) {
 }
 
 static int start_worker(d2k_sched *s, task *t, task_job job) {
-    worker_arg *a = malloc(sizeof *a);
+    worker_arg *a = worker_arg_alloc();
     if (!a) { d2k_diag_memory_alloc_failure(D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG);note_worker_start_failure(s, t); return -1; }
     a->diag_memory_tracked=d2k_diag_memory_acquire(D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG,sizeof *a);
     a->s = s; a->t = t;
@@ -3309,7 +3335,7 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     if (!created) {
         if (a->use_fd >= 0) { close(a->use_fd); }
         d2k_diag_memory_release(D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG,sizeof *a,a->diag_memory_tracked);
-        free(a);
+        worker_arg_free(a);
         note_worker_start_failure(s, t);
         return -1;
     }

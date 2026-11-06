@@ -12,7 +12,7 @@ static int capture_spawn;
 int summary_thread_create(pthread_t *thread, const pthread_attr_t *attr,
                           void *(*start)(void *), void *arg) {
     (void)thread; (void)attr; (void)start; (void)arg;
-    if (capture_spawn) { free(arg); return 0; }
+    if (capture_spawn) { worker_arg_free((worker_arg *)arg); return 0; }
     return EAGAIN;
 }
 
@@ -233,7 +233,10 @@ static void verify_reselects_witness(d2k_sched *s, int mode) {
     if (mode == 0) strcpy(t->ech_witnesses[t->ech_witness_count++], "third.example");
     rr_queries = 0; probe_calls = 0; probed_origin[0] = 0;
     d2k_sched_ech_resolve_hook = summary_resolve;
-    worker_arg *arg = calloc(1, sizeof *arg);
+    worker_arg *arg = worker_arg_alloc();
+    CHECK(arg != NULL);
+    if (!arg) return;
+    memset(arg, 0, sizeof *arg);
     arg->s = s; arg->t = t; arg->use_fd = -1;
     worker_run(arg);
     CHECK(!t->ech_reselect);
@@ -246,7 +249,10 @@ static void verify_reselects_witness(d2k_sched *s, int mode) {
         CHECK(!strcmp(t->ech_origin, "primary.example"));
         CHECK(t->ver.level == D2K_VER_HANDSHAKE && strstr(t->ver.reason, "не осталось"));
         /* Следующий кандидат относится к той же задаче, но не помечен для повторного выбора. */
-        worker_arg *next = calloc(1, sizeof *next);
+        worker_arg *next = worker_arg_alloc();
+        CHECK(next != NULL);
+        if (!next) return;
+        memset(next, 0, sizeof *next);
         next->s = s; next->t = t; next->use_fd = -1;
         worker_run(next);
         CHECK(probe_calls == 0);
