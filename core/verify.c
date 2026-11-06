@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -875,6 +876,246 @@ static void budget_say(d2k_ver_result *r, int outcome, const char *fmt, ...) {
     va_end(ap);
 }
 
+static size_t gateway_header_end(const uint8_t *buf, size_t used) {
+    for (size_t i = 0; i + 3 < used; i++)
+        if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+            buf[i + 2] == '\r' && buf[i + 3] == '\n') return i;
+    return (size_t)-1;
+}
+
+static char *gateway_header_value(char *line, const char *name) {
+    char *colon = strchr(line, ':');
+    if (!colon) return NULL;
+    size_t name_len = strlen(name);
+    if ((size_t)(colon - line) != name_len || strncasecmp(line, name, name_len)) return NULL;
+    *colon = '\0';
+    char *value = colon + 1;
+    while (*value == ' ' || *value == '\t') value++;
+    size_t n = strlen(value);
+    while (n && (value[n - 1] == ' ' || value[n - 1] == '\t')) value[--n] = '\0';
+    return value;
+}
+
+static int gateway_connection_upgrade(const char *value) {
+    while (*value) {
+        while (*value == ' ' || *value == '\t' || *value == ',') value++;
+        const char *start = value;
+        while (*value && *value != ',') value++;
+        const char *end = value;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        if ((size_t)(end - start) == 7 && !strncasecmp(start, "Upgrade", 7)) return 1;
+    }
+    return 0;
+}
+
+static int gateway_json_hello(const uint8_t *json, size_t len, int *opcode) {
+    size_t i = 0;
+    int depth = 0;
+    if (opcode) *opcode = -1;
+    while (i < len && (json[i] == ' ' || json[i] == '\t' || json[i] == '\r' || json[i] == '\n')) i++;
+    if (i == len || json[i++] != '{') return 0;
+    depth = 1;
+    while (i < len && depth > 0) {
+        uint8_t c = json[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { i++; continue; }
+        if (c == '"') {
+            size_t start = ++i, end;
+            int closed = 0;
+            while (i < len) {
+                if (json[i] == '\\') {
+                    if (i + 1 >= len) return 0;
+                    i += 2;
+                } else if (json[i++] == '"') {
+                    closed = 1;
+                    break;
+                }
+            }
+            if (!closed) return 0;
+            end = i - 1;
+            size_t colon = i;
+            while (colon < len && (json[colon] == ' ' || json[colon] == '\t' ||
+                   json[colon] == '\r' || json[colon] == '\n')) colon++;
+            if (depth == 1 && colon < len && json[colon] == ':') {
+                if (end - start == 2 && json[start] == 'o' && json[start + 1] == 'p') {
+                    size_t p = colon + 1;
+                    unsigned value = 0;
+                    int digits = 0, overflow = 0;
+                    while (p < len && (json[p] == ' ' || json[p] == '\t' ||
+                           json[p] == '\r' || json[p] == '\n')) p++;
+                    while (p < len && json[p] >= '0' && json[p] <= '9') {
+                        digits = 1;
+                        if (value > 100000u) overflow = 1;
+                        else value = value * 10u + (unsigned)(json[p] - '0');
+                        if (value > 100000u) overflow = 1;
+                        p++;
+                    }
+                    while (p < len && (json[p] == ' ' || json[p] == '\t' ||
+                           json[p] == '\r' || json[p] == '\n')) p++;
+                    if (!digits || p >= len || (json[p] != ',' && json[p] != '}')) return 0;
+                    if (!overflow && opcode) *opcode = (int)value;
+                    return !overflow && value == 10u;
+                }
+                i = colon + 1;
+                continue;
+            }
+            continue;
+        }
+        if (c == '{' || c == '[') depth++;
+        else if (c == '}' || c == ']') depth--;
+        i++;
+    }
+    return 0;
+}
+
+static int gateway_fill(read_fn rd, void *sess, uint8_t *buf, size_t cap,
+                        size_t *used, size_t need, int64_t until,
+                        char *err, size_t errcap) {
+    while (*used < need) {
+        if (*used == cap) {
+            snprintf(err, errcap, "WebSocket-ответ больше локального предела");
+            return -1;
+        }
+        int64_t left = until - verify_now_ms();
+        if (left <= 0) {
+            snprintf(err, errcap, "тайм-аут WebSocket Gateway");
+            return -1;
+        }
+        err[0] = '\0';
+        long got = rd(sess, buf + *used, cap - *used, (int)left, err, errcap);
+        if (got <= 0) {
+            if (!err[0]) snprintf(err, errcap, "Gateway закрыл WebSocket до Hello");
+            return -1;
+        }
+        *used += (size_t)got;
+    }
+    return 0;
+}
+
+static void request_gateway_websocket(read_fn rd, write_fn wr, void *sess,
+                                      int deadline_ms, d2k_ver_result *r,
+                                      char *err, size_t errcap) {
+    /* shortcut: fixed RFC nonce; use per-probe randomness if a gateway rejects repeated probes. */
+    static const char request[] =
+        "GET /?v=10&encoding=json HTTP/1.1\r\n"
+        "Host: gateway.discord.gg\r\n"
+        "User-Agent: Mozilla/5.0\r\n"
+        "Origin: https://discord.com\r\n"
+        "Connection: Upgrade\r\n"
+        "Upgrade: websocket\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    static const char expected_accept[] = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+    /* shortcut: 4 KiB Gateway cap; raise it if a real header or Hello exceeds it. */
+    uint8_t buf[4096];
+    size_t used = 0;
+    size_t header_end;
+    int code = 0, upgrade_count = 0, accept_count = 0, connection_upgrade = 0;
+    r->level = D2K_VER_HANDSHAKE;
+    r->budget_requests = 1;
+    budget_say(r, D2K_BUDGET_NOT_APPLICABLE,
+               "Gateway WebSocket: HTTP keep-alive budget is not applicable");
+    err[0] = '\0';
+    if (wr(sess, (const uint8_t *)request, sizeof request - 1, err, errcap) != 0) {
+        snprintf(r->reason, sizeof r->reason, "WebSocket-запрос не ушёл: %.120s", err);
+        return;
+    }
+    int64_t until = verify_now_ms() + (deadline_ms > 0 ? deadline_ms : 3000);
+    while ((header_end = gateway_header_end(buf, used)) == (size_t)-1) {
+        if (gateway_fill(rd, sess, buf, sizeof buf, &used, used + 1, until, err, errcap) != 0) {
+            snprintf(r->reason, sizeof r->reason, "нет полного WebSocket-заголовка: %.100s", err);
+            return;
+        }
+    }
+    size_t status_end = 0;
+    while (status_end + 1 < header_end &&
+           !(buf[status_end] == '\r' && buf[status_end + 1] == '\n')) status_end++;
+    if (status_end + 1 >= header_end || status_end >= 128) {
+        snprintf(r->reason, sizeof r->reason, "битая строка статуса WebSocket Gateway");
+        return;
+    }
+    buf[status_end] = '\0';
+    if (sscanf((char *)buf, "HTTP/1.1 %d", &code) != 1 || code < 100 || code > 599) {
+        snprintf(r->reason, sizeof r->reason, "битая строка статуса WebSocket Gateway");
+        return;
+    }
+    r->status = code;
+    if (code != 101) {
+        snprintf(r->reason, sizeof r->reason,
+                 "Gateway ответил HTTP %d без WebSocket Upgrade", code);
+        return;
+    }
+    for (size_t pos = status_end + 2; pos < header_end; ) {
+        size_t end = pos;
+        while (end <= header_end && !(buf[end] == '\r' && buf[end + 1] == '\n')) end++;
+        if (end > header_end) break;
+        buf[end] = '\0';
+        char *line = (char *)buf + pos;
+        char *value = gateway_header_value(line, "Upgrade");
+        if (value) {
+            upgrade_count++;
+            if (strcasecmp(value, "websocket")) upgrade_count = 2;
+        } else if ((value = gateway_header_value(line, "Connection")) != NULL) {
+            if (gateway_connection_upgrade(value)) connection_upgrade = 1;
+        } else if ((value = gateway_header_value(line, "Sec-WebSocket-Accept")) != NULL) {
+            accept_count++;
+            if (strcmp(value, expected_accept)) accept_count = 2;
+        }
+        pos = end + 2;
+    }
+    if (upgrade_count != 1 || !connection_upgrade || accept_count != 1) {
+        snprintf(r->reason, sizeof r->reason,
+                 "Gateway 101 не подтвердил WebSocket Upgrade");
+        return;
+    }
+    size_t frame = header_end + 4;
+    if (gateway_fill(rd, sess, buf, sizeof buf, &used, frame + 2, until, err, errcap) != 0) {
+        snprintf(r->reason, sizeof r->reason, "Gateway не прислал Hello: %.100s", err);
+        return;
+    }
+    uint8_t first = buf[frame], second = buf[frame + 1];
+    if (!(first & 0x80) || (first & 0x70) || (first & 0x0f) != 1 || (second & 0x80)) {
+        snprintf(r->reason, sizeof r->reason, "Gateway прислал неподдерживаемый первый WebSocket frame");
+        return;
+    }
+    size_t frame_header = 2;
+    uint64_t payload_len = second & 0x7f;
+    if (payload_len == 126) {
+        if (gateway_fill(rd, sess, buf, sizeof buf, &used, frame + 4, until, err, errcap) != 0) {
+            snprintf(r->reason, sizeof r->reason, "неполная длина Gateway Hello");
+            return;
+        }
+        payload_len = ((uint64_t)buf[frame + 2] << 8) | buf[frame + 3];
+        frame_header = 4;
+    } else if (payload_len == 127) {
+        if (gateway_fill(rd, sess, buf, sizeof buf, &used, frame + 10, until, err, errcap) != 0) {
+            snprintf(r->reason, sizeof r->reason, "неполная длина Gateway Hello");
+            return;
+        }
+        payload_len = 0;
+        for (size_t i = 0; i < 8; i++) payload_len = (payload_len << 8) | buf[frame + 2 + i];
+        frame_header = 10;
+    }
+    if (payload_len > sizeof buf - frame - frame_header ||
+        gateway_fill(rd, sess, buf, sizeof buf, &used,
+                     frame + frame_header + (size_t)payload_len, until, err, errcap) != 0) {
+        snprintf(r->reason, sizeof r->reason, "Gateway Hello превышает предел или неполон");
+        return;
+    }
+    /* shortcut: first unfragmented text frame; extend if Discord fragments Hello. */
+    int opcode = -1;
+    if (!gateway_json_hello(buf + frame + frame_header, (size_t)payload_len, &opcode)) {
+        if (opcode >= 0)
+            snprintf(r->reason, sizeof r->reason, "первый WebSocket frame Gateway op=%d, не Hello op=10", opcode);
+        else
+            snprintf(r->reason, sizeof r->reason, "первый WebSocket frame Gateway не содержит top-level op=10");
+        return;
+    }
+    r->level = D2K_VER_APPLICATION;
+    r->body_complete = 1;
+    snprintf(r->http_evidence, sizeof r->http_evidence, "WebSocket 101 + Gateway Hello op=10");
+    snprintf(r->reason, sizeof r->reason, "Gateway WebSocket принят, получен Hello op=10");
+}
+
 /* Чтение с запоминанием законного конца потока (close_notify): после него
    сокет может ещё не показать FIN, а молчанием коробки это не является. */
 /* Заодно помнит, чем кончилось последнее чтение: отказ (n < 0) и сколько
@@ -1003,6 +1244,10 @@ static void request_page_budget(read_fn rd, write_fn wr, void *sess,
                                 int deadline_ms, int tls12,
                                 const budget_io *io, unsigned budget,
                                 d2k_ver_result *r, char *err, size_t errcap) {
+    if (!initial_path && host && !strcasecmp(host, "gateway.discord.gg")) {
+        request_gateway_websocket(rd, wr, sess, deadline_ms, r, err, errcap);
+        return;
+    }
     char path[1024] = "/";
     if (initial_path) snprintf(path, sizeof path, "%s", initial_path);
     const char *accept_encoding = encoding == 1 ? "gzip" :

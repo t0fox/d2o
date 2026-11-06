@@ -24,6 +24,22 @@ static int fixture_write(void *ctx, const uint8_t *buf, size_t n,
     return 0;
 }
 
+typedef struct { fixture stream; char request[512]; size_t writes; } gateway_fixture;
+static long gateway_read(void *ctx, uint8_t *buf, size_t cap, int wait,
+                         char *err, size_t errcap) {
+    return fixture_read(&((gateway_fixture *)ctx)->stream, buf, cap, wait, err, errcap);
+}
+static int gateway_write(void *ctx, const uint8_t *buf, size_t n,
+                         char *err, size_t errcap) {
+    gateway_fixture *g = ctx;
+    if (n >= sizeof g->request) {
+        snprintf(err, errcap, "gateway request too long");
+        return -1;
+    }
+    memcpy(g->request, buf, n); g->request[n] = '\0'; g->writes++;
+    return 0;
+}
+
 /* Задача 44: поток HTTP/3 с кадром HEADERS заданной длины, кусками по step. */
 typedef struct { uint8_t *data; size_t len, pos, step; } h3_fixture;
 static long h3_fixture_recv(void *ctx, uint8_t *buf, size_t cap, char *err, size_t errcap) {
@@ -249,36 +265,93 @@ static int budget_checks(void) {
                     r.budget_requests, r.budget_note); fails++;
         }
     }
-    /* (2) gateway.discord.gg: 404 на 933 байта (один сегмент) — повторы по
-       два пакета; коробка режет — CUT, без коробки — PASSED. */
-    for (int cut = 0; cut < 2; cut++) {
-        static char r404[1024];
-        int o = snprintf(r404, sizeof r404, "HTTP/1.1 404 Not Found\r\nContent-Length: 800\r\n\r\n");
-        memset(r404 + o, 'n', 800); r404[o + 800] = 0;
-        static ka_srv k; memset(&k, 0, sizeof k);
-        k.resp = r404; k.mss = 1400; k.pk = 6; k.cut_at = cut ? 25 : 0;
-        budget_io io = { ka_packets, ka_spoke, &k };
+    /* (2) gateway.discord.gg is a WebSocket endpoint: an ordinary 404 for GET /
+       is not evidence that a candidate carries the Gateway protocol. */
+    {
+        static const char r404[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nno!";
+        gateway_fixture g; memset(&g, 0, sizeof g);
+        g.stream.reply = r404; g.stream.fragment = 7; g.stream.len = sizeof r404 - 1;
         d2k_ver_result r = {0}; char err[200] = "";
         r.level = D2K_VER_HANDSHAKE;
-        request_page_budget(ka_read, ka_write, &k, "gateway.discord.gg", 2, NULL,
-                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
-        if (r.budget != (cut ? D2K_BUDGET_CUT : D2K_BUDGET_PASSED) ||
-            r.budget_requests < (cut ? 9u : 20u)) {
-            fprintf(stderr, "budget 404 cut=%d: budget %d pk %u req %u [%s]\n", cut, r.budget,
-                    r.budget_packets, r.budget_requests, r.budget_note); fails++;
+        request_page_budget(gateway_read, gateway_write, &g, "gateway.discord.gg", 2, NULL,
+                            60, 0, NULL, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+        if (r.level != D2K_VER_HANDSHAKE || r.status != 404 ||
+            r.budget != D2K_BUDGET_NOT_APPLICABLE || g.writes != 1 ||
+            !strstr(g.request, "GET /?v=10&encoding=json HTTP/1.1") ||
+            !strstr(g.request, "Upgrade: websocket")) {
+            fprintf(stderr, "gateway 404 was accepted: level %d status %d budget %d writes %zu [%s]\n",
+                    r.level, r.status, r.budget, g.writes, r.reason); fails++;
         }
-        /* ПОРОГ ОБЯЗАН БЫТЬ В СООБЩЕНИИ ЦЕЛИКОМ. Поле 12.10.2026: текст
-           кириллический, по два байта на символ, и при коротком буфере он
-           обрезался посреди слова — 30 с лишним строк отказа по
-           www.userscript.zone читались как «из нужных» без самого числа, и
-           отказ кандидата нечем было проверить по журналу. */
-        if (cut) {
-            char need[32];
-            snprintf(need, sizeof need, "из нужных %u", r.budget_need);
-            if (!strstr(r.budget_note, need)) {
-                fprintf(stderr, "budget note truncated, no \"%s\": [%s]\n",
-                        need, r.budget_note); fails++;
-            }
+    }
+    {
+        static const char hello[] =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: WebSocket\r\n"
+            "Connection: keep-alive, Upgrade\r\n"
+            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+            "\x81\x2a{\"op\":10,\"d\":{\"heartbeat_interval\":45000}}";
+        gateway_fixture g; memset(&g, 0, sizeof g);
+        g.stream.reply = hello; g.stream.fragment = 7; g.stream.len = sizeof hello - 1;
+        d2k_ver_result r = {0}; char err[200] = "";
+        r.level = D2K_VER_HANDSHAKE;
+        request_page_budget(gateway_read, gateway_write, &g, "gateway.discord.gg", 2, NULL,
+                            60, 0, NULL, 0, &r, err, sizeof err);
+        if (r.level != D2K_VER_APPLICATION || r.status != 101 || !r.body_complete ||
+            r.budget != D2K_BUDGET_NOT_APPLICABLE || g.writes != 1 ||
+            !strstr(g.request, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==")) {
+            fprintf(stderr, "gateway websocket hello: level %d status %d complete %d budget %d [%s]\n",
+                    r.level, r.status, r.body_complete, r.budget, r.reason); fails++;
+        }
+        static const char reordered[] =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+            "\x81\x10{\"d\":{},\"op\":10}";
+        memset(&g, 0, sizeof g);
+        g.stream.reply = reordered; g.stream.fragment = 9; g.stream.len = sizeof reordered - 1;
+        memset(&r, 0, sizeof r); r.level = D2K_VER_HANDSHAKE; err[0] = '\0';
+        request_page_budget(gateway_read, gateway_write, &g, "gateway.discord.gg", 2, NULL,
+                            60, 0, NULL, 0, &r, err, sizeof err);
+        if (r.level != D2K_VER_APPLICATION || r.status != 101) {
+            fprintf(stderr, "gateway rejected Hello with reordered fields: level %d status %d [%s]\n",
+                    r.level, r.status, r.reason); fails++;
+        }
+        char bad[sizeof hello]; memcpy(bad, hello, sizeof hello);
+        char *accept = strstr(bad, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        assert(accept); accept[0] = 'x';
+        memset(&g, 0, sizeof g);
+        g.stream.reply = bad; g.stream.fragment = 11; g.stream.len = sizeof bad - 1;
+        memset(&r, 0, sizeof r); r.level = D2K_VER_HANDSHAKE; err[0] = '\0';
+        request_page_budget(gateway_read, gateway_write, &g, "gateway.discord.gg", 2, NULL,
+                            60, 0, NULL, 0, &r, err, sizeof err);
+        if (r.level == D2K_VER_APPLICATION) {
+            fprintf(stderr, "gateway accepted mismatched Sec-WebSocket-Accept\n"); fails++;
+        }
+        memcpy(bad, hello, sizeof hello);
+        char *op = strstr(bad, "\"op\":10");
+        assert(op); op[5] = '9';
+        memset(&g, 0, sizeof g);
+        g.stream.reply = bad; g.stream.fragment = 13; g.stream.len = sizeof bad - 1;
+        memset(&r, 0, sizeof r); r.level = D2K_VER_HANDSHAKE; err[0] = '\0';
+        request_page_budget(gateway_read, gateway_write, &g, "gateway.discord.gg", 2, NULL,
+                            60, 0, NULL, 0, &r, err, sizeof err);
+        if (r.level == D2K_VER_APPLICATION) {
+            fprintf(stderr, "gateway accepted a non-Hello first frame\n"); fails++;
+        }
+        static const char nested_op[] =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+            "\x81\x16{\"d\":{\"op\":10},\"op\":9}";
+        memset(&g, 0, sizeof g);
+        g.stream.reply = nested_op; g.stream.fragment = 8; g.stream.len = sizeof nested_op - 1;
+        memset(&r, 0, sizeof r); r.level = D2K_VER_HANDSHAKE; err[0] = '\0';
+        request_page_budget(gateway_read, gateway_write, &g, "gateway.discord.gg", 2, NULL,
+                            60, 0, NULL, 0, &r, err, sizeof err);
+        if (r.level == D2K_VER_APPLICATION) {
+            fprintf(stderr, "gateway accepted nested op=10 instead of top-level op=9\n"); fails++;
         }
     }
     /* (3) Keep-alive не дают: Connection: close в ответе, либо сервер закрыл
