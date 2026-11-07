@@ -6194,8 +6194,8 @@ static const d2k_cat_plan *area_plan(const d2k_sched *s, const installed_area *a
 }
 
 /* Собственное подтверждённое точное решение цели в этом контексте (имя,
- * транспорт, семейство адресов, форма) — любым планом. Помеченная к
- * перепроверке привязка (задача 21) снята с провода и не считается. */
+ * транспорт, семейство адресов, форма) — любым планом. Старый shape=0 —
+ * wildcard на проводе; помеченная к перепроверке привязка не считается. */
 static int own_exact_confirmed(const d2k_catalog *cat, const char *name,
                                const d2k_group_key *key) {
     for (size_t bi = 0; bi < cat->n_boxes; bi++)
@@ -6206,7 +6206,8 @@ static int own_exact_confirmed(const d2k_catalog *cat, const char *name,
                 (bd->transport ? bd->transport : 6) == key->transport &&
                 (bd->family ? bd->family : 4) == key->family &&
                 ((key->transport == 6 &&
-                  d2k_link_shape_tcp_context(bd->shape, bd->tcp_profile) == key->shape) ||
+                  (!bd->shape ||
+                   d2k_link_shape_tcp_context(bd->shape, bd->tcp_profile) == key->shape)) ||
                  (key->transport != 6 && bd->shape == key->shape))) return 1;
         }
     return 0;
