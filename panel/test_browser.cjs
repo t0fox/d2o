@@ -586,7 +586,7 @@ async function main(){
   assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-install").textContent'),
    'Ожидает установки общего правила','install state is independent from family confirmation');
   assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-fold-text").textContent'),
-   '5 подтверждённых доменов','expanded evidence count comes from the current evidence list');
+   '5 подтверждённых доменов · без плана 1','expanded evidence count comes from the current evidence list');
   await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-fold").click()');
   assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelectorAll(".ftag-tree li").length'),6,
    'all five current confirmations and the separate exception are listed');
