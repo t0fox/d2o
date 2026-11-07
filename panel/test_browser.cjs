@@ -47,8 +47,14 @@ const fixture={telegramStats:{
   {target:'video.example',family:6,transport:17,ip:'2001:db8::5',port:443,phase:'проверяем готовое узнанной коробки',since:iso(200),attempts:1,probes:3,candidate:'план поставлен',source:'готовый план узнанной коробки'},
   {target:'queued.example',family:4,transport:6,ip:'192.0.2.7',port:443,phase:'ожидает безопасного слота замера',since:iso(20),attempts:0,probes:0,candidate:'',source:''}
  ],
- groups:[{suffix:'example.com',transport:6,family:4,shape:1,evidence_count:3,plan_id:'plan-a',probe_path:'/',ech_origin:'',active:true,
-  evidence:['a.example.com','b.example.com','c.example.com'],exceptions:[{name:'skip.example.com'}]}],
+  groups:[
+   {suffix:'example.com',transport:6,family:4,shape:1,evidence_count:3,plan_id:'plan-a',probe_path:'/',ech_origin:'',active:true,
+    evidence:['a.example.com','b.example.com','c.example.com'],exceptions:[{name:'skip.example.com'}]},
+   {suffix:'googlevideo.com',transport:6,family:4,shape:1,evidence_count:5,plan_id:'plan-a',probe_path:'/',ech_origin:'',active:false,
+    install_state:'pending',install_reason:'',
+    evidence:['rr-a.googlevideo.com','rr-b.googlevideo.com','rr-c.googlevideo.com','rr-d.googlevideo.com','rr-e.googlevideo.com'],
+    exceptions:[{name:'clean.googlevideo.com'}]}
+  ],
  boxes:[{id:'box-a',created:iso(3600),updated:iso(60),signals:[{kind:'silent',human:'ответа на приветствие не было',seen:3}],
   plans:[{id:'plan-a',proto:'tls',successes:4,enabled:true,human:'',text:'d2k-plan 1 1\nproto tcp tls\nsplit payload_start +1\norder reverse\n'}],
   bindings:[
@@ -574,11 +580,45 @@ async function main(){
   assert.equal(await evaluate('document.querySelector(".crate-body").getAttribute("style")||""'),'','animation leaves no inline styles behind');
 
   // Бирка семейства ведёт к коробке с её планом: прокрутка и раскрытие.
-  assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap").length'),1,'family is drawn as a tag');
-  await evaluate('document.querySelector(".ftag-box").click()');
+  assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap").length'),2,'families are drawn as tags');
+  assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-stamp").textContent'),
+   'Семейство подтверждено · 5 доменов','family confirmation stays visible before datapath ACK');
+  assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-install").textContent'),
+   'Ожидает установки общего правила','install state is independent from family confirmation');
+  assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-fold-text").textContent'),
+   '5 подтверждённых доменов · без плана 1','expanded evidence count comes from the current evidence list');
+  await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-fold").click()');
+  assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelectorAll(".ftag-tree li").length'),6,
+   'all five current confirmations and the separate exception are listed');
+  await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-box").click()');
   await until('document.querySelector(".crate").open&&!gsap.isTweening(window)','family tag link opens its box');
   await evaluate('document.querySelector(".crate-lid").click()');
   await until('!document.querySelector(".crate").open','box closes again');
+  fixture.knowledge.groups[1].install_state='active';
+  fixture.knowledge.groups[1].active=true;
+  await until('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-install")?.textContent==="Общее правило активно"',
+   'positive datapath ACK is shown as active');
+  fixture.knowledge.groups[1].install_state='removing';
+  fixture.knowledge.groups[1].active=false;
+  fixture.knowledge.groups[1].possibly_active=true;
+  fixture.knowledge.groups[1].remove_pending=true;
+  fixture.knowledge.groups[1].exception_install_state='pending';
+  await until('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-install")?.textContent.includes("правило может оставаться активным")',
+   'pending exception warns that the old family rule may still apply');
+  fixture.knowledge.groups[1].install_state='retrying';
+  fixture.knowledge.groups[1].install_reason='ack_timeout';
+  fixture.knowledge.groups[1].active=false;
+  fixture.knowledge.groups[1].remove_pending=false;
+  fixture.knowledge.groups[1].possibly_active=false;
+  fixture.knowledge.groups[1].exception_install_state='none';
+  await until('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-install")?.textContent.includes("датапат не ответил")',
+   'lost ACK shows an automatic retry and its reason');
+  fixture.knowledge.groups[1].install_state='rejected';
+  fixture.knowledge.groups[1].install_reason='bad_plan';
+  await until('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-install")?.textContent.includes("план не принят")',
+   'permanent datapath refusal shows its specific reason');
+  assert.equal(await evaluate('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-stamp").textContent'),
+   'Семейство подтверждено · 5 доменов','installation failures do not revoke family evidence');
   assert.equal(await evaluate('!!document.querySelector(".index-marker")&&getComputedStyle(document.querySelector(".index-marker")).display'),'block','navigation marker is present');
   assert.match(await evaluate('document.title'),/^(● )?D2K — Движок работает, идёт подбор$/,'title carries the engine state and no theme name');
   assert.equal(await evaluate('document.body.textContent.includes("Ведомость")'),false,'the theme name is not shown in the interface');

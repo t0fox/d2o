@@ -936,6 +936,75 @@ static int live_probes_used(d2k_sched *s) {
     return v;
 }
 
+static const char *live_json(d2k_sched *s) {
+    static char body[65536];
+    char path[] = "/tmp/d2k-live-json-XXXXXX";
+    int fd = mkstemp(path);
+    body[0] = 0;
+    if (fd < 0) return body;
+    close(fd);
+    if (d2k_sched_write_live(s, path, "catalog.json") == 0) {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            size_t got = fread(body, 1, sizeof body - 1, f);
+            body[got] = 0;
+            fclose(f);
+        }
+    }
+    unlink(path);
+    return body;
+}
+
+static int live_evidence_has(d2k_sched *s, const char *suffix, const char *name) {
+    char group[300];
+    snprintf(group, sizeof group, "\"suffix\": \"%s\"", suffix);
+    const char *body = live_json(s), *at = strstr(body, group);
+    const char *list = at ? strstr(at, "\"evidence\": [") : NULL;
+    const char *end = list ? strchr(list, ']') : NULL;
+    const char *found = list ? strstr(list, name) : NULL;
+    return found && end && found < end;
+}
+
+static int live_evidence_count(d2k_sched *s, const char *suffix) {
+    char group[300]; int count = 0;
+    snprintf(group, sizeof group, "\"suffix\": \"%s\"", suffix);
+    const char *body = live_json(s), *at = strstr(body, group);
+    const char *list = at ? strstr(at, "\"evidence\": [") : NULL;
+    const char *open = list ? strchr(list, '[') : NULL;
+    const char *end = open ? strchr(open, ']') : NULL;
+    if (!open || !end) return -1;
+    for (at = open + 1; at < end; at++) if (*at == '"') count++;
+    return count / 2;
+}
+
+static int live_group_reported_count(d2k_sched *s, const char *suffix) {
+    char group[300];
+    snprintf(group, sizeof group, "\"suffix\": \"%s\"", suffix);
+    const char *body = live_json(s), *at = strstr(body, group);
+    const char *count = at ? strstr(at, "\"evidence_count\":") : NULL;
+    return count ? atoi(count + strlen("\"evidence_count\":")) : -1;
+}
+
+static int live_group_bool(d2k_sched *s, const char *suffix, const char *field) {
+    char group[300];
+    snprintf(group, sizeof group, "\"suffix\": \"%s\"", suffix);
+    const char *body = live_json(s), *at = strstr(body, group);
+    const char *end = at ? strchr(at, '}') : NULL;
+    const char *value = at ? strstr(at, field) : NULL;
+    if (!value || !end || value >= end) return -1;
+    value += strlen(field);
+    while (*value == ' ') value++;
+    return !strncmp(value, "true", 4) ? 1 : !strncmp(value, "false", 5) ? 0 : -1;
+}
+
+static int live_group_active(d2k_sched *s, const char *suffix) {
+    return live_group_bool(s, suffix, "\"active\":");
+}
+
+static int live_group_possible(d2k_sched *s, const char *suffix) {
+    return live_group_bool(s, suffix, "\"possibly_active\":");
+}
+
 /* Запись ОДНОЙ активной задачи из живого файла (до закрывающей скобки).
    Пустая строка — задачи нет среди активных или файл не прочитан. */
 static const char *live_task_entry(d2k_sched *s, const char *target) {
@@ -2275,10 +2344,15 @@ int main(int argc, char **argv) {
         confirm_once(&c, sv[0], "rr-a.googlevideo.com", 40301);
         confirm_once(&c, sv[0], "rr-b.googlevideo.com", 40302);
         confirm_once(&c, sv[0], "rr-c.googlevideo.com", 40303);
+        confirm_once(&c, sv[0], "rr-d.googlevideo.com", 40310);
+        confirm_once(&c, sv[0], "rr-e.googlevideo.com", 40311);
         d2k_group_key key = {0}; key.transport = 6; key.family = 4; key.shape = 1;
         strcpy(key.probe_path, "/");
         const d2k_domain_group *g = d2k_group_match(c.groups, "rr-new.googlevideo.com", &key);
-        CHECK(g && !strcmp(g->suffix, "googlevideo.com"), "three own blocking outcomes teach shared area");
+        CHECK(g && !strcmp(g->suffix, "googlevideo.com") && g->evidence_count == 5,
+              "five own blocking outcomes confirm the family independently of installation");
+        char family_plan_id[40] = {0}; int64_t family_at = 0;
+        if (g) { strcpy(family_plan_id, g->plan_id); family_at = g->at; }
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         tcp_calls = vol_calls = ver_calls = 0;
         d2k_ev h = ev_hello(6, 40304, "rr-new.googlevideo.com");
@@ -2288,30 +2362,83 @@ int main(int argc, char **argv) {
         CHECK(!binding_of(&c, "rr-new.googlevideo.com", 6), "new member creates no individual binding");
         drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
         CHECK(sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) == 1, "restart sync installs learned suffix");
-        CHECK(g && sent_has(g->plan_id), "suffix carries its own nonzero Plan ID");
-        CHECK(d2k_sched_sync_pending(s), "suffix write waits for ACK");
+        CHECK(family_plan_id[0] && sent_has(family_plan_id), "suffix carries its own nonzero Plan ID");
+        CHECK(!d2k_sched_sync_pending(s), "suffix ACK wait sleeps until event or timeout");
+        CHECK(strstr(live_json(s), "\"evidence_count\": 5") &&
+              strstr(live_json(s), "\"install_state\": \"pending\"") &&
+              strstr(live_json(s), "rr-e.googlevideo.com"),
+              "live JSON separates five confirmed domains from the pending datapath install");
         d2k_ev stale = {0}; stale.kind=D2K_EV_ACK; stale.code=D2K_CMD_SET_SUFFIX;
         stale.num=1u<<8; area_ack_id(&stale);
+        uint8_t first_area_id[D2K_TRIAL_ID_LEN];
+        memcpy(first_area_id, stale.trial_id, sizeof first_area_id);
         skip_ahead(s, 6000); sync_out(s);
-        CHECK(!d2k_sched_sync_pending(s), "lost area ACK ends bounded wait");
-        c.groups->disabled=1; CHECK(!d2k_group_restore(c.groups), "disable learned areas");
-        d2k_sched_sync(s); sync_out(s);
-        CHECK(sent_command_count(D2K_CMD_DEL_SUFFIX,NULL,0)==1,
-              "possibly installed rule is removed even when its install ACK was lost");
-        d2k_ev removed={0}; removed.kind=D2K_EV_ACK; removed.code=D2K_CMD_DEL_SUFFIX;
-        removed.num=1u<<8; area_ack_id(&removed);
-        d2k_sched_event(s,&removed); sync_out(s);
-        c.groups->disabled=0; CHECK(!d2k_group_restore(c.groups), "restore eligible family");
-        g=d2k_group_match(c.groups,"rr-new.googlevideo.com",&key);
-        d2k_sched_sync(s); sync_out(s);
-        CHECK(sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) == 2,
-              "lost ACK can retry safely on next synchronization");
-        d2k_sched_event(s,&stale); sync_out(s);
-        CHECK(d2k_sched_sync_pending(s), "late ACK cannot confirm a newer area command");
+        CHECK(!d2k_sched_sync_pending(s) &&
+              strstr(live_json(s), "\"install_state\": \"retrying\"") &&
+              strstr(live_json(s), "\"install_reason\": \"ack_timeout\""),
+              "lost ACK becomes a visible transient failure with bounded retry");
+        drain(); forget_sent(); skip_ahead(s, 60000); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) == 1,
+              "lost ACK is retried automatically after backoff");
         d2k_ev ack = {0}; ack.kind = D2K_EV_ACK; ack.code = D2K_CMD_SET_SUFFIX; ack.num = 1u << 8;
         area_ack_id(&ack);
+        CHECK(memcmp(first_area_id, ack.trial_id, sizeof first_area_id) != 0,
+              "each automatic suffix retry uses a fresh command ID");
+        d2k_sched_event(s,&stale); sync_out(s);
+        CHECK(strstr(live_json(s), "\"active\": false") &&
+              strstr(live_json(s), "\"install_state\": \"retrying\""),
+              "late ACK cannot confirm the newer retry");
         d2k_sched_event(s, &ack); sync_out(s);
-        CHECK(!d2k_sched_sync_pending(s), "positive suffix ACK completes sync");
+        CHECK(strstr(live_json(s), "\"active\": true") &&
+              strstr(live_json(s), "\"install_state\": \"active\""),
+              "positive suffix ACK activates only the datapath rule");
+        drain(); forget_sent();
+        char restart_path[] = "/tmp/d2k-family-restart-XXXXXX";
+        int restart_fd = mkstemp(restart_path);
+        d2k_catalog restored = {0}; char restore_err[200] = {0};
+        int restored_ok = restart_fd >= 0;
+        if (restart_fd >= 0) {
+            close(restart_fd);
+            restored_ok = d2k_catalog_save(&c, restart_path, restore_err, sizeof restore_err) == 0 &&
+                          d2k_catalog_load(restart_path, &restored, restore_err, sizeof restore_err) == 0;
+        }
+        CHECK(restored_ok && d2k_group_match(restored.groups, "rr-new.googlevideo.com", &key),
+              "five-domain family survives the persisted catalog restart");
+        d2k_sched_free(s);
+        if (restored_ok) {
+            d2k_catalog_free(&c);
+            c = restored;
+            memset(&restored, 0, sizeof restored);
+        }
+        d2k_catalog_free(&restored);
+        unlink(restart_path);
+        s = d2k_sched_new(&c, sv[0], 0x2d);
+        d2k_sched_sync(s); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) == 1,
+              "controller restart re-installs the durable learned family");
+        area_ack_id(&ack); d2k_sched_event(s, &ack); sync_out(s);
+        CHECK(strstr(live_json(s), "\"install_state\": \"active\""),
+              "restarted controller marks the family active only after a new ACK");
+        confirm_once(&c, sv[0], "a.youtube.com", 40320);
+        confirm_once(&c, sv[0], "b.youtube.com", 40321);
+        confirm_once(&c, sv[0], "c.youtube.com", 40322);
+        confirm_once(&c, sv[0], "a.ytimg.com", 40323);
+        confirm_once(&c, sv[0], "b.ytimg.com", 40324);
+        confirm_once(&c, sv[0], "c.ytimg.com", 40325);
+        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
+        CHECK(last_area_command() == D2K_CMD_SET_SUFFIX,
+              "new family installation reaches the first suffix independently");
+        ack.num = D2K_ACK_BAD_PLAN;
+        area_ack_id(&ack); d2k_sched_event(s, &ack); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) == 2,
+              "permanent refusal of one suffix does not block the next family");
+        CHECK(strstr(live_json(s), "\"install_state\": \"rejected\"") &&
+              strstr(live_json(s), "\"install_reason\": \"bad_plan\""),
+              "permanent datapath rejection remains visible with its concrete reason");
+        ack.num = 1u << 8; area_ack_id(&ack); d2k_sched_event(s, &ack); sync_out(s);
+        drain(); forget_sent(); skip_ahead(s, 20 * 60 * 1000); sync_out(s);
+        CHECK(!sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0),
+              "permanent rejection is not retried in an unbounded command loop");
         h = ev_hello(6, 40308, "rr-fresh.googlevideo.com");
         d2k_sched_event(s, &h);
         d2k_ev fresh = ev_suspect(6, 40308);
@@ -2341,20 +2468,74 @@ int main(int argc, char **argv) {
         drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
         CHECK(!sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) &&
               !sent_command_count(D2K_CMD_DEL_SUFFIX, NULL, 0), "unchanged group never withdrawn or resent");
+        CHECK(live_group_active(s, "googlevideo.com") == 1,
+              "fixture: the family rule is active before its first exclusion");
         d2k_group_observation failed = {0};
-        strcpy(failed.name, "rr-new.googlevideo.com"); strcpy(failed.plan_id, g->plan_id);
-        failed.key = key; failed.evidence = D2K_GROUP_PLAN_FAILED; failed.at = g->at+1;
+        strcpy(failed.name, "rr-new.googlevideo.com"); strcpy(failed.plan_id, family_plan_id);
+        failed.key = key; failed.evidence = D2K_GROUP_PLAN_FAILED; failed.at = family_at+1;
         CHECK(d2k_group_learn(c.groups, &failed) > 0, "targeted member failure recorded");
+        CHECK(live_group_active(s, "googlevideo.com") == 0 &&
+              live_group_possible(s, "googlevideo.com") == 1,
+              "uninstalled exclusion makes the active family unsafe but visibly possible");
         drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
-        CHECK(sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) == 1 &&
-              !sent_command_count(D2K_CMD_DEL_SUFFIX, NULL, 0), "one exception does not withdraw family");
+        CHECK(sent_command_count(D2K_CMD_DEL_SUFFIX, NULL, 0) == 1 &&
+              !sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) &&
+              strstr(live_json(s), "\"install_state\": \"removing\"") &&
+              strstr(live_json(s), "\"exception_install_state\": \"pending\""),
+              "an active family is withdrawn before installing a new exception");
+        ack.code = D2K_CMD_DEL_SUFFIX; ack.num = 1u << 8;
+        area_ack_id(&ack);
+        uint8_t first_delete_id[D2K_TRIAL_ID_LEN];
+        memcpy(first_delete_id, ack.trial_id, sizeof first_delete_id);
+        skip_ahead(s, 6000); sync_out(s);
+        CHECK(live_group_active(s, "googlevideo.com") == 0 &&
+              live_group_possible(s, "googlevideo.com") == 1 &&
+              strstr(live_json(s), "\"remove_pending\": true") &&
+              strstr(live_json(s), "\"install_reason\": \"ack_timeout\""),
+              "lost DEL_SUFFIX ACK keeps the possibly active rule visible with its failure reason");
+        drain(); forget_sent(); skip_ahead(s, 60000); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_DEL_SUFFIX, NULL, 0) == 1 &&
+              !sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) &&
+              !sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0),
+              "failed deletion retries DEL_SUFFIX before any replacement or exception command");
+        area_ack_id(&ack);
+        CHECK(memcmp(first_delete_id, ack.trial_id, sizeof first_delete_id) != 0,
+              "DEL_SUFFIX retry uses a fresh command ID");
+        ack.num = 1u << 8; d2k_sched_event(s, &ack);
+        forget_sent(); sync_out(s);
+        CHECK(live_group_active(s, "googlevideo.com") == 0 &&
+              live_group_possible(s, "googlevideo.com") == 0 &&
+              sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) == 1 &&
+              !sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0),
+              "the suffix stays withdrawn while the exception is installed");
         ack.code = D2K_CMD_SET_BYPASS; ack.num = D2K_ACK_NO_ROOM;
         area_ack_id(&ack);
         d2k_sched_event(s, &ack); sync_out(s);
-        CHECK(!d2k_sched_sync_pending(s), "negative area ACK ends sync explicitly");
-        drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
-        CHECK(sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) == 1, "negative ACK was not remembered as installed");
-        ack.num = 1u << 8; area_ack_id(&ack); d2k_sched_event(s, &ack); sync_out(s);
+        CHECK(!d2k_sched_sync_pending(s), "negative exception ACK releases the current sync pass");
+        CHECK(live_group_active(s, "googlevideo.com") == 0 &&
+              strstr(live_json(s), "\"exception_install_state\": \"retrying\"") &&
+              strstr(live_json(s), "\"exception_install_reason\": \"no_room\"") &&
+              !sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0),
+              "failed exception installation keeps the family suspended with its reason");
+        uint8_t failed_exception_id[D2K_TRIAL_ID_LEN];
+        memcpy(failed_exception_id, ack.trial_id, sizeof failed_exception_id);
+        CHECK(d2k_group_match(c.groups, "rr-other.googlevideo.com", &key),
+              "transient exception install failure preserves the learned family");
+        drain(); forget_sent(); skip_ahead(s, 60000); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) == 1,
+              "transient exception refusal is retried automatically after backoff");
+        area_ack_id(&ack);
+        CHECK(memcmp(failed_exception_id, ack.trial_id, sizeof failed_exception_id) != 0,
+              "exception retry uses a fresh command ID");
+        ack.num = 1u << 8; area_ack_id(&ack); d2k_sched_event(s, &ack);
+        forget_sent(); sync_out(s);
+        CHECK(sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) == 1 &&
+              live_group_active(s, "googlevideo.com") == 0,
+              "family installation resumes only after the exception ACK");
+        ack.code = D2K_CMD_SET_SUFFIX; ack.num = 1u << 8; area_ack_id(&ack);
+        d2k_sched_event(s, &ack); sync_out(s);
+        CHECK(live_group_active(s, "googlevideo.com") == 1,
+              "family becomes active again only after its new suffix ACK");
         CHECK(d2k_group_match(c.groups, "rr-other.googlevideo.com", &key), "other members retain learned plan");
         tcp_answer = D2K_V_CLEAR; vol_direct_complete = 1;
         h = ev_hello(6, 40305, "clean.googlevideo.com"); d2k_sched_event(s, &h);
@@ -2391,12 +2572,17 @@ int main(int argc, char **argv) {
         {
             const d2k_cat_binding *own = binding_of(&c, "rr-b.googlevideo.com", 6);
             CHECK(own && own->level >= 3 && !own->recheck_since && own->shape == key.shape &&
-                  !strcmp(own->plan_id, g->plan_id),
+                  !strcmp(own->plan_id, family_plan_id),
                   "fixture: member holds own exact confirmed binding with the group plan");
             d2k_group_observation own_fail = {0};
-            strcpy(own_fail.name, "rr-b.googlevideo.com"); strcpy(own_fail.plan_id, g->plan_id);
-            own_fail.key = key; own_fail.evidence = D2K_GROUP_PLAN_FAILED; own_fail.at = g->at+2;
+            strcpy(own_fail.name, "rr-b.googlevideo.com"); strcpy(own_fail.plan_id, family_plan_id);
+            own_fail.key = key; own_fail.evidence = D2K_GROUP_PLAN_FAILED; own_fail.at = family_at+2;
             CHECK(d2k_group_learn(c.groups, &own_fail) > 0, "member failure of group plan recorded");
+            CHECK(live_group_reported_count(s, "googlevideo.com") == 4 &&
+                  live_evidence_count(s, "googlevideo.com") == 4 &&
+                  !live_evidence_has(s, "googlevideo.com", "rr-new.googlevideo.com") &&
+                  !live_evidence_has(s, "googlevideo.com", "rr-b.googlevideo.com"),
+                  "cancelled confirmations are excluded from the count and active evidence list");
             drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
             CHECK(!sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0),
                   "family bypass is never installed over a member's own exact confirmed plan");
@@ -2408,7 +2594,7 @@ int main(int argc, char **argv) {
             d2k_ev foreign = h; foreign.kind = D2K_EV_REFUSED; foreign.code = D2K_REFUSE_TOO_LONG;
             foreign.client_shape = 1;
             memset(foreign.plan_id, 0, sizeof foreign.plan_id);
-            memcpy(foreign.plan_id, g->plan_id, strlen(g->plan_id));
+            memcpy(foreign.plan_id, family_plan_id, strlen(family_plan_id));
             d2k_sched_event(s, &foreign);
             int stale_vote = 0;
             for (size_t i = 0; i < c.groups->n_observations; i++)
