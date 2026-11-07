@@ -970,9 +970,10 @@ static int live_evidence_count(d2k_sched *s, const char *suffix) {
     snprintf(group, sizeof group, "\"suffix\": \"%s\"", suffix);
     const char *body = live_json(s), *at = strstr(body, group);
     const char *list = at ? strstr(at, "\"evidence\": [") : NULL;
-    const char *end = list ? strchr(list, ']') : NULL;
-    if (!list || !end) return -1;
-    for (at = list; at < end; at++) if (*at == '"') count++;
+    const char *open = list ? strchr(list, '[') : NULL;
+    const char *end = open ? strchr(open, ']') : NULL;
+    if (!open || !end) return -1;
+    for (at = open + 1; at < end; at++) if (*at == '"') count++;
     return count / 2;
 }
 
