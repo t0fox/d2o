@@ -711,6 +711,15 @@ static int tls_shape_event(d2k_ev *e, const char *name, d2k_shape shape) {
                                   &e->shape_len);
 }
 
+static void shape_same_flow(d2k_ev *shape, const d2k_ev *flow) {
+    shape->family = flow->family;
+    shape->transport = flow->transport;
+    memcpy(shape->low_ip, flow->low_ip, sizeof shape->low_ip);
+    memcpy(shape->high_ip, flow->high_ip, sizeof shape->high_ip);
+    shape->low_port = flow->low_port;
+    shape->high_port = flow->high_port;
+}
+
 /* СНИМОК ПРИВЕТСТВИЯ QUIC для имени. У TLS ту же роль в этом файле играет
    d2k_hello_from_profile; для QUIC профиля нет и быть не может (см.
    d2k_quichello.h), поэтому снимок делается ровно тем же способом, каким его
@@ -6575,6 +6584,7 @@ shape_test:
         CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "late.tcp.snapshot.example",
               sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
               "TCP late-snapshot fixture failed");
+        shape_same_flow(&sh, &h);
         d2k_sched_event(s, &sh);
         /* On the old implementation this release prevents the test itself
            from waiting forever; only a real stop request satisfies the
@@ -6665,6 +6675,7 @@ shape_test:
         d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "snap.stop.example",
               sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31: снимок");
+        shape_same_flow(&sh, &h);
         /* Клиент повторяет приветствие — несколько снимков одной цели. */
         for (int k = 0; k < 4; k++) d2k_sched_event(s, &sh);
         /* Соседнее имя занимает общую ячейку снимка. */
@@ -6729,6 +6740,7 @@ shape_test:
         d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, name,
               sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31/rx: снимок");
+        shape_same_flow(&sh, &h2);
         d2k_sched_event(s, &sh);
         d2k_ev other = {0}; other.kind = D2K_EV_SHAPE; other.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "neighbour.rx.example",
@@ -6795,6 +6807,7 @@ shape_test:
         d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, name,
               sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31/rx-cut: снимок");
+        shape_same_flow(&sh, &h2);
         d2k_sched_event(s, &sh);
         d2k_ev other = {0}; other.kind = D2K_EV_SHAPE; other.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "neighbour.rx.cut.example",
@@ -6883,6 +6896,7 @@ shape_test:
         d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, name,
               sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31/rx-cut+base: снимок");
+        shape_same_flow(&sh, &h2);
         d2k_sched_event(s, &sh);
         vol_hold = 0;
         spin(s, 200);
@@ -8468,14 +8482,12 @@ lifecycle_test:
             drain();
             CHECK(rounds < 1000, "проход по каталогу не закончился");
             CHECK(!d2k_sched_sync_pending(s), "проход по каталогу остался незакрытым");
-            /* Задача 16: адресная привязка 1.2.3.4 без формы протокола (TCP,
-               старый файл) — неизвестный контекст (§7): общей совместимости
-               ей не выдаём, на провод не едет, требуется повторная проверка.
-               Имя без формы по-прежнему ставится дедушкиным правом. */
-            CHECK(said("поставлено планов по подтверждённым привязкам: 1"),
+            /* Старые TCP-привязки без TLS-формы (по имени или адресу) не
+               задают совместимый контекст TLS/Timestamp и не ставятся. */
+            CHECK(said("поставлено планов по подтверждённым привязкам: 0"),
                   "проход по каталогу не сказал, сколько поставил");
-            CHECK(said("адресных привязок без формы протокола: 1"),
-                  "адресная привязка без формы поставлена как общая либо пропала молча");
+            CHECK(said("привязок без однозначной формы протокола: 2"),
+                  "TCP-привязка без формы поставлена как общая либо пропала молча");
             CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 0,
                   "адресная привязка без формы ушла на провод");
             CHECK(said("не поставлено привязок со слабым доказательством: 1"),
@@ -8514,6 +8526,8 @@ lifecycle_test:
                 snprintf(bd->target, sizeof bd->target, "отвергнутая.example");
                 bd->transport = 6;
                 bd->enabled = 1;
+                bd->shape = D2K_SHAPE_MODERN;
+                bd->tcp_profile = D2K_TCP_PROFILE_TS;
 
                 d2k_sched *s = d2k_sched_new(&c9, sv[0], 0x2d);
                 CHECK(s != NULL, "планировщик для отказов не создался");
@@ -8597,6 +8611,8 @@ lifecycle_test:
         snprintf(c9.boxes[0].binds[0].kind, sizeof c9.boxes[0].binds[0].kind, "name");
         snprintf(c9.boxes[0].binds[0].target, sizeof c9.boxes[0].binds[0].target, "узкий.example");
         c9.boxes[0].binds[0].enabled = 1;
+        c9.boxes[0].binds[0].shape = D2K_SHAPE_MODERN;
+        c9.boxes[0].binds[0].tcp_profile = D2K_TCP_PROFILE_TS;
         uint64_t revision_before = c9.revision;
 
         d2k_sched *s = d2k_sched_new(&c9, sv[0], 0x2d);
@@ -10516,10 +10532,7 @@ rx_volume_tests:
         CHECK(tls_shape_event(&sh, h.name, D2K_SHAPE_MODERN) == 0, "no-ts shape fixture");
         /* Ключ снимка — тот же, что у набора опций: датапат шлёт их парой по
            одному потоку, и связывает их именно ключ (on_shape). */
-        sh.family = h.family;
-        memcpy(sh.low_ip, h.low_ip, 16); memcpy(sh.high_ip, h.high_ip, 16);
-        sh.low_port = h.low_port; sh.high_port = h.high_port;
-        sh.transport = 6;
+        shape_same_flow(&sh, &h);
         d2k_sched_event(s, &sh);
         prime_late_rst(s, h.name, 40199);
         d2k_ev su = ev_suspect(6, 40099); su.code = D2K_SUSPECT_RST_AFTER_APP;
@@ -15024,6 +15037,7 @@ own_first_test:
             d2k_ev sh;
             CHECK(tls_shape_event(&sh, "snap-second.own", D2K_SHAPE_MODERN) == 0,
                   "own-first: снимок не собран");
+            shape_same_flow(&sh, &h);
             d2k_sched_event(s, &sh);
             settle(s);
             d2k_ev ap = ev_applied(6, 42161); d2k_sched_event(s, &ap);

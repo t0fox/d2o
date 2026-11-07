@@ -1360,7 +1360,7 @@ struct d2k_sched {
     size_t       sync_box, sync_bind;
     int          sync_active, sync_pending, sync_sent, sync_skipped;
     int          sync_weak;   /* привязки, чьё доказательство слабее обмена */
-    int          sync_unshaped; /* адресные привязки без однозначной формы протокола */
+    int          sync_unshaped; /* привязки без однозначной формы протокола */
     int          sync_recheck;  /* привязки «требует повторной проверки» (задача 21) */
     int          sync_refused;  /* отказы датапата на планах каталога с прошлой сводки */
     int          sync_unfit;    /* планы, не влезающие в посылку датапата: не поставлены, привязки на повторную проверку */
@@ -6475,7 +6475,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
             strcmp(bd->kind, "name") == 0 && bd->shape == 0) {
             s->sync_unshaped++;
             say(s, "каталог: %s — TCP-привязка без измеренной TLS-формы не ставится: "
-                   "профиль Timestamp неизвестен, требуется отдельное подтверждение",
+                   "нельзя выбрать совместимый контекст TLS/Timestamp; требуется отдельное подтверждение",
                 bd->target);
             continue;
         }
@@ -6624,7 +6624,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
                     s->sync_weak);
             }
             if (s->sync_unshaped > 0) {
-                say(s, "каталог: не поставлено адресных привязок без формы протокола: %d "
+                say(s, "каталог: не поставлено привязок без однозначной формы протокола: %d "
                        "(требуется повторная проверка)", s->sync_unshaped);
             }
             if (s->sync_recheck > 0) {
@@ -7715,9 +7715,11 @@ static int family_recovery_start(d2k_sched *s, task *t) {
                     if(!strcmp(bd_name,o->name) && !strcmp(bd->plan_id,o->plan_id) &&
                        (bd->transport?bd->transport:6)==key.transport &&
                        (bd->family?bd->family:4)==key.family &&
-                       (key.transport==6 ?
-                        d2k_link_shape_tcp_context(bd->shape,bd->tcp_profile)==key.shape :
-                        d2k_cat_shape_fits(bd->shape,key.shape)) &&
+                        (key.transport==6 ?
+                         bd->tcp_profile == t->trigger_tcp_profile &&
+                         d2k_cat_shape_fits(d2k_link_shape_tcp_base(bd->shape),
+                                            t->trigger_shape) :
+                         d2k_cat_shape_fits(bd->shape,key.shape)) &&
                        !strcmp(group_path(key.transport,bd->probe_path),key.probe_path) &&
                        !strcmp(bd->ech_origin,key.ech_origin)) confirmed=1;
                 }
