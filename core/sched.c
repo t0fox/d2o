@@ -1249,7 +1249,7 @@ typedef struct {
 typedef struct {
     char name[256], plan_id[40];
     uint8_t kind, transport, shape, family;
-    uint8_t confirmed, remove_pending, permanent, retry_count, reason, reason_code;
+    uint8_t confirmed, maybe_active, remove_pending, permanent, retry_count, reason, reason_code;
     int64_t retry_at_ms;
     char detail[128];
     uint64_t confirmed_event;
@@ -6224,7 +6224,9 @@ static void area_failure(d2k_sched *s, const installed_area *a, uint8_t reason,
                         uint8_t reason_code, const char *detail) {
     installed_area failed = *a;
     if (failed.retry_count < UINT8_MAX) failed.retry_count++;
-    failed.confirmed = 0;
+    if (!failed.remove_pending) failed.confirmed = 0;
+    if (reason == AREA_REASON_ACK_TIMEOUT || reason == AREA_REASON_SEND_ERROR)
+        failed.maybe_active = 1;
     failed.permanent = reason == AREA_REASON_BAD_PLAN || reason == AREA_REASON_BAD_ARGS ||
                        reason == AREA_REASON_UNKNOWN_ACK;
     failed.reason = reason;
@@ -6257,8 +6259,8 @@ static const char *area_reason_name(uint8_t reason) {
 
 static int area_retry_due(const d2k_sched *s, int64_t now_ms) {
     for (size_t i = 0; i < s->n_areas; i++)
-        if (!s->areas[i].confirmed && !s->areas[i].permanent &&
-            s->areas[i].retry_at_ms && s->areas[i].retry_at_ms <= now_ms) return 1;
+        if (!s->areas[i].permanent && s->areas[i].retry_at_ms &&
+            s->areas[i].retry_at_ms <= now_ms) return 1;
     return 0;
 }
 
@@ -6338,6 +6340,10 @@ static int desired_has_key(const d2k_sched *s, const installed_area *a) {
     return 0;
 }
 
+static void group_exception_status(const d2k_sched *s, size_t group_index,
+                                   const char **state, const char **reason,
+                                   unsigned *reason_code, const char **detail);
+
 static void write_live_groups(FILE *f, const d2k_sched *s) {
     const d2k_group_state *state = s->cat->groups;
     fputs("  \"groups\": [", f);
@@ -6350,37 +6356,59 @@ static void write_live_groups(FILE *f, const d2k_sched *s) {
         fputs(", \"plan_id\": ", f); json_str(f, g->plan_id);
         fputs(", \"probe_path\": ", f); json_str(f, g->key.probe_path);
         fputs(", \"ech_origin\": ", f); json_str(f, g->key.ech_origin);
-        installed_area a; int desired = desired_area(s, i, &a), active = 0;
+        installed_area a; int desired = desired_area(s, i, &a);
+        int active = 0, possibly_active = 0, remove_pending = 0;
         const char *install_state = "pending", *install_reason = "";
         const char *install_detail = "";
         unsigned install_reason_code = 0;
+        const char *exception_state = "none", *exception_reason = "";
+        const char *exception_detail = "";
+        unsigned exception_reason_code = 0;
+        group_exception_status(s, i, &exception_state, &exception_reason,
+                               &exception_reason_code, &exception_detail);
         if (!desired) {
             install_state = "rejected";
             install_reason = "plan_unavailable";
         } else {
             size_t j = area_find(s, &a);
-            if (j < s->n_areas && !strcmp(a.plan_id, s->areas[j].plan_id) &&
-                !s->areas[j].remove_pending) {
+            if (j < s->n_areas && !strcmp(a.plan_id, s->areas[j].plan_id)) {
                 const installed_area *installed = &s->areas[j];
-                if (installed->confirmed) {
-                    install_state = "active";
-                    active = 1;
-                } else if (installed->permanent) {
+                int exceptions_ready = !strcmp(exception_state, "none") ||
+                                       !strcmp(exception_state, "active");
+                remove_pending = installed->remove_pending;
+                possibly_active = installed->confirmed || installed->maybe_active;
+                if (installed->permanent) {
                     install_state = "rejected";
+                    install_reason = area_reason_name(installed->reason);
+                } else if (installed->remove_pending) {
+                    install_state = installed->retry_count ? "retrying" : "removing";
                     install_reason = area_reason_name(installed->reason);
                 } else if (installed->retry_count) {
                     install_state = "retrying";
                     install_reason = area_reason_name(installed->reason);
+                } else if (installed->confirmed && exceptions_ready) {
+                    install_state = "active";
+                    active = 1;
+                } else if ((installed->confirmed || installed->maybe_active) && !exceptions_ready) {
+                    install_state = "removing";
+                    install_detail = "Общее правило требуется снять перед установкой исключения";
                 }
                 install_reason_code = installed->reason_code;
-                install_detail = installed->detail;
+                if (installed->detail[0]) install_detail = installed->detail;
             }
         }
         fputs(", \"install_state\": ", f); json_str(f, install_state);
         fputs(", \"install_reason\": ", f); json_str(f, install_reason);
         fprintf(f, ", \"install_reason_code\": %u, \"install_detail\": ", install_reason_code);
         json_str(f, install_detail);
-        fprintf(f, ", \"active\": %s, \"evidence\": [", active ? "true" : "false");
+        fputs(", \"exception_install_state\": ", f); json_str(f, exception_state);
+        fputs(", \"exception_install_reason\": ", f); json_str(f, exception_reason);
+        fprintf(f, ", \"exception_install_reason_code\": %u, \"exception_install_detail\": ",
+                exception_reason_code);
+        json_str(f, exception_detail);
+        fprintf(f, ", \"remove_pending\": %s, \"active\": %s, \"possibly_active\": %s, \"evidence\": [",
+                remove_pending ? "true" : "false", active ? "true" : "false",
+                possibly_active && !active ? "true" : "false");
         int first = 1;
         for (size_t j = 0; j < state->n_observations; j++) {
             const d2k_group_observation *o = &state->observations[j];
@@ -6415,19 +6443,27 @@ static int sync_area_send(d2k_sched *s, const installed_area *a, int remove) {
     char err[200] = {0}, hex[2*D2K_PLAN_TLV_MAX+1]; int rc;
     installed_area attempt = *a;
     size_t i = area_find(s, a);
-    if (i < s->n_areas && !strcmp(a->plan_id, s->areas[i].plan_id) &&
-        s->areas[i].remove_pending == (uint8_t)remove) {
+    int same_plan = i < s->n_areas && !strcmp(a->plan_id, s->areas[i].plan_id);
+    if (same_plan) {
         attempt.retry_count = s->areas[i].retry_count;
         attempt.reason = s->areas[i].reason;
         attempt.reason_code = s->areas[i].reason_code;
         snprintf(attempt.detail, sizeof attempt.detail, "%s", s->areas[i].detail);
+        attempt.confirmed = s->areas[i].confirmed;
+        attempt.maybe_active = s->areas[i].maybe_active;
     } else {
         attempt.retry_count = 0;
         attempt.reason = AREA_REASON_NONE;
         attempt.reason_code = 0;
         attempt.detail[0] = 0;
+        attempt.confirmed = i < s->n_areas ? s->areas[i].confirmed : 0;
+        attempt.maybe_active = i < s->n_areas ? s->areas[i].maybe_active : 0;
     }
-    attempt.confirmed = 0;
+    if (!remove) {
+        attempt.confirmed = 0;
+        if (!same_plan && i < s->n_areas && s->areas[i].confirmed)
+            attempt.maybe_active = 1;
+    }
     attempt.remove_pending = (uint8_t)remove;
     attempt.permanent = 0;
     attempt.retry_at_ms = 0;
@@ -6472,6 +6508,10 @@ static int sync_area_send(d2k_sched *s, const installed_area *a, int remove) {
         area_failure(s, &attempt, AREA_REASON_SEND_ERROR, 0, err);
         return -1;
     }
+    if (remove) attempt.maybe_active |= attempt.confirmed;
+    else attempt.maybe_active = 1;
+    (void)area_store(s, &attempt);
+    s->area_pending = attempt;
     s->area_command = cmd;
     s->area_deadline_ms = s->now_ms+5000;
     return 1;
@@ -6489,6 +6529,60 @@ static int area_exceptions_ready(const d2k_sched *s, const installed_area *group
         if (j == s->n_areas || !s->areas[j].confirmed || s->areas[j].remove_pending) return 0;
     }
     return 1;
+}
+
+static int area_exception_groups_suspended(const d2k_sched *s,
+                                          const installed_area *exception) {
+    const d2k_group_state *g = s->cat->groups;
+    if (!g) return 1;
+    for (size_t i = 0; i < g->n_groups; i++) {
+        const d2k_domain_group *v = &g->groups[i];
+        if (v->key.transport != exception->transport ||
+            v->key.family != exception->family || v->key.shape != exception->shape ||
+            !d2k_domain_member(exception->name, v->suffix)) continue;
+        installed_area group = {0};
+        group.kind = 1; strcpy(group.name, v->suffix);
+        group.transport = v->key.transport; group.shape = v->key.shape;
+        group.family = v->key.family;
+        size_t j = area_find(s, &group);
+        if (j < s->n_areas && (s->areas[j].confirmed || s->areas[j].maybe_active)) return 0;
+    }
+    return 1;
+}
+
+static void group_exception_status(const d2k_sched *s, size_t group_index,
+                                   const char **state, const char **reason,
+                                   unsigned *reason_code, const char **detail) {
+    const d2k_group_state *g = s->cat->groups;
+    int found = 0, best = 0;
+    *state = "none"; *reason = ""; *reason_code = 0; *detail = "";
+    if (!g || group_index >= g->n_groups) return;
+    const d2k_domain_group *group = &g->groups[group_index];
+    for (size_t i = 0; i < g->n_observations; i++) {
+        installed_area exception;
+        if (!desired_area(s, g->n_groups + i, &exception) || exception.kind != 2 ||
+            exception.transport != group->key.transport ||
+            exception.family != group->key.family || exception.shape != group->key.shape ||
+            !d2k_domain_member(exception.name, group->suffix)) continue;
+        found = 1;
+        size_t j = area_find(s, &exception);
+        if (j < s->n_areas && s->areas[j].confirmed && !s->areas[j].remove_pending) continue;
+        const char *candidate = "pending", *candidate_reason = "", *candidate_detail = "";
+        unsigned candidate_code = 0; int rank = 1;
+        if (j < s->n_areas) {
+            const installed_area *installed = &s->areas[j];
+            if (installed->permanent) { candidate = "rejected"; rank = 3; }
+            else if (installed->retry_count) { candidate = "retrying"; rank = 2; }
+            candidate_reason = area_reason_name(installed->reason);
+            candidate_code = installed->reason_code;
+            candidate_detail = installed->detail;
+        }
+        if (rank > best) {
+            best = rank; *state = candidate; *reason = candidate_reason;
+            *reason_code = candidate_code; *detail = candidate_detail;
+        }
+    }
+    if (found && best == 0) *state = "active";
 }
 
 static int sync_areas(d2k_sched *s) {
@@ -6521,10 +6615,22 @@ static int sync_areas(d2k_sched *s) {
             size_t j = area_find(s, &a);
             int same = j < s->n_areas && !s->areas[j].remove_pending &&
                        !strcmp(a.plan_id, s->areas[j].plan_id);
+            if (kind == 2 && !(same && s->areas[j].confirmed) &&
+                !area_exception_groups_suspended(s, &a)) continue;
+            if (kind == 1 && !area_exceptions_ready(s, &a)) {
+                /* A newly known child exception must not be left under an already active suffix. */
+                if (j < s->n_areas && !s->areas[j].permanent &&
+                    (s->areas[j].confirmed || s->areas[j].maybe_active) &&
+                    (!s->areas[j].remove_pending || !s->areas[j].retry_at_ms ||
+                     s->areas[j].retry_at_ms <= s->now_ms)) {
+                    int rc = sync_area_send(s, &s->areas[j], 1);
+                    if (rc > 0) return 1;
+                }
+                continue;
+            }
             if (same && s->areas[j].confirmed) continue;
             if (same && s->areas[j].permanent) continue;
             if (same && s->areas[j].retry_at_ms && s->areas[j].retry_at_ms > s->now_ms) continue;
-            if (kind == 1 && !area_exceptions_ready(s, &a)) continue;
             if (j == s->n_areas && s->n_areas == D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
                 say(s, "области: исчерпан бюджет синхронизации"); return 0;
             }
@@ -10229,7 +10335,11 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
             if (((ev->num >> 8) & 255) != 1) {
                 uint8_t code = (uint8_t)(ev->num & 255);
                 say(s, "область %s отвергнута датапатом (код %u)", s->area_pending.name, (unsigned)code);
-                area_failure(s, &s->area_pending, area_ack_reason(code), code, "");
+                installed_area rejected = s->area_pending;
+                if (!rejected.remove_pending &&
+                    rejected.reason != AREA_REASON_ACK_TIMEOUT &&
+                    rejected.reason != AREA_REASON_SEND_ERROR) rejected.maybe_active = 0;
+                area_failure(s, &rejected, area_ack_reason(code), code, "");
             } else {
                 size_t i = area_find(s, &s->area_pending);
                 if (ev->code == D2K_CMD_DEL_SUFFIX || ev->code == D2K_CMD_DEL_BYPASS) {
@@ -10237,6 +10347,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
                 } else if (s->areas && i < D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
                     installed_area installed = s->area_pending;
                     installed.confirmed = 1;
+                    installed.maybe_active = 0;
                     installed.remove_pending = 0;
                     installed.permanent = 0;
                     installed.retry_count = 0;

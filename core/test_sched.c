@@ -985,16 +985,24 @@ static int live_group_reported_count(d2k_sched *s, const char *suffix) {
     return count ? atoi(count + strlen("\"evidence_count\":")) : -1;
 }
 
-static int live_group_active(d2k_sched *s, const char *suffix) {
+static int live_group_bool(d2k_sched *s, const char *suffix, const char *field) {
     char group[300];
     snprintf(group, sizeof group, "\"suffix\": \"%s\"", suffix);
     const char *body = live_json(s), *at = strstr(body, group);
     const char *end = at ? strchr(at, '}') : NULL;
-    const char *active = at ? strstr(at, "\"active\":") : NULL;
-    if (!active || !end || active >= end) return -1;
-    active += strlen("\"active\":");
-    while (*active == ' ') active++;
-    return !strncmp(active, "true", 4) ? 1 : !strncmp(active, "false", 5) ? 0 : -1;
+    const char *value = at ? strstr(at, field) : NULL;
+    if (!value || !end || value >= end) return -1;
+    value += strlen(field);
+    while (*value == ' ') value++;
+    return !strncmp(value, "true", 4) ? 1 : !strncmp(value, "false", 5) ? 0 : -1;
+}
+
+static int live_group_active(d2k_sched *s, const char *suffix) {
+    return live_group_bool(s, suffix, "\"active\":");
+}
+
+static int live_group_possible(d2k_sched *s, const char *suffix) {
+    return live_group_bool(s, suffix, "\"possibly_active\":");
 }
 
 /* Запись ОДНОЙ активной задачи из живого файла (до закрывающей скобки).
@@ -2460,22 +2468,29 @@ int main(int argc, char **argv) {
         drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
         CHECK(!sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0) &&
               !sent_command_count(D2K_CMD_DEL_SUFFIX, NULL, 0), "unchanged group never withdrawn or resent");
+        CHECK(live_group_active(s, "googlevideo.com") == 1,
+              "fixture: the family rule is active before its first exclusion");
         d2k_group_observation failed = {0};
         strcpy(failed.name, "rr-new.googlevideo.com"); strcpy(failed.plan_id, family_plan_id);
         failed.key = key; failed.evidence = D2K_GROUP_PLAN_FAILED; failed.at = family_at+1;
         CHECK(d2k_group_learn(c.groups, &failed) > 0, "targeted member failure recorded");
-        CHECK(live_group_active(s, "googlevideo.com") == 1,
-              "fixture: the family rule is active before its first exclusion");
+        CHECK(live_group_active(s, "googlevideo.com") == 0 &&
+              live_group_possible(s, "googlevideo.com") == 1,
+              "uninstalled exclusion makes the active family unsafe but visibly possible");
         drain(); forget_sent(); d2k_sched_sync(s); sync_out(s);
         CHECK(sent_command_count(D2K_CMD_DEL_SUFFIX, NULL, 0) == 1 &&
-              !sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0),
+              !sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) &&
+              strstr(live_json(s), "\"install_state\": \"removing\"") &&
+              strstr(live_json(s), "\"exception_install_state\": \"pending\""),
               "an active family is withdrawn before installing a new exception");
         ack.code = D2K_CMD_DEL_SUFFIX; ack.num = 1u << 8;
         area_ack_id(&ack);
         uint8_t first_delete_id[D2K_TRIAL_ID_LEN];
         memcpy(first_delete_id, ack.trial_id, sizeof first_delete_id);
         skip_ahead(s, 6000); sync_out(s);
-        CHECK(live_group_active(s, "googlevideo.com") == 1 &&
+        CHECK(live_group_active(s, "googlevideo.com") == 0 &&
+              live_group_possible(s, "googlevideo.com") == 1 &&
+              strstr(live_json(s), "\"remove_pending\": true") &&
               strstr(live_json(s), "\"install_reason\": \"ack_timeout\""),
               "lost DEL_SUFFIX ACK keeps the possibly active rule visible with its failure reason");
         drain(); forget_sent(); skip_ahead(s, 60000); sync_out(s);
@@ -2489,6 +2504,7 @@ int main(int argc, char **argv) {
         ack.num = 1u << 8; d2k_sched_event(s, &ack);
         forget_sent(); sync_out(s);
         CHECK(live_group_active(s, "googlevideo.com") == 0 &&
+              live_group_possible(s, "googlevideo.com") == 0 &&
               sent_command_count(D2K_CMD_SET_BYPASS, NULL, 0) == 1 &&
               !sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0),
               "the suffix stays withdrawn while the exception is installed");
@@ -2496,6 +2512,11 @@ int main(int argc, char **argv) {
         area_ack_id(&ack);
         d2k_sched_event(s, &ack); sync_out(s);
         CHECK(!d2k_sched_sync_pending(s), "negative exception ACK releases the current sync pass");
+        CHECK(live_group_active(s, "googlevideo.com") == 0 &&
+              strstr(live_json(s), "\"exception_install_state\": \"retrying\"") &&
+              strstr(live_json(s), "\"exception_install_reason\": \"no_room\"") &&
+              !sent_command_count(D2K_CMD_SET_SUFFIX, NULL, 0),
+              "failed exception installation keeps the family suspended with its reason");
         uint8_t failed_exception_id[D2K_TRIAL_ID_LEN];
         memcpy(failed_exception_id, ack.trial_id, sizeof failed_exception_id);
         CHECK(d2k_group_match(c.groups, "rr-other.googlevideo.com", &key),

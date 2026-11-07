@@ -107,6 +107,15 @@ assert.equal(ui.shapeLabel(undefined, undefined), 'протокол не ука�
     'Установка отклонена: план не принят датапатом: он не разбирается или не подходит способу отправки');
   assert.equal(ui.familyStatus({ ...g, install_state: 'rejected', install_reason: 'bad_args' }, true).installation,
     'Установка отклонена: датапат отклонил параметры команды');
+  assert.equal(ui.familyStatus({ ...g, install_state: 'removing', remove_pending: true, possibly_active: true,
+    exception_install_state: 'pending' }, true).installation,
+  'Удаление общего правила ожидает ACK; правило может оставаться активным');
+  assert.equal(ui.familyStatus({ ...g, install_state: 'retrying', install_reason: 'ack_timeout', remove_pending: true,
+    possibly_active: true, exception_install_state: 'pending' }, true).installation,
+  'Повтор удаления общего правила: датапат не ответил на ACK; правило может оставаться активным');
+  assert.equal(ui.familyStatus({ ...g, install_state: 'pending', exception_install_state: 'retrying',
+    exception_install_reason: 'no_room' }, true).installation,
+  'Общее правило приостановлено; повтор установки исключения: в таблице датапата нет места');
   assert.equal(ui.familyStatus(g, false).installation, 'Нет связи с датапатом; статус установки неизвестен');
 }
 

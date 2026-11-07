@@ -598,9 +598,19 @@ async function main(){
   fixture.knowledge.groups[1].active=true;
   await until('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-install")?.textContent==="Общее правило активно"',
    'positive datapath ACK is shown as active');
+  fixture.knowledge.groups[1].install_state='removing';
+  fixture.knowledge.groups[1].active=false;
+  fixture.knowledge.groups[1].possibly_active=true;
+  fixture.knowledge.groups[1].remove_pending=true;
+  fixture.knowledge.groups[1].exception_install_state='pending';
+  await until('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-install")?.textContent.includes("правило может оставаться активным")',
+   'pending exception warns that the old family rule may still apply');
   fixture.knowledge.groups[1].install_state='retrying';
   fixture.knowledge.groups[1].install_reason='ack_timeout';
   fixture.knowledge.groups[1].active=false;
+  fixture.knowledge.groups[1].remove_pending=false;
+  fixture.knowledge.groups[1].possibly_active=false;
+  fixture.knowledge.groups[1].exception_install_state='none';
   await until('document.querySelectorAll(".ftag-wrap")[1].querySelector(".ftag-install")?.textContent.includes("датапат не ответил")',
    'lost ACK shows an automatic retry and its reason');
   fixture.knowledge.groups[1].install_state='rejected';

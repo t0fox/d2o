@@ -163,6 +163,10 @@
     var evidence = list(g && g.evidence);
     var n = Array.isArray(g && g.evidence) ? evidence.length : Math.max(0, Math.round(num(g && g.evidence_count) || 0));
     var reason = str(g && g.install_reason), detail = str(g && g.install_detail);
+    var exceptionState = str(g && g.exception_install_state);
+    var exceptionReason = str(g && g.exception_install_reason);
+    var exceptionDetail = str(g && g.exception_install_detail);
+    var exceptionWhy;
     var reasons = {
       plan_unavailable: "нет однозначного плана в каталоге",
       ack_timeout: "датапат не ответил на ACK",
@@ -172,8 +176,27 @@
       bad_args: "датапат отклонил параметры команды",
       unknown_ack: "датапат вернул неизвестный код причины " + String(num(g && g.install_reason_code) || "—")
     };
+    exceptionWhy = reasons[exceptionReason] || "причина не указана";
+    if (exceptionReason === "send_error") exceptionWhy = exceptionDetail || "команду не удалось отправить";
+    if (exceptionReason === "unknown_ack") exceptionWhy = "датапат вернул неизвестный код причины " +
+      String(num(g && g.exception_install_reason_code) || "—");
+    if (exceptionDetail && exceptionReason !== "send_error") exceptionWhy += " · " + exceptionDetail;
     var state = str(g && g.install_state), installation;
     if (!linked) installation = "Нет связи с датапатом; статус установки неизвестен";
+    else if (g.remove_pending && state === "rejected") installation = "Удаление общего правила отклонено: " +
+      (reasons[reason] || "причина не указана") + "; правило может оставаться активным";
+    else if (g.remove_pending && state === "retrying") installation = "Повтор удаления общего правила: " +
+      (reasons[reason] || "временная ошибка") + "; правило может оставаться активным";
+    else if (g.remove_pending || state === "removing") installation =
+      "Удаление общего правила ожидает ACK; правило может оставаться активным";
+    else if (exceptionState === "retrying") installation = "Общее правило приостановлено; повтор установки исключения: " +
+      (exceptionReason ? exceptionWhy : "временная ошибка");
+    else if (exceptionState === "rejected") installation = "Общее правило приостановлено; установка исключения отклонена: " +
+      exceptionWhy;
+    else if (exceptionState === "pending") installation = g.possibly_active
+      ? "Исключение ожидает установки; общее правило может оставаться активным"
+      : "Общее правило приостановлено; исключение ожидает установки";
+    else if (exceptionState === "active" && state !== "active") installation = "Исключение установлено; ожидает общего правила";
     else if (state === "active") installation = "Общее правило активно";
     else if (state === "retrying") installation = "Повтор установки: " + (reasons[reason] || "временная ошибка") +
       (detail && reason !== "send_error" ? " · " + detail : "");
@@ -183,7 +206,7 @@
     return {
       confirmation: "Семейство подтверждено · " + count(n, "домен", "домена", "доменов"),
       installation: installation,
-      active: !!linked && state === "active"
+      active: !!linked && state === "active" && !!g.active && !g.remove_pending
     };
   }
 
