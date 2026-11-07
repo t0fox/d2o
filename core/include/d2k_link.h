@@ -20,6 +20,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "../../runtime/d2k_protocol.h"
 
 int d2k_link_set_suffix_family(int, const char *, uint8_t transport,
     const char *plan_text, uint8_t shape, uint8_t family, char *, size_t);
@@ -35,6 +36,7 @@ int d2k_link_del_bypass_family(int, const char *, uint8_t transport,
  * ошибки, различимые по D2K_ACK_* через err (см. ниже). */
 #include "d2k_ctl.h"
 #include "d2k_quicsnap.h"
+
 
 /* Разобранное событие датапата. Поля общие для всех видов события, но
  * заполнены только те, что данный вид события несёт (см. комментарии у
@@ -303,6 +305,38 @@ int  d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap);
 /* Открытый HTTP (v11, задача 51, шаг 4) — то же число, что D2K_PLAN_SHAPE_HTTP. */
 #define D2K_LINK_SHAPE_HTTP 7
 #define D2K_LINK_VOICE_CLASS "@discord-voice"
+
+static inline uint8_t d2k_link_shape_tcp_profile(uint8_t shape) {
+    switch (shape) {
+    case D2K_TCP_SHAPE_MODERN_NO_TS:
+    case D2K_TCP_SHAPE_LEGACY_NO_TS:
+    case D2K_TCP_SHAPE_ECH_NO_TS: return D2K_TCP_PROFILE_NO_TS;
+    case D2K_TCP_SHAPE_MODERN_TS:
+    case D2K_TCP_SHAPE_LEGACY_TS:
+    case D2K_TCP_SHAPE_ECH_TS: return D2K_TCP_PROFILE_TS;
+    default: return D2K_TCP_PROFILE_UNKNOWN;
+    }
+}
+
+static inline uint8_t d2k_link_shape_tcp_base(uint8_t shape) {
+    switch (shape) {
+    case D2K_TCP_SHAPE_MODERN_NO_TS:
+    case D2K_TCP_SHAPE_MODERN_TS: return 1;
+    case D2K_TCP_SHAPE_LEGACY_NO_TS:
+    case D2K_TCP_SHAPE_LEGACY_TS: return 2;
+    case D2K_TCP_SHAPE_ECH_NO_TS:
+    case D2K_TCP_SHAPE_ECH_TS: return D2K_LINK_SHAPE_ECH_TCP;
+    default: return shape;
+    }
+}
+
+static inline uint8_t d2k_link_shape_tcp_context(uint8_t shape, uint8_t profile) {
+    if (profile == D2K_TCP_PROFILE_UNKNOWN) return shape;
+    if (shape == 1) return profile == D2K_TCP_PROFILE_TS ? D2K_TCP_SHAPE_MODERN_TS : D2K_TCP_SHAPE_MODERN_NO_TS;
+    if (shape == 2) return profile == D2K_TCP_PROFILE_TS ? D2K_TCP_SHAPE_LEGACY_TS : D2K_TCP_SHAPE_LEGACY_NO_TS;
+    if (shape == D2K_LINK_SHAPE_ECH_TCP) return profile == D2K_TCP_PROFILE_TS ? D2K_TCP_SHAPE_ECH_TS : D2K_TCP_SHAPE_ECH_NO_TS;
+    return shape;
+}
 
 /* Имя с подтверждённым HTTPS на ttl_s секунд (D2K_CMD_SET_HTTPS, v10,
  * задача 51); ноль снимает. Подтверждение — обычным D2K_EV_ACK. */

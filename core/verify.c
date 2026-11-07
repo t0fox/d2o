@@ -822,6 +822,12 @@ static __thread unsigned g_verify_budget;
 void d2k_verify_budget_set(unsigned budget_packets) { g_verify_budget = budget_packets; }
 unsigned d2k_verify_budget_get(void) { return g_verify_budget; }
 
+static __thread int g_verify_tcp_timestamps = -1;
+void d2k_verify_tcp_timestamps_set(int enabled) {
+    g_verify_tcp_timestamps = enabled >= -1 && enabled <= 1 ? enabled : -1;
+}
+int d2k_verify_tcp_timestamps_get(void) { return g_verify_tcp_timestamps; }
+
 /* ФОРМА ПРИВЕТСТВИЯ КЛИЕНТА ДЛЯ ЗОНДА QUIC (задача 66) — поточная настройка,
    как и бюджет выше: подписи крючков зонда не меняются. Ставится на время
    одной проверки и снимается сразу после. Ноль — как раньше, своё
@@ -1351,8 +1357,9 @@ static int verify_contact(int use_fd, const char *ip, uint16_t port,
             return -2;
         }
     }
-    return d2k_props_contact_on_family(fd, ip, port, (d2k_hello){NULL, 0, NULL, 0, 0, 0}, family,
-                                local_addr, local_port, out_fd);
+    return d2k_props_contact_on_family_tcp_profile(fd, ip, port,
+        (d2k_hello){NULL, 0, NULL, 0, 0, 0}, family, g_verify_tcp_timestamps,
+        local_addr, local_port, out_fd);
 }
 
 static d2k_ver_result verify_probe13_internal(int use_fd, const char *ip, uint16_t port,
@@ -1390,6 +1397,10 @@ static d2k_ver_result verify_probe13_internal(int use_fd, const char *ip, uint16
         if (contact == -2) {
             r.local_refusal = 1;
             snprintf(r.reason, sizeof r.reason, "метка измерительного сокета не поставилась");
+        } else if (contact == -3) {
+            r.unsupported = 1;
+            snprintf(r.reason, sizeof r.reason, "не удалось выставить TCP Timestamp профиль: %.120s",
+                     strerror(errno));
         } else {
             snprintf(r.reason, sizeof r.reason, "нет TCP");
         }
@@ -1498,9 +1509,17 @@ d2k_ver_result d2k_verify_replay_on(int use_fd, const char *ip, uint16_t port,
         return r;
     }
     r.family = strchr(ip, ':') ? 6 : 4;
-    if (d2k_props_contact_on_family(use_fd, ip, port, (d2k_hello){hello, hello_len, NULL, 0, 0, 0},
-                                    r.family, r.local_addr, &r.local_port, &r.fd) != 0) {
-        snprintf(r.reason, sizeof r.reason, "нет TCP для повтора приветствия клиента");
+    int contact = d2k_props_contact_on_family_tcp_profile(use_fd, ip, port,
+        (d2k_hello){hello, hello_len, NULL, 0, 0, 0}, r.family,
+        g_verify_tcp_timestamps, r.local_addr, &r.local_port, &r.fd);
+    if (contact != 0) {
+        if (contact == -3) {
+            r.unsupported = 1;
+            snprintf(r.reason, sizeof r.reason,
+                     "не удалось выставить TCP Timestamp профиль: %.120s", strerror(errno));
+        } else {
+            snprintf(r.reason, sizeof r.reason, "нет TCP для повтора приветствия клиента");
+        }
         return r;
     }
     if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);
@@ -1572,7 +1591,13 @@ d2k_ver_result d2k_verify_probe_alpn_on(int use_fd, const char *ip, uint16_t por
     int contact = verify_contact(use_fd, ip, port, 0, r.family,
                                  r.local_addr, &r.local_port, &r.fd);
     if (contact != 0) {
-        snprintf(r.reason, sizeof r.reason, "нет TCP");
+        if (contact == -3) {
+            r.unsupported = 1;
+            snprintf(r.reason, sizeof r.reason, "не удалось выставить TCP Timestamp профиль: %.120s",
+                     strerror(errno));
+        } else {
+            snprintf(r.reason, sizeof r.reason, "нет TCP");
+        }
         return r;
     }
     r.level = D2K_VER_TRANSPORT;
@@ -1638,6 +1663,10 @@ static d2k_ver_result verify_probe12_internal(int use_fd, const char *ip, uint16
         if (contact == -2) {
             r.local_refusal = 1;
             snprintf(r.reason, sizeof r.reason, "метка измерительного сокета не поставилась");
+        } else if (contact == -3) {
+            r.unsupported = 1;
+            snprintf(r.reason, sizeof r.reason, "не удалось выставить TCP Timestamp профиль: %.120s",
+                     strerror(errno));
         } else {
             snprintf(r.reason, sizeof r.reason, "нет TCP");
         }

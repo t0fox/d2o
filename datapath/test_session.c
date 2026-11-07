@@ -1628,6 +1628,71 @@ static void test_template_plan_needs_client_timestamp(void) {
     d2k_nat_hook = saved;
 }
 
+static void test_tcp_timestamp_profile_selects_distinct_binding(void) {
+    d2k_nat_fn saved = d2k_nat_hook;
+    uint8_t hello[512], pkt[1024], buf[4096], ts_plan[sizeof plan_with_send_id];
+    char err[128];
+    size_t hlen = build_hello(hello);
+    const uint8_t versions[] = {0,43,0,3,2,3,4};
+    size_t extlen = 5 + 4 + 2 + 32;
+    extlen += 1 + hello[extlen];
+    extlen += 2 + ((size_t)hello[extlen] << 8 | hello[extlen + 1]);
+    extlen += 1 + hello[extlen];
+    memcpy(hello + hlen, versions, sizeof versions);
+    wr16(hello + extlen, (uint16_t)(((unsigned)hello[extlen] << 8 |
+                                     hello[extlen + 1]) + sizeof versions));
+    wr16(hello + 7, (uint16_t)(((unsigned)hello[7] << 8 | hello[8]) + sizeof versions));
+    wr16(hello + 3, (uint16_t)(((unsigned)hello[3] << 8 | hello[4]) + sizeof versions));
+    hlen += sizeof versions;
+    memcpy(ts_plan, plan_with_send_id, sizeof ts_plan);
+    ts_plan[16] = 0xD0;
+    d2k_result r;
+    d2k_session *g = d2k_session_new(8, 8);
+    d2k_plan *no_ts = NULL, *with_ts = NULL;
+    CHECK(d2k_plan_load(plan_with_send_id, sizeof plan_with_send_id, &no_ts,
+                        err, sizeof err) == 0, "no-Timestamp profile plan parse");
+    CHECK(d2k_plan_load(ts_plan, sizeof ts_plan, &with_ts, err, sizeof err) == 0,
+                       "Timestamp profile plan parse");
+    static const uint8_t name[] = "hetzner.com";
+    CHECK(g && no_ts && with_ts &&
+          d2k_plantab_set_name_family(d2k_session_plans(g), name, sizeof name - 1, 1,
+              no_ts, D2K_PLAN_SHAPE_MODERN_NO_TS, 0, 4) == 0 &&
+          d2k_plantab_set_name_family(d2k_session_plans(g), name, sizeof name - 1, 1,
+              with_ts, D2K_PLAN_SHAPE_MODERN_TS, 0, 4) == 0,
+          "separate Timestamp profile plans install");
+    if (!g || !no_ts || !with_ts) {
+        d2k_plan_free(no_ts); d2k_plan_free(with_ts); d2k_session_free(g);
+        d2k_nat_hook = saved; return;
+    }
+    d2k_nat_hook = nat_stub;
+    nat_calls = 0; nat_miss_first_n = 0;
+
+    size_t n = build_pkt(pkt, 41600, 0x02, NULL, 0);
+    d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    n = build_pkt(pkt, 41600, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 2000, buf, sizeof buf, &r);
+    d2k_key fk;
+    CHECK(d2k_key_make(&fk, 6, pkt + 12, pkt + 16, pkt + 20, pkt + 22) == 0 &&
+          d2k_session_client_shape(g, &fk) == D2K_PLAN_SHAPE_MODERN_NO_TS,
+          "no-Timestamp flow profile was not captured");
+    const d2k_jrn_entry *applied = last_of_kind(g, D2K_JRN_PLAN_APPLIED);
+    CHECK(r.n_out > 0 && applied && applied->plan_id[0] == 0xC0,
+          "no-Timestamp client did not receive its separately confirmed plan");
+
+    n = build_pkt_ts(pkt, 41601, 0x02, NULL, 0);
+    d2k_session_packet(g, pkt, n, 3000, buf, sizeof buf, &r);
+    n = build_pkt_ts(pkt, 41601, 0x18, hello, hlen);
+    d2k_session_packet(g, pkt, n, 4000, buf, sizeof buf, &r);
+    CHECK(d2k_key_make(&fk, 6, pkt + 12, pkt + 16, pkt + 20, pkt + 22) == 0 &&
+          d2k_session_client_shape(g, &fk) == D2K_PLAN_SHAPE_MODERN_TS,
+          "Timestamp flow profile was not captured");
+    applied = last_of_kind(g, D2K_JRN_PLAN_APPLIED);
+    CHECK(r.n_out > 0 && applied && applied->plan_id[0] == 0xD0,
+          "Timestamp client did not receive its separately confirmed plan");
+
+    d2k_session_free(g); d2k_nat_hook = saved;
+}
+
 /* ЗАМЫСЕЛ 2026-10-23, п. 5.1: СНИМОК ПРИВЕТСТВИЯ НЕСЁТ НАБОР ОПЦИЙ TCP КЛИЕНТА.
  * Датапат уже снимает приветствие по запросу (ARM_SHAPE); набор опций TCP того
  * же пакета (тот, что профиль tcp-template-v1 копирует в фальшивки) отдаётся
@@ -1682,6 +1747,7 @@ static void test_shape_carries_client_tcp_options(void) {
 int main(void) {
     D2K_TEST_NAT_NO_TABLE();
     test_template_plan_needs_client_timestamp();
+    test_tcp_timestamp_profile_selects_distinct_binding();
     test_shape_carries_client_tcp_options();
     test_tcp_stall();
     test_route_mark_does_not_leak();
@@ -1986,11 +2052,11 @@ int main(void) {
             d2k_plan *modern = NULL, *legacy = NULL;
             d2k_plan_load(plan_bytes, sizeof plan_bytes, &modern, err, sizeof err);
             CHECK(modern && d2k_plantab_set_name_family(d2k_session_plans(g), nm, 11, 1,
-                      modern, D2K_PLAN_SHAPE_MODERN, 0, 4) == 0, "две формы: план TLS 1.3");
+                      modern, D2K_PLAN_SHAPE_MODERN_NO_TS, 0, 4) == 0, "две формы: план TLS 1.3 без Timestamp");
             if (with_legacy) {
                 d2k_plan_load(plan_bytes, sizeof plan_bytes, &legacy, err, sizeof err);
                 CHECK(legacy && d2k_plantab_set_name_family(d2k_session_plans(g), nm, 11, 1,
-                          legacy, D2K_PLAN_SHAPE_LEGACY, 0, 4) == 0, "две формы: план TLS 1.2");
+                          legacy, D2K_PLAN_SHAPE_LEGACY_NO_TS, 0, 4) == 0, "две формы: план TLS 1.2 без Timestamp");
             }
             n = build_pkt(pkt, (uint16_t)(43010 + with_legacy), 0x18, hello, hlen);
             d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
@@ -2214,7 +2280,7 @@ int main(void) {
             d2k_plan *modern = NULL;
             d2k_plan_load(plan_bytes, sizeof plan_bytes, &modern, err, sizeof err);
             CHECK(modern && d2k_plantab_set_name_family(d2k_session_plans(g), nm, 11, 1,
-                      modern, D2K_PLAN_SHAPE_MODERN, 0, 4) == 0, "PQ: план TLS 1.3");
+                      modern, D2K_PLAN_SHAPE_MODERN_NO_TS, 0, 4) == 0, "PQ: план TLS 1.3 без Timestamp");
             /* Первый сегмент: обрыв посреди тела key_share. */
             n = build_pkt(pkt, (uint16_t)(43020 + with_key_share), 0x18, pq, 600);
             d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
@@ -3287,12 +3353,12 @@ int main(void) {
                                             err, sizeof err) == 0, "late version plan parse");
                         if (scenario >= 6) {
                             CHECK(d2k_plantab_set_suffix_family(d2k_session_plans(v), name,
-                                sizeof name - 1, 1, vp, scenario == 7 ? D2K_PLAN_SHAPE_LEGACY :
-                                scenario == 8 ? D2K_PLAN_SHAPE_ECH_TCP : D2K_PLAN_SHAPE_MODERN, 4) == 0,
+                                sizeof name - 1, 1, vp, scenario == 7 ? D2K_PLAN_SHAPE_LEGACY_NO_TS :
+                                scenario == 8 ? D2K_PLAN_SHAPE_ECH_NO_TS : D2K_PLAN_SHAPE_MODERN_NO_TS, 4) == 0,
                                 "fragmented learned area install");
                             CHECK(d2k_plantab_count(d2k_session_plans(v)) == 0, "area creates no exact host");
                         } else CHECK(d2k_plantab_set_name_probe(d2k_session_plans(v), name,
-                            sizeof name - 1, 1, vp, scenario >= 4 ? D2K_PLAN_SHAPE_ECH_TCP : D2K_PLAN_SHAPE_MODERN,
+                            sizeof name - 1, 1, vp, scenario >= 4 ? D2K_PLAN_SHAPE_ECH_NO_TS : D2K_PLAN_SHAPE_MODERN_NO_TS,
                             scenario == 2 ? htons16(port) : 0) == 0, "late version plan install");
                     }
                     pn = build_pkt(part, port, 0x02, NULL, 0);
@@ -3360,7 +3426,7 @@ int main(void) {
                                                err, sizeof err) == 0, "разбор плана для позднего ECH");
                             CHECK(selected && d2k_plantab_set_name_family(d2k_session_plans(v),
                                 name, sizeof name - 1, 1, selected,
-                                D2K_PLAN_SHAPE_MODERN, 0, 4) == 0, "не удалось установить план MODERN для позднего ECH");
+                                D2K_PLAN_SHAPE_MODERN_NO_TS, 0, 4) == 0, "не удалось установить план MODERN для позднего ECH");
                         }
                         uint16_t port = 47560;
                         pn = build_pkt(part, port, 0x02, NULL, 0);
@@ -3373,12 +3439,12 @@ int main(void) {
                         d2k_key fk;
                         CHECK(d2k_key_make(&fk, 6, part + 12, part + 16, part + 20, part + 22) == 0,
                               "не извлечён ключ потока с фрагментированным ECH");
-                        CHECK(d2k_session_client_shape(v, &fk) == D2K_PLAN_SHAPE_MODERN,
+                        CHECK(d2k_session_client_shape(v, &fk) == D2K_PLAN_SHAPE_MODERN_NO_TS,
                               "первый фрагмент ECH не получил быструю предварительную форму MODERN");
                         pn = build_pkt(part, port, 0x18, late + 1388, late_len - 1388);
                         wr32(part + 24, 2389);
                         d2k_session_packet(v, part, pn, 3, buf, sizeof buf, &r);
-                        CHECK(d2k_session_client_shape(v, &fk) == D2K_PLAN_SHAPE_ECH_TCP,
+                        CHECK(d2k_session_client_shape(v, &fk) == D2K_PLAN_SHAPE_ECH_NO_TS,
                               "полный ClientHello с ECH не заменил предварительную форму MODERN");
                         CHECK(d2k_session_applied(v) == (unsigned)installed && !r.applied,
                               "исправление формы ECH повторно применило план");

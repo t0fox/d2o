@@ -212,6 +212,20 @@ int main(void) {
         CHECK(!d2k_plantab_has_ech_target(t, NULL, 0, NULL, 6, 0), "ECH group never inferred from IP");
         CHECK(!d2k_plantab_set_bypass_family(t, child, sizeof child-1, 6, 6, 6), "ECH bypass");
         CHECK(!d2k_plantab_has_ech_target(t, child, sizeof child-1, NULL, 6, 0), "ECH exception suppresses hold");
+        d2k_plan *ech_no_ts_group = mkplan();
+        CHECK(!d2k_plantab_set_suffix_family(t, root, sizeof root-1, 10,
+                                              ech_no_ts_group, D2K_PLAN_SHAPE_ECH_NO_TS, 6),
+              "IPv6 ECH without-Timestamp suffix");
+        CHECK(d2k_plantab_has_ech_target(t, child, sizeof child-1, NULL, 6, 0),
+              "base ECH exception does not hide the separate no-Timestamp target");
+        CHECK(!d2k_plantab_set_bypass_family(t, child, sizeof child-1, 6,
+                                              D2K_PLAN_SHAPE_ECH_NO_TS, 6),
+              "no-Timestamp ECH bypass");
+        CHECK(!d2k_plantab_has_ech_target(t, child, sizeof child-1, NULL, 6, 0),
+              "no-Timestamp ECH exception suppresses that profile's hold");
+        CHECK(d2k_plantab_del_bypass_family(t, child, sizeof child-1, 6,
+                                             D2K_PLAN_SHAPE_ECH_NO_TS, 6) == 1,
+              "remove no-Timestamp ECH bypass");
         {
             d2k_plan *own_ech = mkplan();
             CHECK(!d2k_plantab_set_name_family(t, child, sizeof child-1, 10, own_ech,
@@ -666,6 +680,38 @@ int main(void) {
               d2k_plantab_find(t, nm, nl, 0, 8, D2K_PLAN_SHAPE_QUIC) != NULL &&
               d2k_plantab_find(t, nm, nl, 0, 9, D2K_PLAN_SHAPE_ANY) != NULL,
               "старый каталог перестал применяться — «не записано» принято за «не подходит»");
+        d2k_plantab_free(t);
+    }
+
+    /* TCP Timestamp is part of the TLS binding context. A plan confirmed on
+       a timestamped flow cannot cover the same ClientHello without it. */
+    {
+        d2k_plantab *t = d2k_plantab_new(4);
+        static const uint8_t nm[] = "timestamp-profile.example";
+        const size_t nl = sizeof nm - 1;
+        d2k_plan *with_ts = mkplan(), *without_ts = mkplan();
+        CHECK(t && d2k_plantab_set_name_shaped(t, nm, nl, 1, with_ts,
+              D2K_PLAN_SHAPE_MODERN_TS) == 0, "timestamped TLS binding install");
+        CHECK(t && d2k_plantab_set_name_shaped(t, nm, nl, 2, without_ts,
+              D2K_PLAN_SHAPE_MODERN_NO_TS) == 0, "no-timestamp TLS binding install");
+        CHECK(t && d2k_plantab_find(t, nm, nl, 0, 3,
+              D2K_PLAN_SHAPE_MODERN_TS) == with_ts,
+              "timestamped flow did not select its confirmed plan");
+        CHECK(t && d2k_plantab_find(t, nm, nl, 0, 3,
+              D2K_PLAN_SHAPE_MODERN_NO_TS) == without_ts,
+              "client without TCP Timestamp did not select its separate plan");
+        CHECK(t && d2k_plantab_find(t, nm, nl, 0, 3,
+              D2K_PLAN_SHAPE_MODERN) == NULL,
+              "profile-specific TLS plan leaked to an unknown TCP-option profile");
+        const uint8_t old_name[] = "old-profile.example";
+        d2k_plan *old = mkplan();
+        CHECK(t && d2k_plantab_set_name_shaped(t, old_name, sizeof old_name - 1, 4, old,
+              D2K_PLAN_SHAPE_MODERN) == 0, "legacy TLS binding install");
+        CHECK(t && d2k_plantab_find(t, old_name, sizeof old_name - 1, 0, 5,
+              D2K_PLAN_SHAPE_MODERN_NO_TS) == NULL &&
+              d2k_plantab_find(t, old_name, sizeof old_name - 1, 0, 6,
+              D2K_PLAN_SHAPE_MODERN_TS) == NULL,
+              "legacy TLS binding was treated as proof for a known Timestamp profile");
         d2k_plantab_free(t);
     }
 

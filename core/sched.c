@@ -871,6 +871,7 @@ typedef struct {
     uint8_t    deny_recheck;
     uint8_t    trigger_planned;
     uint8_t    trigger_shape;
+    uint8_t    trigger_tcp_profile;
     d2k_flowkey trigger_flow;
     /* Форма приветствия, КОТОРЫМ шёл замер, и было ли уже повторение из-за
        её расхождения со снимком. Нужны затем, что снимок настоящего клиента
@@ -1372,7 +1373,7 @@ struct d2k_sched {
        перемер уже заводили. ДРУГОЙ план той же цели (каталог сменился) заводит
        перемер снова — он ещё не проверялся. */
     struct { char name[256]; uint8_t family, transport;
-             uint8_t plan_id[D2K_PLAN_ID_LEN]; } unfit_done[8];
+             uint8_t tcp_profile, plan_id[D2K_PLAN_ID_LEN]; } unfit_done[8];
     size_t       unfit_done_next;
     unsigned     sync_refused_code; /* причина последнего отказа (D2K_ACK_*) */
     installed_area *areas;
@@ -1521,6 +1522,7 @@ static int addr_probe_remove(d2k_sched *s, task *t, char *err, size_t errcap) {
 }
 
 static uint8_t question_shape(const task *t);
+static uint8_t task_wire_shape(const task *t, uint8_t shape);
 static void say(d2k_sched *s, const char *fmt, ...);
 
 /* СНЯТИЕ ПРОБНЫХ ЗАПИСЕЙ ЗАДАЧИ — ТОЧНОЕ И НА КАЖДОМ ПЕРЕХОДЕ (задача 20).
@@ -1543,7 +1545,7 @@ static void question_retire(d2k_sched *s, task *t) {
     if (t->prop_installed && t->prop_sport_be != 0) {
         char err[160];
         if (d2k_link_del_name_probe_family(s->link_fd, t->name, t->transport,
-                                           question_shape(t), t->prop_sport_be,
+                                           task_wire_shape(t, question_shape(t)), t->prop_sport_be,
                                            t->family, err, sizeof err) != 0) {
             say(s, "по %s не удалось снять план вопроса: %s", t->name, err);
         }
@@ -2269,7 +2271,8 @@ static int quic_named_find(const d2k_sched *s, const char *name, uint8_t family)
  * Разбор побайтный, тот же, что у датапата и у зонда: NOP и EOL отдельно,
  * кривая длина — «нет». */
 static int client_offers_ts(const task *t) {
-    if (!t->client_opts_known) { return 1; }
+    if (!t->client_opts_known)
+        return t->trigger_tcp_profile != D2K_TCP_PROFILE_NO_TS;
     const uint8_t *o = t->client_opts;
     size_t n = t->client_opts_len;
     if (n > sizeof t->client_opts) { return 0; }
@@ -2284,12 +2287,44 @@ static int client_offers_ts(const task *t) {
     return 0;
 }
 
+static uint8_t client_tcp_profile(const task *t) {
+    if (!t->client_opts_known || t->client_opts_len > sizeof t->client_opts)
+        return D2K_TCP_PROFILE_UNKNOWN;
+    const uint8_t *o = t->client_opts;
+    size_t n = t->client_opts_len;
+    for (size_t off = 0; off < n;) {
+        uint8_t kind = o[off];
+        if (kind == 0) return D2K_TCP_PROFILE_NO_TS;
+        if (kind == 1) { off++; continue; }
+        if (off + 2 > n || o[off + 1] < 2 || o[off + 1] > n - off)
+            return D2K_TCP_PROFILE_UNKNOWN;
+        if (kind == 8 && o[off + 1] == 10) return D2K_TCP_PROFILE_TS;
+        off += o[off + 1];
+    }
+    return D2K_TCP_PROFILE_NO_TS;
+}
+
+static int flowkey_same(const d2k_flowkey *a, const d2k_flowkey *b) {
+    return a->transport == b->transport && a->family == b->family &&
+           a->a_port == b->a_port && a->b_port == b->b_port &&
+           memcmp(a->a_ip, b->a_ip, a->family == 6 ? 16 : 4) == 0 &&
+           memcmp(a->b_ip, b->b_ip, a->family == 6 ? 16 : 4) == 0;
+}
+
 /* Набор опций клиента — задаче вместе со снимком (замысел 2026-10-23, п. 5.1). */
 static void take_shape_opts(const d2k_sched *s, task *t) {
     int f = t->family == 6;
+    if (!t->trigger_flow.a_port || !t->trigger_flow.b_port ||
+        strcmp(s->tcp_shape_name[f], t->name) != 0 ||
+        !flowkey_same(&t->trigger_flow, &s->tcp_shape_flow[f])) {
+        t->client_opts_known = 0;
+        t->client_opts_len = 0;
+        return;
+    }
     t->client_opts_known = s->tcp_shape_opts_known[f];
     t->client_opts_len = t->client_opts_known ? s->tcp_shape_opts_len[f] : 0;
     if (t->client_opts_len) { memcpy(t->client_opts, s->tcp_shape_opts[f], t->client_opts_len); }
+    t->trigger_tcp_profile = client_tcp_profile(t);
 }
 static void drop_client_opts(task *t) {
     t->client_opts_known = 0;
@@ -2766,6 +2801,9 @@ static void *worker_run_body(void *vp) {
         /* Проверка бюджета потока (задача 55) — поточная настройка зонда:
            подписи крючков зонда не меняются. Снимается сразу после. */
         d2k_verify_budget_set(a_budget);
+        d2k_verify_tcp_timestamps_set(t->transport != 6 ? -1 :
+            t->trigger_tcp_profile == D2K_TCP_PROFILE_NO_TS ? 0 :
+            t->trigger_tcp_profile == D2K_TCP_PROFILE_TS ? 1 : -1);
         /* ФОРМА КЛИЕНТА ДЛЯ ЗОНДА QUIC (задача 66): когда вход замера — пачка
            снятых датаграмм, собственный полёт зонда идёт тем же числом
            датаграмм той же длины. Иначе план, снятый с двухдатаграммного
@@ -2838,6 +2876,7 @@ static void *worker_run_body(void *vp) {
                                                          ? D2K_SHAPE_UNKNOWN
                                                          : d2k_hello_shape(t->trig, t->trig_len)));
         d2k_verify_budget_set(0);
+        d2k_verify_tcp_timestamps_set(-1);
         d2k_verify_quic_form_set(NULL);
         pthread_mutex_lock(&s->mu);
         t->ver = vr;
@@ -3411,7 +3450,8 @@ static int64_t wall_s(const d2k_sched *s, int64_t now_ms) {
 static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_id,
                           const char *plan_text, const char *proto,
                           const char *target, const char *kind, uint8_t transport,
-                          uint8_t family, uint8_t shape, uint8_t verified_by, uint8_t input,
+                          uint8_t family, uint8_t shape, uint8_t tcp_profile,
+                          uint8_t verified_by, uint8_t input,
                           int64_t at_s, const d2k_cat_fp *fp) {
     d2k_cat_box *b = box_ensure(c, box_id);
     if (!b) { return -1; }
@@ -3465,6 +3505,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
         d2k_cat_binding *bd = &b->binds[i];
         if (bd->transport == transport && strcmp(bd->target, target) == 0 &&
             strcmp(bd->kind, kind) == 0 && (bd->family ? bd->family : 4) == family &&
+            bd->tcp_profile == tcp_profile &&
             d2k_cat_shape_fits(bd->shape, shape)) {
             bd->successes++;
             bd->confirmed = at_s;
@@ -3477,6 +3518,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
             if (strcmp(bd->plan_id, plan_id)) bd->budget = 0;
             snprintf(bd->plan_id, sizeof bd->plan_id, "%s", plan_id);
             if (shape) { bd->shape = shape; }
+            bd->tcp_profile = tcp_profile;
             if (verified_by) { bd->verified_by = verified_by; }
             /* Полнота входа пишется только СИЛЬНЕЕ прежней: замер байтами
                клиента отменяет прежнюю заготовку, обратное — нет. Иначе
@@ -3504,6 +3546,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
     bd->transport = transport;
     bd->family = family;
     bd->shape = shape;
+    bd->tcp_profile = tcp_profile;
     bd->verified_by = verified_by;
     bd->input = input;
     b->n_binds++;
@@ -3613,6 +3656,16 @@ static uint8_t probe_shape(const task *t) {
         return (uint8_t)D2K_SHAPE_LEGACY;
     }
     return (uint8_t)SCHED_PROBE_SHAPE;
+}
+
+static uint8_t task_wire_shape(const task *t, uint8_t shape) {
+    return t->transport == 6 ? d2k_link_shape_tcp_context(shape, t->trigger_tcp_profile) : shape;
+}
+
+static uint8_t binding_wire_shape(const d2k_cat_binding *bd) {
+    uint8_t shape = bd->shape ? bd->shape : (uint8_t)D2K_LINK_SHAPE_GRANDFATHER;
+    return (bd->transport ? bd->transport : 6) == 6 ?
+        d2k_link_shape_tcp_context(shape, bd->tcp_profile) : shape;
 }
 
 static int stamp_plan_id(char *text, const uint8_t id[D2K_PLAN_ID_LEN]) {
@@ -3861,7 +3914,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         }
         /* Форма приветствия вопроса — та же, что у снятого триггера. */
         if (d2k_link_set_name_family(s->link_fd, t->name, t->transport, hex,
-                                    question_shape(t), t->prop_sport_be,
+                                    task_wire_shape(t, question_shape(t)), t->prop_sport_be,
                                     t->family, err, sizeof err) != 0) {
             close(t->prop_bound_fd);
             t->prop_bound_fd = -1;
@@ -4632,6 +4685,7 @@ static int install_next(d2k_sched *s, task *t) {
             t->probe_sport_be = local_port;
         }
         int set_rc;
+        uint8_t wire_shape = 0;
         if (t->by_addr) {
             uint8_t dst[16] = {0};
             if (inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, dst) != 1) {
@@ -4648,14 +4702,15 @@ static int install_next(d2k_sched *s, task *t) {
             set_rc = -1;
             snprintf(err, sizeof err, "не удалось создать trial ID установки");
         } else {
+            wire_shape = task_wire_shape(t, probe_shape(t));
             set_rc = d2k_link_set_name_probe_trial(s->link_fd, t->name, t->transport, hex,
-                                                   probe_shape(t), t->probe_sport_be,
+                                                   wire_shape, t->probe_sport_be,
                                                    t->family, t->trial_ack_id,
                                                    err, sizeof err);
         }
         if (set_rc == 0) {
             t->trial_installed = 1;
-            t->trial_shape = (uint8_t)(t->by_addr ? 0 : probe_shape(t));
+            t->trial_shape = (uint8_t)(t->by_addr ? 0 : wire_shape);
             t->trial_shape_seq = s->quic_shape_seq[t->family == 6];
             if (t->by_addr) { t->addr_probe_identity_valid = 1; }
             return 0;
@@ -4820,6 +4875,7 @@ static int bound_plan_here(const d2k_sched *s, const task *t, uint8_t shape,
                 strcmp(bd->kind, "name") || strcmp(bd->target, t->name) ||
                 (bd->transport ? bd->transport : 6) != t->transport ||
                 (bd->family ? bd->family : 4) != t->family || bd->shape != shape ||
+                (t->transport == 6 && bd->tcp_profile != t->trigger_tcp_profile) ||
                 (bd->transport == 17 && bd->verified_by == D2K_VERBY_CLIENT) ||
                 newer_name_binding(s->cat, bd)) continue;
             const d2k_cat_plan *p = plan_by_id(b, bd->plan_id);
@@ -4905,6 +4961,7 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
                     bd->recheck_since || strcmp(bd->kind, "name") ||
                     (bd->transport ? bd->transport : 6) != t->transport ||
                     (bd->family ? bd->family : 4) != t->family ||
+                    (t->transport == 6 && bd->tcp_profile != t->trigger_tcp_profile) ||
                     (ech_replay ? !((bd->shape == want && !bd->ech_origin[0]) ||
                                     bd->shape == D2K_LINK_SHAPE_ECH_TCP)
                                 : ((bd->shape != want && (!cross || bd->shape != cross)) ||
@@ -4918,6 +4975,14 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
                 found = 1;
             }
             if (!found) continue;
+            /* A live TCP client that remained silent after its applied plan
+               is contrary evidence to that exact profile's own probe. Keep
+               the installed confirmation intact while another strategy is
+               searched, but do not re-verify the same candidate as success. */
+            if (t->transport == 6 && t->trigger_planned == D2K_LINK_PLANNED_YES &&
+                t->trigger_tcp_profile != D2K_TCP_PROFILE_UNKNOWN &&
+                t->trigger_code == D2K_SUSPECT_SILENT && bound[0] &&
+                !strcmp(p->id, bound)) continue;
             int lead = bound[0] && !strcmp(p->id, bound);
             uint32_t h = fnv1a(p->text);
             int tried = 0;
@@ -5006,6 +5071,7 @@ static int clear_binding_matches(const d2k_cat_binding *bd, const task *t,
     uint8_t tr = bd->transport ? bd->transport : 6;
     return strcmp(bd->kind, "name") == 0 && strcmp(bd->target, t->name) == 0 &&
            tr == t->transport && (bd->family ? bd->family : 4) == t->family &&
+           (tr != 6 || bd->tcp_profile == t->trigger_tcp_profile) &&
            d2k_cat_shape_fits(bd->shape, measured);
 }
 
@@ -5066,7 +5132,7 @@ static void forget_clear_target_bindings(d2k_sched *s, task *t, int64_t now_ms) 
             bd->recheck_since = wall_s(s, now_ms);
             bd->recheck_mono_ms = now_ms ? now_ms : 1;
             uint8_t tr = bd->transport ? bd->transport : 6;
-            uint8_t wire_shape = bd->shape ? bd->shape : (uint8_t)D2K_LINK_SHAPE_GRANDFATHER;
+            uint8_t wire_shape = binding_wire_shape(bd);
             if (d2k_link_del_name_family(s->link_fd, t->name, tr, wire_shape,
                                          t->family, err, sizeof err) != 0) {
                 say(s, "по %s привязку %s не удалось снять с провода: %s",
@@ -6065,6 +6131,8 @@ int d2k_sched_sync_pending(const d2k_sched *s) {
  * Каталог при этом не правится — запись просто не ставится, и это говорится. */
 static uint8_t addr_binding_shape(const d2k_cat_binding *bd) {
     uint8_t tr = bd->transport;
+    if ((tr == 6 || tr == 0) && bd->shape >= D2K_TCP_SHAPE_MODERN_NO_TS &&
+        bd->shape <= D2K_TCP_SHAPE_MAX) return bd->shape;
     switch (bd->shape) {
     case D2K_LINK_SHAPE_QUIC:
     case D2K_LINK_SHAPE_VOICE:
@@ -6072,7 +6140,8 @@ static uint8_t addr_binding_shape(const d2k_cat_binding *bd) {
     case D2K_SHAPE_MODERN:
     case D2K_SHAPE_LEGACY:
     case D2K_LINK_SHAPE_ECH_TCP:
-        return tr == 6 || tr == 0 ? bd->shape : 0;
+        return tr == 6 || tr == 0 ?
+            d2k_link_shape_tcp_context(bd->shape, bd->tcp_profile) : 0;
     case 0:
         if (tr != 17) return 0;
         if (bd->verified_by == D2K_VERBY_STUN) return D2K_LINK_SHAPE_VOICE;
@@ -6101,6 +6170,8 @@ static int newer_name_binding(const d2k_catalog *cat, const d2k_cat_binding *bd)
                 (other->transport ? other->transport : 6) != (bd->transport ? bd->transport : 6) ||
                 (other->family ? other->family : 4) != (bd->family ? bd->family : 4) ||
                 other->shape != bd->shape ||
+                ((other->transport ? other->transport : 6) == 6 &&
+                 other->tcp_profile != bd->tcp_profile) ||
                 (other->transport == 17 && other->verified_by == D2K_VERBY_CLIENT)) continue;
             const d2k_cat_plan *plan = plan_by_id(box, other->plan_id);
             if (plan && plan->text) return 1;
@@ -6134,14 +6205,9 @@ static int own_exact_confirmed(const d2k_catalog *cat, const char *name,
                 !strcmp(bd->kind, "name") && !strcmp(bd->target, name) &&
                 (bd->transport ? bd->transport : 6) == key->transport &&
                 (bd->family ? bd->family : 4) == key->family &&
-                (bd->shape == key->shape ||
-                 /* Старая подтверждённая привязка имени без формы (дедушкино
-                    право) — своё точное решение участника для любой формы
-                    TCP TLS; датапат так же ставит её выше BYPASS
-                    (финальное ревью, п.6). */
-                 (bd->shape == 0 && key->transport == 6 &&
-                  (key->shape == D2K_SHAPE_MODERN || key->shape == D2K_SHAPE_LEGACY ||
-                   key->shape == D2K_LINK_SHAPE_ECH_TCP)))) return 1;
+                ((key->transport == 6 &&
+                  d2k_link_shape_tcp_context(bd->shape, bd->tcp_profile) == key->shape) ||
+                 (key->transport != 6 && bd->shape == key->shape))) return 1;
         }
     return 0;
 }
@@ -6405,6 +6471,14 @@ int d2k_sched_sync_step(d2k_sched *s) {
             s->sync_weak++;
             continue;
         }
+        if ((bd->transport ? bd->transport : 6) == 6 &&
+            strcmp(bd->kind, "name") == 0 && bd->shape == 0) {
+            s->sync_unshaped++;
+            say(s, "каталог: %s — TCP-привязка без измеренной TLS-формы не ставится: "
+                   "профиль Timestamp неизвестен, требуется отдельное подтверждение",
+                bd->target);
+            continue;
+        }
         const d2k_cat_plan *p = plan_by_id(b, bd->plan_id);
         if (!p || !p->text) {
             s->sync_skipped++;
@@ -6464,8 +6538,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
                 s->sync_unfit++;
                 if (strcmp(bd->kind, "name") == 0) {
                     uint8_t tr = bd->transport ? bd->transport : 6;
-                    uint8_t wire_shape = bd->shape ? (uint8_t)bd->shape
-                                                   : (uint8_t)D2K_LINK_SHAPE_GRANDFATHER;
+                    uint8_t wire_shape = binding_wire_shape(bd);
                     if (d2k_link_del_name_family(s->link_fd, bd->target, tr, wire_shape,
                                                  family, err, sizeof err) != 0) {
                         say(s, "по %s привязку %s не удалось снять с провода: %s",
@@ -6522,8 +6595,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
                поля. Шлём явное дедушкино право, а не ноль: ноль означает
                «сказать нечего», совместимости не даёт, и такой план молча
                перестал бы применяться у человека (0009, U5-R3). */
-            uint8_t wire_shape = bd->shape ? (uint8_t)bd->shape
-                                           : (uint8_t)D2K_LINK_SHAPE_GRANDFATHER;
+            uint8_t wire_shape = binding_wire_shape(bd);
             rc = d2k_link_set_name_family(s->link_fd, bd->target, tr, hex,
                                           wire_shape, 0, family, err, sizeof err);
         }
@@ -7518,8 +7590,9 @@ static int installed_family_ready(const d2k_sched *s, const task *t, uint64_t af
                                   int include_exact) {
     const d2k_group_state *state = s->cat->groups;
     if (!state || t->by_addr) return 0;
-    uint8_t shape = t->trigger_shape;
-    if (!shape) return 0;
+    uint8_t measured_shape = t->trigger_shape;
+    uint8_t group_shape = task_wire_shape(t, measured_shape);
+    if (!measured_shape) return 0;
     for (size_t bi=0; !include_exact && bi<s->cat->n_boxes; bi++) {
         const d2k_cat_box *b=&s->cat->boxes[bi];
         for (size_t j=0; j<b->n_binds; j++) {
@@ -7528,13 +7601,14 @@ static int installed_family_ready(const d2k_sched *s, const task *t, uint64_t af
                 !strcmp(bd->target,t->name) &&
                 (bd->transport ? bd->transport : 6)==t->transport &&
                 (bd->family ? bd->family : 4)==t->family &&
-                d2k_cat_shape_fits(bd->shape,shape)) return 0;
+                (t->transport != 6 || bd->tcp_profile == t->trigger_tcp_profile) &&
+                d2k_cat_shape_fits(bd->shape,measured_shape)) return 0;
         }
     }
     for (size_t i=0; i<state->n_groups; i++) {
         const d2k_domain_group *g=&state->groups[i]; installed_area desired;
         if (g->key.transport!=t->transport || g->key.family!=t->family ||
-            g->key.shape!=shape || d2k_group_match(state,t->name,&g->key)!=g ||
+            g->key.shape!=group_shape || d2k_group_match(state,t->name,&g->key)!=g ||
             !desired_area(s,i,&desired)) continue;
         for (size_t j=0; j<s->n_areas; j++) {
             const installed_area *a=&s->areas[j];
@@ -7548,7 +7622,7 @@ static int installed_family_ready(const d2k_sched *s, const task *t, uint64_t af
 /* Та же совместимость форм, что использует датапат при выборе привязки. */
 static const d2k_cat_binding *binding_covering(const d2k_sched *s, const char *name,
                                                uint8_t transport, uint8_t family,
-                                               uint8_t shape) {
+                                               uint8_t shape, uint8_t tcp_profile) {
     const d2k_cat_binding *exact = NULL, *modern = NULL, *unshaped = NULL;
     if (!s->cat || !name || !name[0]) { return NULL; }
     for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
@@ -7558,7 +7632,8 @@ static const d2k_cat_binding *binding_covering(const d2k_sched *s, const char *n
             if (!bd->enabled || bd->level < 3 || bd->recheck_since ||
                 strcmp(bd->kind, "name") != 0 || strcmp(bd->target, name) != 0 ||
                 (bd->transport ? bd->transport : 6) != transport ||
-                (bd->family ? bd->family : 4) != family) { continue; }
+                (bd->family ? bd->family : 4) != family ||
+                (transport == 6 && bd->tcp_profile != tcp_profile)) { continue; }
             if (shape == 0 || bd->shape == shape) { if (!exact) exact = bd; }
             else if (bd->shape == 0) { if (!unshaped) unshaped = bd; }
             else if (bd->shape == (uint8_t)D2K_SHAPE_MODERN &&
@@ -7600,7 +7675,8 @@ static int family_recovery_start(d2k_sched *s, task *t) {
     if(t->transport==6 &&
        !d2k_cat_shape_fits((uint8_t)d2k_hello_shape(t->trig,t->trig_len),t->trigger_shape)) return 0;
     d2k_group_key key;
-    if(d2k_group_key_make(&key,t->transport,t->family,t->trigger_shape,
+    if(d2k_group_key_make(&key,t->transport,t->family,
+                         task_wire_shape(t,t->trigger_shape),
                          group_path(t->transport,t->measure_path),"")) return 0;
     const d2k_domain_group *g=d2k_group_match(s->cat->groups,t->name,&key);
     if(!g) return 0;
@@ -7639,7 +7715,9 @@ static int family_recovery_start(d2k_sched *s, task *t) {
                     if(!strcmp(bd_name,o->name) && !strcmp(bd->plan_id,o->plan_id) &&
                        (bd->transport?bd->transport:6)==key.transport &&
                        (bd->family?bd->family:4)==key.family &&
-                       d2k_cat_shape_fits(bd->shape,key.shape) &&
+                       (key.transport==6 ?
+                        d2k_link_shape_tcp_context(bd->shape,bd->tcp_profile)==key.shape :
+                        d2k_cat_shape_fits(bd->shape,key.shape)) &&
                        !strcmp(group_path(key.transport,bd->probe_path),key.probe_path) &&
                        !strcmp(bd->ech_origin,key.ech_origin)) confirmed=1;
                 }
@@ -7799,6 +7877,7 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          is_stun ? "stun" : "voice",
                          by_address ? t->ip : t->name,
                          by_address ? "addr" : "name", 17, t->family, D2K_LINK_SHAPE_VOICE,
+                         D2K_TCP_PROFILE_UNKNOWN,
                          is_stun ? D2K_VERBY_STUN : D2K_VERBY_VOICE_DISCOVERY,
                          D2K_INPUT_PROFILE,
                          wall_s(s, now_ms), &t->fp);
@@ -8048,7 +8127,9 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
     if (!t && !by_addr && ev->transport == 6 &&
         ev->planned == D2K_LINK_PLANNED_NO) {
         const d2k_cat_binding *bd = binding_covering(
-            s, name, 6, ev->family ? ev->family : 4, ev->client_shape);
+            s, name, 6, ev->family ? ev->family : 4,
+            d2k_link_shape_tcp_base(ev->client_shape),
+            d2k_link_shape_tcp_profile(ev->client_shape));
         if (bd) {
             char quiet_key[300];
             snprintf(quiet_key, sizeof quiet_key, "unplanned %u %s", ev->transport, name);
@@ -8190,7 +8271,10 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
     t->trigger_flow.b_port = ev->high_port;
     t->trigger_flow.transport = ev->transport;
     t->trigger_flow.family = t->family;
-    if (ev->client_shape) t->trigger_shape = ev->client_shape;
+    if (ev->client_shape) {
+        t->trigger_shape = d2k_link_shape_tcp_base(ev->client_shape);
+        t->trigger_tcp_profile = d2k_link_shape_tcp_profile(ev->client_shape);
+    }
     else if (t->transport == 17) t->trigger_shape = D2K_LINK_SHAPE_QUIC;
     else if (!strcmp(s->tcp_shape_name[t->family == 6], name) &&
              ev_matches_flow(ev, &s->tcp_shape_flow[t->family == 6])) {
@@ -8201,7 +8285,8 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
     }
     if (t->trigger_shape == D2K_LINK_SHAPE_ECH_TCP) {
         const d2k_cat_binding *bd = binding_covering(s, name, 6, t->family,
-                                                     D2K_LINK_SHAPE_ECH_TCP);
+                                                     D2K_LINK_SHAPE_ECH_TCP,
+                                                     t->trigger_tcp_profile);
         if (bd && bd->shape == (uint8_t)D2K_SHAPE_MODERN)
             t->trigger_shape = (uint8_t)D2K_SHAPE_MODERN;
     }
@@ -8570,9 +8655,10 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         if ((t->state == T_QUEUED || t->state == T_ASKING) && t->transport == 6 && ev->transport == 6 &&
             ev_matches_flow(ev,&t->trigger_flow) && !t->trigger_shape) {
             t->trigger_shape=(uint8_t)watch_shape(t, ev->shape, ev->shape_len);
+            take_shape_opts(s, t);
         }
         if (t->state == T_ASKING && t->transport == 6 && ev->transport == 6 &&
-            strcmp(t->name, name) == 0) {
+            strcmp(t->name, name) == 0 && ev_matches_flow(ev, &t->trigger_flow)) {
             if (!t->trig_snapped && !t->reasked && ev->shape_len <= sizeof t->snap &&
                 hello_fits_client(t, ev->shape, ev->shape_len)) {
                 /* The worker owns an immutable cold-start profile copy. Ask
@@ -8586,6 +8672,11 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
                 t->snap_opts_known = s->tcp_shape_opts_known[ev->family == 6];
                 t->snap_opts_len = t->snap_opts_known ? s->tcp_shape_opts_len[ev->family == 6] : 0;
                 if (t->snap_opts_len) memcpy(t->snap_opts, s->tcp_shape_opts[ev->family == 6], t->snap_opts_len);
+                t->client_opts_known = t->snap_opts_known;
+                t->client_opts_len = t->snap_opts_len;
+                if (t->client_opts_len) memcpy(t->client_opts, t->snap_opts, t->client_opts_len);
+                uint8_t profile = client_tcp_profile(t);
+                if (profile != D2K_TCP_PROFILE_UNKNOWN) t->trigger_tcp_profile = profile;
                 t->stop = 1;
                 if (!t->snap_stop) {
                     t->snap_stop = 1;
@@ -8671,6 +8762,7 @@ static void group_record(d2k_sched *s, const task *t, unsigned evidence,
     d2k_group_observation o = {0};
     snprintf(o.name, sizeof o.name, "%s", t->name);
     snprintf(o.plan_id, sizeof o.plan_id, "%s", plan_id ? plan_id : "");
+    shape = task_wire_shape(t, shape);
     if (d2k_group_key_make(&o.key, t->transport, t->family, shape,
             group_path(t->transport, t->measure_path), t->ech_offer ? t->ech_origin : "")) {
         say(s, "по %s контекст слишком длинный для обучения области; точный обход сохранён", t->name);
@@ -9071,6 +9163,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          quic_ech_bind ? t->ip : t->name,
                          (quic_ech_bind || t->by_addr) ? "addr" : "name",
                          t->transport, t->family, rec_shape,
+                         t->transport == 6 ? t->trigger_tcp_profile : D2K_TCP_PROFILE_UNKNOWN,
                          t->ver.replay_proof ? D2K_VERBY_REPLAY_HANDSHAKE :
                          t->ver.handshake_proof ? D2K_VERBY_PROBE_HANDSHAKE
                                                 : D2K_VERBY_PROBE, rec_input,
@@ -9148,7 +9241,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
             d2k_plan_text_to_hex(permanent_wire, permanent_hex,
                                  sizeof permanent_hex, err, sizeof err) != 0 ||
             inet_pton(t->family == 6 ? AF_INET6 : AF_INET, t->ip, addr) != 1 ||
-            d2k_link_set_addr_family(s->link_fd, addr, t->family, rec_shape,
+            d2k_link_set_addr_family(s->link_fd, addr, t->family,
+                                     task_wire_shape(t, rec_shape),
                                      permanent_hex, err, sizeof err) != 0) {
             if (!err[0]) { snprintf(err, sizeof err, "неверный адрес цели или отсутствует REC_ID"); }
             say(s, "по %s адресный план подтверждён, но не удалось продвинуть его в постоянную таблицу: %s",
@@ -9589,8 +9683,8 @@ static void on_refused_foreign(d2k_sched *s, const d2k_ev *ev) {
         name, (unsigned)ev->code);
 }
 
-/* ПОТОК КЛИЕНТА НЕ НЕСЁТ ТОГО, ЧТО ПЛАН ТРЕБУЕТ (D2K_REFUSE_FLOW_UNFIT) —
- * перемерить цель для этого клиента, а не докладывать «подтверждено».
+/* ПОТОК КЛИЕНТА ОТВЕРГНУТ (FLOW_UNFIT / NOT_APPLIED) — перемерить цель,
+ * а не докладывать «подтверждено».
  *
  * Поле issue #7, 22.10.2026: план tcp-template-v1 со сдвигом метки времени
  * подтверждён зондом (зонд метку предлагает всегда — detect/raw.c), телефоны
@@ -9615,6 +9709,9 @@ static void on_refused_unfit(d2k_sched *s, const d2k_ev *ev) {
     snprintf(name, sizeof name, "%s", found);
     uint8_t transport = ev->transport ? ev->transport : 6;
     uint8_t family = ev->family ? ev->family : 4;
+    uint8_t tcp_profile = transport == 6 ?
+        d2k_link_shape_tcp_profile(ev->client_shape) : D2K_TCP_PROFILE_UNKNOWN;
+    int flow_unfit = ev->code == D2K_REFUSE_FLOW_UNFIT;
     uint8_t present = 0;
     for (size_t i = 0; i < D2K_PLAN_ID_LEN; i++) { present |= ev->plan_id[i]; }
     /* ЭТУ ПАРУ «ЦЕЛЬ + ПЛАН» УЖЕ ПЕРЕМЕРЯЛИ — второй раз нечем (находка 3). */
@@ -9622,14 +9719,18 @@ static void on_refused_unfit(d2k_sched *s, const d2k_ev *ev) {
     for (size_t i = 0; i < n_done; i++) {
         if (!s->unfit_done[i].name[0] || s->unfit_done[i].transport != transport ||
             s->unfit_done[i].family != family ||
+            s->unfit_done[i].tcp_profile != tcp_profile ||
             strcmp(s->unfit_done[i].name, name) != 0) { continue; }
         if (memcmp(s->unfit_done[i].plan_id, ev->plan_id, D2K_PLAN_ID_LEN) == 0) {
             char quiet_key[300];
             snprintf(quiet_key, sizeof quiet_key, "unfit-done %u %s", transport, name);
-            say_quiet(s, quiet_key, "по %s поток этого клиента не несёт того, что план "
-                      "требует, и цель по этому плану уже перемеряна — второй раз "
-                      "перемерять нечем, отказ детерминирован (причина %u)",
-                      name, (unsigned)ev->code);
+            say_quiet(s, quiet_key, flow_unfit ?
+                      "по %s поток этого клиента не несёт того, что план требует, "
+                      "и цель по этому плану уже перемеряна — второй раз перемерять "
+                      "нечем, отказ детерминирован (причина %u)" :
+                      "по %s исполнитель уже отверг этот план на потоке клиента, "
+                      "цель по нему перемерена — повторный поиск не запускаю "
+                      "(причина %u)", name, (unsigned)ev->code);
             return;
         }
     }
@@ -9641,6 +9742,7 @@ static void on_refused_unfit(d2k_sched *s, const d2k_ev *ev) {
             if (!bd->enabled || strcmp(bd->kind, "name") || strcmp(bd->target, name) ||
                 (bd->transport ? bd->transport : 6) != transport ||
                 (bd->family ? bd->family : 4) != family) { continue; }
+            if (transport == 6 && bd->tcp_profile != tcp_profile) { continue; }
             if (present) {
                 uint8_t id[D2K_PLAN_ID_LEN] = {0};
                 size_t n = strlen(bd->plan_id); if (n > sizeof id) { n = sizeof id; }
@@ -9657,21 +9759,34 @@ static void on_refused_unfit(d2k_sched *s, const d2k_ev *ev) {
                снимком и набором, который попадёт в ячейку первым — может
                оказаться другой клиент той же цели. Говорим ровно то, что
                делаем: цель перемеряется заново. */
-            say(s, "по %s привязка %s помечена на повторную проверку: поток клиента не "
-                   "несёт того, что план требует (причина %u; у tcp-template-v1 это "
-                   "метка времени TCP) — перемеряю цель заново тем клиентом, чьё "
-                   "приветствие снимется первым, план с провода не снимаю "
-                   "(каталог сохранён)",
-                name, bd->plan_id, (unsigned)ev->code);
+            if (flow_unfit) {
+                say(s, "по %s привязка %s помечена на повторную проверку: поток клиента не "
+                       "несёт того, что план требует (причина %u; у tcp-template-v1 это "
+                       "метка времени TCP) — перемеряю цель заново тем клиентом, чьё "
+                       "приветствие снимется первым, план с провода не снимаю "
+                       "(каталог сохранён)",
+                    name, bd->plan_id, (unsigned)ev->code);
+            } else {
+                say(s, "по %s привязка %s помечена на повторную проверку: исполнитель "
+                       "отверг применение к потоку (причина %u) — запускаю поиск "
+                       "совместимого плана, старую привязку сохраняю в каталоге",
+                    name, bd->plan_id, (unsigned)ev->code);
+            }
         }
     }
     if (marked) { s->cat->revision++; }
+    if (tcp_profile != D2K_TCP_PROFILE_UNKNOWN && !marked) {
+        say(s, "по %s отказ относится к TCP-профилю %s; подтверждение другого профиля не "
+               "меняю и запускаю отдельный подбор совместимого плана",
+            name, tcp_profile == D2K_TCP_PROFILE_NO_TS ? "без Timestamp" : "с Timestamp");
+    }
     if (waiting || task_of(s, name, transport, family)) { return; }
     /* Запоминаем пару до завода замера: он один на эту пару (находка 3). */
     size_t slot = s->unfit_done_next++ % n_done;
     snprintf(s->unfit_done[slot].name, sizeof s->unfit_done[slot].name, "%s", name);
     s->unfit_done[slot].transport = transport;
     s->unfit_done[slot].family = family;
+    s->unfit_done[slot].tcp_profile = tcp_profile;
     memcpy(s->unfit_done[slot].plan_id, ev->plan_id, D2K_PLAN_ID_LEN);
     d2k_ev suspicion = *ev;
     suspicion.kind = D2K_EV_SUSPECT;
@@ -9776,6 +9891,12 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
                 break; /* refusal is execution evidence, not a DPI verdict */
             }
         }
+    }
+    if (ev->code == D2K_REFUSE_NOT_APPLIED) {
+        /* Group failures above retain their own observation; exact bindings
+           then get the same bounded re-search as a client-incompatible plan. */
+        on_refused_unfit(s, ev);
+        return;
     }
     on_refused_foreign(s, ev);
 }

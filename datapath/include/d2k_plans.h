@@ -74,6 +74,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../../runtime/d2k_protocol.h"
+
 #include "d2k_plan.h"
 
 /* Предел длины имени. Длиннее в SNI не бывает: RFC 6066 ограничивает имя
@@ -226,6 +228,12 @@ void         d2k_plantab_clear_probes(d2k_plantab *t);
  * (d2k_plantab_find_http): ни дедушкина запись, ни адрес, ни семейство
  * имён HTTP-запросу не достаются. */
 #define D2K_PLAN_SHAPE_HTTP 7
+#define D2K_PLAN_SHAPE_MODERN_NO_TS D2K_TCP_SHAPE_MODERN_NO_TS
+#define D2K_PLAN_SHAPE_LEGACY_NO_TS D2K_TCP_SHAPE_LEGACY_NO_TS
+#define D2K_PLAN_SHAPE_ECH_NO_TS D2K_TCP_SHAPE_ECH_NO_TS
+#define D2K_PLAN_SHAPE_MODERN_TS D2K_TCP_SHAPE_MODERN_TS
+#define D2K_PLAN_SHAPE_LEGACY_TS D2K_TCP_SHAPE_LEGACY_TS
+#define D2K_PLAN_SHAPE_ECH_TS D2K_TCP_SHAPE_ECH_TS
 
 /* Learned areas never consume/evict exact bindings. Set owns p on all paths,
  * like set_name_family. Exceptions are exact and context-specific. */

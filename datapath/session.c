@@ -417,18 +417,23 @@ static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     refuse_coded(s, at_ns, k, why, D2K_REFUSE_NONE, NULL);
 }
 
-/* Есть ли в опциях TCP пакета метка времени (вид 8, длина 10). Разбор тот же,
-   что у сборщика (wire.c): побайтно, NOP и EOL отдельно, кривая длина — «нет». */
-static int tcp_options_have_timestamp(const uint8_t *o, size_t n) {
+/* Профиль TCP-опций: 0 — кривая запись/неизвестно, 1 — без Timestamp,
+   2 — Timestamp есть. NOP и EOL разбираются отдельно. */
+static uint8_t tcp_options_timestamp_profile(const uint8_t *o, size_t n) {
     for (size_t off = 0; off < n;) {
         uint8_t kind = o[off];
         if (kind == 0) { break; }
         if (kind == 1) { off++; continue; }
-        if (off + 2 > n || o[off + 1] < 2 || o[off + 1] > n - off) { return 0; }
-        if (kind == 8 && o[off + 1] == 10) { return 1; }
+        if (off + 2 > n || o[off + 1] < 2 || o[off + 1] > n - off)
+            return D2K_TCP_PROFILE_UNKNOWN;
+        if (kind == 8 && o[off + 1] == 10) return D2K_TCP_PROFILE_TS;
         off += o[off + 1];
     }
-    return 0;
+    return D2K_TCP_PROFILE_NO_TS;
+}
+
+static int tcp_options_have_timestamp(const uint8_t *o, size_t n) {
+    return tcp_options_timestamp_profile(o, n) == D2K_TCP_PROFILE_TS;
 }
 
 /* План построен и передан на отправку. Ключ потока и идентификатор плана
@@ -2202,8 +2207,14 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                    быстрого пути (MODERN). Целое приветствие с ECH — факт:
                    Chrome переставляет расширения, и ECH уезжает во второй
                    сегмент (поле 17.10.2026). Подозрение несёт форму потока. */
-                if (complete.ech_offer && fl->client_shape == D2K_PLAN_SHAPE_MODERN)
-                    fl->client_shape = D2K_PLAN_SHAPE_ECH_TCP;
+                if (complete.ech_offer) {
+                    if (fl->client_shape == D2K_PLAN_SHAPE_MODERN)
+                        fl->client_shape = D2K_PLAN_SHAPE_ECH_TCP;
+                    else if (fl->client_shape == D2K_PLAN_SHAPE_MODERN_NO_TS)
+                        fl->client_shape = D2K_PLAN_SHAPE_ECH_NO_TS;
+                    else if (fl->client_shape == D2K_PLAN_SHAPE_MODERN_TS)
+                        fl->client_shape = D2K_PLAN_SHAPE_ECH_TS;
+                }
                 if (!fl->controller_probe) {
                     memcpy(s->last_hello[k], hello, hello_len);
                     s->last_hello_len[k] = hello_len;
@@ -2328,6 +2339,22 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             }
             /* Признака нет, блок оборван — «ещё не всё пришло». Формы не
                объявляем: LEGACY здесь был бы выдуманным замером. */
+        }
+        if (seen_shape == D2K_PLAN_SHAPE_MODERN ||
+            seen_shape == D2K_PLAN_SHAPE_LEGACY ||
+            seen_shape == D2K_PLAN_SHAPE_ECH_TCP) {
+            uint8_t tcp_profile = tcp_options_timestamp_profile(t + 20, doff - 20);
+            if (tcp_profile != D2K_TCP_PROFILE_UNKNOWN) {
+                if (seen_shape == D2K_PLAN_SHAPE_MODERN)
+                    seen_shape = tcp_profile == D2K_TCP_PROFILE_TS ?
+                        D2K_PLAN_SHAPE_MODERN_TS : D2K_PLAN_SHAPE_MODERN_NO_TS;
+                else if (seen_shape == D2K_PLAN_SHAPE_LEGACY)
+                    seen_shape = tcp_profile == D2K_TCP_PROFILE_TS ?
+                        D2K_PLAN_SHAPE_LEGACY_TS : D2K_PLAN_SHAPE_LEGACY_NO_TS;
+                else
+                    seen_shape = tcp_profile == D2K_TCP_PROFILE_TS ?
+                        D2K_PLAN_SHAPE_ECH_TS : D2K_PLAN_SHAPE_ECH_NO_TS;
+            }
         }
         fl->client_shape = seen_shape;
         /* Местный порт — см. ту же оговорку в ветке UDP выше. */

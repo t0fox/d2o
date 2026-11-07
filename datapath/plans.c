@@ -169,7 +169,8 @@ static int name_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen)
 static uint8_t shape_transport(uint8_t shape) {
     if (shape == D2K_PLAN_SHAPE_QUIC) return 17;
     if (shape == D2K_PLAN_SHAPE_MODERN || shape == D2K_PLAN_SHAPE_LEGACY ||
-        shape == D2K_PLAN_SHAPE_ECH_TCP) return 6;
+        shape == D2K_PLAN_SHAPE_ECH_TCP ||
+        (shape >= D2K_PLAN_SHAPE_MODERN_NO_TS && shape <= D2K_PLAN_SHAPE_ECH_TS)) return 6;
     return 0;
 }
 
@@ -289,7 +290,10 @@ int d2k_plantab_has_ech_target(const d2k_plantab *t, const uint8_t *name,
     if (!t) return 0;
     for (size_t i = 0; i < t->used; i++) {
         const entry *e = &t->v[i];
-        if (e->family != family || e->shape != D2K_PLAN_SHAPE_ECH_TCP ||
+        if (e->family != family ||
+            (e->shape != D2K_PLAN_SHAPE_ECH_TCP &&
+             e->shape != D2K_PLAN_SHAPE_ECH_NO_TS &&
+             e->shape != D2K_PLAN_SHAPE_ECH_TS) ||
             (e->only_sport && e->only_sport != sport_be)) continue;
         /* Своя точная запись имени исключением семейства не гасится. */
         if (!e->only_sport && e->kind != KEY_NAME &&
@@ -299,8 +303,14 @@ int d2k_plantab_has_ech_target(const d2k_plantab *t, const uint8_t *name,
         if (e->kind == KEY_ADDR && addr &&
             !memcmp(e->addr, addr, family == 6 ? 16 : 4)) return 1;
     }
-    if (area_bypassed(t, name, len, D2K_PLAN_SHAPE_ECH_TCP, family)) return 0;
-    return area_match(t, name, len, D2K_PLAN_SHAPE_ECH_TCP, family) != NULL;
+    static const uint8_t ech_shapes[] = {
+        D2K_PLAN_SHAPE_ECH_TCP, D2K_PLAN_SHAPE_ECH_NO_TS, D2K_PLAN_SHAPE_ECH_TS
+    };
+    for (size_t i = 0; i < sizeof ech_shapes / sizeof ech_shapes[0]; i++) {
+        if (!area_bypassed(t, name, len, ech_shapes[i], family) &&
+            area_match(t, name, len, ech_shapes[i], family)) return 1;
+    }
+    return 0;
 }
 
 int d2k_plantab_stream_candidate(const d2k_plantab *t, const uint8_t *name,
@@ -452,6 +462,12 @@ static entry *find_addr(d2k_plantab *t, const uint8_t *addr, uint8_t family) {
 typedef struct { entry *shaped, *modern, *grandfather, *any; } name_hits;
 typedef struct { entry *shaped, *modern, *grandfather, *any; } addr_hits;
 
+static uint8_t modern_shape_for_ech(uint8_t shape) {
+    if (shape == D2K_PLAN_SHAPE_ECH_NO_TS) return D2K_PLAN_SHAPE_MODERN_NO_TS;
+    if (shape == D2K_PLAN_SHAPE_ECH_TS) return D2K_PLAN_SHAPE_MODERN_TS;
+    return D2K_PLAN_SHAPE_MODERN;
+}
+
 static void scan_name(d2k_plantab *t, const uint8_t *name, size_t len,
                       uint8_t seen_shape, uint8_t family, name_hits *h) {
     memset(h, 0, sizeof *h);
@@ -464,7 +480,7 @@ static void scan_name(d2k_plantab *t, const uint8_t *name, size_t len,
         if (e->shape == D2K_PLAN_SHAPE_HTTP) continue;
         if (!h->any) h->any = e;
         if (!h->shaped && e->shape == seen_shape) h->shaped = e;
-        if (!h->modern && e->shape == D2K_PLAN_SHAPE_MODERN) h->modern = e;
+        if (!h->modern && e->shape == modern_shape_for_ech(seen_shape)) h->modern = e;
         if (!h->grandfather && e->shape == D2K_PLAN_SHAPE_GRANDFATHER) h->grandfather = e;
     }
 }
@@ -480,7 +496,7 @@ static void scan_addr(d2k_plantab *t, const uint8_t *addr, uint8_t family,
         if (!h->any) h->any = e;
         if (!h->shaped && seen_shape != D2K_PLAN_SHAPE_ANY && e->shape == seen_shape)
             h->shaped = e;
-        if (!h->modern && e->shape == D2K_PLAN_SHAPE_MODERN) h->modern = e;
+        if (!h->modern && e->shape == modern_shape_for_ech(seen_shape)) h->modern = e;
         if (!h->grandfather && e->shape == D2K_PLAN_SHAPE_GRANDFATHER) h->grandfather = e;
     }
 }
@@ -1030,6 +1046,8 @@ static int shape_fits(uint8_t entry_shape, uint8_t seen_shape) {
     /* ECH offer is also used by GREASE. Preserve the old TLS-1.3 binding
      * when no dedicated ECH binding exists; never use ECH proof for non-ECH. */
     if (entry_shape == D2K_PLAN_SHAPE_MODERN && seen_shape == D2K_PLAN_SHAPE_ECH_TCP) return 1;
+    if (entry_shape == D2K_PLAN_SHAPE_MODERN_NO_TS && seen_shape == D2K_PLAN_SHAPE_ECH_NO_TS) return 1;
+    if (entry_shape == D2K_PLAN_SHAPE_MODERN_TS && seen_shape == D2K_PLAN_SHAPE_ECH_TS) return 1;
     return entry_shape != 0 && entry_shape == seen_shape;
 }
 
@@ -1148,9 +1166,12 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
                suffix fallback, just like exact-name/address lookup. A
                dedicated ECH family wins; neither family's exception may
                be bypassed by inheriting the ordinary family instead. */
-            if (!area && seen_shape == D2K_PLAN_SHAPE_ECH_TCP) {
-                if (area_bypassed(t, name, len, D2K_PLAN_SHAPE_MODERN, family)) return NULL;
-                area = area_match(t, name, len, D2K_PLAN_SHAPE_MODERN, family);
+            if (!area && (seen_shape == D2K_PLAN_SHAPE_ECH_TCP ||
+                          seen_shape == D2K_PLAN_SHAPE_ECH_NO_TS ||
+                          seen_shape == D2K_PLAN_SHAPE_ECH_TS)) {
+                uint8_t fallback = modern_shape_for_ech(seen_shape);
+                if (area_bypassed(t, name, len, fallback, family)) return NULL;
+                area = area_match(t, name, len, fallback, family);
             }
             if (area) return area->plan;
             /* Имя знаем, а формы такой у него нет — это отдельный факт, см.

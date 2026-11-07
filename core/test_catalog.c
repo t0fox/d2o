@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "d2k_catalog.h"
+#include "../runtime/d2k_protocol.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -235,6 +236,44 @@ static void check_two_shapes_of_one_target_survive(void) {
     }
     CHECK(modern == 1, "привязка современной формы не пережила круговой обход");
     CHECK(legacy == 1, "привязка старой формы не пережила круговой обход");
+    d2k_catalog_free(&c);
+}
+
+static void check_tcp_timestamp_profiles_survive(void) {
+    d2k_catalog c; char err[200] = {0};
+    CHECK(d2k_catalog_load("testdata/catalog-real.json", &c, err, sizeof err) == 0,
+          "загрузка перед проверкой TCP-профилей");
+    if (!c.n_boxes || !c.boxes[0].n_binds) {
+        CHECK(0, "в снимке нет привязок для проверки TCP-профилей");
+        d2k_catalog_free(&c); return;
+    }
+    d2k_cat_box *b = &c.boxes[0];
+    d2k_cat_binding *grown = realloc(b->binds, (b->n_binds + 1) * sizeof *grown);
+    CHECK(grown != NULL, "не хватило памяти на вторую TCP-привязку");
+    if (!grown) { d2k_catalog_free(&c); return; }
+    b->binds = grown;
+    d2k_cat_binding *with_ts = &b->binds[0];
+    with_ts->shape = D2K_SHAPE_MODERN;
+    with_ts->tcp_profile = D2K_TCP_PROFILE_TS;
+    b->binds[b->n_binds] = *with_ts;
+    b->binds[b->n_binds].tcp_profile = D2K_TCP_PROFILE_NO_TS;
+    b->n_binds++;
+    char target[256]; snprintf(target, sizeof target, "%s", with_ts->target);
+    CHECK(d2k_catalog_save(&c, "/tmp/d2k-cat-tcp-profile.json", err, sizeof err) == 0,
+          "запись двух TCP-профилей одной цели");
+    d2k_catalog_free(&c);
+    CHECK(d2k_catalog_load("/tmp/d2k-cat-tcp-profile.json", &c, err, sizeof err) == 0,
+          "перечитывание двух TCP-профилей одной цели");
+    int with_ts_count = 0, no_ts_count = 0;
+    for (size_t bi = 0; bi < c.n_boxes; bi++)
+        for (size_t j = 0; j < c.boxes[bi].n_binds; j++) {
+            const d2k_cat_binding *bd = &c.boxes[bi].binds[j];
+            if (strcmp(bd->target, target) || bd->shape != D2K_SHAPE_MODERN) continue;
+            with_ts_count += bd->tcp_profile == D2K_TCP_PROFILE_TS;
+            no_ts_count += bd->tcp_profile == D2K_TCP_PROFILE_NO_TS;
+        }
+    CHECK(with_ts_count == 1 && no_ts_count == 1,
+          "круговой обход схлопнул подтверждения TCP Timestamp профилей");
     d2k_catalog_free(&c);
 }
 
@@ -794,6 +833,7 @@ int main(void) {
     check_shape_default_zero_on_old_file();
     check_shape_fits_rule();
     check_two_shapes_of_one_target_survive();
+    check_tcp_timestamp_profiles_survive();
     check_input_completeness_survives();
     check_rejects_float_number();
     check_rejects_oversized_string();

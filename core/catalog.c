@@ -47,6 +47,7 @@
 #include <time.h>
 
 #include "d2k_catalog.h"
+#include "../runtime/d2k_protocol.h"
 
 /* Пишет причину отказа в err, если есть куда. err[0]!=0 после этого
  * вызова гарантированно — "не разобралось" без объяснения нечитаемо (см.
@@ -858,6 +859,14 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
     }
     if (strcmp(key, "shape") == 0)
         return jparse_u8(j, &out->shape, "binding.shape", err, errcap);
+    if (strcmp(key, "tcp_profile") == 0) {
+        if (jparse_u8(j, &out->tcp_profile, "binding.tcp_profile", err, errcap) != 0) return -1;
+        if (out->tcp_profile > D2K_TCP_PROFILE_TS) {
+            if (err && errcap) snprintf(err, errcap, "binding.tcp_profile must be 0, 1 or 2");
+            return -1;
+        }
+        return 0;
+    }
     if (strcmp(key, "verified_by") == 0)
         return jparse_u8(j, &out->verified_by, "binding.verified_by", err, errcap);
     if (strcmp(key, "input") == 0)
@@ -1295,6 +1304,7 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
        такое же состояние записи, как измеренное, и молчать о нём значило бы
        делать вид, что поля нет вовсе. */
     wr_indent(f, depth + 1); fprintf(f, "\"shape\": %u,\n", (unsigned)bd->shape);
+    wr_indent(f, depth + 1); fprintf(f, "\"tcp_profile\": %u,\n", (unsigned)bd->tcp_profile);
     wr_indent(f, depth + 1); fprintf(f, "\"verified_by\": %u,\n", (unsigned)bd->verified_by);
     wr_indent(f, depth + 1); fprintf(f, "\"input\": %u", (unsigned)bd->input);
     if (bd->probe_path[0]) {

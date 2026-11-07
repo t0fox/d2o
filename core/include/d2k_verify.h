@@ -206,6 +206,10 @@ typedef struct {
  * базовые и объёмные замеры её не делают). Зовёт рабочий поток испытания
  * кандидата перед зондом и снимает после. */
 void d2k_verify_budget_set(unsigned budget_packets);
+/* TCP Timestamp profile for sockets opened by this verifier thread: -1 uses
+ * the kernel default, 0 omits TCP Timestamp, 1 offers it. */
+void d2k_verify_tcp_timestamps_set(int enabled);
+int d2k_verify_tcp_timestamps_get(void);
 /* Форма приветствия клиента для зонда QUIC (задача 66): его собственный
    первый полёт пойдёт тем же числом датаграмм той же длины, что у клиента.
    NULL или нулевое n — как раньше. Поточная настройка: ставится перед одной

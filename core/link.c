@@ -669,7 +669,8 @@ int d2k_link_set_name_probe_trial(int fd, const char *name, uint8_t transport,
 
 static int area_context_valid(uint8_t transport, uint8_t shape, uint8_t family) {
     return (family == 4 || family == 6) &&
-        ((transport == 6 && (shape == 1 || shape == 2 || shape == 6)) ||
+        ((transport == 6 && (shape == 1 || shape == 2 || shape == 6 ||
+                             (shape >= D2K_TCP_SHAPE_MODERN_NO_TS && shape <= D2K_TCP_SHAPE_ECH_TS))) ||
          (transport == 17 && shape == 3));
 }
 
@@ -781,7 +782,8 @@ int d2k_link_area_identified(int fd, uint16_t cmd, const char *name,
    протоколам IP» (задача 16, D2K_SPEC §5); такая команда не собирается. */
 static int addr_shape_ok(uint8_t shape) {
     return shape == 1 || shape == 2 || shape == D2K_LINK_SHAPE_QUIC ||
-           shape == D2K_LINK_SHAPE_VOICE || shape == D2K_LINK_SHAPE_ECH_TCP;
+           shape == D2K_LINK_SHAPE_VOICE || shape == D2K_LINK_SHAPE_ECH_TCP ||
+           (shape >= D2K_TCP_SHAPE_MODERN_NO_TS && shape <= D2K_TCP_SHAPE_ECH_TS);
 }
 
 int d2k_link_set_addr(int fd, const uint8_t ip4[4], uint8_t shape,

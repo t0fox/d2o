@@ -1,6 +1,7 @@
 #include <string.h>
 #include "include/d2k_domain.h"
 #include "include/d2k_groups.h"
+#include "../runtime/d2k_protocol.h"
 
 /* Seconds (observation `at` is wall-clock seconds, sched.c wall_s). */
 #define D2K_GROUP_VOTE_TTL_S (30*86400)
@@ -26,7 +27,8 @@ static int valid(const d2k_group_observation *o) {
        !memchr(o->key.probe_path,0,sizeof o->key.probe_path) ||
        !memchr(o->key.ech_origin,0,sizeof o->key.ech_origin)) return 0;
     if((o->key.family!=4 && o->key.family!=6) ||
-       !((o->key.transport==6 && (o->key.shape==1 || o->key.shape==2 || o->key.shape==6)) ||
+       !((o->key.transport==6 && (o->key.shape==1 || o->key.shape==2 || o->key.shape==6 ||
+          (o->key.shape>=D2K_TCP_SHAPE_MODERN_NO_TS && o->key.shape<=D2K_TCP_SHAPE_MAX))) ||
          (o->key.transport==17 && o->key.shape==3))) return 0;
     if(o->evidence!=1 && o->evidence!=2 && o->evidence!=4 && o->evidence!=8) return 0;
     return (o->evidence!=D2K_GROUP_BLOCKED_CONFIRMED &&

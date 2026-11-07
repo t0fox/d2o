@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "include/d2k_groups.h"
+#include "../runtime/d2k_protocol.h"
 static int failed;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr,"groups:%d: %s\n",__LINE__,#c); failed++; } } while(0)
 static d2k_group_key modern={6,4,1,"",""};
@@ -58,6 +59,22 @@ int main(void) {
     CHECK(g && !strcmp(g->suffix,"googlevideo.com") && !strcmp(g->plan_id,"plan-a"));
     CHECK(!d2k_group_match(s,"evilgooglevideo.com",&modern));
     CHECK(!d2k_group_match(s,"google.com",&modern));
+    {
+        d2k_group_key no_ts={6,4,D2K_TCP_SHAPE_MODERN_NO_TS,"",""};
+        d2k_group_key with_ts={6,4,D2K_TCP_SHAPE_MODERN_TS,"",""};
+        for(int i=0;i<3;i++) {
+            char name[64];
+            snprintf(name,sizeof name,"p%d.profile.example.com",i);
+            observe(s,name,"profile-plan",D2K_GROUP_BLOCKED_CONFIRMED,no_ts);
+            observe(s,name,"profile-plan",D2K_GROUP_BLOCKED_CONFIRMED,with_ts);
+        }
+        const d2k_domain_group *no_ts_group=d2k_group_match(s,"new.profile.example.com",&no_ts);
+        const d2k_domain_group *with_ts_group=d2k_group_match(s,"new.profile.example.com",&with_ts);
+        CHECK(no_ts_group && with_ts_group && no_ts_group->key.shape==no_ts.shape &&
+              with_ts_group->key.shape==with_ts.shape);
+        d2k_group_key unknown={6,4,1,"",""};
+        CHECK(!d2k_group_match(s,"new.profile.example.com",&unknown));
+    }
     {
         /* Поле 06.10: узел семейства, на котором не помог ни общий план, ни
            собственный поиск, — недоступен. Его отказы выкидываются целиком:

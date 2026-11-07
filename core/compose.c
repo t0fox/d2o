@@ -84,6 +84,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -552,6 +553,91 @@ int d2k_props_contact_on(int use_fd, const char *ip, uint16_t port, d2k_hello h,
 int d2k_props_contact_on_family(int use_fd, const char *ip, uint16_t port,
                                d2k_hello h, uint8_t family, uint8_t *local_addr,
                                uint16_t *local_port, int *out_fd) {
+    return d2k_props_contact_on_family_tcp_profile(use_fd, ip, port, h, family, -1,
+                                                   local_addr, local_port, out_fd);
+}
+
+#ifdef __linux__
+/* Linux exposes TCP Timestamp negotiation as a network-namespace sysctl, not
+   a normal per-socket option. Keep the change around connect() only: the SYN
+   options are formed there, then the previous router setting is restored
+   before polling for the peer. */
+static pthread_mutex_t g_tcp_profile_connect_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int tcp_timestamps_read(char *value) {
+    int fd = open("/proc/sys/net/ipv4/tcp_timestamps", O_RDONLY);
+    if (fd < 0) return -1;
+    char buf[8];
+    ssize_t n = read(fd, buf, sizeof buf);
+    int saved = errno;
+    close(fd);
+    if (n < 1) { errno = n < 0 ? saved : EIO; return -1; }
+    if (buf[0] < '0' || buf[0] > '2') { errno = EINVAL; return -1; }
+    *value = buf[0];
+    return 0;
+}
+
+static int tcp_timestamps_write(char value) {
+    int fd = open("/proc/sys/net/ipv4/tcp_timestamps", O_WRONLY);
+    if (fd < 0) return -1;
+    ssize_t n = write(fd, &value, 1);
+    int saved = errno;
+    close(fd);
+    if (n != 1) { errno = n < 0 ? saved : EIO; return -1; }
+    return 0;
+}
+#endif
+
+static int connect_with_tcp_profile(int fd, const struct sockaddr *addr,
+                                    socklen_t addrlen, int timestamps) {
+    if (timestamps < -1 || timestamps > 1) { errno = EINVAL; return -1; }
+#ifdef __linux__
+    int lock_rc = pthread_mutex_lock(&g_tcp_profile_connect_mu);
+    if (lock_rc != 0) { errno = lock_rc; return -2; }
+    char previous = 0;
+    int changed = 0;
+    if (timestamps >= 0) {
+        if (tcp_timestamps_read(&previous) != 0) goto profile_fail;
+        if ((timestamps == 0 && previous != '0') ||
+            (timestamps == 1 && previous == '0')) {
+            char wanted = timestamps ? '1' : '0';
+            if (tcp_timestamps_write(wanted) != 0) {
+                int saved = errno;
+                (void)tcp_timestamps_write(previous);
+                errno = saved;
+                goto profile_fail;
+            }
+            changed = 1;
+        }
+    }
+    int rc = connect(fd, addr, addrlen);
+    int connect_errno = errno;
+    if (changed && tcp_timestamps_write(previous) != 0) {
+        if (tcp_timestamps_write(previous) != 0) {
+            int restore_errno = errno;
+            pthread_mutex_unlock(&g_tcp_profile_connect_mu);
+            errno = restore_errno;
+            return -2;
+        }
+    }
+    pthread_mutex_unlock(&g_tcp_profile_connect_mu);
+    errno = connect_errno;
+    return rc;
+profile_fail: {
+        int saved = errno;
+        pthread_mutex_unlock(&g_tcp_profile_connect_mu);
+        errno = saved;
+        return -2;
+    }
+#else
+    if (timestamps >= 0) { errno = EOPNOTSUPP; return -2; }
+    return connect(fd, addr, addrlen);
+#endif
+}
+
+int d2k_props_contact_on_family_tcp_profile(int use_fd, const char *ip, uint16_t port,
+                               d2k_hello h, uint8_t family, int tcp_timestamps,
+                               uint8_t *local_addr, uint16_t *local_port, int *out_fd) {
     if (out_fd) { *out_fd = -1; }
     if (!ip || strchr(ip, '%') || (family != 4 && family != 6)) {
         if (use_fd >= 0) { close(use_fd); } return -1;
@@ -605,7 +691,10 @@ int d2k_props_contact_on_family(int use_fd, const char *ip, uint16_t port,
        съела бы умолчание ядра (минуты), а не D2K_PROPS_ASK_WAIT_MS. */
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { close(fd); return -1; }
-    if (connect(fd, (struct sockaddr *)&a, alen) != 0) {
+    int connect_rc = connect_with_tcp_profile(fd, (struct sockaddr *)&a, alen,
+                                              tcp_timestamps);
+    if (connect_rc == -2) { close(fd); return -3; }
+    if (connect_rc != 0) {
         if (errno != EINPROGRESS) { close(fd); return -1; }
         struct pollfd pfd;
         pfd.fd = fd; pfd.events = POLLOUT; pfd.revents = 0;

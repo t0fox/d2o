@@ -375,6 +375,7 @@ static int ver_cloudflare_challenge;
 static int ver_last_fd = -2;
 static int ver_socket_family;
 static uint8_t ver_last_shape;
+static int ver_last_tcp_timestamps = -2;
 
 /* ЗАДАЧА 55: исход проверки бюджета потока по номеру обращения (1..n) и
    бюджет, с которым зонд позван (поточная настройка d2k_verify). Пусто —
@@ -405,6 +406,7 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
     if (use_fd >= 0) { close(use_fd); }
     (void)ip; (void)port; (void)sni; (void)deadline_ms;
     ver_last_shape = client_shape;
+    ver_last_tcp_timestamps = d2k_verify_tcp_timestamps_get();
     ver_last_wire = hello_wire;
     ver_calls++;
     ver_last_transport = transport;
@@ -1813,6 +1815,34 @@ static d2k_cat_binding *binding_mut(d2k_catalog *c, const char *target, uint8_t 
     return NULL;
 }
 
+static int catalog_wire_plan_id(const d2k_catalog *c, const char *id,
+                                uint8_t out[D2K_PLAN_ID_LEN]) {
+    for (size_t bi = 0; c && bi < c->n_boxes; bi++) {
+        const d2k_cat_box *box = &c->boxes[bi];
+        for (size_t pi = 0; pi < box->n_plans; pi++) {
+            const d2k_cat_plan *plan = &box->plans[pi];
+            if (strcmp(plan->id, id) != 0 || !plan->text) continue;
+            const char *line = strstr(plan->text, "id ");
+            line = line ? line + 3 : NULL;
+            if (!line || strlen(line) < 2 * D2K_PLAN_ID_LEN) return 0;
+            for (size_t i = 0; i < D2K_PLAN_ID_LEN; i++) {
+                unsigned value = 0;
+                for (size_t j = 0; j < 2; j++) {
+                    unsigned char c = (unsigned char)line[2 * i + j];
+                    unsigned nibble = c >= '0' && c <= '9' ? c - '0' :
+                        c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                        c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+                    if (nibble > 15) return 0;
+                    value = value * 16 + nibble;
+                }
+                out[i] = (uint8_t)value;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Один полный проход поиска до подтверждения: подозрение, испытание зондом,
    событие применения по ключу потока зонда. Результат остаётся в каталоге —
    его вызывающий и смотрит; планировщик после прохода закрывается, потому что
@@ -2150,13 +2180,14 @@ int main(int argc, char **argv) {
     int recheck_only = argc == 2 && strcmp(argv[1], "--recheck-only") == 0;
     int lifecycle_only = argc == 2 && strcmp(argv[1], "--lifecycle-only") == 0;
     int own_first_only = argc == 2 && strcmp(argv[1], "--own-first-only") == 0;
+    int own_first_profile_only = argc == 2 && strcmp(argv[1], "--own-first-profile-only") == 0;
     int measured_only = argc == 2 && strcmp(argv[1], "--measured-only") == 0;
     int unfit_only = argc == 2 && strcmp(argv[1], "--unfit-only") == 0;
     int client_tcp_only = argc == 2 && strcmp(argv[1], "--client-tcp-only") == 0;
     int ech_only = argc == 2 && strcmp(argv[1], "--ech-only") == 0;
     int clean_hs_only = argc == 2 && strcmp(argv[1], "--clean-hs-multi-client-only") == 0;
-    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !measured_only && !unfit_only && !client_tcp_only && !ech_only && !clean_hs_only) {
-        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only|--measured-only|--ech-only|--clean-hs-multi-client-only]\n");
+    if (argc > 1 && !voice_only && !rx_only && !rst_only && !admission_only && !question_only && !shape_only && !groups_only && !retire_only && !recheck_only && !lifecycle_only && !own_first_only && !own_first_profile_only && !measured_only && !unfit_only && !client_tcp_only && !ech_only && !clean_hs_only) {
+        fprintf(stderr, "usage: test_sched [--voice-only|--rst-only|--admission-only|--question-only|--retire-only|--recheck-only|--lifecycle-only|--own-first-only|--own-first-profile-only|--measured-only|--ech-only|--clean-hs-multi-client-only]\n");
         return 2;
     }
     /* Real default verifier, before replacing hooks: the Plan is scoped to
@@ -2637,7 +2668,7 @@ int main(int argc, char **argv) {
     if (retire_only) { goto retire_test; }
     if (recheck_only) { goto recheck_test; }
     if (lifecycle_only) { goto lifecycle_test; }
-    if (own_first_only) { goto own_first_test; }
+    if (own_first_only || own_first_profile_only) { goto own_first_test; }
     if (measured_only) { goto measured_test; }
     if (unfit_only) { goto unfit_test; }
     if (client_tcp_only) { goto client_tcp_test; }
@@ -13801,21 +13832,24 @@ client_tcp_test:
        метку времени только если её несёт клиент), и привязка помечается
        CLIENT. Снимок без набора (старый датапат, холодный старт) — зонд
        прежним набором, привязка PROFILE, не CLIENT. */
-    for (int with_opts = 1; with_opts >= 0; with_opts--) {
+    for (int with_opts = 1; with_opts >= -1; with_opts--) {
         d2k_catalog c = {0};
         tcp_answer = D2K_V_PREFIX; tcp_owns_search = tcp_found_arm = 0;
         ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
         tcp_calls = 0; tcp_last_opts_known = -1; tcp_last_opts_len = 99;
-        uint16_t port = (uint16_t)(40430 + with_opts);
+        uint16_t port = (uint16_t)(40431 + with_opts);
         ver_answer_port = port;
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         saidbuf[0] = 0; drain(); forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
-        const char *nm = with_opts ? "opts.client.example" : "noopts.client.example";
+        const char *nm = with_opts == 1 ? "opts.client.example" :
+                         with_opts == 0 ? "no-ts.client.example" : "unknown-opts.client.example";
         d2k_ev h = ev_hello(6, port, nm); d2k_sched_event(s, &h);
-        if (with_opts) {
+        if (with_opts >= 0) {
             d2k_ev ct = h; ct.kind = D2K_EV_CLIENT_TCP; ct.name[0] = 0;
-            memcpy(ct.tcp_options, (uint8_t[]){1, 1, 8, 10, 0, 0, 0x23, 0x28, 0, 0, 0, 0}, 12);
-            ct.tcp_options_len = 12;
+            if (with_opts == 1) {
+                memcpy(ct.tcp_options, (uint8_t[]){1, 1, 8, 10, 0, 0, 0x23, 0x28, 0, 0, 0, 0}, 12);
+                ct.tcp_options_len = 12;
+            }
             d2k_sched_event(s, &ct);
         }
         d2k_ev sh = h; sh.kind = D2K_EV_SHAPE; sh.name[0] = 0;
@@ -13830,12 +13864,27 @@ client_tcp_test:
         spin(s, 40);
         CHECK(tcp_calls >= 1, "client-tcp: замер не шёл");
         const d2k_cat_binding *bd = binding_of(&c, nm, 6);
-        if (with_opts) {
+        if (with_opts == 1) {
             CHECK(tcp_last_opts_known == 1 && tcp_last_opts_len == 12,
                   "client-tcp: зонд пошёл не набором клиента");
+            CHECK(bd && bd->tcp_profile == D2K_TCP_PROFILE_TS,
+                  "client-tcp: TCP Timestamp не записан в ключ подтверждения");
+            CHECK(ver_last_tcp_timestamps == 1,
+                  "client-tcp: проверочный зонд не предложил Timestamp клиента");
+        } else if (with_opts == 0) {
+            CHECK(tcp_last_opts_known == 1 && tcp_last_opts_len == 0,
+                  "client-tcp: известный пустой набор опций принят за неизвестный");
+            CHECK(bd && bd->tcp_profile == D2K_TCP_PROFILE_NO_TS,
+                  "client-tcp: клиент без Timestamp не получил отдельный профиль");
+            CHECK(ver_last_tcp_timestamps == 0,
+                  "client-tcp: проверочный зонд предложил Timestamp клиенту без него");
         } else {
             CHECK(tcp_last_opts_known == 0,
                   "client-tcp: без снятого набора зонд объявил набор известным");
+            CHECK(bd && bd->tcp_profile == D2K_TCP_PROFILE_UNKNOWN,
+                  "client-tcp: неизвестные опции ошибочно классифицированы");
+            CHECK(ver_last_tcp_timestamps == -1,
+                  "client-tcp: зонд выдумал неизвестный TCP Timestamp профиль");
         }
         /* Полнота входа — о БАЙТАХ приветствия: снимок клиента остаётся CLIENT
            независимо от того, доехал ли набор опций (решение ниже в журнале
@@ -13898,6 +13947,29 @@ client_tcp_test:
     }
 
 unfit_test:
+    /* A silent real TCP client contradicts its applied plan even if that
+       plan's own verifier once reached the application: do not count the same
+       binding as the next successful result, start strategy discovery. */
+    {
+        d2k_catalog c = {0};
+        tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
+        confirm_once(&c, sv[0], "browser.silent.net", 40419);
+        d2k_cat_binding *bd = binding_mut(&c, "browser.silent.net", 6);
+        CHECK(bd != NULL, "browser outcome: confirmed fixture missing");
+        if (bd) bd->tcp_profile = D2K_TCP_PROFILE_NO_TS;
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = 0; drain(); forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev h = ev_hello(6, 40419, "browser.silent.net"); d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40419);
+        su.planned = D2K_LINK_PLANNED_YES; su.code = D2K_SUSPECT_SILENT;
+        su.client_shape = D2K_TCP_SHAPE_MODERN_NO_TS;
+        tcp_calls = ver_calls = 0;
+        d2k_sched_event(s, &su); settle(s);
+        CHECK(tcp_calls > 0,
+              "browser outcome: own HTTP/application probe reaffirmed the same plan instead of searching");
+        d2k_sched_free(s); d2k_catalog_free(&c);
+    }
+
     /* --- ЗАМЫСЕЛ 23.10.2026, п. 5.3: ПОТОК КЛИЕНТА НЕ НЕСЁТ ТРЕБУЕМОГО ПЛАНОМ.
        Поле issue #7 (22.10.2026): план с меткой времени подтверждён зондом,
        телефоны его исполняют, а ПК без метки времени получает 13 из 13 «план
@@ -13910,23 +13982,26 @@ unfit_test:
         d2k_catalog c = {0};
         tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION; ver_fail_first = 0;
         confirm_once(&c, sv[0], "pc.unfit.net", 40420);
-        const d2k_cat_binding *bd0 = binding_of(&c, "pc.unfit.net", 6);
+        d2k_cat_binding *bd0 = binding_mut(&c, "pc.unfit.net", 6);
         CHECK(bd0 && bd0->level >= 3 && bd0->enabled && !bd0->recheck_since,
               "unfit: fixture — привязка не подтверждена");
+        if (bd0) bd0->tcp_profile = D2K_TCP_PROFILE_TS;
         d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
         saidbuf[0] = 0; drain(); forget_sent(); d2k_sched_set_say(s, collect_say, NULL);
         d2k_ev h = ev_hello(6, 40421, "pc.unfit.net"); d2k_sched_event(s, &h);
         d2k_ev unfit = h; unfit.kind = D2K_EV_REFUSED; unfit.code = D2K_REFUSE_FLOW_UNFIT;
-        unfit.client_shape = bd0 ? bd0->shape : 0;
+        unfit.client_shape = bd0 ? d2k_link_shape_tcp_context(bd0->shape,
+                                      D2K_TCP_PROFILE_NO_TS) : D2K_TCP_SHAPE_MODERN_NO_TS;
         memset(unfit.plan_id, 0, sizeof unfit.plan_id);
-        if (bd0) memcpy(unfit.plan_id, bd0->plan_id, strlen(bd0->plan_id));
+        CHECK(bd0 && catalog_wire_plan_id(&c, bd0->plan_id, unfit.plan_id),
+              "unfit: fixture Plan ID отсутствует в каталоге");
         d2k_sched_event(s, &unfit);
         const d2k_cat_binding *bd = binding_of(&c, "pc.unfit.net", 6);
         CHECK(bd && bd->enabled && bd->level >= 3 && bd->plan_id[0],
               "unfit: привязка стёрта или понижена — отказ клиента не улика против плана");
-        CHECK(bd && bd->recheck_since,
-              "unfit: привязка не помечена на повторную проверку");
-        CHECK(said("метк") || said("не несёт"),
+        CHECK(bd && bd->tcp_profile == D2K_TCP_PROFILE_TS && !bd->recheck_since,
+              "unfit: отказ клиента без Timestamp затронул подтверждение Timestamp-профиля");
+        CHECK(said("без Timestamp") || said("метк") || said("не несёт"),
               "unfit: причина не названа — клиент без того, что план требует");
         CHECK(!said("не помещается в посылку"),
               "unfit: отказ клиента выдан за непоместившуюся посылку");
@@ -13938,7 +14013,8 @@ unfit_test:
         d2k_ev h2 = ev_hello(6, 40422, "pc.unfit.net"); d2k_sched_event(s, &h2);
         d2k_ev unfit2 = unfit; unfit2.high_port = 40422; d2k_sched_event(s, &unfit2);
         bd = binding_of(&c, "pc.unfit.net", 6);
-        CHECK(bd && bd->recheck_since == marked, "unfit: повторный отказ перепометил привязку");
+        CHECK(bd && bd->recheck_since == marked && bd->tcp_profile == D2K_TCP_PROFILE_TS,
+              "unfit: повторный отказ перепометил чужой Timestamp-профиль");
 
         /* --- ОТКАЗ КЛИЕНТА НЕ НАКЛАДЫВАЕТ ВЕТО НА ПОДТВЕРЖДЕНИЕ (ревью, находка 2).
            FLOW_UNFIT уходил ещё и в on_refused_foreign, а тот писал план в
@@ -13949,6 +14025,7 @@ unfit_test:
            подтверждение для телефонов — прямо против решения 5.3 (с провода
            план не снимаем). Замер по этой цели обязан дойти до подтверждения. */
         ver_answer_port = 40423;
+        uint8_t confirmed_plan_id[D2K_PLAN_ID_LEN] = {0};
         for (int i = 0; i < 40 && !said("ПОДТВЕРЖДЕНО"); i++) {
             spin(s, 200);
             d2k_ev ap = ev_applied(6, 40423); d2k_sched_event(s, &ap);
@@ -13957,6 +14034,23 @@ unfit_test:
         CHECK(!said("потоку клиента — нет"),
               "unfit: отказ клиента зачтён как непереносимость плана");
         CHECK(said("ПОДТВЕРЖДЕНО"), "unfit: перемер не дошёл до подтверждения");
+        int have_ts = 0, have_no_ts = 0;
+        for (size_t bi = 0; bi < c.n_boxes; bi++)
+            for (size_t j = 0; j < c.boxes[bi].n_binds; j++) {
+                const d2k_cat_binding *q = &c.boxes[bi].binds[j];
+                if (strcmp(q->target, "pc.unfit.net") || q->transport != 6) continue;
+                if (q->tcp_profile == D2K_TCP_PROFILE_TS && !q->recheck_since) have_ts++;
+                if (q->tcp_profile == D2K_TCP_PROFILE_NO_TS && !q->recheck_since) have_no_ts++;
+            }
+        CHECK(have_ts == 1 && have_no_ts == 1,
+              "unfit: подтверждение без Timestamp перезаписало или не разделило Timestamp-привязку");
+        forget_sent();
+        CHECK(d2k_sched_sync(s) == 0, "unfit: sync отдельных TCP-профилей не запустился");
+        for (int rounds = 0; rounds < 1000 && d2k_sched_sync_step(s); rounds++) { drain(); }
+        drain();
+        CHECK(sent_set_name_shape("pc.unfit.net", D2K_TCP_SHAPE_MODERN_TS) == 1 &&
+              sent_set_name_shape("pc.unfit.net", D2K_TCP_SHAPE_MODERN_NO_TS) == 1,
+              "unfit: синхронизация не установила обе подтверждённые TCP-профили");
         /* Человек получает обход: есть годная (не помеченная) привязка цели с
            подтверждённым планом. Помеченная запись прошлой коробки при этом
            остаётся — перемер пришёл с подозрением без отпечатка и лёг в другую
@@ -13974,6 +14068,8 @@ unfit_test:
             }
         CHECK(clean_rows >= 1 && clean_plan[0],
               "unfit: после перемера у цели нет ни одной годной подтверждённой привязки");
+        CHECK(catalog_wire_plan_id(&c, clean_plan, confirmed_plan_id),
+              "unfit: подтверждённый Plan ID отсутствует в каталоге");
 
         /* --- ПЕРЕМЕР НЕ ЗАЦИКЛИВАЕТСЯ (ревью, находка 3). Подтверждение
            снимает пометку (bind_confirmed), и следующее соединение того же ПК
@@ -13989,7 +14085,7 @@ unfit_test:
         d2k_ev h3 = ev_hello(6, 40424, "pc.unfit.net"); d2k_sched_event(s, &h3);
         d2k_ev unfit3 = unfit; unfit3.high_port = 40424;
         memset(unfit3.plan_id, 0, sizeof unfit3.plan_id);
-        memcpy(unfit3.plan_id, clean_plan, strlen(clean_plan));
+        memcpy(unfit3.plan_id, confirmed_plan_id, sizeof unfit3.plan_id);
         d2k_sched_event(s, &unfit3);
         spin(s, 40);
         CHECK(!said("помечена на повторную проверку"),
@@ -14009,6 +14105,44 @@ unfit_test:
         if (fails) fprintf(stderr, "%s\n", saidbuf);
         settle(s); d2k_sched_free(s); d2k_catalog_free(&c);
         tcp_answer = D2K_V_OPAQUE;
+        {
+            d2k_catalog rejected = {0};
+            tcp_answer = D2K_V_PREFIX; ver_answer = D2K_VER_APPLICATION;
+            confirm_once(&rejected, sv[0], "pc.notapplied.test", 40430);
+            d2k_cat_binding *old = binding_mut(&rejected, "pc.notapplied.test", 6);
+            CHECK(old && old->enabled && old->level >= 3,
+                  "not-applied: fixture — подтверждённая привязка отсутствует");
+            if (old) old->tcp_profile = D2K_TCP_PROFILE_NO_TS;
+            d2k_sched *retry = d2k_sched_new(&rejected, sv[0], 0x2d);
+            saidbuf[0] = 0; drain(); forget_sent();
+            d2k_sched_set_say(retry, collect_say, NULL);
+            d2k_ev hello = ev_hello(6, 40431, "pc.notapplied.test");
+            d2k_sched_event(retry, &hello);
+            d2k_ev refused = hello;
+            refused.kind = D2K_EV_REFUSED;
+            refused.code = D2K_REFUSE_NOT_APPLIED;
+            refused.client_shape = D2K_TCP_SHAPE_MODERN_NO_TS;
+            memset(refused.plan_id, 0, sizeof refused.plan_id);
+            CHECK(old && catalog_wire_plan_id(&rejected, old->plan_id, refused.plan_id),
+                  "not-applied: fixture Plan ID отсутствует в каталоге");
+            d2k_sched_event(retry, &refused);
+            const d2k_cat_binding *marked = binding_of(&rejected, "pc.notapplied.test", 6);
+            CHECK(marked && marked->enabled && marked->level >= 3 &&
+                  marked->tcp_profile == D2K_TCP_PROFILE_NO_TS && marked->recheck_since,
+                  "not-applied: подтверждённая привязка не помечена на перепроверку");
+            CHECK(d2k_sched_active(retry) > 0 && said("совместимого плана"),
+                  "not-applied: отказ применения не запустил новый поиск");
+            int64_t marked_at = marked ? marked->recheck_since : 0;
+            d2k_ev hello2 = ev_hello(6, 40432, "pc.notapplied.test");
+            d2k_sched_event(retry, &hello2);
+            d2k_ev refused2 = refused; refused2.high_port = 40432;
+            d2k_sched_event(retry, &refused2);
+            marked = binding_of(&rejected, "pc.notapplied.test", 6);
+            CHECK(marked && marked->recheck_since == marked_at,
+                  "not-applied: одинаковый отказ перепометил привязку");
+            settle(retry); d2k_sched_free(retry); d2k_catalog_free(&rejected);
+            tcp_answer = D2K_V_OPAQUE;
+        }
         if (unfit_only) { goto voice_only_done; }
     }
 
@@ -14080,6 +14214,50 @@ own_first_test:
             d2k_sched_free(s); d2k_catalog_free(&c);
             d2k_sched_rx_ver_hook = saved_rx;
         }
+
+        /* Подтверждение на TCP с Timestamp — отдельный профиль. Проверка
+           own-first не должна переносить его на ClientHello соединения без
+           Timestamp: после доказанной блокировки идёт полный замер клиента. */
+        {
+            d2k_catalog c = {0};
+            char pid[40];
+            own_box(&c, "box-own-ts-profile", pid, 4, 3, "source.ts-profile.example", 6,
+                    D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            c.boxes[0].binds[0].tcp_profile = D2K_TCP_PROFILE_TS;
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+            ver_app_after_tcp_search = 0; base_blocked_answer = 1;
+            d2k_sched_rx_ver_hook = stub_rx_counting;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            base_calls = tcp_calls = ver_calls = layered_identity_calls = 0;
+            tcp_last_opts_known = -1; tcp_last_opts_len = 99;
+            ver_answer_port = 42103;
+            const char *nm = "target.no-ts-profile.example";
+            d2k_ev h = ev_hello(6, 42103, nm); d2k_sched_event(s, &h);
+            d2k_ev ct = h; ct.kind = D2K_EV_CLIENT_TCP; ct.name[0] = 0;
+            ct.tcp_options_len = 0; d2k_sched_event(s, &ct);
+            d2k_ev sh;
+            CHECK(tls_shape_event(&sh, nm, D2K_SHAPE_MODERN) == 0,
+                  "own-first tcp profile: shape fixture");
+            sh.family = h.family;
+            memcpy(sh.low_ip, h.low_ip, 16); memcpy(sh.high_ip, h.high_ip, 16);
+            sh.low_port = h.low_port; sh.high_port = h.high_port;
+            d2k_sched_event(s, &sh);
+            d2k_ev su = ev_suspect(6, 42103); d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 42103); d2k_sched_event(s, &ap);
+            spin(s, 40);
+            CHECK(tcp_calls >= 1 && tcp_last_opts_known == 1 && tcp_last_opts_len == 0,
+                  "own-first tcp profile: no-Timestamp client did not enter its own measurement");
+            CHECK(!said("пробую свои подтверждённые планы до полного замера: 1") &&
+                  !said("путь: свой план"),
+                  "own-first tcp profile: Timestamp confirmation was reused for a no-Timestamp client");
+            if (fails) fprintf(stderr, "%s\n", saidbuf);
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_rx_ver_hook = saved_rx;
+        }
+        if (own_first_profile_only) { goto voice_only_done; }
 
         /* (a-fam) Блок доказан базовым вопросом (0/3), свой план подтверждён
            своим зондом: это такой же опыт для семейства, как после полного
