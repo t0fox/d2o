@@ -1445,9 +1445,15 @@
         add(ctx, tag(doc, shapeLabel(g.shape, g.transport)), tag(doc, familyLabel(g.family)));
         if (g.ech_origin) ctx.appendChild(tag(doc, "ECH: " + g.ech_origin));
         if (g.probe_path && g.probe_path !== "/") ctx.appendChild(tag(doc, "путь " + g.probe_path));
-        var stamp = el(doc, "span", "ftag-stamp", active ? "Применяется" : "Не подтверждено");
+        var stampText = active ? "Общее правило активно" : !m.linked
+          ? "Нет связи с датапатом" : "Общее правило не подтверждено";
+        var stamp = el(doc, "span", "ftag-stamp", stampText);
         stamp.setAttribute("data-active", String(active));
-        if (!active) stamp.title = "Решение сохранено, но применение к семейству сейчас не подтверждено";
+        stamp.title = active
+          ? "Датапат подтвердил установку правила для суффикса; это само по себе не доказывает успех каждого сайта."
+          : !m.linked
+            ? "Нет связи с датапатом, поэтому текущий статус семейного правила неизвестен."
+            : "План подтверждён на доменах, но датапат не подтвердил установку общего правила для суффикса. Отдельные домены могут работать по собственным точным привязкам.";
         var ev = list(g.evidence);
         /* Отказы узла — по одной строке на узел, с причиной: d2k хранит отказ
            каждого плана отдельно, человеку нужен узел, а не журнал. */
@@ -1466,7 +1472,7 @@
         fold.setAttribute("aria-expanded", String(open));
         fold.setAttribute("aria-controls", regionId);
         var foldText = el(doc, "span", "ftag-fold-text",
-          "Подтверждено на " + count(num(g.evidence_count) || ev.length, "домене", "доменах", "доменах"));
+          "План подтверждён на " + count(num(g.evidence_count) || ev.length, "домене", "доменах", "доменах"));
         if (dead.length) foldText.appendChild(el(doc, "span", "ftag-fold-dead", " · без плана " + dead.length));
         fold.appendChild(foldText);
         fold.appendChild(foldMark(doc));
