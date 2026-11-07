@@ -976,6 +976,14 @@ static int live_evidence_count(d2k_sched *s, const char *suffix) {
     return count / 2;
 }
 
+static int live_group_reported_count(d2k_sched *s, const char *suffix) {
+    char group[300];
+    snprintf(group, sizeof group, "\"suffix\": \"%s\"", suffix);
+    const char *body = live_json(s), *at = strstr(body, group);
+    const char *count = at ? strstr(at, "\"evidence_count\":") : NULL;
+    return count ? atoi(count + strlen("\"evidence_count\":")) : -1;
+}
+
 /* Запись ОДНОЙ активной задачи из живого файла (до закрывающей скобки).
    Пустая строка — задачи нет среди активных или файл не прочитан. */
 static const char *live_task_entry(d2k_sched *s, const char *target) {
@@ -2503,7 +2511,7 @@ int main(int argc, char **argv) {
             strcpy(own_fail.name, "rr-b.googlevideo.com"); strcpy(own_fail.plan_id, family_plan_id);
             own_fail.key = key; own_fail.evidence = D2K_GROUP_PLAN_FAILED; own_fail.at = family_at+2;
             CHECK(d2k_group_learn(c.groups, &own_fail) > 0, "member failure of group plan recorded");
-            CHECK(strstr(live_json(s), "\"evidence_count\": 4") &&
+            CHECK(live_group_reported_count(s, "googlevideo.com") == 4 &&
                   live_evidence_count(s, "googlevideo.com") == 4 &&
                   !live_evidence_has(s, "googlevideo.com", "rr-new.googlevideo.com") &&
                   !live_evidence_has(s, "googlevideo.com", "rr-b.googlevideo.com"),
