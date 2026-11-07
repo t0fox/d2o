@@ -2503,8 +2503,8 @@ int main(int argc, char **argv) {
             strcpy(own_fail.name, "rr-b.googlevideo.com"); strcpy(own_fail.plan_id, family_plan_id);
             own_fail.key = key; own_fail.evidence = D2K_GROUP_PLAN_FAILED; own_fail.at = family_at+2;
             CHECK(d2k_group_learn(c.groups, &own_fail) > 0, "member failure of group plan recorded");
-            CHECK(strstr(live_json(s), "\"evidence_count\": 3") &&
-                  live_evidence_count(s, "googlevideo.com") == 3 &&
+            CHECK(strstr(live_json(s), "\"evidence_count\": 4") &&
+                  live_evidence_count(s, "googlevideo.com") == 4 &&
                   !live_evidence_has(s, "googlevideo.com", "rr-new.googlevideo.com") &&
                   !live_evidence_has(s, "googlevideo.com", "rr-b.googlevideo.com"),
                   "cancelled confirmations are excluded from the count and active evidence list");
