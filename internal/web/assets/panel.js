@@ -159,6 +159,34 @@
 
   function normName(n) { return str(n).toLowerCase().replace(/\.$/, ""); }
 
+  function familyStatus(g, linked) {
+    var evidence = list(g && g.evidence);
+    var n = Array.isArray(g && g.evidence) ? evidence.length : Math.max(0, Math.round(num(g && g.evidence_count) || 0));
+    var reason = str(g && g.install_reason), detail = str(g && g.install_detail);
+    var reasons = {
+      plan_unavailable: "нет однозначного плана в каталоге",
+      ack_timeout: "датапат не ответил на ACK",
+      send_error: detail || "команду не удалось отправить",
+      no_room: "в таблице датапата нет места",
+      bad_plan: "план не принят датапатом: он не разбирается или не подходит способу отправки",
+      bad_args: "датапат отклонил параметры команды",
+      unknown_ack: "датапат вернул неизвестный код причины " + String(num(g && g.install_reason_code) || "—")
+    };
+    var state = str(g && g.install_state), installation;
+    if (!linked) installation = "Нет связи с датапатом; статус установки неизвестен";
+    else if (state === "active") installation = "Общее правило активно";
+    else if (state === "retrying") installation = "Повтор установки: " + (reasons[reason] || "временная ошибка") +
+      (detail && reason !== "send_error" ? " · " + detail : "");
+    else if (state === "rejected") installation = "Установка отклонена: " + (reasons[reason] || "причина не указана") +
+      (detail ? " · " + detail : "");
+    else installation = "Ожидает установки общего правила";
+    return {
+      confirmation: "Семейство подтверждено · " + count(n, "домен", "домена", "доменов"),
+      installation: installation,
+      active: !!linked && state === "active"
+    };
+  }
+
   /* Привязка, уже покрытая применяемым семейством, не дублируется как отдельный результат.
      Исключения семейства остаются видимыми. */
   function coveredBy(binding, groups) {
@@ -1430,7 +1458,8 @@
          применения, дерево доменов-доказательств, исключения и коробки с этим планом. */
       var rail = el(doc, "div", "tag-rail");
       groups.forEach(function (g, gi) {
-        var active = !!(m.linked && g.active);
+        var family = familyStatus(g, m.linked);
+        var active = family.active && !!g.active;
         var wrap = el(doc, "div", "ftag-wrap");
         wrap.setAttribute("data-flip-id", "fam:" + JSON.stringify([g.suffix, g.family, g.transport, g.shape, g.probe_path || "/", g.ech_origin || ""]));
         wrap.setAttribute("data-active", String(active));
@@ -1445,15 +1474,12 @@
         add(ctx, tag(doc, shapeLabel(g.shape, g.transport)), tag(doc, familyLabel(g.family)));
         if (g.ech_origin) ctx.appendChild(tag(doc, "ECH: " + g.ech_origin));
         if (g.probe_path && g.probe_path !== "/") ctx.appendChild(tag(doc, "путь " + g.probe_path));
-        var stampText = active ? "Общее правило активно" : !m.linked
-          ? "Нет связи с датапатом" : "Общее правило не подтверждено";
-        var stamp = el(doc, "span", "ftag-stamp", stampText);
-        stamp.setAttribute("data-active", String(active));
-        stamp.title = active
-          ? "Датапат подтвердил установку правила для суффикса; это само по себе не доказывает успех каждого сайта."
-          : !m.linked
-            ? "Нет связи с датапатом, поэтому текущий статус семейного правила неизвестен."
-            : "План подтверждён на доменах, но датапат не подтвердил установку общего правила для суффикса. Отдельные домены могут работать по собственным точным привязкам.";
+        var stamp = el(doc, "span", "ftag-stamp", family.confirmation);
+        stamp.setAttribute("data-active", "true");
+        stamp.title = "Семейство подтверждено независимыми успешными измерениями. Это не доказывает установку общего правила или работу каждого домена суффикса.";
+        var install = el(doc, "span", "ftag-sub ftag-install", family.installation);
+        install.setAttribute("data-install-state", str(g.install_state) || "pending");
+        install.title = str(g.install_detail) || family.installation;
         var ev = list(g.evidence);
         /* Отказы узла — по одной строке на узел, с причиной: d2k хранит отказ
            каждого плана отдельно, человеку нужен узел, а не журнал. */
@@ -1472,7 +1498,7 @@
         fold.setAttribute("aria-expanded", String(open));
         fold.setAttribute("aria-controls", regionId);
         var foldText = el(doc, "span", "ftag-fold-text",
-          "План подтверждён на " + count(num(g.evidence_count) || ev.length, "домене", "доменах", "доменах"));
+          count(ev.length, "подтверждённый домен", "подтверждённых домена", "подтверждённых доменов"));
         if (dead.length) foldText.appendChild(el(doc, "span", "ftag-fold-dead", " · без плана " + dead.length));
         fold.appendChild(foldText);
         fold.appendChild(foldMark(doc));
@@ -1509,7 +1535,7 @@
             foot.appendChild(links);
           }
         }
-        add(card, name, ctx, stamp, sub, more, foot);
+        add(card, name, ctx, stamp, install, sub, more, foot);
         swing.appendChild(card);
         var tilt = ([-1.4, 0.9, -0.5, 1.6, -1.1, 0.4])[gi % 6];
         wrap.style.setProperty("--tilt", tilt + "deg");
@@ -2390,7 +2416,7 @@
   };
 
   var api = {
-    model: model, coveredBy: coveredBy, slotsView: slotsView, trackFor: trackFor, shapeLabel: shapeLabel,
+    model: model, coveredBy: coveredBy, familyStatus: familyStatus, slotsView: slotsView, trackFor: trackFor, shapeLabel: shapeLabel,
     planGist: planGist, plural: plural, duration: duration,
     telegramRouteName: telegramRouteName,
     telegramFailureStage: telegramFailureStage,
