@@ -6740,7 +6740,7 @@ shape_test:
         d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, name,
               sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31/rx: снимок");
-        shape_same_flow(&sh, &h2);
+        shape_same_flow(&sh, &h1);
         d2k_sched_event(s, &sh);
         d2k_ev other = {0}; other.kind = D2K_EV_SHAPE; other.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "neighbour.rx.example",
@@ -6807,7 +6807,7 @@ shape_test:
         d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, name,
               sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31/rx-cut: снимок");
-        shape_same_flow(&sh, &h2);
+        shape_same_flow(&sh, &h1);
         d2k_sched_event(s, &sh);
         d2k_ev other = {0}; other.kind = D2K_EV_SHAPE; other.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "neighbour.rx.cut.example",
@@ -6896,7 +6896,7 @@ shape_test:
         d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
         CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, name,
               sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "task31/rx-cut+base: снимок");
-        shape_same_flow(&sh, &h2);
+        shape_same_flow(&sh, &h1);
         d2k_sched_event(s, &sh);
         vol_hold = 0;
         spin(s, 200);
