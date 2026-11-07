@@ -10534,8 +10534,15 @@ rx_volume_tests:
            одному потоку, и связывает их именно ключ (on_shape). */
         shape_same_flow(&sh, &h);
         d2k_sched_event(s, &sh);
-        prime_late_rst(s, h.name, 40199);
-        d2k_ev su = ev_suspect(6, 40099); su.code = D2K_SUSPECT_RST_AFTER_APP;
+        d2k_ev h2 = ev_hello(6, 40199, h.name);
+        d2k_sched_event(s, &h2);
+        d2k_ev r2 = ev_suspect(6, 40199);
+        r2.code = D2K_SUSPECT_RST_AFTER_APP;
+        r2.client_shape = D2K_TCP_SHAPE_MODERN_NO_TS;
+        d2k_sched_event(s, &r2);
+        d2k_ev su = ev_suspect(6, 40099);
+        su.code = D2K_SUSPECT_RST_AFTER_APP;
+        su.client_shape = D2K_TCP_SHAPE_MODERN_NO_TS;
         d2k_sched_event(s, &su);
         settle(s);
         /* Журнал обязан называть программу: разные программы — разные опыты. */
