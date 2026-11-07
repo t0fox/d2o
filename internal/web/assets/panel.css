@@ -582,6 +582,9 @@ main { min-width: 0; padding-bottom: 80px; }
 }
 .ftag-stamp[data-active="false"] { border-color: var(--ink-3); color: var(--ink-3); border-style: dashed; transform: rotate(3deg); }
 .ftag-sub { font-size: 0.8125rem; color: var(--ink-2); }
+.ftag-install { text-align: center; }
+.ftag-install[data-install-state="active"] { color: var(--ok); }
+.ftag-install[data-install-state="retrying"], .ftag-install[data-install-state="rejected"] { color: var(--warn); }
 /* Строка-итог и есть рычаг раскрытия: читается как подпись, нажимается как кнопка. */
 .ftag-fold {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;

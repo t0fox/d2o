@@ -1249,9 +1249,24 @@ typedef struct {
 typedef struct {
     char name[256], plan_id[40];
     uint8_t kind, transport, shape, family;
-    uint8_t confirmed;
+    uint8_t confirmed, remove_pending, permanent, retry_count, reason, reason_code;
+    int64_t retry_at_ms;
+    char detail[128];
     uint64_t confirmed_event;
 } installed_area;
+
+enum {
+    AREA_REASON_NONE = 0,
+    AREA_REASON_ACK_TIMEOUT,
+    AREA_REASON_SEND_ERROR,
+    AREA_REASON_NO_ROOM,
+    AREA_REASON_BAD_PLAN,
+    AREA_REASON_BAD_ARGS,
+    AREA_REASON_UNKNOWN_ACK
+};
+
+#define AREA_RETRY_BASE_MS 15000LL
+#define AREA_RETRY_MAX_MS 300000LL
 
 struct d2k_sched {
     d2k_diag_observer diagnostic;
@@ -1380,10 +1395,8 @@ struct d2k_sched {
     size_t n_areas;
     installed_area area_pending;
     uint16_t area_command;
-    uint64_t area_sequence;
     uint8_t area_id[D2K_TRIAL_ID_LEN];
     int64_t area_deadline_ms;
-    int area_sync_failed;
 
     /* Сколько событий датапат потерял к последнему отчёту. Нужно затем, что
        МОЛЧАНИЕ — не доказательство: пропавший обмен неотличим от «плана не
@@ -6108,12 +6121,11 @@ int d2k_sched_sync(d2k_sched *s) {
     s->sync_unshaped = 0;
     s->sync_recheck = 0;
     s->sync_unfit = 0;
-    s->area_sync_failed = 0;
     return 0;
 }
 
 int d2k_sched_sync_pending(const d2k_sched *s) {
-    return (s && (s->sync_active || s->sync_pending)) ? 1 : 0;
+    return (s && !s->area_command && (s->sync_pending || s->sync_active)) ? 1 : 0;
 }
 
 /* Форма протокола адресной привязки на проводе (SET_ADDR v7), 0 — нет
@@ -6183,6 +6195,71 @@ static int newer_name_binding(const d2k_catalog *cat, const d2k_cat_binding *bd)
 static int area_key_same(const installed_area *a, const installed_area *b) {
     return a->kind == b->kind && a->transport == b->transport &&
         a->shape == b->shape && a->family == b->family && !strcmp(a->name, b->name);
+}
+
+static size_t area_find(const d2k_sched *s, const installed_area *a) {
+    size_t i;
+    for (i = 0; i < s->n_areas; i++) if (area_key_same(a, &s->areas[i])) break;
+    return i;
+}
+
+static int area_store(d2k_sched *s, const installed_area *a) {
+    size_t i = area_find(s, a);
+    if (i == s->n_areas && i == D2K_GROUP_MAX + D2K_GROUP_OBSERVATION_MAX) return -1;
+    s->areas[i] = *a;
+    if (i == s->n_areas) s->n_areas++;
+    return 0;
+}
+
+static int64_t area_retry_delay(unsigned attempts) {
+    int64_t delay = AREA_RETRY_BASE_MS;
+    while (attempts > 1 && delay < AREA_RETRY_MAX_MS) {
+        delay *= 2;
+        attempts--;
+    }
+    return delay > AREA_RETRY_MAX_MS ? AREA_RETRY_MAX_MS : delay;
+}
+
+static void area_failure(d2k_sched *s, const installed_area *a, uint8_t reason,
+                        uint8_t reason_code, const char *detail) {
+    installed_area failed = *a;
+    if (failed.retry_count < UINT8_MAX) failed.retry_count++;
+    failed.confirmed = 0;
+    failed.permanent = reason == AREA_REASON_BAD_PLAN || reason == AREA_REASON_BAD_ARGS ||
+                       reason == AREA_REASON_UNKNOWN_ACK;
+    failed.reason = reason;
+    failed.reason_code = reason_code;
+    failed.retry_at_ms = failed.permanent ? 0 : s->now_ms + area_retry_delay(failed.retry_count);
+    snprintf(failed.detail, sizeof failed.detail, "%s", detail ? detail : "");
+    (void)area_store(s, &failed);
+}
+
+static uint8_t area_ack_reason(uint8_t code) {
+    switch (code) {
+    case D2K_ACK_NO_ROOM: return AREA_REASON_NO_ROOM;
+    case D2K_ACK_BAD_PLAN: return AREA_REASON_BAD_PLAN;
+    case D2K_ACK_BAD_ARGS: return AREA_REASON_BAD_ARGS;
+    default: return AREA_REASON_UNKNOWN_ACK;
+    }
+}
+
+static const char *area_reason_name(uint8_t reason) {
+    switch (reason) {
+    case AREA_REASON_ACK_TIMEOUT: return "ack_timeout";
+    case AREA_REASON_SEND_ERROR: return "send_error";
+    case AREA_REASON_NO_ROOM: return "no_room";
+    case AREA_REASON_BAD_PLAN: return "bad_plan";
+    case AREA_REASON_BAD_ARGS: return "bad_args";
+    case AREA_REASON_UNKNOWN_ACK: return "unknown_ack";
+    default: return "";
+    }
+}
+
+static int area_retry_due(const d2k_sched *s, int64_t now_ms) {
+    for (size_t i = 0; i < s->n_areas; i++)
+        if (!s->areas[i].confirmed && !s->areas[i].permanent &&
+            s->areas[i].retry_at_ms && s->areas[i].retry_at_ms <= now_ms) return 1;
+    return 0;
 }
 
 static const d2k_cat_plan *area_plan(const d2k_sched *s, const installed_area *a) {
@@ -6273,17 +6350,43 @@ static void write_live_groups(FILE *f, const d2k_sched *s) {
         fputs(", \"plan_id\": ", f); json_str(f, g->plan_id);
         fputs(", \"probe_path\": ", f); json_str(f, g->key.probe_path);
         fputs(", \"ech_origin\": ", f); json_str(f, g->key.ech_origin);
-        installed_area a; int active = 0;
-        if (desired_area(s, i, &a)) {
-            for (size_t j = 0; j < s->n_areas; j++)
-                if (s->areas[j].confirmed && area_key_same(&a, &s->areas[j]) &&
-                    !strcmp(a.plan_id, s->areas[j].plan_id)) active = 1;
+        installed_area a; int desired = desired_area(s, i, &a), active = 0;
+        const char *install_state = "pending", *install_reason = "";
+        const char *install_detail = "";
+        unsigned install_reason_code = 0;
+        if (!desired) {
+            install_state = "rejected";
+            install_reason = "plan_unavailable";
+        } else {
+            size_t j = area_find(s, &a);
+            if (j < s->n_areas && !strcmp(a.plan_id, s->areas[j].plan_id) &&
+                !s->areas[j].remove_pending) {
+                const installed_area *installed = &s->areas[j];
+                if (installed->confirmed) {
+                    install_state = "active";
+                    active = 1;
+                } else if (installed->permanent) {
+                    install_state = "rejected";
+                    install_reason = area_reason_name(installed->reason);
+                } else if (installed->retry_count) {
+                    install_state = "retrying";
+                    install_reason = area_reason_name(installed->reason);
+                }
+                install_reason_code = installed->reason_code;
+                install_detail = installed->detail;
+            }
         }
+        fputs(", \"install_state\": ", f); json_str(f, install_state);
+        fputs(", \"install_reason\": ", f); json_str(f, install_reason);
+        fprintf(f, ", \"install_reason_code\": %u, \"install_detail\": ", install_reason_code);
+        json_str(f, install_detail);
         fprintf(f, ", \"active\": %s, \"evidence\": [", active ? "true" : "false");
         int first = 1;
         for (size_t j = 0; j < state->n_observations; j++) {
             const d2k_group_observation *o = &state->observations[j];
             if (!(o->evidence & D2K_GROUP_BLOCKED_CONFIRMED) ||
+                (o->evidence & (D2K_GROUP_DIRECT_CLEAR | D2K_GROUP_PLAN_FAILED)) ||
+                !strcmp(o->name, g->suffix) ||
                 !d2k_group_key_same(&g->key, &o->key) || strcmp(g->plan_id, o->plan_id) ||
                 !d2k_domain_member(o->name, g->suffix)) continue;
             if (!first) fputs(", ", f);
@@ -6309,54 +6412,91 @@ static void write_live_groups(FILE *f, const d2k_sched *s) {
 /* One outstanding identified area command. Remember installed state only
  * after its positive ACK; a stale ACK cannot acknowledge a later retry. */
 static int sync_area_send(d2k_sched *s, const installed_area *a, int remove) {
-    char err[200], hex[2*D2K_PLAN_TLV_MAX+1]; int rc;
-    memset(s->area_id, 0, sizeof s->area_id);
-    uint64_t seq = ++s->area_sequence;
-    memcpy(s->area_id, &seq, sizeof seq);
+    char err[200] = {0}, hex[2*D2K_PLAN_TLV_MAX+1]; int rc;
+    installed_area attempt = *a;
+    size_t i = area_find(s, a);
+    if (i < s->n_areas && !strcmp(a->plan_id, s->areas[i].plan_id) &&
+        s->areas[i].remove_pending == (uint8_t)remove) {
+        attempt.retry_count = s->areas[i].retry_count;
+        attempt.reason = s->areas[i].reason;
+        attempt.reason_code = s->areas[i].reason_code;
+        snprintf(attempt.detail, sizeof attempt.detail, "%s", s->areas[i].detail);
+    } else {
+        attempt.retry_count = 0;
+        attempt.reason = AREA_REASON_NONE;
+        attempt.reason_code = 0;
+        attempt.detail[0] = 0;
+    }
+    attempt.confirmed = 0;
+    attempt.remove_pending = (uint8_t)remove;
+    attempt.permanent = 0;
+    attempt.retry_at_ms = 0;
+    if (area_store(s, &attempt) != 0) return -1;
+    s->area_pending = attempt;
+    if (fresh_trial_id(s->area_id) != 0) {
+        area_failure(s, &attempt, AREA_REASON_SEND_ERROR, 0, "не удалось создать ID команды");
+        return -1;
+    }
     uint16_t cmd;
-    if (a->kind == 1 && !remove) {
-        const d2k_cat_plan *p = area_plan(s, a);
+    if (attempt.kind == 1 && !remove) {
+        const d2k_cat_plan *p = area_plan(s, &attempt);
         char wire[sizeof s->tasks[0].plans[0]];
         uint8_t id[D2K_PLAN_ID_LEN] = {0};
-        size_t n = strlen(a->plan_id); if (n > sizeof id) n = sizeof id;
-        memcpy(id, a->plan_id, n);
-        if (!p || strlen(p->text) >= sizeof wire) return -1;
+        size_t n = strlen(attempt.plan_id); if (n > sizeof id) n = sizeof id;
+        memcpy(id, attempt.plan_id, n);
+        if (!p || strlen(p->text) >= sizeof wire) {
+            area_failure(s, &attempt, AREA_REASON_BAD_PLAN, D2K_ACK_BAD_PLAN,
+                         "общий план отсутствует или слишком велик для команды");
+            return -1;
+        }
         strcpy(wire, p->text);
         if (stamp_plan_id(wire, id) || d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err)) {
-            say(s, "область %s: план без проверяемого идентификатора", a->name); return -1;
+            say(s, "область %s: план без проверяемого идентификатора", attempt.name);
+            area_failure(s, &attempt, AREA_REASON_BAD_PLAN, D2K_ACK_BAD_PLAN,
+                         "план нельзя преобразовать в команду датапата");
+            return -1;
         }
         cmd = D2K_CMD_SET_SUFFIX;
-    } else if (a->kind == 1) {
+    } else if (attempt.kind == 1) {
         cmd = D2K_CMD_DEL_SUFFIX;
     } else if (remove) {
         cmd = D2K_CMD_DEL_BYPASS;
     } else {
         cmd = D2K_CMD_SET_BYPASS;
     }
-    rc = d2k_link_area_identified(s->link_fd, cmd, a->name, a->transport,
-        a->shape, a->family, cmd == D2K_CMD_SET_SUFFIX ? hex : NULL,
+    rc = d2k_link_area_identified(s->link_fd, cmd, attempt.name, attempt.transport,
+        attempt.shape, attempt.family, cmd == D2K_CMD_SET_SUFFIX ? hex : NULL,
         s->area_id, err, sizeof err);
-    if (rc) { say(s, "область %s не отправлена: %s", a->name, err); return -1; }
-    s->area_pending = *a; s->area_command = cmd;
+    if (rc) {
+        say(s, "область %s не отправлена: %s", attempt.name, err);
+        area_failure(s, &attempt, AREA_REASON_SEND_ERROR, 0, err);
+        return -1;
+    }
+    s->area_command = cmd;
     s->area_deadline_ms = s->now_ms+5000;
     return 1;
 }
 
+static int area_exceptions_ready(const d2k_sched *s, const installed_area *group) {
+    const d2k_group_state *g = s->cat->groups;
+    if (!g) return 1;
+    for (size_t i = 0; i < g->n_groups + g->n_observations; i++) {
+        installed_area exception;
+        if (!desired_area(s, i, &exception) || exception.kind != 2 ||
+            exception.transport != group->transport || exception.shape != group->shape ||
+            exception.family != group->family || !d2k_domain_member(exception.name, group->name)) continue;
+        size_t j = area_find(s, &exception);
+        if (j == s->n_areas || !s->areas[j].confirmed || s->areas[j].remove_pending) return 0;
+    }
+    return 1;
+}
+
 static int sync_areas(d2k_sched *s) {
-    if (s->area_sync_failed) return 0;
     if (s->area_command) {
-        if (s->now_ms < s->area_deadline_ms) return 1;
+        if (s->now_ms < s->area_deadline_ms) return 2;
         say(s, "область %s: ACK не пришёл; применение не подтверждено", s->area_pending.name);
-        /* A lost ACK does not prove the write was rejected. Retain uncertain
-           installation so a later disable/change can explicitly remove it. */
-        size_t i;
-        for (i=0; i<s->n_areas; i++) if (area_key_same(&s->area_pending,&s->areas[i])) break;
-        if (s->areas && i<D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
-            s->areas[i]=s->area_pending; s->areas[i].confirmed=0;
-            if (i==s->n_areas) s->n_areas++;
-        }
-        s->area_sync_failed = 1; s->area_command = 0;
-        return 0;
+        area_failure(s, &s->area_pending, AREA_REASON_ACK_TIMEOUT, 0, "ACK не пришёл за 5 секунд");
+        s->area_command = 0;
     }
     if (!s->areas && s->cat->groups) {
         s->areas = calloc(D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX, sizeof *s->areas);
@@ -6364,9 +6504,10 @@ static int sync_areas(d2k_sched *s) {
     }
     for (size_t i = 0; i < s->n_areas; i++) {
         if (!desired_has_key(s, &s->areas[i])) {
+            if (s->areas[i].permanent ||
+                (s->areas[i].retry_at_ms && s->areas[i].retry_at_ms > s->now_ms)) continue;
             int rc = sync_area_send(s, &s->areas[i], 1);
-            if (rc < 0) s->area_sync_failed = 1;
-            return rc > 0;
+            if (rc > 0) return 1;
         }
     }
     const d2k_group_state *g = s->cat->groups;
@@ -6377,15 +6518,18 @@ static int sync_areas(d2k_sched *s) {
         for (size_t i = 0; i < g->n_groups+g->n_observations; i++) {
             installed_area a;
             if (!desired_area(s, i, &a) || a.kind != kind) continue;
-            size_t j;
-            for (j = 0; j < s->n_areas; j++) if (area_key_same(&a, &s->areas[j])) break;
-            if (j < s->n_areas && s->areas[j].confirmed && !strcmp(a.plan_id, s->areas[j].plan_id)) continue;
+            size_t j = area_find(s, &a);
+            int same = j < s->n_areas && !s->areas[j].remove_pending &&
+                       !strcmp(a.plan_id, s->areas[j].plan_id);
+            if (same && s->areas[j].confirmed) continue;
+            if (same && s->areas[j].permanent) continue;
+            if (same && s->areas[j].retry_at_ms && s->areas[j].retry_at_ms > s->now_ms) continue;
+            if (kind == 1 && !area_exceptions_ready(s, &a)) continue;
             if (j == s->n_areas && s->n_areas == D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
                 say(s, "области: исчерпан бюджет синхронизации"); return 0;
             }
             int rc = sync_area_send(s, &a, 0);
-            if (rc < 0) s->area_sync_failed = 1;
-            return rc > 0;
+            if (rc > 0) return 1;
         }
     }
     return 0;
@@ -6610,7 +6754,9 @@ int d2k_sched_sync_step(d2k_sched *s) {
     }
 
     if (s->sync_box >= s->cat->n_boxes) {
-        if (sync_areas(s)) return 1;
+        int area_step = sync_areas(s);
+        if (area_step == 1) return 1;
+        if (area_step == 2) return 0;
         s->sync_active = 0;
         stall_budgets_push(s);
         if (s->sync_sent > 0 || s->sync_skipped > 0 || s->sync_weak > 0 ||
@@ -10081,18 +10227,25 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         if (s->area_command && ev->code == s->area_command &&
             !memcmp(ev->trial_id, s->area_id, sizeof s->area_id)) {
             if (((ev->num >> 8) & 255) != 1) {
-                say(s, "область %s отвергнута датапатом (код %u)", s->area_pending.name, (unsigned)(ev->num & 255));
-                s->area_sync_failed = 1;
+                uint8_t code = (uint8_t)(ev->num & 255);
+                say(s, "область %s отвергнута датапатом (код %u)", s->area_pending.name, (unsigned)code);
+                area_failure(s, &s->area_pending, area_ack_reason(code), code, "");
             } else {
-                size_t i;
-                for (i = 0; i < s->n_areas; i++) if (area_key_same(&s->area_pending, &s->areas[i])) break;
+                size_t i = area_find(s, &s->area_pending);
                 if (ev->code == D2K_CMD_DEL_SUFFIX || ev->code == D2K_CMD_DEL_BYPASS) {
                     if (i < s->n_areas) s->areas[i] = s->areas[--s->n_areas];
                 } else if (s->areas && i < D2K_GROUP_MAX+D2K_GROUP_OBSERVATION_MAX) {
-                    s->areas[i] = s->area_pending;
-                    s->areas[i].confirmed = 1;
-                    s->areas[i].confirmed_event = s->event_sequence;
-                    if (i == s->n_areas) s->n_areas++;
+                    installed_area installed = s->area_pending;
+                    installed.confirmed = 1;
+                    installed.remove_pending = 0;
+                    installed.permanent = 0;
+                    installed.retry_count = 0;
+                    installed.reason = AREA_REASON_NONE;
+                    installed.reason_code = 0;
+                    installed.retry_at_ms = 0;
+                    installed.detail[0] = 0;
+                    installed.confirmed_event = s->event_sequence;
+                    (void)area_store(s, &installed);
                 }
             }
             s->area_command = 0;
@@ -10566,6 +10719,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     }
     if (s->sync_pending && !s->sync_active) {
         (void)d2k_sched_sync(s);
+    } else if (!s->sync_active && s->cat && area_retry_due(s, now_ms)) {
+        s->sync_box = s->cat->n_boxes;
+        s->sync_bind = 0;
+        s->sync_active = 1;
     }
 
     int moved = 0;

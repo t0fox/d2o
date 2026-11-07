@@ -90,6 +90,26 @@ assert.equal(ui.shapeLabel(6, 6), 'TLS 1.3 + ECH');
 assert.equal(ui.shapeLabel(0, 17), 'UDP', 'unknown shape must not be guessed as QUIC');
 assert.equal(ui.shapeLabel(undefined, undefined), 'протокол не указан');
 
+// Подтверждение семейства не зависит от установки общего правила.
+{
+  const g = { evidence_count: 5, evidence: ['a.googlevideo.com', 'b.googlevideo.com', 'c.googlevideo.com', 'd.googlevideo.com', 'e.googlevideo.com'],
+    install_state: 'pending', install_reason: '' };
+  assert.deepEqual(ui.familyStatus(g, true), {
+    confirmation: 'Семейство подтверждено · 5 доменов',
+    installation: 'Ожидает установки общего правила', active: false
+  });
+  assert.equal(ui.familyStatus({ ...g, install_state: 'active' }, true).installation, 'Общее правило активно');
+  assert.equal(ui.familyStatus({ ...g, install_state: 'retrying', install_reason: 'ack_timeout' }, true).installation,
+    'Повтор установки: датапат не ответил на ACK');
+  assert.equal(ui.familyStatus({ ...g, install_state: 'retrying', install_reason: 'no_room' }, true).installation,
+    'Повтор установки: в таблице датапата нет места');
+  assert.equal(ui.familyStatus({ ...g, install_state: 'rejected', install_reason: 'bad_plan' }, true).installation,
+    'Установка отклонена: план не принят датапатом: он не разбирается или не подходит способу отправки');
+  assert.equal(ui.familyStatus({ ...g, install_state: 'rejected', install_reason: 'bad_args' }, true).installation,
+    'Установка отклонена: датапат отклонил параметры команды');
+  assert.equal(ui.familyStatus(g, false).installation, 'Нет связи с датапатом; статус установки неизвестен');
+}
+
 // Покрытие семейством: только активное семейство, тот же протокол/IP/путь, не исключение, только имена.
 {
   const g = { suffix: 'example.com', active: true, transport: 6, family: 4, shape: 1, probe_path: '/', ech_origin: '',
