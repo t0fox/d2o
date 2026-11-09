@@ -19,6 +19,8 @@ static void test_config_values_and_legacy_fields(void) {
     tg_config cfg;assert(tg_config_read(path,&cfg)==0);unlink(path);
     assert(cfg.enabled==1&&cfg.local_mode&&cfg.listen_port==1443);
     assert(!cfg.diagnostic_direct_tcp);
+    assert(cfg.ws_routing == TG_WS_ROUTING_ADAPTIVE &&
+           cfg.ws_hedge_delay_ms == 50 && cfg.ws_hedge_limit == 8);
     assert(strcmp(cfg.ca_bundle,"/opt/d2k/files/tg-roots.pem")==0);
     assert(strcmp(cfg.status_path,"/opt/d2k/state/telegram.status")==0);
     assert(strcmp(cfg.stats_socket_path,"/opt/d2k/state/telegram.stats.sock")==0);

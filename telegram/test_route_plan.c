@@ -4,18 +4,19 @@
 #include <stdio.h>
 #include <string.h>
 
-static void test_adaptive_plan_prefers_direct_then_worker_and_pool(void) {
+static void test_adaptive_plan_prefers_worker_then_pool_then_direct(void) {
     tg_route_plan plan;
     assert(tg_route_plan_build(4, 1, TG_WS_ROUTING_ADAPTIVE, 0, 2, 3,
                               0, &plan) == 0);
     assert(plan.count == 10);
-    assert(plan.steps[0].kind == TG_ROUTE_DIRECT_WSS && plan.steps[0].index == 1);
-    assert(plan.steps[1].kind == TG_ROUTE_DIRECT_WSS && plan.steps[1].index == 0);
-    assert(plan.steps[2].kind == TG_ROUTE_CF_WORKER && plan.steps[2].index == 0);
-    assert(plan.steps[4].kind == TG_ROUTE_CF_PROXY && plan.steps[4].index == 1);
-    assert(plan.steps[5].kind == TG_ROUTE_CF_PROXY && plan.steps[5].index == 0);
-    assert(plan.steps[6].kind == TG_ROUTE_CF_PROXY && plan.steps[6].index == 3);
-    assert(plan.steps[9].kind == TG_ROUTE_CF_PROXY && plan.steps[9].index == 4);
+    assert(plan.steps[0].kind == TG_ROUTE_CF_WORKER && plan.steps[0].index == 0);
+    assert(plan.steps[1].kind == TG_ROUTE_CF_WORKER && plan.steps[1].index == 1);
+    assert(plan.steps[2].kind == TG_ROUTE_CF_PROXY && plan.steps[2].index == 1);
+    assert(plan.steps[3].kind == TG_ROUTE_CF_PROXY && plan.steps[3].index == 0);
+    assert(plan.steps[4].kind == TG_ROUTE_CF_PROXY && plan.steps[4].index == 3);
+    assert(plan.steps[7].kind == TG_ROUTE_CF_PROXY && plan.steps[7].index == 4);
+    assert(plan.steps[8].kind == TG_ROUTE_DIRECT_WSS && plan.steps[8].index == 1);
+    assert(plan.steps[9].kind == TG_ROUTE_DIRECT_WSS && plan.steps[9].index == 0);
     for (size_t i = 0; i < plan.count; ++i)
         assert(plan.steps[i].kind != TG_ROUTE_DIRECT_TCP);
 
@@ -37,6 +38,23 @@ static void test_cf_first_and_adaptive_preference_reorder_routes(void) {
     assert(plan.steps[0].kind == TG_ROUTE_CF_WORKER);
     assert(plan.steps[1].kind == TG_ROUTE_CF_PROXY);
     assert(plan.steps[3].kind == TG_ROUTE_DIRECT_WSS);
+}
+
+static void test_dc2_media_fallback_order(void) {
+    tg_route_plan plan;
+    assert(tg_route_plan_build(2, 1, TG_WS_ROUTING_ADAPTIVE, 0, 1, 1,
+                              0, &plan) == 0);
+    assert(plan.count == 5);
+    assert(plan.steps[0].kind == TG_ROUTE_CF_WORKER &&
+           plan.steps[0].index == 0);
+    assert(plan.steps[1].kind == TG_ROUTE_CF_PROXY &&
+           plan.steps[1].index == 1); /* kws2-1: media */
+    assert(plan.steps[2].kind == TG_ROUTE_CF_PROXY &&
+           plan.steps[2].index == 0); /* kws2: normal */
+    assert(plan.steps[3].kind == TG_ROUTE_DIRECT_WSS &&
+           plan.steps[3].index == 1); /* kws2-1: media */
+    assert(plan.steps[4].kind == TG_ROUTE_DIRECT_WSS &&
+           plan.steps[4].index == 0); /* kws2: normal */
 }
 
 static void test_cf_hostnames_and_media_variants(void) {
@@ -63,11 +81,15 @@ static void test_cf_hostnames_and_media_variants(void) {
                                       host, 4) != 0);
     assert(tg_route_plan_build(2, 0, TG_WS_ROUTING_ADAPTIVE, 0,
                                0, 2, 0, &plan) == 0);
-    assert(plan.count == 4); /* direct(2), CF(2) */
-    assert(plan.steps[2].kind == TG_ROUTE_CF_PROXY &&
+    assert(plan.count == 4); /* CF(2), direct(2) */
+    assert(plan.steps[0].kind == TG_ROUTE_CF_PROXY &&
+           plan.steps[0].index == 0);
+    assert(plan.steps[1].kind == TG_ROUTE_CF_PROXY &&
+           plan.steps[1].index == 2);
+    assert(plan.steps[2].kind == TG_ROUTE_DIRECT_WSS &&
            plan.steps[2].index == 0);
-    assert(plan.steps[3].kind == TG_ROUTE_CF_PROXY &&
-           plan.steps[3].index == 2);
+    assert(plan.steps[3].kind == TG_ROUTE_DIRECT_WSS &&
+           plan.steps[3].index == 1);
 }
 
 static void test_plan_bounds_and_websocket_dc_mapping(void) {
@@ -89,8 +111,9 @@ static void test_plan_bounds_and_websocket_dc_mapping(void) {
 }
 
 int main(void) {
-    test_adaptive_plan_prefers_direct_then_worker_and_pool();
+    test_adaptive_plan_prefers_worker_then_pool_then_direct();
     test_cf_first_and_adaptive_preference_reorder_routes();
+    test_dc2_media_fallback_order();
     test_plan_bounds_and_websocket_dc_mapping();
     test_cf_hostnames_and_media_variants();
     puts("Тесты плана Telegram-маршрутизации: ок");

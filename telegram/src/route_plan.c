@@ -67,8 +67,10 @@ int tg_route_plan_build(uint32_t dc_id, int is_media,
          policy != TG_WS_ROUTING_HEDGED))
         return -1;
     memset(out, 0, sizeof(*out));
+    int have_cf_routes = worker_count != 0 || cf_domain_count != 0;
     int cf_first = policy == TG_WS_ROUTING_CF_FIRST ||
-                   (policy == TG_WS_ROUTING_ADAPTIVE && prefer_cf);
+        (policy == TG_WS_ROUTING_ADAPTIVE &&
+         (prefer_cf || have_cf_routes));
     if (cf_first) {
         if (append_cloudflare(out, worker_count, cf_domain_count, is_media) != 0 ||
             append_direct(out, dc_id, is_media) != 0)
