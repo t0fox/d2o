@@ -176,7 +176,8 @@ struct proxy_connection {
     byte_queue to_client;
 };
 
-#define TG_WORKER_POOL_MAX 8u
+#define TG_WORKER_POOL_MAX 12u
+#define TG_WORKER_POOL_SLOTS 12u
 #define TG_WORKER_POOL_MAX_AGE_MS 80000u
 #define TG_WORKER_POOL_CONNECT_TIMEOUT_MS 5000u
 
@@ -184,6 +185,7 @@ typedef struct {
     int fd;
     SSL *ssl;
     uint32_t dc_id;
+    int is_media;
     uint64_t created_ms;
     char hostname[TG_CF_DOMAIN_LEN];
     char path[512];
@@ -202,10 +204,11 @@ typedef struct {
     uint32_t socket_mark;
     int require_socket_mark;
     char domain[TG_CF_DOMAIN_LEN];
-    uint32_t dcs[6];
-    char paths[6][512];
-    uint64_t retry_at[6];
-    unsigned failures[6];
+    uint32_t dcs[TG_WORKER_POOL_SLOTS];
+    int media[TG_WORKER_POOL_SLOTS];
+    char paths[TG_WORKER_POOL_SLOTS][512];
+    uint64_t retry_at[TG_WORKER_POOL_SLOTS];
+    unsigned failures[TG_WORKER_POOL_SLOTS];
     size_t dc_count;
 } worker_pool;
 
@@ -1048,15 +1051,21 @@ static const char *worker_primary_address(uint32_t dc) {
     return NULL;
 }
 
-static int worker_path_for_dc(uint32_t dc, char *path, size_t path_size) {
+static int worker_path_for_dc(uint32_t dc, int is_media,
+                              char *path, size_t path_size) {
+    /* The Worker tunnels raw TCP to the DC's regular endpoint; media=1 only
+       tells a supporting Worker script which Telegram route to use. */
     const char *address = worker_primary_address(dc);
     if (!address || !path || !path_size) return -1;
-    int n = snprintf(path, path_size, "/apiws?dst=%s&dc=%u", address, dc);
+    int n = snprintf(path, path_size, "/apiws?dst=%s&dc=%u&media=%d",
+                     address, dc, is_media ? 1 : 0);
     return n > 0 && (size_t)n < path_size ? 0 : -1;
 }
 
 static int set_worker_path(proxy_connection *connection) {
-    if (worker_path_for_dc(connection->route_dc_id, connection->wss_path,
+    if (worker_path_for_dc(connection->route_dc_id,
+                           connection->route_is_media,
+                           connection->wss_path,
                            sizeof(connection->wss_path)) == 0)
         return 0;
     char original[INET6_ADDRSTRLEN];
@@ -1064,8 +1073,9 @@ static int set_worker_path(proxy_connection *connection) {
                    connection->original.address, original,
                    sizeof(original))) return -1;
     int n = snprintf(connection->wss_path, sizeof(connection->wss_path),
-                     "/apiws?dst=%s&dc=%u", original,
-                     connection->route_dc_id);
+                     "/apiws?dst=%s&dc=%u&media=%d", original,
+                     connection->route_dc_id,
+                     connection->route_is_media ? 1 : 0);
     return n > 0 && (size_t)n < sizeof(connection->wss_path) ? 0 : -1;
 }
 
@@ -1147,11 +1157,12 @@ static int worker_pool_connect_host(const char *domain, uint32_t socket_mark,
     return fd;
 }
 
-static int worker_pool_connect(worker_pool *pool, uint32_t dc,
+static int worker_pool_connect(worker_pool *pool, uint32_t dc, int is_media,
                                worker_pool_entry *out) {
     const char *path = NULL;
     for (size_t i = 0; i < pool->dc_count; ++i)
-        if (pool->dcs[i] == dc) path = pool->paths[i];
+        if (pool->dcs[i] == dc && pool->media[i] == is_media)
+            path = pool->paths[i];
     if (!path) return -1;
     int fd = worker_pool_connect_host(pool->domain, pool->socket_mark,
                                       pool->require_socket_mark);
@@ -1180,6 +1191,7 @@ static int worker_pool_connect(worker_pool *pool, uint32_t dc,
     out->fd = fd;
     out->ssl = ssl;
     out->dc_id = dc;
+    out->is_media = is_media;
     out->created_ms = monotonic_ms();
     snprintf(out->hostname, sizeof(out->hostname), "%s", pool->domain);
     snprintf(out->path, sizeof(out->path), "%s", path);
@@ -1192,6 +1204,7 @@ static void *worker_pool_thread(void *opaque) {
         worker_pool_entry stale[TG_WORKER_POOL_MAX];
         size_t stale_count = 0;
         uint32_t missing = 0;
+        int missing_media = 0;
         size_t missing_index = 0;
         int have_missing = 0;
         pthread_mutex_lock(&pool->lock);
@@ -1210,9 +1223,13 @@ static void *worker_pool_thread(void *opaque) {
         for (size_t i = 0; i < pool->dc_count && !have_missing; ++i) {
             int found = 0;
             for (size_t j = 0; j < pool->count; ++j)
-                if (pool->entries[j].dc_id == pool->dcs[i]) { found = 1; break; }
+                if (pool->entries[j].dc_id == pool->dcs[i] &&
+                    pool->entries[j].is_media == pool->media[i]) {
+                    found = 1; break;
+                }
             if (!found && now >= pool->retry_at[i]) {
                 missing = pool->dcs[i];
+                missing_media = pool->media[i];
                 missing_index = i;
                 have_missing = 1;
             }
@@ -1230,7 +1247,7 @@ static void *worker_pool_thread(void *opaque) {
             worker_pool_entry_close(&stale[i]);
         if (!have_missing) continue;
         worker_pool_entry entry;
-        if (worker_pool_connect(pool, missing, &entry) != 0) {
+        if (worker_pool_connect(pool, missing, missing_media, &entry) != 0) {
             pthread_mutex_lock(&pool->lock);
             if (!pool->stopping) {
                 unsigned failures = pool->failures[missing_index] + 1u;
@@ -1285,12 +1302,16 @@ static worker_pool *worker_pool_start(const tg_epoll_proxy_config *config) {
     if (!pool->domain[0]) { free(pool); return NULL; }
     static const uint32_t candidates[] = {1, 2, 3, 4, 5, 203};
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
-        char path[512];
-        if (worker_path_for_dc(candidates[i], path, sizeof(path)) != 0)
-            continue;
-        pool->dcs[pool->dc_count] = candidates[i];
-        memcpy(pool->paths[pool->dc_count], path, strlen(path) + 1u);
-        ++pool->dc_count;
+        for (int is_media = 0; is_media <= 1; ++is_media) {
+            char path[512];
+            if (worker_path_for_dc(candidates[i], is_media,
+                                   path, sizeof(path)) != 0)
+                continue;
+            pool->dcs[pool->dc_count] = candidates[i];
+            pool->media[pool->dc_count] = is_media;
+            memcpy(pool->paths[pool->dc_count], path, strlen(path) + 1u);
+            ++pool->dc_count;
+        }
     }
     if (!pool->dc_count) { free(pool); return NULL; }
     if (pthread_mutex_init(&pool->lock, NULL) != 0) {
@@ -1314,7 +1335,7 @@ static worker_pool *worker_pool_start(const tg_epoll_proxy_config *config) {
     return pool;
 }
 
-static int worker_pool_take(worker_pool *pool, uint32_t dc,
+static int worker_pool_take(worker_pool *pool, uint32_t dc, int is_media,
                             worker_pool_entry *out) {
     if (!pool || !out) return 0;
     worker_pool_entry stale[TG_WORKER_POOL_MAX];
@@ -1323,7 +1344,8 @@ static int worker_pool_take(worker_pool *pool, uint32_t dc,
     pthread_mutex_lock(&pool->lock);
     uint64_t now = monotonic_ms();
     for (size_t i = 0; i < pool->count;) {
-        if (pool->entries[i].dc_id != dc) { ++i; continue; }
+        if (pool->entries[i].dc_id != dc ||
+            pool->entries[i].is_media != is_media) { ++i; continue; }
         if (now - pool->entries[i].created_ms >= TG_WORKER_POOL_MAX_AGE_MS ||
             !worker_pool_entry_alive(&pool->entries[i])) {
             stale[stale_count++] = pool->entries[i];
@@ -1728,7 +1750,7 @@ static int start_next_route(proxy_connection *connection) {
         if (step.kind == TG_ROUTE_CF_WORKER && server->worker_pool) {
             worker_pool_entry pooled;
             if (worker_pool_take(server->worker_pool, connection->route_dc_id,
-                                 &pooled)) {
+                                 connection->route_is_media, &pooled)) {
                 ++server->worker_pool_hits;
                 connection->direct_wss = 1;
                 ++server->active_wss_connections;
