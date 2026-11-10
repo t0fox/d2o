@@ -487,6 +487,7 @@ async function main(){
   panel.telegramStats({...fixture.telegramStats,active_connections:1,active_sessions:[confirmedSession]});
   await evaluate('document.dispatchEvent(new Event("visibilitychange"))');
   await until('document.querySelector("#telegram-body .tg-flow-canvas").getAttribute("aria-label").includes("Ответ Telegram подтверждён")','confirmed response reaches the live scene accessibility state');
+  await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").scrollIntoView({block:"center"})');
   await wait(180);
   assert.ok(await evaluate('window.__tgGreenDirectRouteStrokes>0'),
     'маршрут становится зелёным только после подтверждённого ответа');
