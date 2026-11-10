@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 36315)
-Total output lines: 3441
-
 #define _POSIX_C_SOURCE 200809L
 #include "tg_epoll_proxy.h"
 #include "tg_mtproto.h"
@@ -1500,7 +1497,568 @@ static void test_self_dial_target_is_rejected(void) {
 
 static void test_epoll_wss_forwards_unrecognized_binary_response(void) {
     char directory[] = "/tmp/d2k-tg-wss-XXXXXX";
-    char cert_path[256], k…6315 tokens truncated…r_fixture wss = {.listener = create_listener(&ws_port),
+    char cert_path[256], key_path[256];
+    assert(mkdtemp(directory) != NULL);
+    assert(snprintf(cert_path, sizeof(cert_path), "%s/cert.pem", directory) > 0);
+    assert(snprintf(key_path, sizeof(key_path), "%s/key.pem", directory) > 0);
+    EVP_PKEY *key = make_wss_test_key();
+    X509 *cert = make_wss_test_cert(key);
+    FILE *file = fopen(cert_path, "w");
+    assert(file && PEM_write_X509(file, cert) == 1);
+    fclose(file);
+    file = fopen(key_path, "w");
+    assert(file && PEM_write_PrivateKey(file, key, NULL, NULL, 0, NULL, NULL) == 1);
+    fclose(file);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+
+    uint16_t ws_port, proxy_port;
+    wss_server_fixture wss = {.listener = create_listener(&ws_port),
+                              .cert_path = cert_path,
+                              .key_path = key_path,
+                              .expect_binary_subprotocol = 1,
+                              .arbitrary_response = 1};
+    atomic_init(&wss.complete, 0);
+    uint8_t invalid_response[4] = {0};
+    tg_mtproto_ctr server_encrypt = {0};
+    assert(tg_mtproto_direct_server_stream_cipher(test_handshake,
+                                                   &server_encrypt) == 0);
+    assert(tg_mtproto_ctr_xor(&server_encrypt, invalid_response,
+                              sizeof(invalid_response)) == 0);
+    tg_mtproto_ctr_destroy(&server_encrypt);
+    memcpy(wss.response_packet, invalid_response, sizeof(invalid_response));
+    wss.response_packet_len = sizeof(invalid_response);
+    memcpy(wss.expected_packet, (uint8_t[]){8,0,0,0,0x11,0x22,0x33,0x44,
+                                             0x55,0x66,0x77,0x88},
+           sizeof(wss.expected_packet));
+    tg_mtproto_ctr client_decrypt = {0}, client_encrypt = {0};
+    assert(tg_mtproto_direct_stream_ciphers(test_handshake, &client_decrypt,
+                                             &client_encrypt) == 0);
+    assert(tg_mtproto_ctr_xor(&client_encrypt, wss.expected_packet,
+                              sizeof(wss.expected_packet)) == 0);
+    tg_mtproto_ctr_destroy(&client_decrypt);
+    tg_mtproto_ctr_destroy(&client_encrypt);
+
+    pthread_t wss_thread;
+    assert(pthread_create(&wss_thread, NULL, serve_direct_wss, &wss) == 0);
+    int listener = create_listener(&proxy_port);
+    proxy_fixture fixture = {0};
+    set_ipv4(&fixture.original, "149.154.167.51", 443);
+    set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
+    SSL_CTX *tls_context = tg_tls_client_context(cert_path);
+    assert(tls_context);
+    tg_epoll_proxy_config config = {
+        .listener_fd = listener,
+        .queue_bytes = 4096,
+        .memory_budget_bytes = 32u * 1024u * 1024u,
+        .configured_max_connections = 8,
+        .handshake_timeout_ms = 3000,
+        .idle_timeout_ms = 5000,
+        .enable_direct_wss = 1,
+        .tls_context = tls_context,
+        .original_destination = original_destination,
+        .select_target = select_target,
+        .context = &fixture,
+    };
+    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+    assert(proxy);
+    assert(tg_epoll_proxy_max_connections(proxy) > 1);
+    proxy_runner runner = {.server = proxy};
+    atomic_init(&runner.stop, 0);
+    pthread_t proxy_thread;
+    assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
+
+    int client = connect_to_listener(proxy_port);
+    struct timeval timeout = {.tv_sec = 5};
+    assert(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                      sizeof(timeout)) == 0);
+    assert(send(client, test_handshake, 17, 0) == 17);
+    assert(send(client, test_handshake + 17, sizeof(test_handshake) - 17u, 0) ==
+           (ssize_t)(sizeof(test_handshake) - 17u));
+    const uint8_t clear_packet[12] = {8,0,0,0,0x11,0x22,0x33,0x44,
+                                      0x55,0x66,0x77,0x88};
+    tg_mtproto_ctr decrypt = {0}, encrypt = {0};
+    uint8_t encrypted_packet[sizeof(clear_packet)];
+    memcpy(encrypted_packet, clear_packet, sizeof(clear_packet));
+    assert(tg_mtproto_direct_stream_ciphers(test_handshake, &decrypt,
+                                             &encrypt) == 0);
+    assert(tg_mtproto_ctr_xor(&encrypt, encrypted_packet,
+                              sizeof(encrypted_packet)) == 0);
+    tg_mtproto_ctr_destroy(&decrypt);
+    tg_mtproto_ctr_destroy(&encrypt);
+    assert(send(client, encrypted_packet, sizeof(encrypted_packet), 0) ==
+           (ssize_t)sizeof(encrypted_packet));
+    assert(shutdown(client, SHUT_WR) == 0);
+
+    uint8_t response[sizeof(invalid_response)];
+    size_t received = 0;
+    while (received < sizeof(response)) {
+        ssize_t n = recv(client, response + received,
+                         sizeof(response) - received, 0);
+        assert(n > 0);
+        received += (size_t)n;
+    }
+    assert(memcmp(response, invalid_response, sizeof(response)) == 0);
+    uint8_t extra;
+    assert(recv(client, &extra, sizeof(extra), 0) == 0);
+    assert(pthread_join(wss_thread, NULL) == 0);
+    assert(atomic_load(&wss.complete) == 1 && fixture.routes == 1);
+    close(client);
+    atomic_store(&runner.stop, 1);
+    assert(pthread_join(proxy_thread, NULL) == 0);
+    tg_epoll_proxy_stats route_stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
+    assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 0 &&
+           route_stats.wss_failures == 1);
+    tg_epoll_proxy_destroy(proxy);
+    close(listener);
+    close(wss.listener);
+    SSL_CTX_free(tls_context);
+    unlink(key_path);
+    unlink(cert_path);
+    assert(rmdir(directory) == 0);
+}
+
+static void test_epoll_wss_upgrade_and_ack_do_not_confirm_route(void) {
+    char directory[] = "/tmp/d2k-tg-wss-ack-XXXXXX";
+    char cert_path[256], key_path[256];
+    assert(mkdtemp(directory) != NULL);
+    assert(snprintf(cert_path, sizeof(cert_path), "%s/cert.pem", directory) > 0);
+    assert(snprintf(key_path, sizeof(key_path), "%s/key.pem", directory) > 0);
+    EVP_PKEY *key = make_wss_test_key();
+    X509 *cert = make_wss_test_cert(key);
+    FILE *file = fopen(cert_path, "w");
+    assert(file && PEM_write_X509(file, cert) == 1);
+    fclose(file);
+    file = fopen(key_path, "w");
+    assert(file && PEM_write_PrivateKey(file, key, NULL, NULL, 0, NULL, NULL) == 1);
+    fclose(file);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+
+    uint16_t ws_port, proxy_port;
+    wss_server_fixture wss = {.listener = create_listener(&ws_port),
+                              .cert_path = cert_path,
+                              .key_path = key_path,
+                              .expect_binary_subprotocol = 1,
+                              .ack_only_response = 1};
+    atomic_init(&wss.complete, 0);
+    prepare_wss_response(&wss, test_handshake, TG_MTPROTO_INTERMEDIATE);
+    wss.response_packet_len = 4;
+    memcpy(wss.expected_packet, (uint8_t[]){8,0,0,0,0x11,0x22,0x33,0x44,
+                                             0x55,0x66,0x77,0x88},
+           sizeof(wss.expected_packet));
+    tg_mtproto_ctr decrypt = {0}, encrypt = {0};
+    assert(tg_mtproto_direct_stream_ciphers(test_handshake, &decrypt,
+                                             &encrypt) == 0);
+    assert(tg_mtproto_ctr_xor(&encrypt, wss.expected_packet,
+                              sizeof(wss.expected_packet)) == 0);
+    tg_mtproto_ctr_destroy(&decrypt);
+    tg_mtproto_ctr_destroy(&encrypt);
+
+    pthread_t wss_thread;
+    assert(pthread_create(&wss_thread, NULL, serve_direct_wss, &wss) == 0);
+    int listener = create_listener(&proxy_port);
+    proxy_fixture fixture = {0};
+    set_ipv4(&fixture.original, "149.154.167.51", 443);
+    set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
+    SSL_CTX *tls_context = tg_tls_client_context(cert_path);
+    assert(tls_context);
+    tg_epoll_proxy_config config = {
+        .listener_fd = listener,
+        .queue_bytes = 4096,
+        .memory_budget_bytes = 32u * 1024u * 1024u,
+        .configured_max_connections = 8,
+        .handshake_timeout_ms = 600,
+        .idle_timeout_ms = 5000,
+        .enable_direct_wss = 1,
+        .tls_context = tls_context,
+        .original_destination = original_destination,
+        .select_target = select_target,
+        .context = &fixture,
+    };
+    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+    assert(proxy);
+    proxy_runner runner = {.server = proxy};
+    atomic_init(&runner.stop, 0);
+    pthread_t proxy_thread;
+    assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
+
+    int client = connect_to_listener(proxy_port);
+    struct timeval timeout = {.tv_sec = 3};
+    assert(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                      sizeof(timeout)) == 0);
+    assert(send(client, test_handshake, sizeof(test_handshake), 0) ==
+           (ssize_t)sizeof(test_handshake));
+    assert(send(client, wss.expected_packet, sizeof(wss.expected_packet), 0) ==
+           (ssize_t)sizeof(wss.expected_packet));
+    uint8_t response[4];
+    size_t received = 0;
+    while (received < sizeof(response)) {
+        ssize_t n = recv(client, response + received,
+                         sizeof(response) - received, 0);
+        assert(n > 0);
+        received += (size_t)n;
+    }
+    assert(memcmp(response, wss.response_packet, sizeof(response)) == 0);
+    tg_epoll_proxy_stats stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.active_connections == 1 && stats.wss_attempts == 1 &&
+           stats.wss_responses == 0 && stats.wss_failures == 0);
+    assert(stats.active_sessions_count == 1 &&
+           stats.active_sessions[0].selected_transport ==
+               TG_ROUTE_SESSION_TRANSPORT_NONE &&
+           !stats.active_sessions[0].telegram_response_seen);
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = 900000000};
+    nanosleep(&delay, NULL);
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.active_connections == 0 && stats.wss_attempts == 1 &&
+           stats.wss_responses == 0 && stats.wss_failures == 1 &&
+           stats.last_failure_stage == TG_EPOLL_FAILURE_MTPROTO);
+
+    assert(shutdown(client, SHUT_WR) == 0);
+    close(client);
+    assert(pthread_join(wss_thread, NULL) == 0);
+    assert(atomic_load(&wss.complete) == 1);
+    atomic_store(&runner.stop, 1);
+    assert(pthread_join(proxy_thread, NULL) == 0);
+    tg_epoll_proxy_destroy(proxy);
+    close(listener);
+    close(wss.listener);
+    SSL_CTX_free(tls_context);
+    unlink(key_path);
+    unlink(cert_path);
+    assert(rmdir(directory) == 0);
+}
+
+static void test_epoll_adaptive_worker_keeps_direct_wss_reserved(
+    tg_mtproto_proto proto) {
+    char directory[] = "/tmp/d2k-tg-wss-hedge-XXXXXX";
+    char cert_path[256], key_path[256];
+    assert(mkdtemp(directory) != NULL);
+    assert(snprintf(cert_path, sizeof(cert_path), "%s/cert.pem", directory) > 0);
+    assert(snprintf(key_path, sizeof(key_path), "%s/key.pem", directory) > 0);
+    EVP_PKEY *key = make_wss_test_key();
+    X509 *cert = make_wss_test_cert(key);
+    FILE *file = fopen(cert_path, "w");
+    assert(file && PEM_write_X509(file, cert) == 1);
+    fclose(file);
+    file = fopen(key_path, "w");
+    assert(file && PEM_write_PrivateKey(file, key, NULL, NULL, 0, NULL, NULL) == 1);
+    fclose(file);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+
+    uint16_t ws_port, proxy_port;
+    wss_server_fixture wss = {
+        .listener = create_listener(&ws_port),
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .expected_sni = "worker.test",
+        .expected_path = "/apiws?dst=149.154.167.51&dc=4&media=1",
+        .expect_binary_subprotocol = 0,
+        .response_delay_ms = 150
+    };
+    atomic_init(&wss.complete, 0);
+    uint8_t handshake[64];
+    make_wss_test_handshake(proto, 4, 1, handshake);
+    memcpy(wss.handshake, handshake, sizeof(handshake));
+    wss.handshake_len = sizeof(handshake);
+    prepare_wss_response(&wss, handshake, proto);
+    uint8_t request_packet[128u * 1024u];
+    size_t request_body_len = sizeof(request_packet) - 4u;
+    memset(request_packet, 0, sizeof(request_packet));
+    if (proto == TG_MTPROTO_ABRIDGED) {
+        uint32_t words = (uint32_t)(request_body_len / 4u);
+        request_packet[0] = 0x7fu;
+        request_packet[1] = (uint8_t)words;
+        request_packet[2] = (uint8_t)(words >> 8);
+        request_packet[3] = (uint8_t)(words >> 16);
+    } else {
+        uint32_t body_len = (uint32_t)request_body_len;
+        request_packet[0] = (uint8_t)body_len;
+        request_packet[1] = (uint8_t)(body_len >> 8);
+        request_packet[2] = (uint8_t)(body_len >> 16);
+        request_packet[3] = (uint8_t)(body_len >> 24);
+    }
+    for (size_t i = 4; i < sizeof(request_packet); ++i)
+        request_packet[i] = (uint8_t)(i * 17u + 3u);
+    wss.expected_packet_data = request_packet;
+    wss.expected_packet_len = sizeof(request_packet);
+    tg_mtproto_ctr decrypt = {0}, encrypt = {0};
+    assert(tg_mtproto_direct_stream_ciphers(handshake, &decrypt,
+                                             &encrypt) == 0);
+    assert(tg_mtproto_ctr_xor(&encrypt, request_packet,
+                              wss.expected_packet_len) == 0);
+    tg_mtproto_ctr_destroy(&decrypt);
+    tg_mtproto_ctr_destroy(&encrypt);
+    pthread_t wss_thread;
+    assert(pthread_create(&wss_thread, NULL, serve_direct_wss, &wss) == 0);
+
+    int listener = create_listener(&proxy_port);
+    proxy_fixture fixture = {0};
+    set_ipv4(&fixture.original, "149.154.167.51", 443);
+    set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
+    SSL_CTX *tls_context = tg_tls_client_context(cert_path);
+    assert(tls_context);
+    tg_config routing = {0};
+    routing.ws_routing = TG_WS_ROUTING_ADAPTIVE;
+    routing.ws_hedge_delay_ms = 50;
+    routing.ws_hedge_limit = 1;
+    routing.cf_worker_domain_count = 1;
+    memcpy(routing.cf_worker_domains[0], "worker.test", sizeof("worker.test"));
+    routing.cf_proxy_domain_count = 1;
+    memcpy(routing.cf_proxy_domains[0], "cfproxy.test", sizeof("cfproxy.test"));
+    tg_epoll_proxy_config config = {
+        .listener_fd = listener,
+        .queue_bytes = 1024,
+        .memory_budget_bytes = 64u * 1024u * 1024u,
+        .configured_max_connections = 8,
+        .handshake_timeout_ms = 3000,
+        .idle_timeout_ms = 5000,
+        .enable_direct_wss = 1,
+        .tls_context = tls_context,
+        .routing_config = &routing,
+        .resolve_domain = resolve_test_route_domain,
+        .route_context = &fixture,
+        .original_destination = original_destination,
+        .select_target = select_target,
+        .context = &fixture,
+    };
+    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+    assert(proxy);
+    proxy_runner runner = {.server = proxy};
+    atomic_init(&runner.stop, 0);
+    pthread_t proxy_thread;
+    assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
+
+    int client = connect_to_listener(proxy_port);
+    struct timeval timeout = {.tv_sec = 5};
+    assert(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                      sizeof(timeout)) == 0);
+    assert(send(client, handshake, sizeof(handshake), 0) ==
+           (ssize_t)sizeof(handshake));
+    assert(send(client, request_packet, wss.expected_packet_len, 0) ==
+           (ssize_t)wss.expected_packet_len);
+    struct timespec before_response = {.tv_sec = 0, .tv_nsec = 80000000L};
+    nanosleep(&before_response, NULL);
+    tg_epoll_proxy_stats route_stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
+    assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 0);
+    uint8_t echoed[sizeof(wss.response_packet)];
+    size_t received = 0;
+    while (received < wss.response_packet_len) {
+        struct pollfd wait = {.fd = client, .events = POLLIN};
+        assert(poll(&wait, 1, 5000) > 0);
+        ssize_t n = recv(client, echoed + received,
+                         wss.response_packet_len - received, 0);
+        assert(n > 0);
+        received += (size_t)n;
+    }
+    assert(memcmp(echoed, wss.response_packet, wss.response_packet_len) == 0);
+    assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
+    assert(route_stats.active_connections == 1 &&
+           route_stats.active_sessions_count == 1);
+    const tg_active_route_session *session = &route_stats.active_sessions[0];
+    assert(session->id > 0 && session->has_dc && session->dc == 4);
+    assert(session->has_media && session->is_media);
+    assert(session->stage == TG_ROUTE_SESSION_STAGE_FIRST_WSS_BINARY_RESPONSE);
+    assert(session->fallback_state == TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
+    assert(session->fallback_transport ==
+           TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_WORKER);
+    assert(session->selected_transport ==
+           TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_WORKER);
+    assert(session->telegram_response_seen);
+    assert(session->bytes_from_clients >= wss.expected_packet_len);
+    assert(session->bytes_from_upstreams >= wss.response_packet_len);
+    assert(session->event_count >= 4);
+    assert(session->events[session->event_count - 1u].state ==
+           TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
+    assert(session->events[session->event_count - 1u].sequence >
+           session->events[session->event_count - 2u].sequence);
+    assert(session->events[session->event_count - 1u].timestamp_ms > 0);
+    assert(route_stats.monotonic_time_ms >=
+           session->events[session->event_count - 1u].timestamp_ms);
+    assert(session->events[session->event_count - 1u].failure_stage ==
+           TG_EPOLL_FAILURE_NONE);
+
+    char stats_path[256];
+    assert(snprintf(stats_path, sizeof(stats_path), "%s/stats.sock", directory) > 0);
+    tg_stats_socket stats_socket = {.fd = -1};
+    if (tg_stats_socket_open(&stats_socket, stats_path) == 0) {
+        int stats_client = socket(AF_UNIX, SOCK_STREAM, 0);
+        assert(stats_client >= 0);
+        struct sockaddr_un stats_address = {.sun_family = AF_UNIX};
+        memcpy(stats_address.sun_path, stats_path, strlen(stats_path) + 1u);
+        assert(connect(stats_client, (struct sockaddr *)&stats_address,
+                       sizeof(stats_address)) == 0);
+        assert(tg_stats_socket_serve(&stats_socket, proxy) == 0);
+        char stats_json[64u * 1024u];
+        size_t stats_json_len = 0;
+        for (;;) {
+            assert(stats_json_len < sizeof(stats_json) - 1u);
+            ssize_t n = recv(stats_client, stats_json + stats_json_len,
+                             sizeof(stats_json) - 1u - stats_json_len, 0);
+            if (n == 0) break;
+            assert(n > 0);
+            stats_json_len += (size_t)n;
+        }
+        stats_json[stats_json_len] = '\0';
+        char expected_session_bytes[128];
+        assert(snprintf(expected_session_bytes,
+            sizeof(expected_session_bytes),
+            "\"telegram_response_seen\":true,\"bytes_from_clients\":%"
+            PRIu64 ",\"bytes_from_upstreams\":%" PRIu64 ",\"events\":[",
+            session->bytes_from_clients, session->bytes_from_upstreams) > 0);
+        assert(strstr(stats_json, expected_session_bytes) != NULL);
+        close(stats_client);
+        tg_stats_socket_close(&stats_socket);
+    } else {
+        assert(errno == EPERM || errno == EACCES || errno == EAFNOSUPPORT);
+    }
+
+    assert(shutdown(client, SHUT_WR) == 0);
+    assert(pthread_join(wss_thread, NULL) == 0);
+    assert(wss.accepted_count == 1 && atomic_load(&wss.complete) == 1);
+    close(client);
+    atomic_store(&runner.stop, 1);
+    assert(pthread_join(proxy_thread, NULL) == 0);
+    assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
+    assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 1);
+    assert(route_stats.client_response_latency_samples == 1 &&
+           route_stats.client_response_latency_p95_us <= 250000u);
+    tg_epoll_proxy_destroy(proxy);
+    close(listener);
+    close(wss.listener);
+    SSL_CTX_free(tls_context);
+    unlink(key_path);
+    unlink(cert_path);
+    assert(rmdir(directory) == 0);
+}
+
+static void test_epoll_wss_partial_request_is_not_replayed(void) {
+    char directory[] = "/tmp/d2k-tg-wss-recovery-XXXXXX";
+    char cert_path[256], key_path[256];
+    assert(mkdtemp(directory) != NULL);
+    assert(snprintf(cert_path, sizeof(cert_path), "%s/cert.pem", directory) > 0);
+    assert(snprintf(key_path, sizeof(key_path), "%s/key.pem", directory) > 0);
+    EVP_PKEY *key = make_wss_test_key();
+    X509 *cert = make_wss_test_cert(key);
+    FILE *file = fopen(cert_path, "w");
+    assert(file && PEM_write_X509(file, cert) == 1);
+    fclose(file);
+    file = fopen(key_path, "w");
+    assert(file && PEM_write_PrivateKey(file, key, NULL, NULL, 0, NULL, NULL) == 1);
+    fclose(file);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+
+    uint16_t ws_port, proxy_port;
+    wss_server_fixture wss = {.listener = create_listener(&ws_port),
+                              .cert_path = cert_path,
+                              .key_path = key_path,
+                              .expect_binary_subprotocol = 1,
+                              .partial_client_packet_prefix = 4};
+    atomic_init(&wss.complete, 0);
+    prepare_wss_response(&wss, test_handshake, TG_MTPROTO_INTERMEDIATE);
+    const uint8_t clear_packet[12] = {8,0,0,0,0x11,0x22,0x33,0x44,
+                                      0x55,0x66,0x77,0x88};
+    memcpy(wss.expected_packet, clear_packet, sizeof(clear_packet));
+    tg_mtproto_ctr decrypt = {0}, encrypt = {0};
+    assert(tg_mtproto_direct_stream_ciphers(test_handshake, &decrypt,
+                                             &encrypt) == 0);
+    assert(tg_mtproto_ctr_xor(&encrypt, wss.expected_packet,
+                              sizeof(wss.expected_packet)) == 0);
+    tg_mtproto_ctr_destroy(&decrypt);
+    tg_mtproto_ctr_destroy(&encrypt);
+    pthread_t wss_thread;
+    assert(pthread_create(&wss_thread, NULL,
+                          serve_wss_partial_request_then_watch_retry,
+                          &wss) == 0);
+
+    int listener = create_listener(&proxy_port);
+    proxy_fixture fixture = {0};
+    set_ipv4(&fixture.original, "149.154.167.51", 443);
+    set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
+    SSL_CTX *tls_context = tg_tls_client_context(cert_path);
+    assert(tls_context);
+    tg_epoll_proxy_config config = {
+        .listener_fd = listener,
+        .queue_bytes = 4096,
+        .memory_budget_bytes = 64u * 1024u * 1024u,
+        .configured_max_connections = 8,
+        .handshake_timeout_ms = 3000,
+        .idle_timeout_ms = 5000,
+        .enable_direct_wss = 1,
+        .tls_context = tls_context,
+        .original_destination = original_destination,
+        .select_target = select_target,
+        .context = &fixture,
+    };
+    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+    assert(proxy);
+    proxy_runner runner = {.server = proxy};
+    atomic_init(&runner.stop, 0);
+    pthread_t proxy_thread;
+    assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
+
+    counted_connect_port = ws_port;
+    counted_connect_attempts = 0;
+    int client = connect_to_listener(proxy_port);
+    struct timeval timeout = {.tv_sec = 5};
+    assert(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                      sizeof(timeout)) == 0);
+    assert(send(client, test_handshake, sizeof(test_handshake), 0) ==
+           (ssize_t)sizeof(test_handshake));
+    assert(send(client, wss.expected_packet, sizeof(wss.expected_packet), 0) ==
+           (ssize_t)sizeof(wss.expected_packet));
+    assert(shutdown(client, SHUT_WR) == 0);
+    assert(pthread_join(wss_thread, NULL) == 0);
+    struct pollfd client_wait = {.fd = client, .events = POLLIN};
+    assert(poll(&client_wait, 1, 5000) > 0);
+    uint8_t response[sizeof(wss.response_packet)];
+    assert(recv(client, response, sizeof(response), 0) == 0);
+    assert(wss.accepted_count == 1 && atomic_load(&wss.complete) == 1);
+    close(client);
+    atomic_store(&runner.stop, 1);
+    assert(pthread_join(proxy_thread, NULL) == 0);
+    tg_epoll_proxy_stats stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.wss_attempts == 1 && stats.wss_failures == 1 &&
+           stats.wss_responses == 0 && counted_connect_attempts == 1);
+    assert(stats.last_failure_dc > 0 &&
+           stats.last_failure_route == TG_ROUTE_DIRECT_WSS &&
+           stats.last_failure_stage == TG_EPOLL_FAILURE_MTPROTO);
+    counted_connect_port = 0;
+    counted_connect_attempts = 0;
+    tg_epoll_proxy_destroy(proxy);
+    close(listener);
+    close(wss.listener);
+    SSL_CTX_free(tls_context);
+    unlink(key_path);
+    unlink(cert_path);
+    assert(rmdir(directory) == 0);
+}
+
+static void test_epoll_wss_partial_response_does_not_replay_request(void) {
+    char directory[] = "/tmp/d2k-tg-wss-partial-XXXXXX";
+    char cert_path[256], key_path[256];
+    assert(mkdtemp(directory) != NULL);
+    assert(snprintf(cert_path, sizeof(cert_path), "%s/cert.pem", directory) > 0);
+    assert(snprintf(key_path, sizeof(key_path), "%s/key.pem", directory) > 0);
+    EVP_PKEY *key = make_wss_test_key();
+    X509 *cert = make_wss_test_cert(key);
+    FILE *file = fopen(cert_path, "w");
+    assert(file && PEM_write_X509(file, cert) == 1);
+    fclose(file);
+    file = fopen(key_path, "w");
+    assert(file && PEM_write_PrivateKey(file, key, NULL, NULL, 0, NULL, NULL) == 1);
+    fclose(file);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+
+    uint16_t ws_port, proxy_port;
+    wss_server_fixture wss = {.listener = create_listener(&ws_port),
                               .cert_path = cert_path,
                               .key_path = key_path,
                               .expect_binary_subprotocol = 1,
