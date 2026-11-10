@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "tg_epoll_proxy.h"
+
+void tg_epoll_proxy_test_set_ping_interval_ms(uint64_t interval_ms);
 #include "tg_mtproto.h"
 #include "tg_stats_socket.h"
 #include "tg_tls.h"
@@ -108,6 +110,8 @@ typedef struct {
     const char *expected_sni;
     const char *expected_path;
     int expect_binary_subprotocol;
+    int expect_no_browser_headers;
+    int expect_ping_after_handshake;
     int arbitrary_response;
     int ack_only_response;
     int close_without_response;
@@ -476,8 +480,13 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
         assert(strstr(request, "Sec-WebSocket-Protocol: binary\r\n"));
     else
         assert(!strstr(request, "Sec-WebSocket-Protocol:"));
-    assert(strstr(request, "Origin: https://web.telegram.org\r\n"));
-    assert(strstr(request, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"));
+    if (fixture->expect_no_browser_headers) {
+        assert(!strstr(request, "Origin: https://web.telegram.org\r\n"));
+        assert(!strstr(request, "User-Agent: Mozilla/5.0"));
+    } else {
+        assert(strstr(request, "Origin: https://web.telegram.org\r\n"));
+        assert(strstr(request, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"));
+    }
     char *key_line = strstr(request, "Sec-WebSocket-Key: ");
     assert(key_line);
     key_line += strlen("Sec-WebSocket-Key: ");
@@ -514,6 +523,19 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
         ? fixture->handshake_len : sizeof(test_handshake);
     assert(opcode == TG_WS_BINARY && payload_len == expected_handshake_len);
     assert(memcmp(payload, expected_handshake, payload_len) == 0);
+    if (fixture->expect_ping_after_handshake) {
+        int ping_rc = read_masked_client_frame(ssl, &opcode, payload,
+                                               sizeof(payload), &payload_len);
+        assert(ping_rc == 0);
+        assert(opcode == TG_WS_PING);
+        assert(payload_len == 3 && memcmp(payload, "d2k", 3) == 0);
+        assert(write_server_frame(ssl, TG_WS_PONG, payload, payload_len) == 0);
+        atomic_store(&fixture->complete, 1);
+        SSL_free(ssl);
+        close(fd);
+        SSL_CTX_free(context);
+        return;
+    }
     if (fixture->wait_for_fallback) {
         if (fixture->partial_server_frame_before_fallback) {
             const uint8_t partial_frame_header = 0x82u;
@@ -2045,8 +2067,9 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(void) {
         .cert_path = cert_path,
         .key_path = key_path,
         .expected_sni = "worker.test",
-        .expected_path = "/apiws?dst=149.154.167.51&dc=4&media=1",
-        .expect_binary_subprotocol = 0
+        .expected_path = "/apiws?dst=149.154.167.91&dc=4",
+        .expect_binary_subprotocol = 0,
+        .expect_no_browser_headers = 1
     };
     atomic_init(&worker.complete, 0);
     prepare_wss_response(&worker, test_handshake, TG_MTPROTO_INTERMEDIATE);
@@ -2161,8 +2184,9 @@ static void test_async_route_dns_waits_before_worker(void) {
         .cert_path = cert_path,
         .key_path = key_path,
         .expected_sni = "worker.test",
-        .expected_path = "/apiws?dst=149.154.167.51&dc=4&media=1",
-        .expect_binary_subprotocol = 0
+        .expected_path = "/apiws?dst=149.154.167.91&dc=4",
+        .expect_binary_subprotocol = 0,
+        .expect_no_browser_headers = 1
     };
     atomic_init(&worker.complete, 0);
     prepare_wss_response(&worker, test_handshake, TG_MTPROTO_INTERMEDIATE);
@@ -3018,6 +3042,89 @@ static void test_epoll_certificate_failure_keeps_diagnostic_tcp(void) {
     assert(rmdir(directory) == 0);
 }
 
+static void test_epoll_wss_sends_ping(void) {
+    char directory[] = "/tmp/d2k-tg-wss-ping-XXXXXX";
+    char cert_path[256], key_path[256];
+    assert(mkdtemp(directory) != NULL);
+    assert(snprintf(cert_path, sizeof(cert_path), "%s/cert.pem", directory) > 0);
+    assert(snprintf(key_path, sizeof(key_path), "%s/key.pem", directory) > 0);
+    EVP_PKEY *key = make_wss_test_key();
+    X509 *cert = make_wss_test_cert(key);
+    FILE *file = fopen(cert_path, "w");
+    assert(file && PEM_write_X509(file, cert) == 1);
+    fclose(file);
+    file = fopen(key_path, "w");
+    assert(file && PEM_write_PrivateKey(file, key, NULL, NULL, 0, NULL, NULL) == 1);
+    fclose(file);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+
+    uint16_t ws_port, proxy_port;
+    wss_server_fixture wss = {
+        .listener = create_listener(&ws_port),
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .expected_sni = "kws4-1.web.telegram.org",
+        .expected_path = "/apiws",
+        .expect_binary_subprotocol = 1,
+        .expect_ping_after_handshake = 1
+    };
+    atomic_init(&wss.complete, 0);
+    memcpy(wss.handshake, test_handshake, sizeof(test_handshake));
+    wss.handshake_len = sizeof(test_handshake);
+    pthread_t wss_thread;
+    assert(pthread_create(&wss_thread, NULL, serve_direct_wss, &wss) == 0);
+
+    int listener = create_listener(&proxy_port);
+    proxy_fixture fixture = {0};
+    set_ipv4(&fixture.original, "149.154.167.51", 443);
+    set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
+    SSL_CTX *tls_context = tg_tls_client_context(cert_path);
+    assert(tls_context);
+    tg_config routing = {0};
+    tg_epoll_proxy_config config = {
+        .listener_fd = listener,
+        .queue_bytes = 4096,
+        .memory_budget_bytes = 32u * 1024u * 1024u,
+        .configured_max_connections = 8,
+        .handshake_timeout_ms = 3000,
+        .idle_timeout_ms = 5000,
+        .enable_direct_wss = 1,
+        .tls_context = tls_context,
+        .routing_config = &routing,
+        .original_destination = original_destination,
+        .select_target = select_target,
+        .context = &fixture,
+    };
+    tg_epoll_proxy_test_set_ping_interval_ms(80);
+    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+    assert(proxy);
+    proxy_runner runner = {.server = proxy};
+    atomic_init(&runner.stop, 0);
+    pthread_t proxy_thread;
+    assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
+
+    int client = connect_to_listener(proxy_port);
+    struct timeval timeout = {.tv_sec = 4};
+    assert(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                      sizeof(timeout)) == 0);
+    assert(send(client, test_handshake, sizeof(test_handshake), 0) ==
+           (ssize_t)sizeof(test_handshake));
+    assert(pthread_join(wss_thread, NULL) == 0);
+    assert(atomic_load(&wss.complete) == 1);
+    close(client);
+    atomic_store(&runner.stop, 1);
+    assert(pthread_join(proxy_thread, NULL) == 0);
+    tg_epoll_proxy_test_set_ping_interval_ms(30000u);
+    tg_epoll_proxy_destroy(proxy);
+    close(listener);
+    close(wss.listener);
+    SSL_CTX_free(tls_context);
+    unlink(key_path);
+    unlink(cert_path);
+    assert(rmdir(directory) == 0);
+}
+
 int main(void) {
     (void)signal(SIGPIPE, SIG_IGN);
     test_epoll_bridge_preserves_handshake_and_half_close();
@@ -3039,6 +3146,7 @@ int main(void) {
     test_epoll_wss_partial_request_is_not_replayed();
     test_epoll_wss_partial_response_does_not_replay_request();
     test_epoll_cf_worker_uses_raw_stream_framing();
+    test_epoll_wss_sends_ping();
     test_async_route_dns_waits_before_worker();
     test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing();
     test_epoll_reuses_confirmed_media_route_across_ips();

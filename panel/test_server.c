@@ -386,6 +386,75 @@ static void test_telegram_worker_domains_are_validated_and_restart_only_c11(void
     unlink(marker);
 }
 
+static void test_telegram_route_only_is_validated_and_restarts_c11(void) {
+    char config[] = "/tmp/d2k-panel-route-config.XXXXXX";
+    char service[] = "/tmp/d2k-panel-route-service.XXXXXX";
+    char marker[] = "/tmp/d2k-panel-route-marker.XXXXXX";
+    write_temp_file(config, "MODE=apply\nTG_ENABLED=1\nTG_MODE=local\n"
+                           "TG_CF_WORKER_DOMAIN=worker.example\n"
+                           "TG_ROUTE_ONLY=auto\n# комментарий\n");
+    write_temp_file(marker, "");
+    char service_script[512];
+    int script_len = snprintf(service_script, sizeof service_script,
+        "#!/bin/sh\nprintf '%%s\\n' \"$1\" > '%s'\n", marker);
+    assert(script_len > 0 && (size_t)script_len < sizeof service_script);
+    rewrite_file(service, service_script);
+    assert(chmod(service, 0700) == 0);
+    d2k_panel_config cfg = { .config_path = config, .service_path = service,
+        .control_enabled = 1 };
+    char response[8192];
+    (void)request(&cfg,
+        "GET /api/telegram/route HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(response, "\"route\":\"auto\"") != NULL);
+
+    const char *json = "{\"route\":\"worker\"}";
+    char req[1024];
+    int req_len = snprintf(req, sizeof req,
+        "POST /api/telegram/route HTTP/1.1\r\nHost: localhost\r\n"
+        "Origin: http://localhost\r\nContent-Type: application/json\r\n"
+        "Content-Length: %zu\r\n\r\n%s", strlen(json), json);
+    assert(req_len > 0 && (size_t)req_len < sizeof req);
+    (void)request(&cfg, req, response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 202 Accepted") != NULL);
+    wait_action_done(&cfg);
+    FILE *f = fopen(config, "r");
+    assert(f != NULL);
+    char contents[2048] = {0};
+    assert(fread(contents, 1, sizeof contents - 1, f) > 0);
+    fclose(f);
+    assert(strstr(contents, "TG_ROUTE_ONLY=worker\n") != NULL);
+    assert(strstr(contents, "# комментарий") != NULL);
+    assert(strstr(contents, "TG_CF_WORKER_DOMAIN=worker.example") != NULL);
+    f = fopen(marker, "r");
+    assert(f != NULL);
+    char action[64] = {0};
+    assert(fgets(action, sizeof action, f) != NULL);
+    fclose(f);
+    assert(strcmp(action, "telegram-restart\n") == 0);
+
+    const char *invalid = "{\"route\":\"bogus\"}";
+    req_len = snprintf(req, sizeof req,
+        "POST /api/telegram/route HTTP/1.1\r\nHost: localhost\r\n"
+        "Origin: http://localhost\r\nContent-Type: application/json\r\n"
+        "Content-Length: %zu\r\n\r\n%s", strlen(invalid), invalid);
+    assert(req_len > 0 && (size_t)req_len < sizeof req);
+    (void)request(&cfg, req, response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 400 Bad Request") != NULL);
+
+    req_len = snprintf(req, sizeof req,
+        "POST /api/telegram/route HTTP/1.1\r\nHost: localhost\r\n"
+        "Origin: http://attacker.example\r\nContent-Type: application/json\r\n"
+        "Content-Length: %zu\r\n\r\n%s", strlen(json), json);
+    assert(req_len > 0 && (size_t)req_len < sizeof req);
+    (void)request(&cfg, req, response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 403 Forbidden") != NULL);
+    unlink(config);
+    unlink(service);
+    unlink(marker);
+}
+
 /* Состояние автообновления пишет d2k-update.sh; панель отдаёт файл как есть.
    Нет утилиты — «не подключено», есть, но не проверялось — пустое состояние. */
 static void test_update_state_is_served_from_file(void) {
@@ -802,6 +871,7 @@ int main(void) {
     test_telegram_status_is_dynamic_and_never_exposes_secret();
     test_telegram_stats_socket_is_normalized_for_status_api();
     test_telegram_worker_domains_are_validated_and_restart_only_c11();
+    test_telegram_route_only_is_validated_and_restarts_c11();
     test_update_state_is_served_from_file();
     test_unsupported_method_is_rejected();
     test_slow_control_does_not_block_status();

@@ -274,6 +274,9 @@ int tg_stats_socket_serve(tg_stats_socket *server,
                     ",\"last_success_age_ms\":%" PRIu64
                     ",\"last_failure_dc\":%u,\"last_failure_route\":%u"
                     ",\"last_failure_stage\":%u,\"last_failure_age_ms\":%" PRIu64
+                    ",\"worker_pool_hits\":%" PRIu64
+                    ",\"worker_pool_misses\":%" PRIu64
+                    ",\"worker_pool_responses\":%" PRIu64
                     ",\"client_response_latency_total\":%" PRIu64
                     ",\"client_response_latency_samples\":%zu"
                     ",\"client_response_latency_last_us\":%" PRIu64
@@ -291,6 +294,8 @@ int tg_stats_socket_serve(tg_stats_socket *server,
                     stats.last_success_age_ms, stats.last_failure_dc,
                     stats.last_failure_route, stats.last_failure_stage,
                     stats.last_failure_age_ms,
+                    stats.worker_pool_hits, stats.worker_pool_misses,
+                    stats.worker_pool_responses,
                     stats.client_response_latency_total,
                     stats.client_response_latency_samples,
                     stats.client_response_latency_last_us,

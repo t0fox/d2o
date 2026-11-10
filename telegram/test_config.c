@@ -80,7 +80,8 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
           "TG_CF_DOMAIN=Edge.Example,edge2.example\n"
           "TG_CF_BALANCE=1\nTG_WS_ROUTING=cf-first\n"
           "TG_WS_HEDGE_DELAY_MS=250\nTG_WS_HEDGE_LIMIT=4\n"
-          "TG_DEFAULT_DOMAINS=1\nTG_DIAGNOSTIC_DIRECT_TCP=yes\n", file);
+          "TG_DEFAULT_DOMAINS=1\nTG_DIAGNOSTIC_DIRECT_TCP=yes\n"
+          "TG_ROUTE_ONLY=worker\n", file);
     assert(fclose(file) == 0);
 
     tg_config config;
@@ -93,6 +94,7 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
     assert(config.cf_proxy_domain_count == 2);
     assert(strcmp(config.cf_proxy_domains[0], "edge.example") == 0);
     assert(config.ws_routing == TG_WS_ROUTING_CF_FIRST);
+    assert(config.route_only == TG_ROUTE_ONLY_WORKER);
     assert(config.ws_hedge_delay_ms == 250 && config.ws_hedge_limit == 4);
     tg_config_clean(&config);
 
@@ -111,6 +113,12 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
     file = fopen(path, "w");
     assert(file);
     fputs("TG_DIAGNOSTIC_DIRECT_TCP=maybe\n", file);
+    assert(fclose(file) == 0);
+    assert(tg_config_read(path, &config) != 0);
+
+    file = fopen(path, "w");
+    assert(file);
+    fputs("TG_ROUTE_ONLY=unknown\n", file);
     assert(fclose(file) == 0);
     assert(tg_config_read(path, &config) != 0);
     unlink(path);

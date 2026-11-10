@@ -402,6 +402,44 @@ static void telegram_config_flags(const d2k_panel_config *cfg,int *enabled,int *
     fclose(f);*configured=mode_valid&&mode_seen&&local_mode;
 }
 
+static void telegram_route_only_value(const d2k_panel_config *cfg,
+                                      char out[16]) {
+    snprintf(out, 16, "auto");
+    if (!cfg || !cfg->config_path) return;
+    FILE *f = fopen(cfg->config_path, "r");
+    if (!f) return;
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || !*p) continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq++ = '\0';
+        char *end = p + strlen(p);
+        while (end > p && (end[-1] == ' ' || end[-1] == '\t' ||
+                           end[-1] == '\r' || end[-1] == '\n')) *--end = '\0';
+        while (*eq == ' ' || *eq == '\t') eq++;
+        end = eq + strlen(eq);
+        while (end > eq && (end[-1] == ' ' || end[-1] == '\t' ||
+                            end[-1] == '\r' || end[-1] == '\n')) *--end = '\0';
+        if (strcmp(p, "TG_ROUTE_ONLY") != 0) continue;
+        if (*eq == '\'' || *eq == '"') {
+            char quote = *eq;
+            if (end - eq < 2 || end[-1] != quote) break;
+            *--end = '\0';
+            eq++;
+        }
+        if (strcmp(eq, "direct") == 0 || strcmp(eq, "worker") == 0 ||
+            strcmp(eq, "cf-proxy") == 0 || strcmp(eq, "tcp") == 0)
+            snprintf(out, 16, "%s", eq);
+        else if (strcmp(eq, "auto") == 0)
+            snprintf(out, 16, "auto");
+        break;
+    }
+    fclose(f);
+}
+
 static void telegram_status_value(const d2k_panel_config *cfg,int enabled,int configured,int *running,char out[24]) {
     *running=cfg&&cfg->telegram_pid_path?pid_path_running(cfg->telegram_pid_path,NULL):0;
     const char *fallback=!configured?"not_configured":(!enabled||!*running?"stopped":"connecting");
@@ -781,6 +819,87 @@ static int worker_config_write(const char *path,
     return rc;
 }
 
+static int route_config_write(const char *path, const char *route) {
+    if (!path || !route || !*route) return -1;
+    int input = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (input < 0) return -1;
+    struct stat st;
+    if (fstat(input, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uint64_t)st.st_size > BODY_MAX) { close(input); return -1; }
+    size_t length = (size_t)st.st_size;
+    char *source = malloc(length + 1);
+    if (!source) { close(input); return -1; }
+    size_t used = 0;
+    while (used < length) {
+        ssize_t n = read(input, source + used, length - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { free(source); close(input); return -1; }
+        used += (size_t)n;
+    }
+    close(input);
+    source[used] = '\0';
+    if (memchr(source, '\0', used)) { free(source); return -1; }
+    size_t route_len = strlen(route);
+    char *output = malloc(length + route_len + 32);
+    if (!output) { free(source); return -1; }
+    size_t written = 0, offset = 0;
+    while (offset < used) {
+        size_t end = offset;
+        while (end < used && source[end] != '\n') end++;
+        size_t line_length = end - offset;
+        if (line_length && source[offset + line_length - 1] == '\r') line_length--;
+        int replace = 0;
+        size_t start = offset;
+        while (start < offset + line_length &&
+               (source[start] == ' ' || source[start] == '\t')) start++;
+        if (start < offset + line_length && source[start] != '#') {
+            const char *equal = memchr(source + start, '=',
+                                       offset + line_length - start);
+            if (equal) {
+                size_t key_end = (size_t)(equal - source);
+                while (key_end > start &&
+                       (source[key_end - 1] == ' ' || source[key_end - 1] == '\t'))
+                    key_end--;
+                static const char key[] = "TG_ROUTE_ONLY";
+                replace = key_end - start == sizeof key - 1 &&
+                          memcmp(source + start, key, sizeof key - 1) == 0;
+            }
+        }
+        if (!replace) {
+            size_t full = (end < used ? end + 1 : end) - offset;
+            memcpy(output + written, source + offset, full);
+            written += full;
+        }
+        offset = end < used ? end + 1 : used;
+    }
+    if (written && output[written - 1] != '\n') output[written++] = '\n';
+    written += (size_t)snprintf(output + written, length + route_len + 32 - written,
+                                "TG_ROUTE_ONLY=%s\n", route);
+    size_t path_len = strlen(path);
+    char *temporary = malloc(path_len + sizeof ".route.XXXXXX");
+    if (!temporary) { free(output); free(source); return -1; }
+    (void)snprintf(temporary, path_len + sizeof ".route.XXXXXX",
+                   "%s.route.XXXXXX", path);
+    int out = mkstemp(temporary);
+    int rc = -1;
+    if (out >= 0) {
+        int failed = fchmod(out, st.st_mode & 0777) != 0;
+        size_t sent = 0;
+        while (!failed && sent < written) {
+            ssize_t n = write(out, output + sent, written - sent);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { failed = 1; break; }
+            sent += (size_t)n;
+        }
+        if (!failed && fsync(out) != 0) failed = 1;
+        if (close(out) != 0) failed = 1;
+        if (!failed && rename(temporary, path) == 0) rc = 0;
+        else unlink(temporary);
+    }
+    free(temporary); free(output); free(source);
+    return rc;
+}
+
 static int worker_request_body(int fd, const char *req, size_t used,
                                char body[TG_WORKER_BODY_MAX + 1],
                                size_t *body_len) {
@@ -889,6 +1008,76 @@ static int api_telegram_workers(int fd, const d2k_panel_config *cfg,
                         json_type, body, sizeof body - 1);
     }
     static const char body[] = "{\"ok\":true,\"message\":\"Настройки сохранены, C11 перезапускается\"}";
+    return response(fd, 202, "Accepted", json_type, body, sizeof body - 1);
+}
+
+static int api_telegram_route(int fd, const d2k_panel_config *cfg,
+                              const char *req, size_t used,
+                              const char *method) {
+    static const char json_type[] = "application/json; charset=utf-8";
+    if (!cfg || !cfg->config_path) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Файл конфигурации недоступен\"}";
+        return response(fd, 503, "Service Unavailable", json_type, body, sizeof body - 1);
+    }
+    char route[16];
+    if (strcmp(method, "GET") == 0) {
+        telegram_route_only_value(cfg, route);
+        char body[64];
+        int n = snprintf(body, sizeof body, "{\"route\":\"%s\"}", route);
+        if (n <= 0 || (size_t)n >= sizeof body) return -1;
+        return response(fd, 200, "OK", json_type, body, (size_t)n);
+    }
+    if (strcmp(method, "POST") != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Метод не поддерживается\"}";
+        return response(fd, 405, "Method Not Allowed", json_type, body, sizeof body - 1);
+    }
+    if (!cfg->control_enabled || !d2k_panel_same_origin(req)) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Изменять настройки можно только с этой панели\"}";
+        return response(fd, 403, "Forbidden", json_type, body, sizeof body - 1);
+    }
+    const char *content_type = NULL;
+    size_t content_type_len = 0;
+    if (!header_value(req, "Content-Type", &content_type, &content_type_len) ||
+        content_type_len < 16 || strncasecmp(content_type, "application/json", 16) != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Ожидается JSON с маршрутом\"}";
+        return response(fd, 415, "Unsupported Media Type", json_type, body, sizeof body - 1);
+    }
+    char request_body[TG_WORKER_BODY_MAX + 1];
+    size_t request_len = 0;
+    const char *value = NULL;
+    size_t value_len = 0;
+    if (worker_request_body(fd, req, used, request_body, &request_len) != 0 ||
+        !json_top_value(request_body, "route", &value, &value_len) ||
+        value_len < 3 || value[0] != '"' || value[value_len - 1] != '"' ||
+        value_len - 2 >= sizeof route) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Укажите маршрут: auto, direct, worker, cf-proxy или tcp\"}";
+        return response(fd, 400, "Bad Request", json_type, body, sizeof body - 1);
+    }
+    memcpy(route, value + 1, value_len - 2);
+    route[value_len - 2] = '\0';
+    if (strcmp(route, "auto") != 0 && strcmp(route, "direct") != 0 &&
+        strcmp(route, "worker") != 0 && strcmp(route, "cf-proxy") != 0 &&
+        strcmp(route, "tcp") != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Неизвестный маршрут\"}";
+        return response(fd, 400, "Bad Request", json_type, body, sizeof body - 1);
+    }
+    d2k_panel_control_tick();
+    if (action_pid) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Дождитесь завершения текущей команды\"}";
+        return response(fd, 409, "Conflict", json_type, body, sizeof body - 1);
+    }
+    if (route_config_write(cfg->config_path, route) != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Не удалось сохранить маршрут\"}";
+        return response(fd, 500, "Config Error", json_type, body, sizeof body - 1);
+    }
+    int started = run_service_action(cfg, "telegram-restart", fd);
+    if (started != 0) {
+        static const char body[] = "{\"ok\":false,\"message\":\"Маршрут сохранён, но C11 не удалось перезапустить\"}";
+        return response(fd, started > 0 ? 409 : 500,
+                        started > 0 ? "Conflict" : "Service Error",
+                        json_type, body, sizeof body - 1);
+    }
+    static const char body[] = "{\"ok\":true,\"message\":\"Маршрут сохранён, C11 перезапускается\"}";
     return response(fd, 202, "Accepted", json_type, body, sizeof body - 1);
 }
 
@@ -1183,8 +1372,10 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     const char *panel_listen = cfg && cfg->panel_listen ? cfg->panel_listen : "127.0.0.1:8090";
     int queue = cfg ? cfg->queue_num : 2000;
     int telegram_enabled=0,telegram_configured=0,telegram_running=0;char telegram_status[24];
+    char telegram_route_only[16];
     char telegram_stats[TELEGRAM_STATS_MAX];
     telegram_config_flags(cfg,&telegram_enabled,&telegram_configured);
+    telegram_route_only_value(cfg, telegram_route_only);
     telegram_status_value(cfg,telegram_enabled,telegram_configured,&telegram_running,telegram_status);
     telegram_stats_value(cfg,telegram_stats);
     buf_puts(b, "{\"taken\":"); buf_json_string(b, now_iso);
@@ -1206,6 +1397,8 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     buf_printf(b, ",\"telegram_enabled\":%s,\"telegram_configured\":%s,\"telegram_running\":%s,\"telegram_status\":",
                telegram_enabled?"true":"false",telegram_configured?"true":"false",telegram_running?"true":"false");
     buf_json_string(b,telegram_status);
+    buf_puts(b, ",\"telegram_route_only\":");
+    buf_json_string(b, telegram_route_only);
     buf_puts(b, ",\"telegram_stats\":");
     buf_puts(b, telegram_stats);
     buf_puts(b, ",\"state_dir\":"); buf_json_string(b, state_dir);
@@ -1425,6 +1618,13 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
                             "method not allowed\n", 19);
         }
         return api_telegram_workers(fd, cfg, req, used, method);
+    }
+    if (strcmp(path, "/api/telegram/route") == 0) {
+        if (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0) {
+            return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8",
+                            "method not allowed\n", 19);
+        }
+        return api_telegram_route(fd, cfg, req, used, method);
     }
     if (!strcmp(path,"/api/diagnostics"))
         return api_diagnostics(fd,cfg,req,method,query?query:"status");

@@ -197,8 +197,8 @@ function mountTelegramFlow(canvas) {
       for (let index = 0; index < count; index += 1) {
         const representedBytes = delta.bytes / count;
         parts.push({ kind: "pkt", lane, path, t0: now + deltaIndex * 55 + index * 45,
-          dur: 1200 + Math.random() * 500, back: delta.direction === "response",
-          dc: delta.dc, size: 3 + Math.min(9, Math.log2(1 + representedBytes / 256)) });
+          dur: 2400 + Math.random() * 1000, back: delta.direction === "response",
+          dc: delta.dc, size: 4 + Math.min(8, Math.log2(1 + representedBytes / 256)) });
       }
       while (parts.length > 110) parts.shift();
     });
@@ -426,18 +426,30 @@ function mountTelegramFlow(canvas) {
       context.shadowBlur = 0;
     }
     for (const particle of parts) {
-      const fraction = Math.min(1, (now - particle.t0) / particle.dur), eased = ease(fraction);
+      const fraction = Math.max(0, Math.min(1, (now - particle.t0) / particle.dur)), eased = ease(fraction);
       const progress = particle.back ? 1 - eased : eased, point = pointAt(particle.path, progress);
       if (particle.kind === "pkt") {
         const next = pointAt(particle.path, progress + (particle.back ? -0.01 : 0.01));
         const angle = Math.atan2(next[1] - point[1], next[0] - point[0]);
         const normalX = -Math.sin(angle) * (particle.back ? 4 : -4);
         const normalY = Math.cos(angle) * (particle.back ? 4 : -4);
-        context.save(); context.translate(point[0] + normalX, point[1] + normalY); context.rotate(angle);
-        context.fillStyle = rgba(particle.back ? COLORS.ok : particle.lane.color,
+        const packetColor = particle.back ? COLORS.ok : COLORS.sig;
+        const packetAlpha = Math.max(0,
           0.85 * Math.sin(Math.PI * Math.min(1, fraction * 1.05)));
-        context.shadowColor = rgba(particle.back ? COLORS.ok : particle.lane.color, 1);
-        context.shadowBlur = 12; context.fillRect(-particle.size / 2, -1.2, particle.size, 2.4);
+        for (let tail = 1; tail <= 4; tail += 1) {
+          const tailPoint = pointAt(particle.path,
+            progress - (particle.back ? -1 : 1) * tail * 0.008);
+          context.beginPath(); context.arc(tailPoint[0], tailPoint[1],
+            2.4 - tail * 0.35, 0, Math.PI * 2);
+          context.fillStyle = rgba(packetColor, packetAlpha * 0.18 * (1 - tail / 5));
+          context.fill();
+        }
+        context.save(); context.translate(point[0] + normalX, point[1] + normalY); context.rotate(angle);
+        context.fillStyle = rgba(packetColor, packetAlpha);
+        context.shadowColor = rgba(packetColor, 1);
+        context.shadowBlur = 14; context.fillRect(-particle.size / 2, -1.2, particle.size, 2.4);
+        context.fillStyle = rgba(COLORS.ink, Math.min(1, packetAlpha * 1.1));
+        context.fillRect(-particle.size / 4, -0.6, particle.size / 2, 1);
         context.shadowBlur = 0; context.restore();
       } else if (particle.kind === "win") {
         context.beginPath(); context.arc(point[0], point[1], 5, 0, Math.PI * 2);

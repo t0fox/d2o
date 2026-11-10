@@ -290,6 +290,8 @@ int tg_ws_reassembly_feed(tg_ws_reassembly *state, const uint8_t *src,
     return 1;
 }
 
+static int flush_tx(tg_ws_pump *p);
+
 static int dispatch_frames(tg_ws_pump *p,tg_ws_message_cb callback,void *ctx) {
     while(p->rx_len){
         uint8_t op=0;const uint8_t *data=NULL;size_t len=0,used=0;
@@ -299,7 +301,13 @@ static int dispatch_frames(tg_ws_pump *p,tg_ws_message_cb callback,void *ctx) {
         if(ready==0)return 0;
         if(ready==1){
             if(op==TG_WS_PING){if(queue_opcode(p,TG_WS_PONG,data,len,0)!=0)return -1;}
-            else if(op==TG_WS_CLOSE){p->closed=1;return 0;}
+            else if(op==TG_WS_CLOSE){
+                if(!p->closed){
+                    if(queue_opcode(p,TG_WS_CLOSE,NULL,0,0)!=0)return -1;
+                    (void)flush_tx(p);
+                }
+                p->closed=1;return 0;
+            }
             else if(op==TG_WS_TEXT)return -1;
             else if(op==TG_WS_BINARY&&callback&&
                     callback(ctx,data,len)!=0)return -1;

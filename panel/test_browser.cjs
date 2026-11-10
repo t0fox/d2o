@@ -225,6 +225,20 @@ async function main(){
    'the prototype is shown without extra technical panels');
   assert.equal(await evaluate('document.querySelectorAll(".tg-flow-legend").length'),0,
    'пользовательские пояснения не заменяются техническими инструкциями');
+  const help=await evaluate('(()=>{const d=document.querySelector(".tg-flow-help");return d?{open:d.open,summary:d.querySelector("summary")?.textContent.trim(),text:d.textContent}:null})()');
+  assert.ok(help,'live Telegram card must include the route-state explainer');
+  assert.equal(help.open,false,'the route-state explainer starts collapsed');
+  assert.match(help.summary,/Как читать состояния/);
+  assert.match(help.text,/Ответ Telegram подтверждён/);
+  assert.match(help.text,/Прямой TCP · диагностика/);
+  assert.match(help.text,/DNS → TCP → TLS → WS → MTP/);
+  assert.match(help.text,/маркер пульсирует/);
+  assert.match(help.text,/пунктирное кольцо вращается/);
+  assert.match(help.text,/оранжевая точка — запрос к Telegram, зелёная — ответ обратно/);
+  assert.equal(await evaluate('!!document.querySelector("[data-tg-route-lock]")'),true,
+   'Telegram card exposes a route-only switch');
+  assert.equal(await evaluate('document.querySelector("[data-tg-route-select]").disabled'),true,
+   'route selector is disabled while automatic routing is active');
   assert.equal(await evaluate('document.querySelectorAll("[data-tg-actions] [data-control]").length'),2,
    'only the real C11 controls are kept beside the prototype title');
   await evaluate('document.querySelector("#telegram").scrollIntoView({block:"center"})');
@@ -392,10 +406,13 @@ async function main(){
     'canvas keeps the source prototype 900×420 composition ratio');
   assert.equal(await evaluate('document.querySelector("#telegram-body .tg-flow-canvas").dataset.state'),'mixed','C11 sessions show active and connecting route states');
   assert.match(await evaluate('document.querySelector("#tg-flow-caption").textContent'),/Несколько DC · media 2/);
-  assert.equal(await evaluate('document.querySelectorAll(".tg-flow-metric").length'),6,
-    'the six prototype metrics are preserved without extra session cards');
+  assert.equal(await evaluate('document.querySelectorAll(".tg-flow-metric").length'),7,
+    'six prototype metrics plus the current confirmed-session count are shown');
   assert.equal(await evaluate('document.querySelector("[data-tg-accepted-count]").textContent'),'77');
-  assert.equal(await evaluate('document.querySelector("[data-tg-confirmed-count]").textContent'),'5');
+  assert.equal(await evaluate('document.querySelector("[data-tg-confirmed-count]").textContent'),'5',
+    'cumulative Telegram responses stay separate from current sessions');
+  assert.equal(await evaluate('document.querySelector("[data-tg-confirmed-active]").textContent'),'1',
+    'current confirmed sessions match the active route rows');
   assert.equal(await evaluate('document.querySelector("[data-tg-active-count]").textContent'),'4');
   assert.match(await evaluate('document.querySelector("[data-tg-process-start]").textContent'),/Процесс с/);
   assert.equal(await evaluate('document.querySelector("[data-tg-latency]").textContent'),'43 / 187 мс',

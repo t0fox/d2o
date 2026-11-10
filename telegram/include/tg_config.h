@@ -16,6 +16,14 @@ typedef enum {
     TG_WS_ROUTING_HEDGED = 3
 } tg_ws_routing_policy;
 
+typedef enum {
+    TG_ROUTE_ONLY_AUTO = 0,
+    TG_ROUTE_ONLY_DIRECT = 1,
+    TG_ROUTE_ONLY_WORKER = 2,
+    TG_ROUTE_ONLY_CF_PROXY = 3,
+    TG_ROUTE_ONLY_TCP = 4
+} tg_route_only;
+
 typedef struct {
     int enabled;
     int local_mode;
@@ -29,6 +37,7 @@ typedef struct {
     size_t cf_worker_domain_count;
     size_t cf_proxy_domain_count;
     tg_ws_routing_policy ws_routing;
+    tg_route_only route_only;
     uint32_t ws_hedge_delay_ms;
     uint32_t ws_hedge_limit;
     int diagnostic_direct_tcp;

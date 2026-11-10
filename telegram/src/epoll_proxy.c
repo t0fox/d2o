@@ -13,6 +13,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -34,9 +36,19 @@
 #define TG_HEDGE_DELAY_DEFAULT_MS 125u
 #define TG_ROUTE_DNS_WAIT_TIMEOUT_MS 20000u
 #define TG_ROUTE_DNS_RETRY_MS 50u
+#define TG_WS_PING_INTERVAL_MS 30000u
 #define TG_EPOLL_RUNTIME_RESERVE_PER_CONNECTION (256u * 1024u)
 #ifndef TG_ROUTE_HEALTH_COOLDOWN_MS
 #define TG_ROUTE_HEALTH_COOLDOWN_MS 30000u
+#endif
+
+#ifdef TG_EPOLL_TESTING
+static uint64_t ws_ping_interval_ms = TG_WS_PING_INTERVAL_MS;
+void tg_epoll_proxy_test_set_ping_interval_ms(uint64_t interval_ms) {
+    ws_ping_interval_ms = interval_ms ? interval_ms : 1u;
+}
+#else
+#define ws_ping_interval_ms TG_WS_PING_INTERVAL_MS
 #endif
 
 enum { WSS_NONE, WSS_TLS, WSS_UPGRADE_WRITE, WSS_UPGRADE_READ, WSS_READY };
@@ -105,6 +117,7 @@ struct proxy_connection {
     int direct_wss;
     int packet_framing;
     int wss_subprotocol;
+    int wss_close_queued;
     uint32_t route_dc_id;
     int route_is_media;
     int route_tcp_only;
@@ -122,6 +135,7 @@ struct proxy_connection {
     int route_health_index;
     int route_data_seen;
     int route_response_seen;
+    int from_worker_pool;
     int response_observer_disabled;
     int wss_replay_disabled;
     int wss_client_payload_started;
@@ -154,6 +168,7 @@ struct proxy_connection {
     size_t handshake_len;
     uint64_t handshake_deadline_ms;
     uint64_t last_activity_ms;
+    uint64_t next_ping_ms;
     uint64_t upstream_connect_deadline_ms;
     tg_listener_destination original;
     tg_listener_destination upstream_target;
@@ -161,12 +176,46 @@ struct proxy_connection {
     byte_queue to_client;
 };
 
+#define TG_WORKER_POOL_MAX 8u
+#define TG_WORKER_POOL_MAX_AGE_MS 80000u
+#define TG_WORKER_POOL_CONNECT_TIMEOUT_MS 5000u
+
+typedef struct {
+    int fd;
+    SSL *ssl;
+    uint32_t dc_id;
+    uint64_t created_ms;
+    char hostname[TG_CF_DOMAIN_LEN];
+    char path[512];
+} worker_pool_entry;
+
+typedef struct {
+    struct tg_epoll_proxy *server;
+    pthread_mutex_t lock;
+    pthread_cond_t wake;
+    pthread_t thread;
+    int started;
+    int stopping;
+    size_t count;
+    worker_pool_entry entries[TG_WORKER_POOL_MAX];
+    SSL_CTX *tls_context;
+    uint32_t socket_mark;
+    int require_socket_mark;
+    char domain[TG_CF_DOMAIN_LEN];
+    uint32_t dcs[6];
+    char paths[6][512];
+    uint64_t retry_at[6];
+    unsigned failures[6];
+    size_t dc_count;
+} worker_pool;
+
 struct tg_epoll_proxy {
     int epoll_fd;
     int listener_fd;
     socket_watch listener_watch;
     tg_epoll_proxy_config config;
     tg_route_dns *route_dns;
+    worker_pool *worker_pool;
     uint16_t listen_ports[TG_EPOLL_MAX_LISTEN_PORTS];
     size_t max_connections;
     size_t active_connections;
@@ -190,6 +239,9 @@ struct tg_epoll_proxy {
     size_t client_response_latency_count;
     size_t client_response_latency_next;
     uint64_t client_response_latency_total;
+    uint64_t worker_pool_hits;
+    uint64_t worker_pool_misses;
+    uint64_t worker_pool_responses;
     route_health route_health[TG_ROUTE_HEALTH_MAX];
     proxy_connection *connections;
     proxy_connection *retired;
@@ -209,6 +261,7 @@ static void hedge_cancel_candidates(proxy_connection *connection);
 static int hedge_promote_candidate(proxy_connection *candidate);
 static void advance_half_closes(proxy_connection *connection);
 static int progress_wss(proxy_connection *connection, uint32_t events);
+static int establish_wss_stream(proxy_connection *connection);
 
 static uint64_t monotonic_ms(void) {
     struct timespec now;
@@ -561,6 +614,18 @@ static void watch_remove(tg_epoll_proxy *server, socket_watch *watch) {
     }
 }
 
+static void wss_close_best_effort(proxy_connection *connection) {
+    if (!connection) return;
+    if (connection->ws_pump_ready && connection->wss_phase == WSS_READY &&
+        !connection->wss_close_queued && !connection->ws_pump.failed &&
+        !connection->ws_pump.closed) {
+        connection->wss_close_queued = 1;
+        if (tg_ws_pump_queue_close(&connection->ws_pump) == 0)
+            (void)tg_ws_pump_process(&connection->ws_pump, POLLOUT, NULL, NULL);
+    }
+    if (connection->upstream_ssl) (void)SSL_shutdown(connection->upstream_ssl);
+}
+
 static void connection_close(proxy_connection *connection) {
     if (!connection || connection->closed) return;
     tg_epoll_proxy *server = connection->server;
@@ -570,6 +635,7 @@ static void connection_close(proxy_connection *connection) {
         --server->active_wss_connections;
     watch_remove(server, &connection->client_watch);
     watch_remove(server, &connection->upstream_watch);
+    wss_close_best_effort(connection);
     if (connection->upstream_ssl) SSL_free(connection->upstream_ssl);
     if (connection->client_fd >= 0) close(connection->client_fd);
     if (connection->upstream_fd >= 0) close(connection->upstream_fd);
@@ -835,6 +901,22 @@ static void route_plan_prioritize_kind(tg_route_plan *plan,
     }
 }
 
+static int route_plan_keep_only(tg_route_plan *plan, tg_route_only only) {
+    tg_route_kind wanted;
+    switch (only) {
+    case TG_ROUTE_ONLY_DIRECT: wanted = TG_ROUTE_DIRECT_WSS; break;
+    case TG_ROUTE_ONLY_WORKER: wanted = TG_ROUTE_CF_WORKER; break;
+    case TG_ROUTE_ONLY_CF_PROXY: wanted = TG_ROUTE_CF_PROXY; break;
+    case TG_ROUTE_ONLY_TCP: wanted = TG_ROUTE_DIRECT_TCP; break;
+    default: return 0;
+    }
+    size_t kept = 0;
+    for (size_t i = 0; i < plan->count; ++i)
+        if (plan->steps[i].kind == wanted) plan->steps[kept++] = plan->steps[i];
+    plan->count = kept;
+    return kept ? 0 : -1;
+}
+
 static int target_sockaddr(const tg_listener_destination *target,
                            struct sockaddr_storage *address,
                            socklen_t *length) {
@@ -951,15 +1033,362 @@ static int set_direct_hostname(proxy_connection *connection, unsigned variant) {
     return n > 0 && (size_t)n < sizeof(connection->tls_hostname) ? 0 : -1;
 }
 
+static const struct {
+    uint32_t dc;
+    const char *address;
+} worker_fallback[] = {
+    {1, "149.154.175.50"}, {2, "149.154.167.51"},
+    {3, "149.154.175.100"}, {4, "149.154.167.91"},
+    {5, "149.154.171.5"}, {203, "91.105.192.100"},
+};
+
+static const char *worker_primary_address(uint32_t dc) {
+    for (size_t i = 0; i < sizeof(worker_fallback) / sizeof(worker_fallback[0]); ++i)
+        if (worker_fallback[i].dc == dc) return worker_fallback[i].address;
+    return NULL;
+}
+
+static int worker_path_for_dc(uint32_t dc, char *path, size_t path_size) {
+    const char *address = worker_primary_address(dc);
+    if (!address || !path || !path_size) return -1;
+    int n = snprintf(path, path_size, "/apiws?dst=%s&dc=%u", address, dc);
+    return n > 0 && (size_t)n < path_size ? 0 : -1;
+}
+
 static int set_worker_path(proxy_connection *connection) {
-    char address[INET6_ADDRSTRLEN];
-    if (!inet_ntop(connection->original.family, connection->original.address,
-                   address, sizeof(address))) return -1;
+    if (worker_path_for_dc(connection->route_dc_id, connection->wss_path,
+                           sizeof(connection->wss_path)) == 0)
+        return 0;
+    char original[INET6_ADDRSTRLEN];
+    if (!inet_ntop(connection->original.family,
+                   connection->original.address, original,
+                   sizeof(original))) return -1;
     int n = snprintf(connection->wss_path, sizeof(connection->wss_path),
-                     "/apiws?dst=%s&dc=%u&media=%u", address,
-                     connection->route_dc_id,
-                     (unsigned)connection->route_is_media);
+                     "/apiws?dst=%s&dc=%u", original,
+                     connection->route_dc_id);
     return n > 0 && (size_t)n < sizeof(connection->wss_path) ? 0 : -1;
+}
+
+static void worker_pool_entry_close(worker_pool_entry *entry) {
+    if (!entry) return;
+    if (entry->ssl) SSL_free(entry->ssl);
+    if (entry->fd >= 0) close(entry->fd);
+    entry->ssl = NULL;
+    entry->fd = -1;
+}
+
+static int worker_pool_entry_alive(const worker_pool_entry *entry) {
+    if (!entry || entry->fd < 0 || !entry->ssl) return 0;
+    if (SSL_pending(entry->ssl) > 0) return 0;
+    struct pollfd ready = { .fd = entry->fd, .events = POLLIN };
+    int rc = poll(&ready, 1, 0);
+    if (rc < 0) return 0;
+    if (ready.revents & (POLLERR | POLLHUP | POLLNVAL)) return 0;
+    if (!(ready.revents & POLLIN)) return 1;
+    uint8_t byte;
+    int peek = SSL_peek(entry->ssl, &byte, 1);
+    if (peek > 0) return 0;
+    int error = SSL_get_error(entry->ssl, peek);
+    return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE;
+}
+
+static int worker_pool_connect_host(const char *domain, uint32_t socket_mark,
+                                    int require_socket_mark) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *result = NULL;
+    if (getaddrinfo(domain, "443", &hints, &result) != 0) {
+        fprintf(stderr, "worker pool: DNS %s failed\n", domain);
+        return -1;
+    }
+    int fd = -1;
+    for (struct addrinfo *it = result; it; it = it->ai_next) {
+        fd = socket(it->ai_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) continue;
+        if (require_socket_mark) {
+#ifdef SO_MARK
+            int mark = (int)socket_mark;
+            if (!mark || setsockopt(fd, SOL_SOCKET, SO_MARK, &mark,
+                                    sizeof(mark)) != 0) {
+                close(fd); fd = -1; continue;
+            }
+#else
+            close(fd); fd = -1; continue;
+#endif
+        }
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(fd); fd = -1; continue;
+        }
+        int rc = connect(fd, it->ai_addr, it->ai_addrlen);
+        if (rc != 0 && errno != EINPROGRESS) { close(fd); fd = -1; continue; }
+        if (rc != 0) {
+            struct pollfd ready = { .fd = fd, .events = POLLOUT };
+            rc = poll(&ready, 1, TG_WORKER_POOL_CONNECT_TIMEOUT_MS);
+            if (rc <= 0 || (ready.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                close(fd); fd = -1; continue;
+            }
+            int error = 0;
+            socklen_t error_len = sizeof(error);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &error_len) != 0 ||
+                error != 0) {
+                close(fd); fd = -1; continue;
+            }
+        }
+        if (fcntl(fd, F_SETFL, flags) != 0) { close(fd); fd = -1; continue; }
+        struct timeval timeout = { .tv_sec = 8 };
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        break;
+    }
+    freeaddrinfo(result);
+    return fd;
+}
+
+static int worker_pool_connect(worker_pool *pool, uint32_t dc,
+                               worker_pool_entry *out) {
+    const char *path = NULL;
+    for (size_t i = 0; i < pool->dc_count; ++i)
+        if (pool->dcs[i] == dc) path = pool->paths[i];
+    if (!path) return -1;
+    int fd = worker_pool_connect_host(pool->domain, pool->socket_mark,
+                                      pool->require_socket_mark);
+    if (fd < 0) return -1;
+    SSL *ssl = tg_tls_connect_fd_sni(pool->tls_context, fd, pool->domain,
+                                      pool->domain);
+    if (!ssl) {
+        fprintf(stderr, "worker pool: TLS %s failed\n", pool->domain);
+        close(fd);
+        return -1;
+    }
+    if (tg_ws_upgrade(ssl, pool->domain, path) != 0) {
+        fprintf(stderr, "worker pool: WS %s%s failed\n", pool->domain, path);
+        SSL_free(ssl);
+        close(fd);
+        return -1;
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        fprintf(stderr, "worker pool: nonblocking %s failed\n", pool->domain);
+        SSL_free(ssl);
+        close(fd);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    out->fd = fd;
+    out->ssl = ssl;
+    out->dc_id = dc;
+    out->created_ms = monotonic_ms();
+    snprintf(out->hostname, sizeof(out->hostname), "%s", pool->domain);
+    snprintf(out->path, sizeof(out->path), "%s", path);
+    return 0;
+}
+
+static void *worker_pool_thread(void *opaque) {
+    worker_pool *pool = opaque;
+    for (;;) {
+        worker_pool_entry stale[TG_WORKER_POOL_MAX];
+        size_t stale_count = 0;
+        uint32_t missing = 0;
+        size_t missing_index = 0;
+        int have_missing = 0;
+        pthread_mutex_lock(&pool->lock);
+        if (pool->stopping) { pthread_mutex_unlock(&pool->lock); break; }
+        uint64_t now = monotonic_ms();
+        for (size_t i = 0; i < pool->count;) {
+            if (now - pool->entries[i].created_ms >=
+                TG_WORKER_POOL_MAX_AGE_MS ||
+                !worker_pool_entry_alive(&pool->entries[i])) {
+                stale[stale_count++] = pool->entries[i];
+                pool->entries[i] = pool->entries[--pool->count];
+            } else {
+                ++i;
+            }
+        }
+        for (size_t i = 0; i < pool->dc_count && !have_missing; ++i) {
+            int found = 0;
+            for (size_t j = 0; j < pool->count; ++j)
+                if (pool->entries[j].dc_id == pool->dcs[i]) { found = 1; break; }
+            if (!found && now >= pool->retry_at[i]) {
+                missing = pool->dcs[i];
+                missing_index = i;
+                have_missing = 1;
+            }
+        }
+        if (!have_missing) {
+            struct timespec wake_at;
+            clock_gettime(CLOCK_REALTIME, &wake_at);
+            wake_at.tv_sec += 1;
+            (void)pthread_cond_timedwait(&pool->wake, &pool->lock, &wake_at);
+            pthread_mutex_unlock(&pool->lock);
+        } else {
+            pthread_mutex_unlock(&pool->lock);
+        }
+        for (size_t i = 0; i < stale_count; ++i)
+            worker_pool_entry_close(&stale[i]);
+        if (!have_missing) continue;
+        worker_pool_entry entry;
+        if (worker_pool_connect(pool, missing, &entry) != 0) {
+            pthread_mutex_lock(&pool->lock);
+            if (!pool->stopping) {
+                unsigned failures = pool->failures[missing_index] + 1u;
+                pool->failures[missing_index] = failures;
+                unsigned shift = failures > 7u ? 6u : failures - 1u;
+                uint64_t delay = (uint64_t)1000u << shift;
+                if (delay > 60000u) delay = 60000u;
+                pool->retry_at[missing_index] = monotonic_ms() + delay;
+                struct timespec retry_at;
+                clock_gettime(CLOCK_REALTIME, &retry_at);
+                retry_at.tv_sec += 1;
+                (void)pthread_cond_timedwait(&pool->wake, &pool->lock,
+                                             &retry_at);
+            }
+            pthread_mutex_unlock(&pool->lock);
+            continue;
+        }
+        pthread_mutex_lock(&pool->lock);
+        pool->failures[missing_index] = 0;
+        pool->retry_at[missing_index] = 0;
+        if (pool->stopping || pool->count >= TG_WORKER_POOL_MAX) {
+            pthread_mutex_unlock(&pool->lock);
+            worker_pool_entry_close(&entry);
+            continue;
+        }
+        pool->entries[pool->count++] = entry;
+        pthread_mutex_unlock(&pool->lock);
+    }
+    pthread_mutex_lock(&pool->lock);
+    for (size_t i = 0; i < pool->count; ++i)
+        worker_pool_entry_close(&pool->entries[i]);
+    pool->count = 0;
+    pthread_mutex_unlock(&pool->lock);
+    return NULL;
+}
+
+static worker_pool *worker_pool_start(const tg_epoll_proxy_config *config) {
+    if (!config || !config->routing_config || !config->tls_context ||
+        !config->enable_direct_wss || config->resolve_domain ||
+        !config->routing_config->cf_worker_domain_count)
+        return NULL;
+    tg_route_only only = config->routing_config->route_only;
+    if (only != TG_ROUTE_ONLY_AUTO && only != TG_ROUTE_ONLY_WORKER)
+        return NULL;
+    worker_pool *pool = calloc(1, sizeof(*pool));
+    if (!pool) return NULL;
+    pool->tls_context = config->tls_context;
+    pool->socket_mark = config->socket_mark;
+    pool->require_socket_mark = config->require_socket_mark;
+    snprintf(pool->domain, sizeof(pool->domain), "%s",
+             config->routing_config->cf_worker_domains[0]);
+    if (!pool->domain[0]) { free(pool); return NULL; }
+    static const uint32_t candidates[] = {1, 2, 3, 4, 5, 203};
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        char path[512];
+        if (worker_path_for_dc(candidates[i], path, sizeof(path)) != 0)
+            continue;
+        pool->dcs[pool->dc_count] = candidates[i];
+        memcpy(pool->paths[pool->dc_count], path, strlen(path) + 1u);
+        ++pool->dc_count;
+    }
+    if (!pool->dc_count) { free(pool); return NULL; }
+    if (pthread_mutex_init(&pool->lock, NULL) != 0) {
+        free(pool);
+        return NULL;
+    }
+    if (pthread_cond_init(&pool->wake, NULL) != 0) {
+        pthread_mutex_destroy(&pool->lock);
+        free(pool);
+        return NULL;
+    }
+    pool->stopping = 0;
+    pool->started = pthread_create(&pool->thread, NULL, worker_pool_thread,
+                                   pool) == 0 ? 1 : 0;
+    if (!pool->started) {
+        pthread_cond_destroy(&pool->wake);
+        pthread_mutex_destroy(&pool->lock);
+        free(pool);
+        return NULL;
+    }
+    return pool;
+}
+
+static int worker_pool_take(worker_pool *pool, uint32_t dc,
+                            worker_pool_entry *out) {
+    if (!pool || !out) return 0;
+    worker_pool_entry stale[TG_WORKER_POOL_MAX];
+    size_t stale_count = 0;
+    int found = 0;
+    pthread_mutex_lock(&pool->lock);
+    uint64_t now = monotonic_ms();
+    for (size_t i = 0; i < pool->count;) {
+        if (pool->entries[i].dc_id != dc) { ++i; continue; }
+        if (now - pool->entries[i].created_ms >= TG_WORKER_POOL_MAX_AGE_MS ||
+            !worker_pool_entry_alive(&pool->entries[i])) {
+            stale[stale_count++] = pool->entries[i];
+            pool->entries[i] = pool->entries[--pool->count];
+            continue;
+        }
+        *out = pool->entries[i];
+        pool->entries[i] = pool->entries[--pool->count];
+        (void)pthread_cond_signal(&pool->wake);
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&pool->lock);
+    for (size_t i = 0; i < stale_count; ++i)
+        worker_pool_entry_close(&stale[i]);
+    return found;
+}
+
+static void worker_pool_stop(worker_pool *pool) {
+    if (!pool) return;
+    pthread_mutex_lock(&pool->lock);
+    pool->stopping = 1;
+    (void)pthread_cond_signal(&pool->wake);
+    pthread_mutex_unlock(&pool->lock);
+    if (pool->started) (void)pthread_join(pool->thread, NULL);
+    pthread_mutex_lock(&pool->lock);
+    for (size_t i = 0; i < pool->count; ++i)
+        worker_pool_entry_close(&pool->entries[i]);
+    pool->count = 0;
+    pthread_mutex_unlock(&pool->lock);
+    pthread_cond_destroy(&pool->wake);
+    pthread_mutex_destroy(&pool->lock);
+    free(pool);
+}
+
+static int attach_pooled_worker(proxy_connection *connection,
+                                worker_pool_entry *entry) {
+    if (!connection || !entry || entry->fd < 0 || !entry->ssl) return -1;
+    tg_epoll_proxy *server = connection->server;
+    connection->upstream_fd = entry->fd;
+    connection->upstream_ssl = entry->ssl;
+    entry->fd = -1;
+    entry->ssl = NULL;
+    connection->direct_wss = 1;
+    connection->from_worker_pool = 1;
+    connection->packet_framing = 0;
+    connection->wss_subprotocol = 0;
+    connection->connecting = 0;
+    connection->upstream_connect_deadline_ms = 0;
+    snprintf(connection->tls_hostname, sizeof(connection->tls_hostname),
+             "%s", entry->hostname);
+    snprintf(connection->wss_path, sizeof(connection->wss_path),
+             "%s", entry->path);
+    /* The pooled TLS/WS handshake is already complete; run the same
+       post-upgrade setup as a cold worker so the MTProto cipher, splitter and
+       replay state are initialized before the first response arrives. */
+    if (establish_wss_stream(connection) != 0) return -1;
+    connection->upstream_watch = (socket_watch){
+        .kind = 2, .connection = connection, .side = 1,
+        .fd = connection->upstream_fd
+    };
+    if (watch_update(server, &connection->upstream_watch,
+                     upstream_events(connection)) != 0)
+        return -1;
+    return 0;
 }
 
 static int prepare_wss_tls(proxy_connection *connection) {
@@ -1062,6 +1491,8 @@ static void clear_wss_state(proxy_connection *connection) {
     connection->wss_phase = WSS_NONE;
     connection->tls_want = 0;
     connection->wss_deadline_ms = 0;
+    connection->next_ping_ms = 0;
+    connection->wss_close_queued = 0;
 }
 
 static void clear_route_attempt(proxy_connection *connection, int failed) {
@@ -1087,6 +1518,7 @@ static void clear_route_attempt(proxy_connection *connection, int failed) {
 route_attempt_cleared:
     if (connection->direct_wss && server->active_wss_connections)
         --server->active_wss_connections;
+    wss_close_best_effort(connection);
     watch_remove(server, &connection->upstream_watch);
     clear_wss_state(connection);
     if (connection->upstream_fd >= 0) close(connection->upstream_fd);
@@ -1096,6 +1528,7 @@ route_attempt_cleared:
     connection->upstream_shutdown = 0;
     connection->upstream_connect_deadline_ms = 0;
     connection->direct_wss = 0;
+    connection->from_worker_pool = 0;
     connection->route_health_index = -1;
     connection->route_data_seen = 0;
     connection->route_response_seen = 0;
@@ -1291,6 +1724,21 @@ static int start_next_route(proxy_connection *connection) {
             connection->route_response_seen = 0;
             connection->route_started_ms = monotonic_ms();
             if (health->attempts != UINT64_MAX) ++health->attempts;
+        }
+        if (step.kind == TG_ROUTE_CF_WORKER && server->worker_pool) {
+            worker_pool_entry pooled;
+            if (worker_pool_take(server->worker_pool, connection->route_dc_id,
+                                 &pooled)) {
+                ++server->worker_pool_hits;
+                connection->direct_wss = 1;
+                ++server->active_wss_connections;
+                if (attach_pooled_worker(connection, &pooled) == 0)
+                    return 0;
+                --server->active_wss_connections;
+                clear_route_attempt(connection, 1);
+                continue;
+            }
+            ++server->worker_pool_misses;
         }
         connection->direct_wss = 1;
         connection->wss_phase = WSS_NONE;
@@ -1595,10 +2043,12 @@ static void advance_half_closes(proxy_connection *connection) {
                                         queue_wss_packet, connection)
             : TG_MTPROTO_SPLIT_OK;
         if (split_rc != TG_MTPROTO_SPLIT_OK ||
-            tg_ws_pump_queue_close(&connection->ws_pump) != 0) {
+            (!connection->wss_close_queued &&
+             tg_ws_pump_queue_close(&connection->ws_pump) != 0)) {
             connection_close(connection);
             return;
         }
+        connection->wss_close_queued = 1;
         connection->upstream_shutdown = 1;
     }
     if (!connection->connecting && connection->upstream_fd >= 0 &&
@@ -1678,25 +2128,33 @@ static int route_after_handshake(proxy_connection *connection) {
     have_preferred = route_health_preferred_step(server, connection,
                                                   &preferred);
     int prefer_cf = policy == TG_WS_ROUTING_ADAPTIVE && have_preferred &&
-        (preferred.kind == TG_ROUTE_CF_WORKER ||
-         preferred.kind == TG_ROUTE_CF_PROXY);
+        preferred.kind == TG_ROUTE_CF_PROXY;
+    tg_route_only route_only = server->config.routing_config
+        ? server->config.routing_config->route_only : TG_ROUTE_ONLY_AUTO;
     int diagnostic_direct_tcp = server->config.routing_config &&
         server->config.routing_config->diagnostic_direct_tcp;
+    if (route_only == TG_ROUTE_ONLY_TCP) diagnostic_direct_tcp = 1;
     if (tg_route_plan_build(selection.tcp_only ? 0 : connection->route_dc_id,
                             connection->route_is_media, policy, prefer_cf,
                             worker_count, cf_count, diagnostic_direct_tcp,
                             &connection->route_plan) != 0)
         return -1;
+    if (route_only != TG_ROUTE_ONLY_AUTO &&
+        route_plan_keep_only(&connection->route_plan, route_only) != 0) {
+        route_failure_record(connection, TG_ROUTE_NONE,
+                             TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE);
+        return -1;
+    }
     if (!connection->route_plan.count) {
         route_failure_record(connection, TG_ROUTE_NONE,
                              TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE);
         return -1;
     }
     if (policy == TG_WS_ROUTING_ADAPTIVE) {
-        if (have_preferred) {
+        if (have_preferred && preferred.kind != TG_ROUTE_CF_WORKER) {
             route_plan_prioritize(&connection->route_plan, &preferred);
         } else {
-            /* Try every configured CF Proxy variant before slow direct WSS. */
+            /* CF Worker остаётся резервом после прямого WSS и CF Proxy. */
             route_plan_prioritize_kind(&connection->route_plan,
                                        TG_ROUTE_CF_PROXY);
         }
@@ -2101,6 +2559,9 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
     }
     if (response > 0 && !connection->route_response_seen) {
         connection->route_response_seen = 1;
+        if (connection->from_worker_pool &&
+            connection->server->worker_pool_responses != UINT64_MAX)
+            ++connection->server->worker_pool_responses;
         record_client_response_latency(connection->server, connection);
         route_session_first_response(connection);
         if (connection->route_health_index >= 0) {
@@ -2173,6 +2634,8 @@ static int establish_wss_stream(proxy_connection *connection) {
     connection->wss_deadline_ms = monotonic_ms() +
         connection->server->config.handshake_timeout_ms;
     connection->last_activity_ms = monotonic_ms();
+    connection->next_ping_ms = connection->last_activity_ms +
+                               ws_ping_interval_ms;
     if (flush_wss_replay(connection) != 0) return -1;
     return 0;
 }
@@ -2202,10 +2665,12 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
                 tg_ws_upgrade_start_ex(&connection->ws_upgrade,
                     connection->tls_hostname, connection->wss_path,
                     connection->wss_subprotocol ? "binary" : NULL,
-                    "https://web.telegram.org",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36") != 0)
+                    connection->route_kind == TG_ROUTE_CF_WORKER
+                        ? NULL : "https://web.telegram.org",
+                    connection->route_kind == TG_ROUTE_CF_WORKER
+                        ? NULL : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  "Chrome/131.0.0.0 Safari/537.36") != 0)
                 return -1;
             connection->wss_phase = WSS_UPGRADE_WRITE;
             connection->tls_want = EPOLLOUT;
@@ -2594,6 +3059,9 @@ static int timeout_until_expiry(tg_epoll_proxy *server, int timeout_ms) {
                     ? connection->last_activity_ms +
                       server->config.idle_timeout_ms
                     : connection->handshake_deadline_ms;
+        if (connection->wss_phase == WSS_READY && connection->next_ping_ms &&
+            connection->next_ping_ms < expires)
+            expires = connection->next_ping_ms;
         if (connection->route_dns_pending &&
             connection->route_dns_deadline_ms < expires)
             expires = connection->route_dns_deadline_ms;
@@ -2611,6 +3079,10 @@ static int timeout_until_expiry(tg_epoll_proxy *server, int timeout_ms) {
                     ? candidate->wss_deadline_ms
                     : candidate->last_activity_ms +
                       server->config.idle_timeout_ms;
+                if (candidate->wss_phase == WSS_READY &&
+                    candidate->next_ping_ms &&
+                    candidate->next_ping_ms < expires)
+                    expires = candidate->next_ping_ms;
                 if (candidate->connecting &&
                     candidate->upstream_connect_deadline_ms &&
                     candidate->upstream_connect_deadline_ms < expires)
@@ -2634,10 +3106,29 @@ static void expire_connections(tg_epoll_proxy *server) {
         for (size_t i = 0; i < 2 && !connection->closed; ++i) {
             proxy_connection *candidate = connection->hedges[i];
             if (candidate) {
+                if (candidate->wss_phase == WSS_READY &&
+                    candidate->next_ping_ms &&
+                    now >= candidate->next_ping_ms) {
+                    if (tg_ws_pump_queue_ping(&candidate->ws_pump,
+                                              (const uint8_t *)"d2k", 3) != 0) {
+                        hedge_fail_candidate(candidate);
+                        break;
+                    }
+                    candidate->next_ping_ms = now + ws_ping_interval_ms;
+                    if (watch_update(server, &candidate->upstream_watch,
+                                     upstream_events(candidate)) != 0) {
+                        hedge_fail_candidate(candidate);
+                        break;
+                    }
+                }
                 uint64_t expires = wss_waiting_for_first_response(candidate)
                     ? candidate->wss_deadline_ms
                     : candidate->last_activity_ms +
                       server->config.idle_timeout_ms;
+                if (candidate->wss_phase == WSS_READY &&
+                    candidate->next_ping_ms &&
+                    candidate->next_ping_ms < expires)
+                    expires = candidate->next_ping_ms;
                 if (candidate->connecting &&
                     candidate->upstream_connect_deadline_ms &&
                     candidate->upstream_connect_deadline_ms < expires)
@@ -2657,6 +3148,21 @@ static void expire_connections(tg_epoll_proxy *server) {
         if (connection->closed) {
             connection = next;
             continue;
+        }
+        if (connection->wss_phase == WSS_READY && connection->next_ping_ms &&
+            now >= connection->next_ping_ms) {
+            if (tg_ws_pump_queue_ping(&connection->ws_pump,
+                                      (const uint8_t *)"d2k", 3) != 0) {
+                connection_close(connection);
+                connection = next;
+                continue;
+            }
+            connection->next_ping_ms = now + ws_ping_interval_ms;
+            connection_update(connection);
+            if (connection->closed) {
+                connection = next;
+                continue;
+            }
         }
         if (connection->route_dns_pending) {
             if (now >= connection->route_dns_deadline_ms) {
@@ -2793,6 +3299,7 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config) {
                                                config->cf_domain_pool);
         }
     }
+    server->worker_pool = worker_pool_start(&server->config);
     if (set_nonblocking(server->listener_fd) != 0) goto fail;
     server->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (server->epoll_fd < 0) goto fail;
@@ -2803,6 +3310,7 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config) {
     return server;
 fail:
     if (server->epoll_fd >= 0) close(server->epoll_fd);
+    worker_pool_stop(server->worker_pool);
     tg_route_dns_destroy(server->route_dns);
     free(server);
     return NULL;
@@ -2837,6 +3345,7 @@ int tg_epoll_proxy_step(tg_epoll_proxy *server, int timeout_ms) {
 
 void tg_epoll_proxy_destroy(tg_epoll_proxy *server) {
     if (!server) return;
+    worker_pool_stop(server->worker_pool);
     while (server->connections) connection_close(server->connections);
     collect_retired(server);
     if (server->epoll_fd >= 0) close(server->epoll_fd);
@@ -2905,6 +3414,9 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
     out->last_failure_stage = server->last_failure_stage;
     out->last_failure_age_ms = server->last_failure_ms &&
         now >= server->last_failure_ms ? now - server->last_failure_ms : 0;
+    out->worker_pool_hits = server->worker_pool_hits;
+    out->worker_pool_misses = server->worker_pool_misses;
+    out->worker_pool_responses = server->worker_pool_responses;
     out->client_response_latency_total =
         server->client_response_latency_total;
     out->client_response_latency_samples =
