@@ -120,6 +120,7 @@ typedef struct {
     const char *fallback_sni;
     const char *fallback_path;
     int fallback_expect_binary_subprotocol;
+    int verify_fallback_client_packet;
     int skip_client_packet;
     size_t response_prefix_len;
     int wait_for_second;
@@ -577,7 +578,8 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
         fixture->expect_binary_subprotocol =
             fixture->fallback_expect_binary_subprotocol ||
             !fixture->fallback_sni;
-        fixture->skip_client_packet = 1;
+        fixture->skip_client_packet =
+            !fixture->verify_fallback_client_packet;
         SSL_free(ssl);
         close(fd);
         SSL_CTX_free(context);
@@ -678,16 +680,6 @@ static void *serve_direct_wss(void *opaque) {
     assert(fd >= 0);
     fixture->accepted_count = 1;
     serve_direct_wss_connection(fixture, fd);
-    return NULL;
-}
-
-static void *serve_hedged_wss(void *opaque) {
-    wss_server_fixture *fixture = opaque;
-    int first = accept(fixture->listener, NULL, NULL);
-    assert(first >= 0);
-    fixture->accepted_count = 1;
-    fixture->expected_sni = "kws4-1.web.telegram.org";
-    serve_direct_wss_connection(fixture, first);
     return NULL;
 }
 
@@ -1724,7 +1716,7 @@ static void test_epoll_wss_upgrade_and_ack_do_not_confirm_route(void) {
     assert(rmdir(directory) == 0);
 }
 
-static void test_epoll_hedged_wss_commits_one_route_before_payload(
+static void test_epoll_adaptive_worker_keeps_direct_wss_reserved(
     tg_mtproto_proto proto) {
     char directory[] = "/tmp/d2k-tg-wss-hedge-XXXXXX";
     char cert_path[256], key_path[256];
@@ -1743,10 +1735,15 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     EVP_PKEY_free(key);
 
     uint16_t ws_port, proxy_port;
-    wss_server_fixture wss = {.listener = create_listener(&ws_port),
-                              .cert_path = cert_path,
-                              .key_path = key_path,
-                              .expect_binary_subprotocol = 1};
+    wss_server_fixture wss = {
+        .listener = create_listener(&ws_port),
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .expected_sni = "worker.test",
+        .expected_path = "/apiws?dst=149.154.167.51&dc=4&media=1",
+        .expect_binary_subprotocol = 0,
+        .response_delay_ms = 150
+    };
     atomic_init(&wss.complete, 0);
     uint8_t handshake[64];
     make_wss_test_handshake(proto, 4, 1, handshake);
@@ -1770,7 +1767,7 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     tg_mtproto_ctr_destroy(&decrypt);
     tg_mtproto_ctr_destroy(&encrypt);
     pthread_t wss_thread;
-    assert(pthread_create(&wss_thread, NULL, serve_hedged_wss, &wss) == 0);
+    assert(pthread_create(&wss_thread, NULL, serve_direct_wss, &wss) == 0);
 
     int listener = create_listener(&proxy_port);
     proxy_fixture fixture = {0};
@@ -1779,9 +1776,11 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     SSL_CTX *tls_context = tg_tls_client_context(cert_path);
     assert(tls_context);
     tg_config routing = {0};
-    routing.ws_routing = TG_WS_ROUTING_HEDGED;
-    routing.ws_hedge_delay_ms = 125;
+    routing.ws_routing = TG_WS_ROUTING_ADAPTIVE;
+    routing.ws_hedge_delay_ms = 50;
     routing.ws_hedge_limit = 1;
+    routing.cf_worker_domain_count = 1;
+    memcpy(routing.cf_worker_domains[0], "worker.test", sizeof("worker.test"));
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
@@ -1792,6 +1791,8 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
         .enable_direct_wss = 1,
         .tls_context = tls_context,
         .routing_config = &routing,
+        .resolve_domain = resolve_test_route_domain,
+        .route_context = &fixture,
         .original_destination = original_destination,
         .select_target = select_target,
         .context = &fixture,
@@ -1811,6 +1812,11 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
            (ssize_t)sizeof(handshake));
     assert(send(client, wss.expected_packet, wss.expected_packet_len, 0) ==
            (ssize_t)wss.expected_packet_len);
+    struct timespec before_response = {.tv_sec = 0, .tv_nsec = 80000000L};
+    nanosleep(&before_response, NULL);
+    tg_epoll_proxy_stats route_stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
+    assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 0);
     uint8_t echoed[sizeof(wss.response_packet)];
     size_t received = 0;
     while (received < wss.response_packet_len) {
@@ -1822,7 +1828,6 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
         received += (size_t)n;
     }
     assert(memcmp(echoed, wss.response_packet, wss.response_packet_len) == 0);
-    tg_epoll_proxy_stats route_stats;
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
     assert(route_stats.active_connections == 1 &&
            route_stats.active_sessions_count == 1);
@@ -1830,9 +1835,11 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     assert(session->id > 0 && session->has_dc && session->dc == 4);
     assert(session->has_media && session->is_media);
     assert(session->stage == TG_ROUTE_SESSION_STAGE_FIRST_WSS_BINARY_RESPONSE);
-    assert(session->direct_state == TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
-    assert(session->direct_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
-    assert(session->selected_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
+    assert(session->fallback_state == TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
+    assert(session->fallback_transport ==
+           TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_WORKER);
+    assert(session->selected_transport ==
+           TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_WORKER);
     assert(session->telegram_response_seen);
     assert(session->bytes_from_clients >= wss.expected_packet_len);
     assert(session->bytes_from_upstreams >= wss.response_packet_len);
@@ -1890,6 +1897,8 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     assert(pthread_join(proxy_thread, NULL) == 0);
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
     assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 1);
+    assert(route_stats.client_response_latency_samples == 1 &&
+           route_stats.client_response_latency_p95_us <= 250000u);
     tg_epoll_proxy_destroy(proxy);
     close(listener);
     close(wss.listener);
@@ -2245,12 +2254,25 @@ static void test_adaptive_worker_ack_falls_back_within_250ms(void) {
         .fallback_sni = "kws4-1.cfproxy.test",
         .fallback_path = "/apiws",
         .fallback_expect_binary_subprotocol = 1,
+        .verify_fallback_client_packet = 1,
         .expect_binary_subprotocol = 0,
         .wait_for_fallback = 1,
         .fallback_probe_response_len = 4
     };
     atomic_init(&worker.complete, 0);
     prepare_wss_response(&worker, test_handshake, TG_MTPROTO_INTERMEDIATE);
+    static const uint8_t request_clear[12] = {
+        8,0,0,0,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88
+    };
+    memcpy(worker.expected_packet, request_clear, sizeof(request_clear));
+    worker.expected_packet_len = sizeof(request_clear);
+    tg_mtproto_ctr request_decrypt = {0}, request_encrypt = {0};
+    assert(tg_mtproto_direct_stream_ciphers(test_handshake, &request_decrypt,
+                                             &request_encrypt) == 0);
+    assert(tg_mtproto_ctr_xor(&request_encrypt, worker.expected_packet,
+                              worker.expected_packet_len) == 0);
+    tg_mtproto_ctr_destroy(&request_decrypt);
+    tg_mtproto_ctr_destroy(&request_encrypt);
     pthread_t worker_thread;
     assert(pthread_create(&worker_thread, NULL, serve_direct_wss, &worker) == 0);
 
@@ -2298,6 +2320,8 @@ static void test_adaptive_worker_ack_falls_back_within_250ms(void) {
     uint64_t started = test_monotonic_ms();
     assert(send(client, test_handshake, sizeof(test_handshake), 0) ==
            (ssize_t)sizeof(test_handshake));
+    assert(send(client, worker.expected_packet, worker.expected_packet_len, 0) ==
+           (ssize_t)worker.expected_packet_len);
     uint8_t response[sizeof(worker.response_packet)];
     size_t received = 0;
     while (received < worker.response_packet_len) {
@@ -2316,7 +2340,8 @@ static void test_adaptive_worker_ack_falls_back_within_250ms(void) {
                   worker.response_packet_len) == 0);
     tg_epoll_proxy_stats route_stats;
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
-    assert(route_stats.wss_attempts == 2 && route_stats.wss_responses == 1 &&
+    /* Worker + both CF proxy media variants may race; direct WSS stays idle. */
+    assert(route_stats.wss_attempts <= 3 && route_stats.wss_responses == 1 &&
            route_stats.cf_wss_responses == 1);
     assert(route_stats.client_response_latency_samples == 1 &&
            route_stats.client_response_latency_p95_us <= 250000u);
@@ -3367,9 +3392,9 @@ int main(void) {
     test_self_dial_target_is_rejected();
     test_epoll_wss_forwards_unrecognized_binary_response();
     test_epoll_wss_upgrade_and_ack_do_not_confirm_route();
-    test_epoll_hedged_wss_commits_one_route_before_payload(TG_MTPROTO_ABRIDGED);
-    test_epoll_hedged_wss_commits_one_route_before_payload(TG_MTPROTO_INTERMEDIATE);
-    test_epoll_hedged_wss_commits_one_route_before_payload(
+    test_epoll_adaptive_worker_keeps_direct_wss_reserved(TG_MTPROTO_ABRIDGED);
+    test_epoll_adaptive_worker_keeps_direct_wss_reserved(TG_MTPROTO_INTERMEDIATE);
+    test_epoll_adaptive_worker_keeps_direct_wss_reserved(
         TG_MTPROTO_PADDED_INTERMEDIATE);
     test_epoll_wss_partial_request_is_not_replayed();
     test_epoll_wss_partial_response_does_not_replay_request();

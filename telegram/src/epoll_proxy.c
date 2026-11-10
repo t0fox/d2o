@@ -38,6 +38,7 @@
 #ifndef TG_ROUTE_HEALTH_COOLDOWN_MS
 #define TG_ROUTE_HEALTH_COOLDOWN_MS 30000u
 #endif
+#define TG_HEDGE_MTPROTO_RESPONSE_TIMEOUT_MS 250u
 
 enum { WSS_NONE, WSS_TLS, WSS_UPGRADE_WRITE, WSS_UPGRADE_READ, WSS_READY };
 
@@ -770,7 +771,6 @@ static int route_health_preferred_step(const tg_epoll_proxy *server,
             !health->last_success_ms || now < health->last_success_ms ||
             health->original.port != target->port ||
             health->cooldown_until_ms > now ||
-            health->last_failure_ms > health->last_success_ms ||
             (health->kind == TG_ROUTE_CF_WORKER &&
              (health->original.family != target->family ||
               memcmp(health->original.address, target->address,
@@ -1341,7 +1341,10 @@ static int hedge_launch_next(proxy_connection *parent) {
         return 0;
     while (parent->route_index < parent->route_plan.count) {
         tg_route_step step = parent->route_plan.steps[parent->route_index];
-        if (step.kind == TG_ROUTE_DIRECT_TCP) return 0;
+        /* Direct WSS stays the final serial fallback; it must not race CF. */
+        if (step.kind == TG_ROUTE_DIRECT_WSS ||
+            step.kind == TG_ROUTE_DIRECT_TCP)
+            return 0;
         ++parent->route_index;
         if (!server->config.enable_direct_wss) continue;
 
@@ -1453,6 +1456,7 @@ static int hedge_fill(proxy_connection *parent, int fill_second_slot) {
         return start_next_route(parent);
     }
     if (current < 2 && parent->route_index < parent->route_plan.count &&
+        parent->route_plan.steps[parent->route_index].kind != TG_ROUTE_DIRECT_WSS &&
         parent->route_plan.steps[parent->route_index].kind != TG_ROUTE_DIRECT_TCP &&
         parent->server->active_wss_connections <
             parent->server->max_wss_connections) {
@@ -1770,11 +1774,15 @@ static int receive_client(proxy_connection *connection) {
                     proxy_connection *candidate = connection->hedges[i];
                     if (!candidate || candidate->wss_phase != WSS_READY)
                         continue;
-                    if (hedge_promote_candidate(candidate) != 0) {
+                    if (hedge_candidate_flush_buffered_payload(candidate) != 0) {
+                        hedge_fail_candidate(candidate);
+                        if (connection->closed) return -1;
+                    } else if (watch_update(connection->server,
+                                            &candidate->upstream_watch,
+                                            upstream_events(candidate)) != 0) {
                         hedge_fail_candidate(candidate);
                         if (connection->closed) return -1;
                     }
-                    break;
                 }
             } else if (connection->direct_wss
                            ? queue_wss_replay_payload(connection, buffer,
@@ -1935,6 +1943,11 @@ static int hedge_candidate_flush_buffered_payload(
                         candidate->hedge_payload_offset, length);
         if (process_client_payload(candidate, buffer, length) != 0) return -1;
         candidate->hedge_payload_offset += length;
+    }
+    if (candidate->hedge_payload_offset && !candidate->route_response_seen) {
+        candidate->wss_client_payload_started = 1;
+        candidate->wss_deadline_ms = monotonic_ms() +
+            TG_HEDGE_MTPROTO_RESPONSE_TIMEOUT_MS;
     }
     return 0;
 }
@@ -2173,6 +2186,9 @@ static int establish_wss_stream(proxy_connection *connection) {
         connection->server->config.handshake_timeout_ms;
     connection->last_activity_ms = monotonic_ms();
     if (flush_wss_replay(connection) != 0) return -1;
+    if (connection->hedge_parent &&
+        hedge_candidate_flush_buffered_payload(connection) != 0)
+        return -1;
     return 0;
 }
 
@@ -2279,7 +2295,18 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
             int pump_rc = tg_ws_pump_process(&connection->ws_pump, revents,
                                              queue_wss_response, connection);
             disable_wss_replay_after_payload_write(connection);
+            if (connection->hedge_parent &&
+                !connection->route_response_seen &&
+                connection->response_observer_disabled) {
+                hedge_fail_candidate(connection);
+                return 0;
+            }
             if (pump_rc != 0) {
+                if (connection->hedge_parent &&
+                    !connection->route_response_seen) {
+                    hedge_fail_candidate(connection);
+                    return 0;
+                }
                 if (connection->route_data_seen) {
                     if (!connection->route_response_seen)
                         route_health_failed(connection);
