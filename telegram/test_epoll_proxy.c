@@ -129,6 +129,7 @@ typedef struct {
     uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN];
     size_t handshake_len;
     uint8_t expected_packet[12];
+    const uint8_t *expected_packet_data;
     size_t expected_packet_len;
     uint8_t response_packet[96];
     size_t response_packet_len;
@@ -420,9 +421,16 @@ static int read_masked_client_frame(SSL *ssl, uint8_t *opcode,
         if (ssl_read_exact(ssl, extended, sizeof(extended)) != 0) return -1;
         length = ((uint64_t)extended[0] << 8) | extended[1];
     } else if (length == 127) {
-        return -1;
+        uint8_t extended[8];
+        if (ssl_read_exact(ssl, extended, sizeof(extended)) != 0 ||
+            (extended[0] & 0x80u))
+            return -1;
+        length = 0;
+        for (size_t i = 0; i < sizeof(extended); ++i)
+            length = (length << 8) | extended[i];
     }
-    if (length > capacity || ssl_read_exact(ssl, mask, sizeof(mask)) != 0 ||
+    if (length > capacity ||
+        ssl_read_exact(ssl, mask, sizeof(mask)) != 0 ||
         (length && ssl_read_exact(ssl, payload, (size_t)length) != 0))
         return -1;
     for (size_t i = 0; i < (size_t)length; ++i) payload[i] ^= mask[i & 3u];
@@ -541,7 +549,7 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
     assert(ssl_write_exact(ssl, (const uint8_t *)response,
                            (size_t)response_len) == 0);
 
-    uint8_t payload[TG_MTPROTO_HANDSHAKE_LEN + 32u], opcode;
+    uint8_t payload[256u * 1024u], opcode;
     size_t payload_len = 0;
     int handshake_frame_rc = read_masked_client_frame(
         ssl, &opcode, payload, sizeof(payload), &payload_len);
@@ -596,13 +604,20 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
         return;
     }
     if (!fixture->skip_client_packet) {
-        int packet_frame_rc = read_masked_client_frame(
-            ssl, &opcode, payload, sizeof(payload), &payload_len);
-        assert(packet_frame_rc == 0);
         size_t expected_len = fixture->expected_packet_len
             ? fixture->expected_packet_len : sizeof(fixture->expected_packet);
-        assert(opcode == TG_WS_BINARY && payload_len == expected_len);
-        assert(memcmp(payload, fixture->expected_packet, payload_len) == 0);
+        const uint8_t *expected = fixture->expected_packet_data
+            ? fixture->expected_packet_data : fixture->expected_packet;
+        size_t received = 0;
+        while (received < expected_len) {
+            int packet_frame_rc = read_masked_client_frame(
+                ssl, &opcode, payload, sizeof(payload), &payload_len);
+            assert(packet_frame_rc == 0 && payload_len > 0 &&
+                   payload_len <= expected_len - received);
+            assert(opcode == TG_WS_BINARY &&
+                   memcmp(payload, expected + received, payload_len) == 0);
+            received += payload_len;
+        }
     }
     if (fixture->wait_for_second) {
         struct pollfd wait = {.fd = fixture->listener, .events = POLLIN};
@@ -1750,19 +1765,30 @@ static void test_epoll_adaptive_worker_keeps_direct_wss_reserved(
     memcpy(wss.handshake, handshake, sizeof(handshake));
     wss.handshake_len = sizeof(handshake);
     prepare_wss_response(&wss, handshake, proto);
-    static const uint8_t request_body[8] =
-        {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88};
-    size_t header_len = proto == TG_MTPROTO_ABRIDGED ? 1u : 4u;
-    wss.expected_packet_len = header_len + sizeof(request_body);
-    wss.expected_packet[0] =
-        proto == TG_MTPROTO_ABRIDGED ? 2u : (uint8_t)sizeof(request_body);
-    memset(wss.expected_packet + 1, 0, header_len - 1u);
-    memcpy(wss.expected_packet + header_len, request_body,
-           sizeof(request_body));
+    uint8_t request_packet[128u * 1024u];
+    size_t request_body_len = sizeof(request_packet) - 4u;
+    memset(request_packet, 0, sizeof(request_packet));
+    if (proto == TG_MTPROTO_ABRIDGED) {
+        uint32_t words = (uint32_t)(request_body_len / 4u);
+        request_packet[0] = 0x7fu;
+        request_packet[1] = (uint8_t)words;
+        request_packet[2] = (uint8_t)(words >> 8);
+        request_packet[3] = (uint8_t)(words >> 16);
+    } else {
+        uint32_t body_len = (uint32_t)request_body_len;
+        request_packet[0] = (uint8_t)body_len;
+        request_packet[1] = (uint8_t)(body_len >> 8);
+        request_packet[2] = (uint8_t)(body_len >> 16);
+        request_packet[3] = (uint8_t)(body_len >> 24);
+    }
+    for (size_t i = 4; i < sizeof(request_packet); ++i)
+        request_packet[i] = (uint8_t)(i * 17u + 3u);
+    wss.expected_packet_data = request_packet;
+    wss.expected_packet_len = sizeof(request_packet);
     tg_mtproto_ctr decrypt = {0}, encrypt = {0};
     assert(tg_mtproto_direct_stream_ciphers(handshake, &decrypt,
                                              &encrypt) == 0);
-    assert(tg_mtproto_ctr_xor(&encrypt, wss.expected_packet,
+    assert(tg_mtproto_ctr_xor(&encrypt, request_packet,
                               wss.expected_packet_len) == 0);
     tg_mtproto_ctr_destroy(&decrypt);
     tg_mtproto_ctr_destroy(&encrypt);
@@ -1783,7 +1809,7 @@ static void test_epoll_adaptive_worker_keeps_direct_wss_reserved(
     memcpy(routing.cf_worker_domains[0], "worker.test", sizeof("worker.test"));
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
-        .queue_bytes = 4096,
+        .queue_bytes = 1024,
         .memory_budget_bytes = 64u * 1024u * 1024u,
         .configured_max_connections = 8,
         .handshake_timeout_ms = 3000,
@@ -1810,7 +1836,7 @@ static void test_epoll_adaptive_worker_keeps_direct_wss_reserved(
                       sizeof(timeout)) == 0);
     assert(send(client, handshake, sizeof(handshake), 0) ==
            (ssize_t)sizeof(handshake));
-    assert(send(client, wss.expected_packet, wss.expected_packet_len, 0) ==
+    assert(send(client, request_packet, wss.expected_packet_len, 0) ==
            (ssize_t)wss.expected_packet_len);
     struct timespec before_response = {.tv_sec = 0, .tv_nsec = 80000000L};
     nanosleep(&before_response, NULL);

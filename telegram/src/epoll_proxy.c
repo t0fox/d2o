@@ -475,6 +475,13 @@ static void queue_release(proxy_connection *connection, byte_queue *queue) {
     queue->dynamic_bytes = 0;
 }
 
+static size_t client_queue_limit(const proxy_connection *connection) {
+    /* Keep one complete MTProto packet replayable until a route is confirmed. */
+    if (connection && connection->route_racing)
+        return TG_MTPROTO_MAX_PACKET;
+    return connection ? connection->server->config.queue_bytes : 0;
+}
+
 static int queue_flush(int fd, byte_queue *queue, uint64_t *last_activity,
                        proxy_connection *connection) {
     while (queue->len) {
@@ -503,8 +510,8 @@ static uint32_t client_events(const proxy_connection *connection) {
         (!connection->direct_wss || connection->wss_phase == WSS_READY);
     int wss_backpressure = connection->ws_pump_ready &&
                            connection->ws_pump.tx_memory_bytes != 0;
-    int queue_has_room = connection->to_upstream.len <
-                         connection->server->config.queue_bytes;
+    size_t queue_limit = client_queue_limit(connection);
+    int queue_has_room = connection->to_upstream.len < queue_limit;
     if ((!connection->route_dns_pending || !connection->route_dns_peer_fin) &&
         (!connection->route_racing || queue_has_room)) events |= EPOLLRDHUP;
     if (!connection->client_eof && upstream_ready && !wss_backpressure &&
@@ -1561,6 +1568,10 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
         .fd = parent->upstream_fd
     };
     parent->wss_forwarded_offset = candidate->hedge_payload_offset;
+    if (parent->route_data_seen) {
+        queue_release(parent, &parent->to_upstream);
+        parent->wss_forwarded_offset = 0;
+    }
     parent->route_racing = 0;
     parent->hedge_due_ms = 0;
 
@@ -1727,11 +1738,11 @@ static int receive_client(proxy_connection *connection) {
              connection->ws_pump.tx_memory_bytes != 0))
             return 0;
         size_t capacity = sizeof(buffer);
+        size_t queue_limit = client_queue_limit(connection);
         if (!connection->handshake_done) {
             capacity = sizeof(connection->handshake) - connection->handshake_len;
             if (!capacity) return -1;
         } else {
-            size_t queue_limit = connection->server->config.queue_bytes;
             size_t free_bytes = connection->to_upstream.len < queue_limit
                 ? queue_limit - connection->to_upstream.len : 0;
             if (!free_bytes && connection->direct_wss &&
@@ -1767,13 +1778,17 @@ static int receive_client(proxy_connection *connection) {
             } else if (connection->route_racing) {
                 if (queue_append_grow(connection, &connection->to_upstream,
                                      buffer, (size_t)n,
-                                     connection->server->config.queue_bytes) != 0)
+                                     queue_limit) != 0)
                     return -1;
                 connection->wss_client_payload_started = 1;
                 for (size_t i = 0; i < 2; ++i) {
                     proxy_connection *candidate = connection->hedges[i];
-                    if (!candidate || candidate->wss_phase != WSS_READY)
+                    if (!candidate) continue;
+                    if (candidate->wss_phase != WSS_READY) {
+                        candidate->wss_deadline_ms = monotonic_ms() +
+                            TG_HEDGE_MTPROTO_RESPONSE_TIMEOUT_MS;
                         continue;
+                    }
                     if (hedge_candidate_flush_buffered_payload(candidate) != 0) {
                         hedge_fail_candidate(candidate);
                         if (connection->closed) return -1;
@@ -2265,12 +2280,8 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
             }
             if (rc == 1) {
                 if (establish_wss_stream(connection) != 0) return -1;
-                if (connection->hedge_parent) {
-                    proxy_connection *parent = connection->hedge_parent;
-                    if (parent->to_upstream.len >
-                        connection->hedge_payload_offset)
-                        return hedge_promote_candidate(connection);
-                } else if (flush_wss_replay(connection) != 0) {
+                if (!connection->hedge_parent &&
+                    flush_wss_replay(connection) != 0) {
                     return -1;
                 }
                 continue;
