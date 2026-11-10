@@ -193,10 +193,7 @@ static int discover_wss_host(SSL_CTX *tls_context, tg_route_dns *route_dns,
     size_t seen_count = 0;
     while (!discovery_cancelled(cancelled, dns_deadline)) {
         tg_listener_destination target = {0};
-        int dns_status = tg_route_dns_resolve_status(route_dns, hostname,
-                                                       &target);
-        if (dns_status < 0) return -1;
-        if (dns_status > 0) {
+        if (tg_route_dns_resolve(route_dns, hostname, &target) != 0) {
             struct timespec pause = {.tv_sec = 0, .tv_nsec = 50000000L};
             (void)nanosleep(&pause, NULL);
             continue;
@@ -241,6 +238,14 @@ static int refresh_local_dc_map(const tg_config *config,
     uint64_t started = monotonic_ms();
     if (!started) return -1;
     uint64_t deadline = started + TG_DC_DISCOVERY_TOTAL_MS;
+    for (size_t i = 0; i < 3; ++i) {
+        if (discovery_cancelled(cancelled, deadline)) return -1;
+        if (tg_mtproto_discover_config(dc_bootstraps[i].address, 443,
+                dc_bootstraps[i].dc_id, TG_DC_DISCOVERY_TIMEOUT_MS,
+                TG_OUTBOUND_SOCKET_MARK, now, snapshot) == 0)
+            return 0;
+    }
+
     for (size_t i = 0; i < sizeof(dc_bootstraps) / sizeof(dc_bootstraps[0]);
          ++i) {
         uint32_t dc_id = dc_bootstraps[i].dc_id;
@@ -283,16 +288,6 @@ static int refresh_local_dc_map(const tg_config *config,
                     dc_id, now, cancelled, deadline, snapshot) == 0)
                 return 0;
         }
-    }
-
-    /* Prefer the configured Worker/CF transports. Avoid spending three
-     * full direct-TCP probe timeouts before discovery even tries them. */
-    for (size_t i = 0; i < 3; ++i) {
-        if (discovery_cancelled(cancelled, deadline)) return -1;
-        if (tg_mtproto_discover_config(dc_bootstraps[i].address, 443,
-                dc_bootstraps[i].dc_id, TG_DC_DISCOVERY_TIMEOUT_MS,
-                TG_OUTBOUND_SOCKET_MARK, now, snapshot) == 0)
-            return 0;
     }
     return -1;
 }

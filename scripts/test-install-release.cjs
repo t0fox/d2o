@@ -21,10 +21,6 @@ function put(file, contents, mode = 0o755) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, contents, { mode });
 }
-function hasPath(file) {
-  try { fs.lstatSync(file); return true; }
-  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-}
 try {
   // OpenSSL 3: pkeyutl -rawin для Ed25519 (у macOS свой LibreSSL без него).
   const openssl = ['/opt/homebrew/opt/openssl@3/bin/openssl', '/usr/local/opt/openssl@3/bin/openssl', '/usr/bin/openssl']
@@ -41,10 +37,7 @@ try {
     try { names = fs.readdirSync(dir); } catch { continue; }
     for (const name of names) {
       const target = path.join(sys, name);
-      if (!hidden.has(name) && !hasPath(target)) {
-        try { fs.symlinkSync(path.join(dir, name), target); }
-        catch (error) { if (error.code !== 'EEXIST') throw error; }
-      }
+      if (!hidden.has(name) && !fs.existsSync(target)) fs.symlinkSync(path.join(dir, name), target);
     }
   }
   const bin = path.join(tmp, 'bin');

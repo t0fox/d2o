@@ -133,7 +133,7 @@ int tg_config_read(const char *path,tg_config *out) {
     if(!path||!out)return -1;
     memset(out,0,sizeof(*out));out->listen_port=1443;
     out->ws_routing=TG_WS_ROUTING_ADAPTIVE;
-    out->ws_hedge_delay_ms=50;
+    out->ws_hedge_delay_ms=125;
     out->ws_hedge_limit=8;
     out->default_domains=1;
     if(copy_value(out->ca_bundle,sizeof(out->ca_bundle),"/opt/d2k/files/tg-roots.pem")||
