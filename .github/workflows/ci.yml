@@ -231,8 +231,17 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-      - name: Install tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq busybox
+      - name: Install BusyBox
+        run: |
+          . /etc/os-release
+          sources="$RUNNER_TEMP/d2o-busybox.list"
+          # Use the signed Ubuntu archive directly so runner mirror selection
+          # cannot route this install through an unavailable security mirror.
+          printf 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu/ %s main universe\n' "$VERSION_CODENAME" > "$sources"
+          apt_options=(-o "Dir::Etc::sourcelist=$sources" -o Dir::Etc::sourceparts=- -o Acquire::Retries=2)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -qq
+          sudo apt-get "${apt_options[@]}" install -y -qq busybox
+          busybox ash -c ':'
       # Integration tests run against built code, not source. The controller
       # handshake test starts the real core/d2kc.
       - name: Build the controller
