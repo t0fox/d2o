@@ -126,6 +126,7 @@ file "$ROOT/build/telegram/openssl-link-smoke-$ARCH"
     "$ROOT/telegram/src/mtproto_probe.c" \
     "$ROOT/telegram/src/mtproto_auth.c" \
     "$ROOT/telegram/src/mtproto_splitter.c" \
+    "$ROOT/telegram/src/faketls.c" \
     "$ROOT/telegram/src/dc_map.c" \
     "$ROOT/telegram/src/dc_map_json.c" \
     "$ROOT/telegram/src/dc_map_store.c" \
