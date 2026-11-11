@@ -80,49 +80,27 @@ jobs:
       - name: QEMU and tools
         run: |
           set -euo pipefail
-          APT_OPTS=(
-            -o Acquire::ForceIPv4=true
-            -o Acquire::Retries=3
-            -o Acquire::http::Timeout=30
-            -o Acquire::https::Timeout=30
-            -o DPkg::Lock::Timeout=120
-          )
-          # GitHub's azure mirror иногда зависает; archive.ubuntu.com —
-          # канонический запасной вариант. IPv4 обязателен: сломанный IPv6
-          # на runner'е даёт ровно такое зависание без вывода.
-          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
-              /etc/apt/sources.list.d/ubuntu.sources
-          fi
-          for attempt in 1 2 3; do
-            if timeout 120 sudo apt-get "${APT_OPTS[@]}" update -qq 2>&1 | tee /tmp/apt-update.log; then
-              break
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              echo "::error::apt-get update failed after 3 attempts"
-              sed -n '1,25p' /tmp/apt-update.log | while IFS= read -r line; do
-                echo "::error::$line"
-              done
-              exit 1
-            fi
-            echo "apt-get update failed (attempt $attempt); retrying"
-            sleep 10
+          # apt-get в этом окружении зависает на update (три таймаута по
+          # 240 с в логе 11.11.2026). QEMU берём статическим бинарником:
+          # обновление индексов apt для него не нужно, а -cpu и -L он
+          # поддерживает так же, как пакет qemu-user.
+          dest="${RUNNER_TEMP}/qemu"
+          mkdir -p "$dest"
+          for arch in aarch64 arm mips mipsel mips64el ppc64 riscv64 i386 x86_64; do
+            url="https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/qemu-${arch}-static.tar.gz"
+            curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+              -o "$dest/$arch.tgz" "$url"
+            tar -xzf "$dest/$arch.tgz" -C "$dest"
+            sudo install -m 0755 "$dest/qemu-${arch}-static" "/usr/local/bin/qemu-${arch}"
           done
-          for attempt in 1 2 3; do
-            if timeout 300 sudo apt-get "${APT_OPTS[@]}" install -y -qq \
-              make python3 qemu-user binutils file nodejs 2>&1 | tee /tmp/apt-install.log; then
-              break
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              echo "::error::apt-get install failed after 3 attempts"
-              sed -n '1,25p' /tmp/apt-install.log | while IFS= read -r line; do
-                echo "::error::$line"
-              done
+          for tool in file readelf make python3 node; do
+            command -v "$tool" >/dev/null || {
+              echo "::error::$tool is not preinstalled on the runner"
               exit 1
-            fi
-            echo "apt-get install failed (attempt $attempt); retrying"
-            sleep 10
+            }
           done
+          qemu-aarch64 --version | head -1
+          qemu-mips --version | head -1
       # No cache in a release build: a cache hit would skip the SHA-256 check.
       - uses: ./.github/actions/setup-zig
         with:
