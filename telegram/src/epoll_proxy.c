@@ -34,6 +34,7 @@
 #define TG_ROUTE_HEALTH_MAX 256u
 #define TG_CLIENT_LATENCY_SAMPLE_COUNT 128u
 #define TG_HEDGE_DELAY_DEFAULT_MS 125u
+#define TG_HEDGE_CANDIDATES 4u
 #define TG_ROUTE_DNS_WAIT_TIMEOUT_MS 20000u
 #define TG_ROUTE_DNS_RETRY_MS 50u
 #define TG_WS_PING_INTERVAL_MS 30000u
@@ -94,7 +95,7 @@ struct proxy_connection {
     proxy_connection *next;
     proxy_connection *retired_next;
     proxy_connection *hedge_parent;
-    proxy_connection *hedges[2];
+    proxy_connection *hedges[TG_HEDGE_CANDIDATES];
     struct tg_epoll_proxy *server;
     socket_watch client_watch;
     socket_watch upstream_watch;
@@ -128,6 +129,7 @@ struct proxy_connection {
     uint8_t route_failure_stage;
     tg_active_route_session route_session;
     size_t route_index;
+    uint8_t hedge_step_index;
     size_t route_dns_step_index;
     uint64_t route_dns_retry_at_ms;
     uint64_t route_dns_deadline_ms;
@@ -711,7 +713,7 @@ static int route_health_in_use(const tg_epoll_proxy *server, size_t index) {
          connection = connection->next) {
         if (!connection->closed && connection->route_health_index == (int)index)
             return 1;
-        for (size_t i = 0; i < 2; ++i)
+        for (size_t i = 0; i < TG_HEDGE_CANDIDATES; ++i)
             if (connection->hedges[i] &&
                 connection->hedges[i]->route_health_index == (int)index)
                 return 1;
@@ -1636,7 +1638,7 @@ static void hedge_retire_candidate(proxy_connection *candidate, int failed) {
     if (!candidate || candidate->closed) return;
     proxy_connection *parent = candidate->hedge_parent;
     if (parent) {
-        for (size_t i = 0; i < 2; ++i)
+        for (size_t i = 0; i < TG_HEDGE_CANDIDATES; ++i)
             if (parent->hedges[i] == candidate) parent->hedges[i] = NULL;
     }
     clear_route_attempt(candidate, failed);
@@ -1648,7 +1650,7 @@ static void hedge_retire_candidate(proxy_connection *candidate, int failed) {
 
 static void hedge_cancel_candidates(proxy_connection *connection) {
     if (!connection) return;
-    for (size_t i = 0; i < 2; ++i) {
+    for (size_t i = 0; i < TG_HEDGE_CANDIDATES; ++i) {
         proxy_connection *candidate = connection->hedges[i];
         if (candidate) hedge_retire_candidate(candidate, 0);
         connection->hedges[i] = NULL;
@@ -1891,8 +1893,10 @@ static int advance_route(proxy_connection *connection) {
 }
 
 static size_t hedge_candidate_count(const proxy_connection *connection) {
-    return (connection->hedges[0] != NULL) +
-           (connection->hedges[1] != NULL);
+    size_t count = 0;
+    for (size_t i = 0; i < TG_HEDGE_CANDIDATES; ++i)
+        if (connection->hedges[i]) ++count;
+    return count;
 }
 
 static size_t hedge_connection_count(const tg_epoll_proxy *server) {
@@ -1904,24 +1908,37 @@ static size_t hedge_connection_count(const tg_epoll_proxy *server) {
 }
 
 static size_t hedge_next_index(const proxy_connection *parent) {
-    size_t index = parent->route_index;
-    const proxy_connection *active = parent->hedges[0]
-        ? parent->hedges[0] : parent->hedges[1];
-    if (!active) return index;
-    int direct = active->route_kind == TG_ROUTE_DIRECT_WSS;
-    int has_cf = 0;
-    for (size_t i = 0; i < parent->route_plan.count; ++i) {
-        tg_route_kind kind = parent->route_plan.steps[i].kind;
-        if (kind == TG_ROUTE_CF_WORKER || kind == TG_ROUTE_CF_PROXY) has_cf = 1;
+    size_t direct = 0, worker = 0, cf = 0, cf_index = 0;
+    for (size_t i = 0; i < TG_HEDGE_CANDIDATES; ++i) {
+        const proxy_connection *candidate = parent->hedges[i];
+        if (!candidate) continue;
+        if (candidate->route_kind == TG_ROUTE_DIRECT_WSS) ++direct;
+        else if (candidate->route_kind == TG_ROUTE_CF_WORKER) ++worker;
+        else if (candidate->route_kind == TG_ROUTE_CF_PROXY) {
+            ++cf;
+            cf_index = candidate->hedge_step_index / 2u;
+        }
     }
-    if (!has_cf) return index;
-    while (index < parent->route_plan.count) {
-        tg_route_kind kind = parent->route_plan.steps[index].kind;
-        if (kind == TG_ROUTE_DIRECT_TCP) return parent->route_plan.count;
-        if ((kind == TG_ROUTE_DIRECT_WSS) != direct) break;
-        ++index;
+    size_t next_direct = parent->route_plan.count;
+    size_t next_cf = parent->route_plan.count;
+    for (size_t i = parent->route_index; i < parent->route_plan.count; ++i) {
+        tg_route_step step = parent->route_plan.steps[i];
+        if (step.kind == TG_ROUTE_DIRECT_TCP) break;
+        if (step.kind == TG_ROUTE_DIRECT_WSS) {
+            if (direct < 2 && next_direct == parent->route_plan.count) next_direct = i;
+        } else if (!worker && next_cf == parent->route_plan.count) {
+            if ((step.kind == TG_ROUTE_CF_WORKER && !cf) ||
+                (step.kind == TG_ROUTE_CF_PROXY && cf < 2 &&
+                 (!cf || cf_index != step.index / 2u)))
+                next_cf = i;
+        }
     }
-    return index;
+    /* Give an unopened branch its first candidate before racing alternatives. */
+    if (direct && !worker && !cf && next_cf < parent->route_plan.count)
+        return next_cf;
+    if (!direct && (worker || cf) && next_direct < parent->route_plan.count)
+        return next_direct;
+    return next_direct < next_cf ? next_direct : next_cf;
 }
 
 static int hedge_launch_next(proxy_connection *parent) {
@@ -1954,6 +1971,7 @@ static int hedge_launch_next(proxy_connection *parent) {
         candidate->route_dc_id = parent->route_dc_id;
         candidate->route_is_media = parent->route_is_media;
         candidate->route_tcp_only = parent->route_tcp_only;
+        candidate->hedge_step_index = step.index;
         candidate->wss_proto = parent->wss_proto;
         memcpy(candidate->handshake, parent->handshake,
                sizeof(candidate->handshake));
@@ -1994,8 +2012,9 @@ static int hedge_launch_next(proxy_connection *parent) {
             free(candidate);
             continue;
         }
-        int slot = parent->hedges[0] ? (parent->hedges[1] ? -1 : 1) : 0;
-        if (slot < 0) {
+        size_t slot = 0;
+        while (slot < TG_HEDGE_CANDIDATES && parent->hedges[slot]) ++slot;
+        if (slot == TG_HEDGE_CANDIDATES) {
             free(candidate);
             return 0;
         }
@@ -2036,7 +2055,8 @@ static int hedge_launch_next(proxy_connection *parent) {
 
 static int hedge_fill(proxy_connection *parent, int fill_second_slot) {
     size_t current = hedge_candidate_count(parent);
-    size_t wanted = current ? (fill_second_slot ? 2u : current) : 1u;
+    size_t wanted = current;
+    if (!current || (fill_second_slot && current < TG_HEDGE_CANDIDATES)) ++wanted;
     while (current < wanted) {
         int started = hedge_launch_next(parent);
         if (started < 0) return -1;
@@ -2049,7 +2069,7 @@ static int hedge_fill(proxy_connection *parent, int fill_second_slot) {
         return start_next_route(parent);
     }
     size_t next_index = hedge_next_index(parent);
-    if (current < 2 && next_index < parent->route_plan.count &&
+    if (current < TG_HEDGE_CANDIDATES && next_index < parent->route_plan.count &&
         parent->route_plan.steps[next_index].kind != TG_ROUTE_DIRECT_TCP &&
         parent->server->active_wss_connections <
             parent->server->max_wss_connections) {
@@ -2105,7 +2125,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
         return -1;
     }
     tg_epoll_proxy *server = parent->server;
-    for (size_t i = 0; i < 2; ++i)
+    for (size_t i = 0; i < TG_HEDGE_CANDIDATES; ++i)
         if (parent->hedges[i] == candidate) parent->hedges[i] = NULL;
     candidate->hedge_parent = NULL;
     watch_remove(server, &candidate->upstream_watch);
@@ -2322,7 +2342,7 @@ static int route_after_handshake(proxy_connection *connection) {
         ? server->config.routing_config->ws_hedge_limit : 0;
     int adaptive_hedge = policy == TG_WS_ROUTING_ADAPTIVE &&
         route_only == TG_ROUTE_ONLY_AUTO && !have_preferred &&
-        (worker_count || cf_count);
+        connection->route_plan.count > 1;
     if ((policy == TG_WS_ROUTING_HEDGED || adaptive_hedge) && hedge_limit > 0 &&
         hedge_connection_count(server) < hedge_limit) {
         connection->route_racing = 1;
@@ -2386,7 +2406,7 @@ static int receive_client(proxy_connection *connection) {
                                      connection->server->config.queue_bytes) != 0)
                     return -1;
                 connection->wss_client_payload_started = 1;
-                for (size_t i = 0; i < 2; ++i) {
+                for (size_t i = 0; i < TG_HEDGE_CANDIDATES; ++i) {
                     proxy_connection *candidate = connection->hedges[i];
                     if (!candidate || candidate->wss_phase != WSS_READY)
                         continue;
@@ -3261,7 +3281,7 @@ static int timeout_until_expiry(tg_epoll_proxy *server, int timeout_ms) {
         if (expires < nearest) nearest = expires;
         if (connection->hedge_due_ms && connection->hedge_due_ms < nearest)
             nearest = connection->hedge_due_ms;
-        for (size_t i = 0; i < 2; ++i) {
+        for (size_t i = 0; i < TG_HEDGE_CANDIDATES; ++i) {
             const proxy_connection *candidate = connection->hedges[i];
             if (candidate) {
                 uint64_t expires = wss_waiting_for_first_response(candidate)
@@ -3292,7 +3312,7 @@ static void expire_connections(tg_epoll_proxy *server) {
     proxy_connection *connection = server->connections;
     while (connection) {
         proxy_connection *next = connection->next;
-        for (size_t i = 0; i < 2 && !connection->closed; ++i) {
+        for (size_t i = 0; i < TG_HEDGE_CANDIDATES && !connection->closed; ++i) {
             proxy_connection *candidate = connection->hedges[i];
             if (candidate) {
                 if (candidate->wss_phase == WSS_READY &&
@@ -3453,7 +3473,8 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config) {
     size_t max_connections = tg_limits_auto_max_connections(
         tg_limits_soft_nofile(), config->memory_budget_bytes,
         memory_per_connection,
-        config->routing_config ? config->routing_config->ws_hedge_limit : 0,
+        config->routing_config
+            ? config->routing_config->ws_hedge_limit * (TG_HEDGE_CANDIDATES - 1u) : 0,
         config->configured_max_connections);
     if (!max_connections) {
         errno = ENOMEM;

@@ -3150,6 +3150,53 @@ static void test_epoll_wss_sends_ping(void) {
     assert(rmdir(directory) == 0);
 }
 
+static void test_adaptive_races_alternates_in_both_wss_branches(void) {
+    uint16_t client_port, target_port;
+    int listener = create_listener(&client_port);
+    int target = create_listener(&target_port);
+    proxy_fixture fixture = {0};
+    set_ipv4(&fixture.original, "149.154.167.51", 443);
+    set_ipv4(&fixture.upstream, "127.0.0.1", target_port);
+    fixture.cf_proxy_b_upstream = fixture.upstream;
+    SSL_CTX *tls_context = SSL_CTX_new(TLS_client_method());
+    assert(tls_context);
+    tg_config routing = {
+        .ws_routing = TG_WS_ROUTING_ADAPTIVE,
+        .ws_hedge_delay_ms = 125, .ws_hedge_limit = 1,
+        .cf_proxy_domain_count = 2,
+        .cf_proxy_domains = {"cfproxy-a.test", "cfproxy-b.test"}
+    };
+    tg_epoll_proxy_config config = {
+        .listener_fd = listener, .queue_bytes = 4096,
+        .memory_budget_bytes = 16 * 1024 * 1024, .configured_max_connections = 8,
+        .handshake_timeout_ms = 5000, .idle_timeout_ms = 6000,
+        .enable_direct_wss = 1, .tls_context = tls_context, .routing_config = &routing,
+        .original_destination = original_destination, .select_route = select_pending_test_route,
+        .resolve_domain = resolve_test_route_domain, .route_context = &fixture,
+        .context = &fixture
+    };
+    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+    assert(proxy);
+    int client = connect_to_listener(client_port);
+    assert(send(client, test_handshake, sizeof(test_handshake), 0) ==
+           (ssize_t)sizeof(test_handshake));
+    step_many(proxy, 5);
+    for (unsigned i = 0; i < 3; ++i) {
+        atomic_fetch_add(&test_monotonic_offset_ms, 126u);
+        step_many(proxy, 3);
+    }
+    tg_epoll_proxy_stats stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.wss_attempts == 4 && stats.active_wss_connections == 4);
+    assert(fixture.cf_proxy_a_resolve_calls == 1 && fixture.cf_proxy_b_resolve_calls == 1);
+    close(client);
+    tg_epoll_proxy_destroy(proxy);
+    close(target);
+    close(listener);
+    SSL_CTX_free(tls_context);
+    atomic_store(&test_monotonic_offset_ms, 0);
+}
+
 static void test_listener_recovery_preserves_runtime(void) {
     uint16_t port, replacement_port;
     int listener = create_listener(&port);
@@ -3196,6 +3243,7 @@ static void test_listener_recovery_preserves_runtime(void) {
 int main(void) {
     (void)signal(SIGPIPE, SIG_IGN);
     test_listener_recovery_preserves_runtime();
+    test_adaptive_races_alternates_in_both_wss_branches();
     test_epoll_bridge_preserves_handshake_and_half_close();
     test_epoll_many_concurrent_tcp_clients();
     test_pending_tcp_connect_expires_before_idle_timeout();
