@@ -74,6 +74,9 @@ static int fails;
 #define ROLE_PUBLIC_HTML 66
 #define ROLE_PARTIAL_TLS 67
 #define ROLE_BAD_TAG_TLS 68
+#define ROLE_DNS 69
+#define ROLE_DNS_WRONG_ID 70
+#define ROLE_DNS_TRUNCATED 71
 
 static const struct {
     const char *text;
@@ -612,6 +615,27 @@ static void *stand_run(void *arg) {
     memcpy(stand_request, req, copy);
     stand_request[copy] = '\0';
 
+    if (s->role >= ROLE_DNS && s->role <= ROLE_DNS_TRUNCATED) {
+        static const uint8_t question[] = {7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0, 0, 1, 0, 1};
+        static const uint8_t answer[] = {0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 42};
+        if (rlen == 14 + sizeof question && req[0] == 0 && req[1] == rlen - 2 &&
+            !memcmp(req + 14, question, sizeof question)) {
+            uint8_t response[14 + sizeof question + sizeof answer];
+            memcpy(response, req, rlen);
+            memcpy(response + rlen, answer, sizeof answer);
+            response[1] = sizeof response - 2;
+            response[4] = 0x81;
+            response[5] = 0x80;
+            response[9] = 1;
+            if (s->role == ROLE_DNS_WRONG_ID) response[3] ^= 1;
+            size_t n = sizeof response - (s->role == ROLE_DNS_TRUNCATED);
+            (void)rec_write(c, &wr, REC_APPDATA, response, 1);
+            (void)rec_write(c, &wr, REC_APPDATA, response + 1, n - 1);
+        }
+        close(c);
+        return NULL;
+    }
+
     if(s->role==ROLE_PARTIAL_TLS||s->role==ROLE_BAD_TAG_TLS) {
         uint8_t payload[16367];memset(payload,'x',sizeof payload);
         memcpy(payload,"HTTP/1.1 200 OK\r\nContent-Length: 16300\r\n\r\n",42);
@@ -1071,6 +1095,19 @@ int main(int argc,char **argv) {
         stand_stop(&s);
         CHECK(s.accepted_identity && !s.accepted_compression,
               "RX-кандидат проверяется сжатием вместо identity");
+    }
+
+    for (int role = ROLE_DNS; role <= ROLE_DNS_TRUNCATED; ++role) {
+        struct stand s;
+        uint16_t port = stand_start(&s, role);
+        CHECK(port != 0, "DoT fixture did not start");
+        if (port == 0) continue;
+        d2k_ver_result r = d2k_verify_dns_on(-1, "127.0.0.1", port, NULL, 1500, 0, 6, 0, NULL, 0);
+        CHECK(r.level == (role == ROLE_DNS ? D2K_VER_APPLICATION : D2K_VER_HANDSHAKE),
+              "DoT accepted a wrong ID/truncated response or missed a complete answer");
+        CHECK(r.dns_reply == (role == ROLE_DNS), "DoT application proof did not match the DNS response");
+        d2k_verify_close(&r);
+        stand_stop(&s);
     }
 
     /* --- ответило приложение: ЭТО и есть доказательство ------------------- */

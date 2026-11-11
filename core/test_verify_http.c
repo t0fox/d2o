@@ -105,7 +105,8 @@ static d2k_qc *real_h3_conn(int *server, struct sockaddr_in *client_addr) {
     return c;
 }
 /* Сервер: кадр HEADERS длиной section_len на потоке 0, пакетами по ~1100 байт. */
-static void real_h3_serve(int server, const struct sockaddr_in *to, const uint8_t *data, size_t n) {
+static void real_quic_serve(int server, const struct sockaddr_in *to,
+                            const uint8_t *data, size_t n, int fin) {
     uint8_t secret[32];
     memset(secret, 0x42, sizeof secret);
     d2k_qw_keys sk;
@@ -115,7 +116,7 @@ static void real_h3_serve(int server, const struct sockaddr_in *to, const uint8_
         size_t take = n - off > 1100 ? 1100 : n - off;
         uint8_t fr[1200], hdr[16], pkt[1500];
         size_t o = 0;
-        fr[o++] = 0x0e; /* STREAM: OFF | LEN, без FIN */
+        fr[o++] = (uint8_t)(0x0e | (fin && off + take == n)); /* STREAM: OFF | LEN | FIN */
         o += d2k_qw_varint_write(fr + o, sizeof fr - o, 0);
         o += d2k_qw_varint_write(fr + o, sizeof fr - o, off);
         o += d2k_qw_varint_write(fr + o, sizeof fr - o, take);
@@ -493,7 +494,34 @@ static int budget_checks(void) {
     return fails;
 }
 
+/* A real protected QUIC stream must carry the matching, complete DNS reply. */
+static void test_doq_response(void) {
+    static const uint8_t answer[] = {
+        0, 45, 0, 0, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0,
+        7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0, 0, 1, 0, 1,
+        0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 42
+    };
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        int server;
+        struct sockaddr_in client;
+        d2k_qc *q = real_h3_conn(&server, &client);
+        q->peer_streams[0] = 1; q->peer_streams_set[0] = 1;
+        q->peer_max_data = 1024; q->peer_max_data_set = 1;
+        q->peer_sdata[0] = 1024; q->peer_sdata_set[0] = 1;
+        uint8_t response[sizeof answer];
+        memcpy(response, answer, sizeof response);
+        if (scenario == 1) response[3] = 1; /* wrong DoQ ID */
+        if (scenario == 2) response[15] = 'z'; /* wrong question */
+        real_quic_serve(server, &client, response, sizeof response, scenario != 3);
+        char err[160];
+        assert(dns_quic_exchange(q, 100, err, sizeof err) == (scenario == 0));
+        d2k_qc_close(q);
+        close(server);
+    }
+}
+
 int main(void) {
+    test_doq_response();
     struct { const char *reply; d2k_ver_level level; } cases[] = {
         {"HTTP/1.1 302 Found\r\nLocation: https://www.google.com/\r\nContent-Length: 0\r\n\r\n", D2K_VER_APPLICATION},
         {"HTTP/1.1 302 Found\r\nLocation: https://warning.rt.ru/\r\nContent-Length: 0\r\n\r\n", D2K_VER_BLOCKPAGE},
@@ -689,7 +717,7 @@ int main(void) {
             static const uint8_t req[] = {1, 2, 3};
             assert(d2k_qc_stream_send(c, 0, req, sizeof req, 1, err, sizeof err) == 0);
             size_t fl = h3_headers_frame(frame, sizes[k]);
-            real_h3_serve(server, &to, frame, fl);
+            real_quic_serve(server, &to, frame, fl, 0);
             quic_recv_ctx rc = { c };
             size_t got = 0; int st = 0, closed = 0;
             int too_long = h3_read_headers(quic_recv_chunk, &rc, rx, sizeof rx,

@@ -101,8 +101,8 @@ for tool in iptables ip6tables; do
         "$tool" -t mangle -C "$chain" -d "$loopback" -j RETURN || fail "$tool queues local resolver IPC"
     done
     for proto in tcp udp; do
-        "$tool" -t mangle -C D2K_OUT -p "$proto" -m multiport --dports 53,853 -j RETURN || fail "$tool queues DNS"
-        "$tool" -t mangle -C D2K_IN -p "$proto" -m multiport --sports 53,853 -j RETURN || fail "$tool queues DNS replies"
+        "$tool" -t mangle -C D2K_OUT -p "$proto" -m multiport --dports 53 -j RETURN || fail "$tool queues DNS"
+        "$tool" -t mangle -C D2K_IN -p "$proto" -m multiport --sports 53 -j RETURN || fail "$tool queues DNS replies"
     done
 done
 

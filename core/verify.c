@@ -1988,6 +1988,168 @@ d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_
                                              hello_wire, 0, path);
 }
 
+/* RFC 7858 and RFC 9250 use the same length-prefixed DNS message.
+ * Probe a public A record; the query does not contain any client's name.
+ * DoQ requires a zero ID, while DoT echoes the connection's query ID. */
+static const uint8_t dns_query[] = {
+    0, 29, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+    7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0, 0, 1, 0, 1
+};
+
+static int dns_probe_reply(const uint8_t *msg, size_t len, unsigned id) {
+    if (len < 12 || dns16(msg) != id || (dns16(msg + 2) & 0xfa0f) != 0x8000 ||
+        dns16(msg + 4) != 1 || dns16(msg + 6) == 0) return 0;
+    size_t pos = 12;
+    char name[256];
+    if (ech_dns_name(msg, len, &pos, name) || strcmp(name, "example.com") ||
+        len - pos < 4 || dns16(msg + pos) != 1 || dns16(msg + pos + 2) != 1) return 0;
+    pos += 4;
+    unsigned answers = dns16(msg + 6);
+    unsigned records = answers + dns16(msg + 8) + dns16(msg + 10);
+    int have_address = 0;
+    for (unsigned i = 0; i < records; ++i) {
+        if (ech_dns_name(msg, len, &pos, name) || len - pos < 10) return 0;
+        unsigned rdlen = dns16(msg + pos + 8);
+        if (rdlen > len - pos - 10) return 0;
+        if (i < answers && !strcmp(name, "example.com") && dns16(msg + pos) == 1 &&
+            dns16(msg + pos + 2) == 1 && rdlen == 4) have_address = 1;
+        pos += 10 + rdlen;
+    }
+    return pos == len && have_address;
+}
+
+static int dns_read_frame(read_fn read, void *session, unsigned id, int64_t until,
+                          size_t *frame_len, char *err, size_t errcap) {
+    uint8_t reply[4096];
+    size_t have = 0, need = 2;
+    while (have < need) {
+        int64_t left = until - verify_now_ms();
+        if (left <= 0) return 0;
+        long n = read(session, reply + have, need - have, (int)left, err, errcap);
+        if (n <= 0 || (size_t)n > need - have) return 0;
+        have += (size_t)n;
+        if (have == 2) {
+            need = 2 + dns16(reply);
+            if (need < 14 || need > sizeof reply) return 0;
+        }
+    }
+    *frame_len = have;
+    return dns_probe_reply(reply + 2, have - 2, id);
+}
+
+static long dns_quic_read(void *session, uint8_t *buf, size_t cap, int wait_ms,
+                          char *err, size_t errcap) {
+    uint64_t stream = 0;
+    long n = d2k_qc_stream_recv(session, &stream, buf, cap, wait_ms, err, errcap);
+    return n > 0 && stream != 0 ? -1 : n;
+}
+
+static int dns_quic_exchange(d2k_qc *q, int timeout, char *err, size_t errcap) {
+    int64_t until = verify_now_ms() + timeout;
+    size_t frame_len = 0;
+    if (d2k_qc_stream_send(q, 0, dns_query, sizeof dns_query, 1, err, errcap) != 0 ||
+        !dns_read_frame(dns_quic_read, q, 0, until, &frame_len, err, errcap))
+        return 0;
+    uint64_t bytes;
+    int complete;
+    d2k_qc_app_progress(q, &bytes, &complete);
+    int64_t left = until - verify_now_ms();
+    if (!complete && left > 0) {
+        uint8_t extra;
+        (void)dns_quic_read(q, &extra, 1, (int)left, err, errcap);
+        d2k_qc_app_progress(q, &bytes, &complete);
+    }
+    return complete && bytes == frame_len;
+}
+
+static void dns_probe_result(d2k_ver_result *r, int valid, const char *protocol) {
+    if (valid && r->name_ok != 0) {
+        r->level = D2K_VER_APPLICATION;
+        r->body_complete = 1;
+        r->dns_reply = 1;
+        snprintf(r->reason, sizeof r->reason, "%s: получен корректный DNS-ответ", protocol);
+    } else {
+        snprintf(r->reason, sizeof r->reason, "%s: нет подтверждённого DNS-ответа", protocol);
+    }
+}
+
+d2k_ver_result d2k_verify_dns_on(int use_fd, const char *ip, uint16_t port, const char *sni,
+                                  int deadline_ms, size_t hello_wire, uint8_t transport,
+                                  int tls12, const uint8_t *alpn, size_t alpn_len) {
+    d2k_ver_result r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1;
+    r.name_ok = -1;
+    if (!ip || !ip[0] || (transport != 6 && transport != 17)) {
+        if (use_fd >= 0) close(use_fd);
+        r.unsupported = 1;
+        snprintf(r.reason, sizeof r.reason, "неподдерживаемый вход DNS-зонда");
+        return r;
+    }
+    const char *protocol = transport == 17 ? "DoQ" : "DoT";
+    char err[160] = "";
+    size_t frame_len = 0;
+    int timeout = deadline_ms > 0 ? deadline_ms : 5000;
+    snprintf(r.reason, sizeof r.reason, "%s: рукопожатие не завершено", protocol);
+    if (transport == 17) {
+        d2k_qc_opts opts = { .ip = ip, .port = port, .sni = sni, .alpn = "doq",
+            .deadline_ms = timeout, .pad_to = hello_wire,
+            .form = g_verify_quic_form_set ? &g_verify_quic_form : NULL, .use_fd = use_fd };
+        d2k_qc *q = NULL;
+        int rc = d2k_qc_connect(&opts, &q, err, sizeof err);
+        if (rc != 0) {
+            r.local_refusal = rc == -2;
+            snprintf(r.reason, sizeof r.reason, "DoQ: %.140s", err);
+            return r;
+        }
+        r.level = D2K_VER_HANDSHAKE;
+        r.negotiated_tls = 0x0304;
+        r.name_ok = d2k_qc_peer_name(q);
+        d2k_qc_local_addr(q, r.local_addr, &r.family, &r.local_port);
+        if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);
+        int valid = dns_quic_exchange(q, timeout, err, sizeof err);
+        r.fd = d2k_qc_release(q);
+        dns_probe_result(&r, valid, protocol);
+        return r;
+    }
+
+    r.family = strchr(ip, ':') ? 6 : 4;
+    int contact = verify_contact(use_fd, ip, port, 0, r.family, r.local_addr, &r.local_port, &r.fd);
+    if (contact != 0) {
+        r.unsupported = contact == -3;
+        snprintf(r.reason, sizeof r.reason, "DoT: нет TCP");
+        return r;
+    }
+    r.level = D2K_VER_TRANSPORT;
+    if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);
+    uint8_t query[sizeof dns_query];
+    memcpy(query, dns_query, sizeof query);
+    query[3] = 1;
+    int valid;
+    if (tls12) {
+        d2k_tls12 *tls = NULL;
+        if (d2k_tls12_connect(r.fd, sni, timeout, hello_wire, &tls, err, sizeof err) != 0) return r;
+        r.level = D2K_VER_HANDSHAKE;
+        r.negotiated_tls = 0x0303;
+        r.name_ok = d2k_tls12_peer_name(tls);
+        valid = d2k_tls12_write(tls, query, sizeof query, err, sizeof err) == 0 &&
+            dns_read_frame(read12, tls, 1, verify_now_ms() + timeout, &frame_len, err, sizeof err);
+        d2k_tls12_free(tls);
+    } else {
+        d2k_tls *tls = NULL;
+        if (d2k_tls_connect_alpn(r.fd, sni, timeout, hello_wire, alpn, alpn_len,
+                                 &tls, err, sizeof err) != 0) return r;
+        r.level = D2K_VER_HANDSHAKE;
+        r.negotiated_tls = d2k_tls_version(tls);
+        r.name_ok = d2k_tls_peer_name(tls);
+        valid = d2k_tls_write(tls, query, sizeof query, err, sizeof err) == 0 &&
+            dns_read_frame(read13, tls, 1, verify_now_ms() + timeout, &frame_len, err, sizeof err);
+        d2k_tls_free(tls);
+    }
+    dns_probe_result(&r, valid, protocol);
+    return r;
+}
+
 d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, uint16_t port,
                                                  const char *sni, int deadline_ms,
                                                  size_t hello_wire, uint32_t mark,

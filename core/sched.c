@@ -2839,6 +2839,14 @@ static void *worker_run_body(void *vp) {
             /* Свидетеля нет: кандидат проверяется теми же байтами клиента. */
             vr = d2k_sched_replay_ver_hook(a_use_fd, t->ip, t->port, trig.bytes, trig.len,
                                            SCHED_VERIFY_STEP_MS);
+        } else if (t->port == 853 && (t->transport == 17 || !t->ech_offer)) {
+            if (t->transport == 6 &&
+                d2k_hello_alpn(trig.bytes, trig.len, alpn, sizeof alpn, &alpn_len) < 0)
+                alpn_len = 0;
+            vr = d2k_verify_dns_on(a_use_fd, t->ip, t->port, t->by_addr ? NULL : t->name,
+                SCHED_VERIFY_STEP_MS, trig.len, t->transport,
+                t->transport == 6 && d2k_hello_shape(trig.bytes, trig.len) == D2K_SHAPE_LEGACY,
+                alpn, alpn_len);
         } else if (client_alpn_nonhttp(t, alpn, sizeof alpn, &alpn_len)) {
             vr = d2k_sched_alpn_ver_hook(a_use_fd, t->ip, t->port, t->name,
                                          SCHED_VERIFY_STEP_MS, trig.len, alpn, alpn_len);
@@ -3076,11 +3084,11 @@ static void *worker_run_body(void *vp) {
        обычным приветствием внешнего имени, а это другой вопрос (выше). */
     int volume_first = t->transport == 6 && !t->skip_volume_once && !t->ech_offer &&
                        (t->rx_volume_only || t->family_reuse == 1);
-    int volume_after = t->transport == 6 && !t->skip_volume_once && !t->ech_offer &&
+    int volume_after = t->transport == 6 && t->port != 853 && !t->skip_volume_once && !t->ech_offer &&
                        !volume_first;
     /* Обрыв ответа, доказанный прошлым прогоном этой задачи и не
        переспрашиваемый (повтор снимком, «отвеченное не переспрашивается»). */
-    int volume_carried = t->transport == 6 && t->skip_volume_once &&
+    int volume_carried = t->transport == 6 && t->port != 853 && t->skip_volume_once &&
                          (t->vol.verdict == D2K_VOL_CUT || t->vol.rx_cut);
     if (volume_first) {
         worker_volume(s, t, trig);
@@ -3157,9 +3165,10 @@ static void *worker_run_body(void *vp) {
            (docs/field/2026-10-12g) — она давала повод спросить по рабочим
            целям, 97 единиц зондов и ни одного плана. Датапат такого повода
            не присылает. */
-        t->arm.data_cut = t->trigger_code != D2K_SUSPECT_QUIC_STALL &&
-                          t->trigger_code != D2K_SUSPECT_SILENT ? 0 :
-                          t->deny_recheck ? 2 : 1;
+        /* DNS over QUIC has no HTTP/3 object to measure. */
+        t->arm.data_cut = t->port == 853 ||
+            (t->trigger_code != D2K_SUSPECT_QUIC_STALL && t->trigger_code != D2K_SUSPECT_SILENT)
+            ? 0 : t->deny_recheck ? 2 : 1;
         /* Бюджет коробки (задача 55, task_budget): свой запрос повторяется
            на новых потоках до 2 × бюджет датаграмм или тишины сервера. */
         t->arm.budget_pk = a_budget;
@@ -9549,6 +9558,10 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                "(путь: %s) — TLS с ALPN клиента завершён (план применён к потоку зонда); "
                "протокол клиента не HTTP, прикладной уровень не измерен",
             t->name, plan_id, candidate_path(t));
+    else if (t->ver.dns_reply)
+        say(s, "по %s ПОДТВЕРЖДЕНО собственным зондом: %s (путь: %s), %s "
+               "(план применён к потоку зонда)",
+            t->name, plan_id, candidate_path(t), t->ver.reason);
     else
     say(s, "по %s (%s) ПОДТВЕРЖДЕНО собственным зондом: %s (путь: %s), приложение "
            "ответило %d (план применён к потоку зонда)",
@@ -11982,6 +11995,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                         say(s, "по %s рукопожатие с ALPN клиента завершено с местного порта %u "
                                "— жду применения плана к его потоку",
                             t->name, (unsigned)t->ver.local_port);
+                    else if (t->ver.dns_reply)
+                        say(s, "по %s %s с местного порта %u — жду применения плана к потоку",
+                            t->name, t->ver.reason, (unsigned)t->ver.local_port);
                     else
                     say(s, "по %s зонд дошёл до приложения (%d) с местного порта %u "
                            "— жду применения плана к его потоку",

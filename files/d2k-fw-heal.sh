@@ -61,7 +61,7 @@ printf '%s\n' "$state" | grep -q "датапат: работает" || exit 0
 # недостающее и молчит, если цели PPE в прошивке нет.
 if printf '%s\n' "$state" | grep -q "правила: стоят"; then
     "$INIT_SCRIPT" ppe-ensure >/dev/null 2>&1
-    # DNS роутера (DoH/DoT) — исключение по адресам, которые меняются: сверка
+    # Обычный DNS на нестандартных портах: сверка исключений по адресам
     # каждый круг, недостающее ставится, устаревшее снимается (S99d2k).
     "$INIT_SCRIPT" dns-ensure >/dev/null 2>&1
     exit 0
@@ -89,7 +89,7 @@ rc=$?
 rmdir "$HEAL_LOCK" 2>/dev/null
 
 if [ "$rc" = 0 ]; then
-    # The cached DoH rules were installed before the NFQUEUE hooks. Refresh
+    # The cached plaintext DNS rules were installed before the NFQUEUE hooks. Refresh
     # the upstreams now in case NDM also changed the DNS configuration.
     "$INIT_SCRIPT" dns-ensure >/dev/null 2>&1
     echo "d2k: правила снесены извне и восстановлены сторожем" >&2

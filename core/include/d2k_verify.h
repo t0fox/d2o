@@ -71,7 +71,7 @@ typedef enum {
     D2K_VER_NOT_MEASURED = 0, /* обращение не состоялось — про линию не сказано ничего */
     D2K_VER_TRANSPORT,        /* TCP встал, рукопожатие не дошло до конца */
     D2K_VER_HANDSHAKE,        /* рукопожатие завершено, прикладного ответа нет */
-    D2K_VER_APPLICATION,      /* полный HTTP-ответ, включая HTTPS redirect другой цели */
+    D2K_VER_APPLICATION,      /* полный прикладной ответ HTTP или DNS */
     D2K_VER_CHALLENGE,        /* Cloudflare cf-mitigated: challenge; не успех обхода */
     D2K_VER_BLOCKPAGE,        /* явная сигнатура страницы блокировки */
     D2K_VER_DENIED            /* HTTP 451: юридический отказ, не диагноз DPI */
@@ -107,6 +107,7 @@ typedef struct {
        Это НЕ подлинность (цепочка не строится) и НЕ доказательство заглушки.
        Для обычного TLS несовпадение диагностическое; ECH требует отдельного
        строгого подтверждения имени origin и принятия ECH. */
+    int      dns_reply; /* validated DNS application response */
     int      name_ok;
     /* Зонд НЕ УМЕЕТ такой транспорт — и не научится сменой кандидата.
      *
@@ -257,6 +258,11 @@ d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
  * создать свой сокет, тогда это в точности d2k_verify_probe. */
 d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,
                                    const char *sni, int deadline_ms, size_t hello_wire);
+
+/* A DNS response on the actual DoT (TCP) or DoQ (UDP) transport. */
+d2k_ver_result d2k_verify_dns_on(int use_fd, const char *ip, uint16_t port, const char *sni,
+                                  int deadline_ms, size_t hello_wire, uint8_t transport,
+                                  int tls12, const uint8_t *alpn, size_t alpn_len);
 
 /* Зонд TLS 1.3 с ALPN КЛИЕНТА (alpn_list — protocol_name_list как на проводе,
  * alpn_len 0 — без ALPN, как у клиента без него) для протокола, который не

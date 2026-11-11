@@ -2430,7 +2430,14 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
        (иначе "свежий" адрес мог бы совпасть с уже использованным, и ротация
        была бы фиктивной). Сама сборка — d2k_quic_build_pool. */
     char pool[D2K_QUIC_MAX_ADDRS][D2K_QUIC_ADDR_LEN];
-    size_t n_pool = d2k_quic_build_pool(ip, sni, pool, D2K_QUIC_MAX_ADDRS);
+    size_t n_pool = 1;
+    if (port == 853) {
+        /* The resolver being measured may be the system's only upstream.
+           Use the address from the intercepted connection. */
+        snprintf(pool[0], sizeof pool[0], "%s", ip);
+    } else {
+        n_pool = d2k_quic_build_pool(ip, sni, pool, D2K_QUIC_MAX_ADDRS);
+    }
     size_t next_addr = 1; /* pool[0] занят базовой живостью/прямым зондом/шагом 2 — см. шапку файла */
 
     int all_marked = 1;

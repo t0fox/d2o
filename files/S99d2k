@@ -168,10 +168,9 @@ ip6tables() { xt_wait ip6tables "$@"; }
 # Frequent live snapshots are volatile. The learned catalog stays on /opt.
 RUNTIME_DIR=${D2K_RUNTIME_DIR:-/tmp/d2k}
 LIVE=$RUNTIME_DIR/live.json
-# DNS and encrypted DNS are transport infrastructure, not strategy candidates.
-# Keep standard DNS/DoT/DoQ ports out of the packet classifier even when PORTS
-# is 0:65535; this does not alter resolver settings or DNS routing.
-DNS_PORTS=53,853
+# Plain DNS stays out of the classifier. Encrypted DNS uses the same
+# TCP/TLS or QUIC capture path as other traffic on both backends.
+DNS_PORTS=53
 # ПРОВОДНИК УСТАНОВКИ НА VPS (relay-gate/) — канал самого D2K, а не цель.
 # Через него идут установка и ночное обновление (D2K_GATE — та же настройка,
 # что у установщика и d2k-update.sh). Только явно настроенный пользователем
@@ -428,9 +427,8 @@ fw_family_up() (
     # порождает из них новое обнаружение.
     "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN || return 1
     "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN || return 1
-    # Never queue DNS (UDP/TCP 53) or encrypted DNS (DoT/DoQ, 853). These
-    # packets are required for ordinary connectivity and are not useful
-    # strategy inputs. Place exclusions before the broad TCP/UDP NFQUEUE rules.
+    # Plain DNS is infrastructure for the probes. DoT and DoQ (853)
+    # must reach the broad TCP/UDP rules along with DoH (443).
     for proto in tcp udp; do
         "$fw_tool" -t mangle -A "$CHAIN_OUT" -p "$proto" -m multiport --dports "$DNS_PORTS" \
             -j RETURN || return 1
@@ -893,111 +891,28 @@ fw_lock_release() {
     rmdir "$FW_LOCK"
 }
 
-# Keenetic's local resolver must reach its upstreams outside NFQUEUE.
-# The loopback port in show dns-proxy is IPC; its comment names the upstream.
-# Older NDM output can omit the comments, so also read its configured URLs
-# when an unannotated loopback helper is present.
-dns_upstreams() {
-    local dns_status dns_config
-    dns_status=$(LD_LIBRARY_PATH='' ndmc -c "show dns-proxy" 2>/dev/null) || return 1
-    printf '%s\n' "$dns_status" | grep -Eq 'proxy-config:|^[[:space:]]*dns_server[[:space:]]*=' ||
+# NDM can also report plain DNS servers on nonstandard ports. Keep these
+# exact exceptions; loopback helpers and their encrypted upstream annotations
+# are not plain DNS. Discovery never queries a resolver.
+dns_plain_upstreams() {
+    local status
+    status=$(LD_LIBRARY_PATH='' ndmc -c "show dns-proxy" 2>/dev/null) || return 1
+    printf '%s\n' "$status" | grep -Eq 'proxy-config:|^[[:space:]]*dns_server[[:space:]]*=' ||
         return 1
-    dns_config=
-    if printf '%s\n' "$dns_status" | awk '
-        $1 == "dns_server" && $2 == "=" &&
-        $3 ~ /^(127\.|\[?::1\]?(:|$))/ && $0 !~ /#[[:space:]]*[^[:space:]]/ { found = 1 }
-        END { exit !found }'; then
-        dns_config=$(LD_LIBRARY_PATH='' ndmc -c "show running-config" 2>/dev/null) || return 1
-        printf '%s\n' "$dns_config" | grep -Eq '^(!|system |interface |dns-proxy([[:space:]]|$))' ||
-            return 1
-    fi
-    printf '%s\n%s\n' "$dns_status" "$dns_config" | tr -d '\033\r' | awk '
-        function emit(s, port,    host, t) {
-            host = s; t = s
-            if (s ~ /^\[/) {
-                sub(/^\[/, "", host); sub(/\].*/, "", host)
-                if (s ~ /\]:[0-9]+$/) { port = s; sub(/.*\]:/, "", port) }
-            } else if (gsub(/:/, ":", t) == 1) {
-                sub(/:.*/, "", host); port = s; sub(/.*:/, "", port)
-            }
-            host = tolower(host)
-            sub(/\.$/, "", host)
-            if ((host ~ /^[a-z0-9][a-z0-9.-]*$/ || host ~ /^[0-9a-f:]+:[0-9a-f:.]*$/) &&
-                host !~ /^(127\.|::1$|localhost$)/ && port ~ /^[0-9]+$/ && port + 0 > 0 && port + 0 < 65536)
-                print host, port + 0
-        }
-        function upstream(s,    port) {
-            gsub(/^"|"$/, "", s)
-            if (s ~ /^https:\/\//) {
-                sub(/^https:\/\//, "", s); sub(/[\/?#@].*/, "", s); port = 443
-            } else {
-                sub(/^(tls|quic):\/\//, "", s); sub(/@.*/, "", s); port = 853
-            }
-            emit(s, port)
-        }
-        $1 == "dns_server" && $2 == "=" {
-            emit($3, 53)
-            if (match($0, /#[[:space:]]*[^[:space:]]+/)) {
-                s = substr($0, RSTART, RLENGTH); sub(/^#[[:space:]]*/, "", s); upstream(s)
-            }
-        }
-        /^dns-proxy[[:space:]]*$/ { proxy = 1; next }
-        /^[^[:space:]]/ { proxy = 0 }
-        $1 == "dns-proxy" && $2 == "https" && $3 == "upstream" { upstream($4) }
-        proxy && $1 == "https" && $2 == "upstream" { upstream($3) }
-    ' | sort -u
-}
-
-dns_lookup_addresses() {
-    # A failed local resolver must not tie up the firewall operation. BusyBox
-    # can print both numbered Address entries and unnumbered Address: lines.
-    {
-        if command -v timeout >/dev/null 2>&1; then
-            timeout 2 nslookup "$1" "$2"
-        elif command -v busybox >/dev/null 2>&1 && busybox --list | grep -qx timeout; then
-            busybox timeout 2 nslookup "$1" "$2"
-        else
-            nslookup "$1" "$2"
-        fi
-    } 2>/dev/null | awk '
-        /^Name:[[:space:]]/ { answer = 1; next }
-        !answer { next }
-        $1 == "Address:" { ip = $2 }
-        $1 == "Address" && $2 ~ /^[0-9]+:$/ { ip = $3 }
-        ip != "" {
-            if (ip ~ /^[0-9a-fA-F:]+:[0-9a-fA-F:.]*$/ && ip != "::1") print tolower(ip)
-            if (ip ~ /^[0-9.]+$/ && split(ip, octet, ".") == 4 &&
-                octet[1] + 0 != 127 && octet[1] + 0 != 0 && octet[1] + 0 < 224 &&
-                octet[2] + 0 <= 255 && octet[3] + 0 <= 255 && octet[4] + 0 <= 255) print ip
-            ip = ""
+    printf '%s\n' "$status" | awk '
+        $1 == "dns_server" && $2 == "=" && $0 !~ /#/ {
+            ip = $3
+            if (ip ~ /^\[[0-9a-fA-F:.]+\]:[0-9]+$/) {
+                sub(/^\[/, "", ip)
+                split(ip, fields, "]:")
+            } else if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/) {
+                split(ip, fields, ":")
+            } else next
+            ip = tolower(fields[1]); port = fields[2] + 0
+            if (ip !~ /^(127\.|::1$)/ && port > 0 && port < 65536 &&
+                port != 53 && port != 443 && port != 853)
+                print ip, ip, port
         }'
-}
-
-dns_excl_discover() { # <previous state>
-    local upstreams host port ips ip
-    upstreams=$(dns_upstreams) || return 1
-    while read -r host port; do
-        [ -n "$host" ] || continue
-        case "$host" in
-            *:* ) ips=$host ;;
-            *[!0-9.]*)
-                ips=$(dns_lookup_addresses "$host" 127.0.0.1)
-                # Public bootstrap resolvers are contacted only on failure. The
-                # query contains the upstream hostname, never a client's name.
-                [ -n "$ips" ] || ips=$(dns_lookup_addresses "$host" 8.8.8.8)
-                [ -n "$ips" ] || ips=$(dns_lookup_addresses "$host" 1.1.1.1)
-                ;;
-            *) ips=$host ;;
-        esac
-        if [ -n "$ips" ]; then
-            for ip in $ips; do printf '%s %s %s\n' "$host" "$ip" "$port"; done
-        elif [ -f "$1" ]; then
-            awk -v h="$host" -v p="$port" '$1 == h && $3 == p' "$1"
-        fi
-    done <<EOF
-$upstreams
-EOF
-    return 0
 }
 
 # Match both IPs to keep traffic forwarded to the same CDN edge in NFQUEUE.
@@ -1110,8 +1025,8 @@ dns_excl_ruleset() {
 
 dns_excl_sync_unlocked() {
     local upstreams state targets previous ruleset stale rc
-    upstreams=$RUN/dns-excl
-    state=$RUN/dns-excl-rules
+    upstreams=$RUN/dns-plain-excl
+    state=$RUN/dns-plain-excl-rules
     if ! targets=$(dns_excl_targets "$upstreams"); then
         [ -r "$state" ] || return 1
         targets=$(cat "$state") || return 1
@@ -1156,12 +1071,12 @@ dns_excl_enabled() {
 dns_excl_sync() {
     local state previous discovered found rc
     dns_excl_enabled || return 0
-    state=$RUN/dns-excl
+    state=$RUN/dns-plain-excl
     previous=$(cat "$state" 2>/dev/null || true)
-    # A stalled DoH must not hold the lock needed to stop or rebuild
-    # the firewall. Keep a concurrent refresh's result if it got here first.
+    # NDM discovery must not hold the firewall lock. Keep a concurrent
+    # refresh's result if it got here first.
     found=0
-    discovered=$(dns_excl_discover "$state") && found=1
+    discovered=$(dns_plain_upstreams) && found=1
     fw_lock_acquire || return 1
     rc=0
     if [ "$found" = 1 ] && [ "$previous" = "$(cat "$state" 2>/dev/null || true)" ]; then
@@ -1189,12 +1104,12 @@ fw_up() {
     else
         targets=
         if dns_excl_enabled; then
-            if [ ! -f "$RUN/dns-excl" ] && discovered=$(dns_excl_discover "$RUN/dns-excl"); then
-                dns_excl_save "$RUN/dns-excl" "$discovered" ||
+            if [ ! -f "$RUN/dns-plain-excl" ] && discovered=$(dns_plain_upstreams); then
+                dns_excl_save "$RUN/dns-plain-excl" "$discovered" ||
                     say "не удалось сохранить адреса DNS роутера"
             fi
-            if ! targets=$(dns_excl_targets "$RUN/dns-excl"); then
-                targets=$(cat "$RUN/dns-excl-rules" 2>/dev/null) ||
+            if ! targets=$(dns_excl_targets "$RUN/dns-plain-excl"); then
+                targets=$(cat "$RUN/dns-plain-excl-rules" 2>/dev/null) ||
                     say "локальные адреса для исключения DNS пока недоступны"
             fi
         fi
@@ -1204,9 +1119,9 @@ fw_up() {
             # fw_family_up has already inserted the DNS rules before attaching
             # NFQUEUE. Save their ownership for the next in-place refresh.
             if dns_excl_enabled; then
-                rm -f "$RUN/dns-excl-rules.check"
-                if ! { printf '%s\n' "$targets" > "$RUN/dns-excl-rules.new" &&
-                    mv -f "$RUN/dns-excl-rules.new" "$RUN/dns-excl-rules"; }; then
+                rm -f "$RUN/dns-plain-excl-rules.check"
+                if ! { printf '%s\n' "$targets" > "$RUN/dns-plain-excl-rules.new" &&
+                    mv -f "$RUN/dns-plain-excl-rules.new" "$RUN/dns-plain-excl-rules"; }; then
                     say "не удалось сохранить состояние правил DNS"
                 fi
             fi
