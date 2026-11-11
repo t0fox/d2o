@@ -111,7 +111,7 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
     sh('printf "arch %s %s\\n" "$1" "$2" >> "$CALLS"; [ -n "$2" ] || exit 1; printf "amd64\\n"'));
   for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, sh('exit 0'));
   fixture('builds/d2kpanel-linux-amd64', sh('echo features=telegram-control'));
-  fixture('builds/d2ktg-linux-amd64', sh('echo features=telegram-local-tcp-epoll,instagram-ip-probe,meta-hosts-v3'));
+  fixture('builds/d2ktg-linux-amd64', sh('echo features=telegram-local-tcp-epoll,telegram-local-proxy,instagram-ip-probe,meta-hosts-v3'));
   fixture('builds/d2kd-linux-amd64', sh('exit 0'));
   fixture('builds/d2kc-linux-amd64', sh('exit 2'));
   fixture('builds/d2kfetch-linux-amd64', sh('exit 2'));

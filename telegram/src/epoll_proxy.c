@@ -105,6 +105,16 @@ struct proxy_connection {
     tg_mtproto_ctr client_decrypt;
     tg_mtproto_ctr client_encrypt;
     tg_mtproto_ctr server_decrypt;
+    /* Local tg://proxy bridge: client transport ciphers and the raw relay
+       ciphers used towards Telegram. */
+    int local_proxy;
+    uint8_t client_handshake[TG_MTPROTO_HANDSHAKE_LEN];
+    uint8_t local_secret[16];
+    size_t local_secret_len;
+    tg_mtproto_ctr local_decrypt;
+    tg_mtproto_ctr local_encrypt;
+    tg_mtproto_ctr relay_encrypt;
+    tg_mtproto_ctr relay_decrypt;
     tg_mtproto_splitter splitter;
     tg_mtproto_proto wss_proto;
     tg_route_plan route_plan;
@@ -648,6 +658,10 @@ static void connection_close(proxy_connection *connection) {
     tg_mtproto_ctr_destroy(&connection->client_decrypt);
     tg_mtproto_ctr_destroy(&connection->client_encrypt);
     tg_mtproto_ctr_destroy(&connection->server_decrypt);
+    tg_mtproto_ctr_destroy(&connection->local_decrypt);
+    tg_mtproto_ctr_destroy(&connection->local_encrypt);
+    tg_mtproto_ctr_destroy(&connection->relay_encrypt);
+    tg_mtproto_ctr_destroy(&connection->relay_decrypt);
     connection->client_fd = connection->upstream_fd = -1;
     connection->upstream_connect_deadline_ms = 0;
     proxy_connection **link = &server->connections;
@@ -2122,6 +2136,7 @@ static int route_after_handshake(proxy_connection *connection) {
                                        server->config.listen_port_count)))
         return -1;
     connection->upstream_target = *upstream;
+    if (selection.local_proxy) connection->original = *upstream;
     connection->direct_wss = 0;
     size_t worker_count = 0, cf_count = 0;
     tg_ws_routing_policy policy = TG_WS_ROUTING_ADAPTIVE;
@@ -2132,6 +2147,27 @@ static int route_after_handshake(proxy_connection *connection) {
     connection->route_tcp_only = selection.tcp_only;
     connection->route_failure_recorded = 0;
     connection->wss_proto = selection.proto;
+    if (selection.local_proxy) {
+        const tg_config *routing = server->config.routing_config;
+        if (!routing || !routing->proxy_secret_len ||
+            routing->proxy_secret_len > sizeof(connection->local_secret))
+            return -1;
+        memcpy(connection->client_handshake, connection->handshake,
+               sizeof(connection->client_handshake));
+        memcpy(connection->local_secret, routing->proxy_secret,
+               routing->proxy_secret_len);
+        connection->local_secret_len = routing->proxy_secret_len;
+        if (tg_mtproto_build_client_ciphers(
+                connection->client_handshake, connection->local_secret,
+                connection->local_secret_len, &connection->local_decrypt,
+                &connection->local_encrypt) != 0 ||
+            tg_mtproto_make_obfuscated2_init(
+                selection.proto, selection.dc_id, selection.is_media,
+                connection->handshake, &connection->relay_encrypt,
+                &connection->relay_decrypt) != 0)
+            return -1;
+        connection->local_proxy = 1;
+    }
     if (connection->route_session_tracked) {
         connection->route_session.stage = TG_ROUTE_SESSION_STAGE_ROUTING;
         if (selection.dc_id) {
@@ -2295,6 +2331,12 @@ static int receive_upstream(proxy_connection *connection) {
             add_bytes(&connection->server->bytes_from_upstreams, (size_t)n);
             route_session_add_bytes(connection, 0, (size_t)n);
             connection->last_activity_ms = monotonic_ms();
+            if (connection->local_proxy &&
+                (tg_mtproto_ctr_xor(&connection->relay_decrypt, buffer,
+                                    (size_t)n) != 0 ||
+                 tg_mtproto_ctr_xor(&connection->local_encrypt, buffer,
+                                    (size_t)n) != 0))
+                return -1;
             if (queue_append_grow(connection, &connection->to_client,
                                   buffer, (size_t)n, queue_limit) != 0)
                 return -1;
@@ -2327,6 +2369,26 @@ static int queue_wss_packet(void *opaque, const uint8_t *packet,
 
 static int process_client_payload(proxy_connection *connection,
                                   uint8_t *buffer, size_t length) {
+    if (connection->local_proxy) {
+        if (tg_mtproto_ctr_xor(&connection->local_decrypt, buffer, length) != 0)
+            return -1;
+        if (connection->direct_wss && connection->packet_framing) {
+            if (tg_mtproto_splitter_feed(&connection->splitter,
+                                         &connection->relay_encrypt,
+                                         buffer, length, queue_wss_packet,
+                                         connection) != TG_MTPROTO_SPLIT_OK)
+                return -1;
+            return 0;
+        }
+        if (tg_mtproto_ctr_xor(&connection->relay_encrypt, buffer, length) != 0)
+            return -1;
+        if (connection->direct_wss)
+            return tg_ws_pump_queue_mtproto_payload(&connection->ws_pump,
+                                                    buffer, length);
+        return queue_append_grow(connection, &connection->to_upstream, buffer,
+                                 length,
+                                 connection->server->config.queue_bytes);
+    }
     if (connection->direct_wss) {
         if (connection->packet_framing) {
             if (tg_mtproto_ctr_xor(&connection->client_decrypt, buffer,
@@ -2609,6 +2671,14 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
                 ++health->cf_responses;
         }
     }
+    if (connection->local_proxy && payload_len) {
+        uint8_t *mutable_payload = (uint8_t *)payload;
+        if (tg_mtproto_ctr_xor(&connection->relay_decrypt, mutable_payload,
+                               payload_len) != 0 ||
+            tg_mtproto_ctr_xor(&connection->local_encrypt, mutable_payload,
+                               payload_len) != 0)
+            return -1;
+    }
     if (queue_append_grow(connection, &connection->to_client,
                           payload, payload_len,
                           TG_MTPROTO_MAX_PACKET) != 0)
@@ -2633,7 +2703,10 @@ static int establish_wss_stream(proxy_connection *connection) {
         return -1;
     connection->ws_pump_ready = 1;
     if (connection->packet_framing) {
-        if (tg_mtproto_direct_stream_ciphers(connection->handshake,
+        /* A local tg://proxy bridge already has client/relay ciphers; the
+           splitter only needs to frame the plaintext transport. */
+        if (!connection->local_proxy &&
+            tg_mtproto_direct_stream_ciphers(connection->handshake,
                                              &connection->client_decrypt,
                                              &connection->client_encrypt) != 0)
             return -1;
@@ -3018,12 +3091,18 @@ static void accept_clients(tg_epoll_proxy *server) {
         }
         tg_listener_destination original;
         memset(&original, 0, sizeof(original));
-        if (server->config.original_destination(server->config.context, fd,
-                                                &original) != 0 ||
-            !original.port ||
-            (server->config.enforce_self_dial &&
-             tg_listener_is_self_dial_addr(&original, server->listen_ports,
-                                           server->config.listen_port_count))) {
+        int have_original =
+            server->config.original_destination(server->config.context, fd,
+                                                &original) == 0 &&
+            original.port != 0;
+        if (!have_original && !server->config.accept_direct_clients) {
+            close(fd);
+            continue;
+        }
+        if (server->config.enforce_self_dial &&
+            !server->config.accept_direct_clients &&
+            tg_listener_is_self_dial_addr(&original, server->listen_ports,
+                                          server->config.listen_port_count)) {
             close(fd);
             continue;
         }

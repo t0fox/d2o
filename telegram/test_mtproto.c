@@ -63,6 +63,51 @@ static void test_secret_vector_requires_matching_secret(void) {
     assert(parsed.proto == TG_MTPROTO_INTERMEDIATE);
 }
 
+static void test_raw_relay_ciphers_match_generated_handshake(void) {
+    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN], payload[32], expected[32], actual[32];
+    tg_mtproto_ctr sender = {0}, reply = {0}, raw_enc = {0}, raw_dec = {0};
+    assert(tg_mtproto_make_obfuscated2_init(TG_MTPROTO_INTERMEDIATE, 4, 1,
+                                            handshake, &sender, &reply) == 0);
+    assert(tg_mtproto_build_raw_ciphers(handshake, &raw_enc, &raw_dec) == 0);
+    for (size_t i = 0; i < sizeof(payload); ++i) payload[i] = (uint8_t)(i * 7u + 3u);
+    memcpy(expected, payload, sizeof(payload));
+    memcpy(actual, payload, sizeof(actual));
+    assert(tg_mtproto_ctr_xor(&sender, expected, sizeof(expected)) == 0);
+    assert(tg_mtproto_ctr_xor(&raw_enc, actual, sizeof(actual)) == 0);
+    assert(memcmp(expected, actual, sizeof(actual)) == 0);
+    memcpy(expected, payload, sizeof(payload));
+    memcpy(actual, payload, sizeof(actual));
+    assert(tg_mtproto_ctr_xor(&reply, expected, sizeof(expected)) == 0);
+    assert(tg_mtproto_ctr_xor(&raw_dec, actual, sizeof(actual)) == 0);
+    assert(memcmp(expected, actual, sizeof(actual)) == 0);
+    tg_mtproto_ctr_destroy(&sender);
+    tg_mtproto_ctr_destroy(&reply);
+    tg_mtproto_ctr_destroy(&raw_enc);
+    tg_mtproto_ctr_destroy(&raw_dec);
+}
+
+static void test_client_secret_ciphers_build_and_differ_by_direction(void) {
+    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN], secret[16], payload[32];
+    tg_mtproto_ctr decrypt = {0}, encrypt = {0};
+    assert(unhex("0001020304050607000102030405060708090a0b0c0d0e0f"
+                 "101112131415161718191a1b1c1d1e1f0001020304050607"
+                 "08090a0b0c0d0e0f7c380b6e418caed2",
+                 handshake, sizeof(handshake)) == sizeof(handshake));
+    assert(unhex("101112131415161718191a1b1c1d1e1f",
+                 secret, sizeof(secret)) == sizeof(secret));
+    for (size_t i = 0; i < sizeof(payload); ++i) payload[i] = (uint8_t)i;
+    assert(tg_mtproto_build_client_ciphers(handshake, secret, sizeof(secret),
+                                           &decrypt, &encrypt) == 0);
+    uint8_t decrypted[32], encrypted[32];
+    memcpy(decrypted, payload, sizeof(decrypted));
+    memcpy(encrypted, payload, sizeof(encrypted));
+    assert(tg_mtproto_ctr_xor(&decrypt, decrypted, sizeof(decrypted)) == 0);
+    assert(tg_mtproto_ctr_xor(&encrypt, encrypted, sizeof(encrypted)) == 0);
+    assert(memcmp(decrypted, encrypted, sizeof(decrypted)) != 0);
+    tg_mtproto_ctr_destroy(&decrypt);
+    tg_mtproto_ctr_destroy(&encrypt);
+}
+
 static void test_invalid_handshake_and_secret_inputs_are_rejected(void) {
     uint8_t packet[TG_MTPROTO_HANDSHAKE_LEN] = {0};
     tg_mtproto_init parsed;
@@ -134,6 +179,8 @@ int main(void) {
     test_ctr_matches_nist_vector_across_partial_reads();
     test_direct_obfuscated2_vector_decodes_media_dc();
     test_secret_vector_requires_matching_secret();
+    test_raw_relay_ciphers_match_generated_handshake();
+    test_client_secret_ciphers_build_and_differ_by_direction();
     test_invalid_handshake_and_secret_inputs_are_rejected();
     test_reserved_protocol_prefixes_are_rejected();
     test_direct_stream_ciphers_skip_obfuscated2_init();

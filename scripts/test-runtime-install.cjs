@@ -37,7 +37,7 @@ exit 1
   fixture('scripts/architecture.sh', '#!/bin/sh\nprintf "amd64\\n"\n');
   for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, '#!/bin/sh\nexit 0\n');
   fixture('builds/d2kpanel-linux-amd64', '#!/bin/sh\necho features=telegram-control\n');
-  fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=telegram-local-tcp-epoll,instagram-ip-probe,meta-hosts-v3\n');
+  fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=telegram-local-tcp-epoll,telegram-local-proxy,instagram-ip-probe,meta-hosts-v3\n');
   fixture('builds/d2kd-linux-amd64', '#!/bin/sh\nexit 0\n');
   for (const name of ['d2kc','d2kfetch']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
   fixture('files/S99d2k', '#!/bin/sh\nprintf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
@@ -103,7 +103,7 @@ exit 1
   // A d2ktg without the 15-name certificate check would silently skip WhatsApp/fbcdn.
   const tgFixture = path.join(tmp, 'source/builds/d2ktg-linux-amd64');
   const tgCurrent = fs.readFileSync(tgFixture);
-  fs.writeFileSync(tgFixture, '#!/bin/sh\necho features=telegram-local-tcp-epoll,instagram-ip-probe,meta-hosts-v2\n');
+  fs.writeFileSync(tgFixture, '#!/bin/sh\necho features=telegram-local-tcp-epoll,telegram-local-proxy,instagram-ip-probe,meta-hosts-v2\n');
   const stale = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
   assert.notEqual(stale.status, 0, 'installer must reject a d2ktg without the Meta host list check');
   assert.match(stale.stdout + stale.stderr, /d2ktg устарел/);

@@ -103,15 +103,39 @@ int tg_transparent_select_route(
     const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
     tg_epoll_route_selection *selection) {
     const tg_transparent_policy *policy = opaque;
-    if (!policy || !handshake || !selection ||
-        !destination_allowed(policy, original))
-        return -1;
+    if (!policy || !handshake || !selection) return -1;
+    int64_t now = (int64_t)time(NULL);
+    /* Direct tg://proxy clients carry the proxy secret in their obfuscated2
+       handshake. They have no useful original destination, so accept them
+       before the transparent-destination checks. */
+    if (policy->local_secret_len) {
+        tg_mtproto_init local;
+        if (tg_mtproto_parse_secret(handshake, policy->local_secret,
+                                    policy->local_secret_len, &local) == 0) {
+            tg_dc_endpoint endpoint;
+            if (tg_dc_map_store_resolve_id(policy->map_store, now,
+                                           local.dc_id, local.is_media,
+                                           &endpoint) != 0)
+                return -1;
+            memset(selection, 0, sizeof(*selection));
+            selection->upstream.family = endpoint.family;
+            memcpy(selection->upstream.address, endpoint.address,
+                   sizeof(endpoint.address));
+            selection->upstream.port = endpoint.port ? endpoint.port : 443;
+            selection->dc_id = local.dc_id;
+            selection->is_media = local.is_media;
+            selection->proto = local.proto;
+            selection->tcp_only = endpoint.cdn || endpoint.tcpo_only;
+            selection->local_proxy = 1;
+            return 0;
+        }
+    }
+    if (!destination_allowed(policy, original)) return -1;
     tg_mtproto_init parsed;
     int used_official_secret = 0;
     if (parse_client_handshake(policy, original, handshake, &parsed,
                                &used_official_secret) != 0)
         return -1;
-    int64_t now = (int64_t)time(NULL);
     tg_dc_endpoint endpoint = {0};
     tg_dc_map_source source;
     int result = tg_dc_map_store_resolve(policy->map_store, now, original,

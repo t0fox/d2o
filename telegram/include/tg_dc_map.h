@@ -84,6 +84,11 @@ int tg_dc_map_store_resolve(const tg_dc_map_store *store, int64_t now,
                             const tg_listener_destination *destination,
                             int media_hint, uint32_t dc_hint, int allow_cdn,
                             tg_dc_endpoint *out, tg_dc_map_source *source);
+/* Resolve by DC id alone for a local MTProto proxy, where there is no
+   original destination address to match. */
+int tg_dc_map_store_resolve_id(const tg_dc_map_store *store, int64_t now,
+                               uint32_t dc_id, int media_hint,
+                               tg_dc_endpoint *out);
 size_t tg_dc_handshake_secrets(const tg_dc_snapshot *snapshot,
                                const tg_listener_destination *destination,
                                int64_t now, tg_dc_secret *out, size_t out_cap);

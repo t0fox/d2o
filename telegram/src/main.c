@@ -407,7 +407,9 @@ static int run_local_daemon(const char *config_path) {
         .allowed_ports = allowed_ports,
         .allowed_port_count = sizeof(allowed_ports) / sizeof(allowed_ports[0]),
         .allowed_cidrs = allowed_cidrs,
-        .allowed_cidr_count = sizeof(allowed_cidrs) / sizeof(allowed_cidrs[0])
+        .allowed_cidr_count = sizeof(allowed_cidrs) / sizeof(allowed_cidrs[0]),
+        .local_secret = cfg.proxy_secret_len ? cfg.proxy_secret : NULL,
+        .local_secret_len = cfg.proxy_secret_len
     };
     tg_epoll_proxy_config proxy_config = {
         .listener_fd = listener,
@@ -427,7 +429,8 @@ static int run_local_daemon(const char *config_path) {
         .listen_port_count = sizeof(listen_ports) / sizeof(listen_ports[0]),
         .select_target = tg_transparent_select_target,
         .select_route = tg_transparent_select_route,
-        .context = &policy
+        .context = &policy,
+        .accept_direct_clients = cfg.proxy_secret_len != 0
     };
     proxy = tg_epoll_proxy_create(&proxy_config);
     if (!proxy) {
@@ -732,7 +735,7 @@ int main(int argc,char **argv) {
     int offline = d2k_runtime_offline(argc, argv, "d2ktg", offline_self_check);
     if (offline >= 0) return offline;
     const char *config="/opt/d2k/config",*log_path=NULL;
-    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=instagram-ip-probe,meta-hosts-v3,telegram-local-tcp-epoll,mtproto-respq,mtproto-auth,mtproto-v2,mtproto-help-config,mtproto-gzip-config,mtproto-wss-probe release=" D2K_RELEASE_ID);return 0;}
+    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=instagram-ip-probe,meta-hosts-v3,telegram-local-tcp-epoll,telegram-local-proxy,mtproto-respq,mtproto-auth,mtproto-v2,mtproto-help-config,mtproto-gzip-config,mtproto-wss-probe release=" D2K_RELEASE_ID);return 0;}
     if(argc==5&&strcmp(argv[1],"--check-instagram-ip")==0)return check_instagram_ip(argv[2],argv[3],argv[4]);
     if((argc==4||argc==5)&&strcmp(argv[1],"--check-telegram-dc")==0)return check_telegram_dc(argv[2],argv[3],argc==5?argv[4]:NULL);
     if((argc==4||argc==5)&&strcmp(argv[1],"--discover-telegram-dc")==0)return discover_telegram_dc(argv[2],argv[3],argc==5?argv[4]:NULL);

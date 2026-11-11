@@ -152,6 +152,8 @@ typedef struct {
     int is_media;
     tg_mtproto_proto proto;
     int tcp_only;
+    /* Direct tg://proxy client accepted on the local listener. */
+    int local_proxy;
 } tg_epoll_route_selection;
 
 typedef int (*tg_epoll_select_route_fn)(
@@ -184,6 +186,11 @@ typedef struct {
     tg_epoll_select_target_fn select_target;
     tg_epoll_select_route_fn select_route;
     void *context;
+    /* With a local tg://proxy secret, clients may connect directly to the
+       listener instead of arriving through a transparent redirect. Such a
+       connection has no useful SO_ORIGINAL_DST; the secret handshake names
+       the DC instead. */
+    int accept_direct_clients;
 } tg_epoll_proxy_config;
 
 tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config);

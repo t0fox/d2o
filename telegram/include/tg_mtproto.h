@@ -37,6 +37,18 @@ int tg_mtproto_make_obfuscated2_init(tg_mtproto_proto proto, uint32_t dc_id,
                                      uint8_t packet[TG_MTPROTO_HANDSHAKE_LEN],
                                      tg_mtproto_ctr *to_server,
                                      tg_mtproto_ctr *from_server);
+/* Client side of a tg://proxy secret handshake: decrypt = client -> proxy,
+   encrypt = proxy -> client. The decryptor is advanced past the 64-byte
+   handshake, matching the Rust r2o bridge. */
+int tg_mtproto_build_client_ciphers(
+    const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
+    const uint8_t *secret, size_t secret_len,
+    tg_mtproto_ctr *decrypt, tg_mtproto_ctr *encrypt);
+/* Raw relay ciphers for a handshake generated without a proxy secret:
+   encrypt = proxy -> Telegram, decrypt = Telegram -> proxy. */
+int tg_mtproto_build_raw_ciphers(
+    const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
+    tg_mtproto_ctr *encrypt, tg_mtproto_ctr *decrypt);
 int tg_mtproto_ctr_init(tg_mtproto_ctr *ctx, const uint8_t key[32],
                         const uint8_t iv[16]);
 int tg_mtproto_ctr_xor(tg_mtproto_ctr *ctx, uint8_t *data, size_t len);

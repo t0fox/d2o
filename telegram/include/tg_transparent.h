@@ -12,6 +12,10 @@ typedef struct {
     size_t allowed_port_count;
     const char *const *allowed_cidrs;
     size_t allowed_cidr_count;
+    /* Optional tg://proxy secret. When set, direct local clients with this
+       secret are accepted in addition to transparent connections. */
+    const uint8_t *local_secret;
+    size_t local_secret_len;
 } tg_transparent_policy;
 
 int tg_transparent_select_route(

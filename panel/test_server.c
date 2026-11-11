@@ -215,6 +215,12 @@ static void test_telegram_status_is_dynamic_and_never_exposes_secret(void) {
     rewrite_file(config,"TG_ENABLED=1\nTG_MODE=local\nTG_MODE=relay\nTG_RELAY_URL=wss://relay.example/ws\nTG_ENROLL_PORT=9443\n");
     (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
     assert(strstr(response,"\"telegram_configured\":false")!=NULL);
+    rewrite_file(config,"TG_ENABLED=1\nTG_MODE=local\nPANEL_LISTEN=192.168.1.1:8090\n"
+                        "TG_PORT=1443\nTG_PROXY_SECRET=0123456789abcdef0123456789abcdef\n"
+                        "TG_RELAY_SECRET=secret-must-not-leak\n");
+    (void)request(&cfg,"GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",response,sizeof response);
+    assert(strstr(response,"\"telegram_proxy_link\":\"tg://proxy?server=192.168.1.1&port=1443&secret=0123456789abcdef0123456789abcdef\"")!=NULL);
+    assert(strstr(response,"secret-must-not-leak")==NULL);
     unlink(live);unlink(config);unlink(status);unlink(pid);
 }
 

@@ -23,6 +23,7 @@ static int parse(const char *text) {
 int main(void) {
     assert(known_key("TG_MODE") && known_key("TG_DC_MAP_PATH"));
     assert(known_key("TG_CF_WORKER_DOMAIN"));
+    assert(known_key("TG_PROXY_SECRET"));
     size_t unknown_count = 0;
     assert(parse_with_unknown("TG_DIAGNOSTIC_DIRECT_TCP=1\n",
                               &unknown_count) == 0);

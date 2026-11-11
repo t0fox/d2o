@@ -440,6 +440,74 @@ static void telegram_route_only_value(const d2k_panel_config *cfg,
     fclose(f);
 }
 
+/* A tg://proxy link for the local MTProto listener.  The secret is the same
+   one d2ktg reads from TG_PROXY_SECRET; it is only exposed inside this link,
+   which the owner copies into Telegram. */
+static int telegram_proxy_link_value(const d2k_panel_config *cfg,
+                                     char out[256]) {
+    out[0] = '\0';
+    if (!cfg || !cfg->config_path) return 0;
+    char secret[33] = {0};
+    char listen[128] = {0};
+    int port = 1443;
+    FILE *f = fopen(cfg->config_path, "r");
+    if (!f) return 0;
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || !*p) continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq++ = '\0';
+        char *end = p + strlen(p);
+        while (end > p && (end[-1] == ' ' || end[-1] == '\t' ||
+                           end[-1] == '\r' || end[-1] == '\n')) *--end = '\0';
+        while (*eq == ' ' || *eq == '\t') eq++;
+        end = eq + strlen(eq);
+        while (end > eq && (end[-1] == ' ' || end[-1] == '\t' ||
+                            end[-1] == '\r' || end[-1] == '\n')) *--end = '\0';
+        if (*eq == '\'' || *eq == '"') {
+            char quote = *eq;
+            if (end - eq < 2 || end[-1] != quote) break;
+            *--end = '\0';
+            eq++;
+        }
+        if (strcmp(p, "TG_PROXY_SECRET") == 0) {
+            size_t n = strlen(eq);
+            int valid = n == 32;
+            for (size_t i = 0; valid && i < n; ++i)
+                if (!isxdigit((unsigned char)eq[i])) valid = 0;
+            if (valid) memcpy(secret, eq, n + 1);
+        } else if (strcmp(p, "TG_PORT") == 0) {
+            char *tail = NULL;
+            long value = strtol(eq, &tail, 10);
+            if (tail && *tail == '\0' && value >= 1 && value <= 65535)
+                port = (int)value;
+        } else if (strcmp(p, "PANEL_LISTEN") == 0) {
+            snprintf(listen, sizeof(listen), "%s", eq);
+        }
+    }
+    fclose(f);
+    if (!secret[0]) return 0;
+    char host[128] = "127.0.0.1";
+    if (listen[0]) {
+        char *colon = strrchr(listen, ':');
+        if (colon) *colon = '\0';
+        char *h = listen;
+        if (h[0] == '[') {
+            ++h;
+            char *close = strchr(h, ']');
+            if (close) *close = '\0';
+        }
+        if (h[0] && strcmp(h, "0.0.0.0") != 0 && strcmp(h, "::") != 0)
+            snprintf(host, sizeof(host), "%s", h);
+    }
+    int n = snprintf(out, 256, "tg://proxy?server=%s&port=%d&secret=%s",
+                     host, port, secret);
+    return n > 0 && (size_t)n < 256;
+}
+
 static void telegram_status_value(const d2k_panel_config *cfg,int enabled,int configured,int *running,char out[24]) {
     *running=cfg&&cfg->telegram_pid_path?pid_path_running(cfg->telegram_pid_path,NULL):0;
     const char *fallback=!configured?"not_configured":(!enabled||!*running?"stopped":"connecting");
@@ -1373,9 +1441,11 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     int queue = cfg ? cfg->queue_num : 2000;
     int telegram_enabled=0,telegram_configured=0,telegram_running=0;char telegram_status[24];
     char telegram_route_only[16];
+    char telegram_proxy_link[256];
     char telegram_stats[TELEGRAM_STATS_MAX];
     telegram_config_flags(cfg,&telegram_enabled,&telegram_configured);
     telegram_route_only_value(cfg, telegram_route_only);
+    int have_proxy_link = telegram_proxy_link_value(cfg, telegram_proxy_link);
     telegram_status_value(cfg,telegram_enabled,telegram_configured,&telegram_running,telegram_status);
     telegram_stats_value(cfg,telegram_stats);
     buf_puts(b, "{\"taken\":"); buf_json_string(b, now_iso);
@@ -1399,6 +1469,9 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     buf_json_string(b,telegram_status);
     buf_puts(b, ",\"telegram_route_only\":");
     buf_json_string(b, telegram_route_only);
+    buf_puts(b, ",\"telegram_proxy_link\":");
+    if (have_proxy_link) buf_json_string(b, telegram_proxy_link);
+    else buf_puts(b, "null");
     buf_puts(b, ",\"telegram_stats\":");
     buf_puts(b, telegram_stats);
     buf_puts(b, ",\"state_dir\":"); buf_json_string(b, state_dir);

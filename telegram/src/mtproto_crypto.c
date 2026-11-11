@@ -212,6 +212,87 @@ done:
     return rc;
 }
 
+static int secret_prekey_key(const uint8_t prekey[32],
+                             const uint8_t *secret, size_t secret_len,
+                             uint8_t key[32]) {
+    EVP_MD_CTX *hash = EVP_MD_CTX_new();
+    unsigned int key_len = 0;
+    int rc = -1;
+    if (!hash || !secret || !secret_len ||
+        EVP_DigestInit_ex(hash, EVP_sha256(), NULL) != 1 ||
+        EVP_DigestUpdate(hash, prekey, 32) != 1 ||
+        EVP_DigestUpdate(hash, secret, secret_len) != 1 ||
+        EVP_DigestFinal_ex(hash, key, &key_len) != 1 || key_len != 32)
+        goto done;
+    rc = 0;
+done:
+    EVP_MD_CTX_free(hash);
+    return rc;
+}
+
+int tg_mtproto_build_client_ciphers(
+    const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
+    const uint8_t *secret, size_t secret_len,
+    tg_mtproto_ctr *decrypt, tg_mtproto_ctr *encrypt) {
+    uint8_t key[32] = {0}, reversed[TG_MTPROTO_PREKEY_IV_LEN], zero[64] = {0};
+    int rc = -1;
+    if (!handshake || !secret || !secret_len || secret_len > 256 ||
+        !decrypt || !encrypt || decrypt->ctx || encrypt->ctx)
+        return -1;
+    if (secret_prekey_key(handshake + 8, secret, secret_len, key) != 0 ||
+        tg_mtproto_ctr_init(decrypt, key, handshake + 40) != 0 ||
+        tg_mtproto_ctr_xor(decrypt, zero, sizeof(zero)) != 0)
+        goto done;
+    memcpy(reversed, handshake + 8, sizeof(reversed));
+    for (size_t i = 0; i < sizeof(reversed) / 2; ++i) {
+        uint8_t tmp = reversed[i];
+        reversed[i] = reversed[sizeof(reversed) - 1 - i];
+        reversed[sizeof(reversed) - 1 - i] = tmp;
+    }
+    if (secret_prekey_key(reversed, secret, secret_len, key) != 0 ||
+        tg_mtproto_ctr_init(encrypt, key, reversed + 32) != 0)
+        goto done;
+    rc = 0;
+done:
+    if (rc != 0) {
+        tg_mtproto_ctr_destroy(decrypt);
+        tg_mtproto_ctr_destroy(encrypt);
+    }
+    OPENSSL_cleanse(key, sizeof(key));
+    OPENSSL_cleanse(reversed, sizeof(reversed));
+    OPENSSL_cleanse(zero, sizeof(zero));
+    return rc;
+}
+
+int tg_mtproto_build_raw_ciphers(
+    const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
+    tg_mtproto_ctr *encrypt, tg_mtproto_ctr *decrypt) {
+    uint8_t reversed[TG_MTPROTO_PREKEY_IV_LEN], zero[64] = {0};
+    int rc = -1;
+    if (!handshake || !encrypt || !decrypt ||
+        encrypt->ctx || decrypt->ctx) return -1;
+    if (tg_mtproto_ctr_init(encrypt, handshake + 8, handshake + 40) != 0 ||
+        tg_mtproto_ctr_xor(encrypt, zero, sizeof(zero)) != 0)
+        goto done;
+    memcpy(reversed, handshake + 8, sizeof(reversed));
+    for (size_t i = 0; i < sizeof(reversed) / 2; ++i) {
+        uint8_t tmp = reversed[i];
+        reversed[i] = reversed[sizeof(reversed) - 1 - i];
+        reversed[sizeof(reversed) - 1 - i] = tmp;
+    }
+    if (tg_mtproto_ctr_init(decrypt, reversed, reversed + 32) != 0)
+        goto done;
+    rc = 0;
+done:
+    if (rc != 0) {
+        tg_mtproto_ctr_destroy(encrypt);
+        tg_mtproto_ctr_destroy(decrypt);
+    }
+    OPENSSL_cleanse(reversed, sizeof(reversed));
+    OPENSSL_cleanse(zero, sizeof(zero));
+    return rc;
+}
+
 int tg_mtproto_make_obfuscated2_init(tg_mtproto_proto proto, uint32_t dc_id,
                                      int is_media,
                                      uint8_t packet[TG_MTPROTO_HANDSHAKE_LEN],

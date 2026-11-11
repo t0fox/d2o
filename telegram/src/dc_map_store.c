@@ -350,6 +350,42 @@ int tg_dc_map_store_resolve(const tg_dc_map_store *store, int64_t now,
                          allow_cdn, out, source);
 }
 
+int tg_dc_map_store_resolve_id(const tg_dc_map_store *store, int64_t now,
+                               uint32_t dc_id, int media_hint,
+                               tg_dc_endpoint *out) {
+    if (!store || !out || dc_id < 1 || dc_id > 999 ||
+        (media_hint != 0 && media_hint != 1))
+        return TG_DC_LOOKUP_INVALID;
+    const tg_dc_snapshot *snapshot = tg_dc_map_store_current(store);
+    if (!snapshot_is_fresh(snapshot, now)) snapshot = NULL;
+    if (snapshot && snapshot->endpoints && snapshot->endpoint_count) {
+        const tg_dc_endpoint *best = NULL;
+        for (size_t i = 0; i < snapshot->endpoint_count; ++i) {
+            const tg_dc_endpoint *endpoint = &snapshot->endpoints[i];
+            if (endpoint->id != dc_id || endpoint->cdn) continue;
+            if (endpoint->media_only && !media_hint) continue;
+            if (!best || (media_hint && endpoint->media_only &&
+                          !best->media_only))
+                best = endpoint;
+        }
+        if (best) {
+            *out = *best;
+            if (!out->port) out->port = 443;
+            return TG_DC_LOOKUP_OK;
+        }
+    }
+    for (size_t i = 0; i < tg_dc_builtin_endpoint_count(); ++i) {
+        tg_dc_endpoint endpoint;
+        if (tg_dc_builtin_endpoint_at(i, now, &endpoint) != 0 ||
+            endpoint.id != dc_id) continue;
+        if (endpoint.media_only && !media_hint) continue;
+        *out = endpoint;
+        if (!out->port) out->port = 443;
+        return TG_DC_LOOKUP_OK;
+    }
+    return TG_DC_LOOKUP_NOT_LISTED;
+}
+
 static int destination_equals(const tg_dc_endpoint *endpoint,
                               const tg_listener_destination *destination) {
     const uint8_t mapped_prefix[12] = {

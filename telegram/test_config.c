@@ -81,7 +81,8 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
           "TG_CF_BALANCE=1\nTG_WS_ROUTING=cf-first\n"
           "TG_WS_HEDGE_DELAY_MS=250\nTG_WS_HEDGE_LIMIT=4\n"
           "TG_DEFAULT_DOMAINS=1\nTG_DIAGNOSTIC_DIRECT_TCP=yes\n"
-          "TG_ROUTE_ONLY=worker\n", file);
+          "TG_ROUTE_ONLY=worker\n"
+          "TG_PROXY_SECRET=00112233445566778899aabbccddeeff\n", file);
     assert(fclose(file) == 0);
 
     tg_config config;
@@ -96,6 +97,8 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
     assert(config.ws_routing == TG_WS_ROUTING_CF_FIRST);
     assert(config.route_only == TG_ROUTE_ONLY_WORKER);
     assert(config.ws_hedge_delay_ms == 250 && config.ws_hedge_limit == 4);
+    assert(config.proxy_secret_len == 16);
+    assert(config.proxy_secret[0] == 0x00 && config.proxy_secret[15] == 0xff);
     tg_config_clean(&config);
 
     file = fopen(path, "w");
@@ -119,6 +122,18 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
     file = fopen(path, "w");
     assert(file);
     fputs("TG_ROUTE_ONLY=unknown\n", file);
+    assert(fclose(file) == 0);
+    assert(tg_config_read(path, &config) != 0);
+
+    file = fopen(path, "w");
+    assert(file);
+    fputs("TG_PROXY_SECRET=0011223344556677\n", file);
+    assert(fclose(file) == 0);
+    assert(tg_config_read(path, &config) != 0);
+
+    file = fopen(path, "w");
+    assert(file);
+    fputs("TG_PROXY_SECRET=00112233445566778899aabbccddeefg\n", file);
     assert(fclose(file) == 0);
     assert(tg_config_read(path, &config) != 0);
     unlink(path);

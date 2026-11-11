@@ -44,6 +44,11 @@ typedef struct {
     int cf_balance;
     int default_domains;
     uint16_t listen_port;
+    /* Optional Telegram MTProto proxy secret (16 bytes). With a secret the
+       listener accepts direct tg://proxy clients as well as transparent
+       connections. */
+    uint8_t proxy_secret[16];
+    size_t proxy_secret_len;
 } tg_config;
 
 /* Strictly reads only Telegram-owned keys; unknown D2K config keys are ignored. */

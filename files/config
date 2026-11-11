@@ -17,4 +17,7 @@ D2K_PPE_DEOFFLOAD=1
 MARK=0x2d
 TG_ENABLED=1
 TG_MODE=local
+# Секрет локального MTProto-прокси для ручного подключения по tg://proxy
+# (32 hex-символа). Установщик создаёт его автоматически, если строки нет.
+# TG_PROXY_SECRET=
 # TG_PORT=1443

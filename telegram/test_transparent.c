@@ -73,6 +73,39 @@ static void test_known_dc_is_validated_and_target_is_preserved(void) {
     assert(selected.proto == TG_MTPROTO_INTERMEDIATE);
 }
 
+static void test_local_proxy_secret_selects_dc_without_original(void) {
+    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN], secret[16];
+    assert(unhex("0001020304050607000102030405060708090a0b0c0d0e0f"
+                 "101112131415161718191a1b1c1d1e1f0001020304050607"
+                 "08090a0b0c0d0e0f7c380b6e418caed2",
+                 handshake, sizeof(handshake)) == sizeof(handshake));
+    assert(unhex("101112131415161718191a1b1c1d1e1f",
+                 secret, sizeof(secret)) == sizeof(secret));
+    const uint16_t ports[] = {443};
+    const char *cidrs[] = {"149.154.0.0/16"};
+    tg_dc_map_store store = {0};
+    tg_transparent_policy policy = {
+        .map_store = &store,
+        .allowed_ports = ports,
+        .allowed_port_count = 1,
+        .allowed_cidrs = cidrs,
+        .allowed_cidr_count = 1,
+        .local_secret = secret,
+        .local_secret_len = sizeof(secret),
+    };
+    tg_listener_destination original;
+    destination(&original, "127.0.0.1", 1443);
+    tg_epoll_route_selection selected = {0};
+    assert(tg_transparent_select_route(&policy, &original, handshake,
+                                       &selected) == 0);
+    assert(selected.local_proxy);
+    assert(selected.dc_id == 4 && selected.is_media);
+    assert(selected.proto == TG_MTPROTO_INTERMEDIATE);
+    assert(selected.upstream.port == 443);
+    assert(selected.upstream.family == AF_INET);
+    assert(!selected.tcp_only);
+}
+
 static void test_policy_rejects_wrong_port_cidr_and_unlisted_dc(void) {
     uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN];
     assert(unhex("0001020304050607000102030405060708090a0b0c0d0e0f"
@@ -214,6 +247,7 @@ static void test_exact_tcpo_secret_is_used_for_original_destination_only(void) {
 
 int main(void) {
     test_known_dc_is_validated_and_target_is_preserved();
+    test_local_proxy_secret_selects_dc_without_original();
     test_policy_rejects_wrong_port_cidr_and_unlisted_dc();
     test_unmapped_direct_route_preserves_exact_original_target();
     test_dc4_media_alias_uses_dc4_wss_route();

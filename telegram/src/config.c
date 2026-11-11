@@ -88,6 +88,24 @@ static int parse_domain_list(char domains[][TG_CONFIG_DOMAIN_SIZE],
     return 0;
 }
 
+static int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int parse_proxy_secret(const char *value, uint8_t out[16]) {
+    if (!value || strlen(value) != 32) return -1;
+    for (size_t i = 0; i < 16; ++i) {
+        int high = hex_digit(value[2 * i]);
+        int low = hex_digit(value[2 * i + 1]);
+        if (high < 0 || low < 0) return -1;
+        out[i] = (uint8_t)((high << 4) | low);
+    }
+    return 0;
+}
+
 static int parse_boolean(const char *value, int *out) {
     if (strcmp(value, "1") == 0 || strcmp(value, "yes") == 0) *out = 1;
     else if (strcmp(value, "0") == 0 || strcmp(value, "no") == 0) *out = 0;
@@ -126,7 +144,8 @@ int tg_config_read(const char *path,tg_config *out) {
            K_CF_WORKER=1u<<8,K_CF_PROXY=1u<<9,K_CF_BALANCE=1u<<10,
            K_WS_ROUTING=1u<<11,K_WS_HEDGE_DELAY=1u<<12,K_WS_HEDGE_LIMIT=1u<<13,
            K_DEFAULT_DOMAINS=1u<<14,K_CF_CACHE=1u<<15,
-           K_DIAGNOSTIC_DIRECT_TCP=1u<<16,K_ROUTE_ONLY=1u<<17 };
+           K_DIAGNOSTIC_DIRECT_TCP=1u<<16,K_ROUTE_ONLY=1u<<17,
+           K_PROXY_SECRET=1u<<18 };
     FILE *f;char line[2048],state_dir[512]="/opt/d2k/state";unsigned seen=0;int rc=-1;
     int have_status=0,have_dc_map=0,have_stats_socket=0;
     int have_cf_cache=0;
@@ -164,6 +183,7 @@ int tg_config_read(const char *path,tg_config *out) {
         else if(strcmp(key,"TG_DEFAULT_DOMAINS")==0)bit=K_DEFAULT_DOMAINS;
         else if(strcmp(key,"TG_DIAGNOSTIC_DIRECT_TCP")==0)bit=K_DIAGNOSTIC_DIRECT_TCP;
         else if(strcmp(key,"TG_ROUTE_ONLY")==0)bit=K_ROUTE_ONLY;
+        else if(strcmp(key,"TG_PROXY_SECRET")==0)bit=K_PROXY_SECRET;
         else if(strcmp(key,"TG_CF_DOMAIN_CACHE_PATH")==0){bit=K_CF_CACHE;dst=out->cf_domain_cache_path;cap=sizeof(out->cf_domain_cache_path);}
         else if(strcmp(key,"STATE_DIR")==0){bit=K_STATE;dst=state_dir;cap=sizeof(state_dir);}
         if(!bit)continue;
@@ -214,6 +234,9 @@ int tg_config_read(const char *path,tg_config *out) {
             else if(strcmp(value,"cf-proxy")==0)out->route_only=TG_ROUTE_ONLY_CF_PROXY;
             else if(strcmp(value,"tcp")==0)out->route_only=TG_ROUTE_ONLY_TCP;
             else goto done;
+        } else if(bit==K_PROXY_SECRET) {
+            if(parse_proxy_secret(value,out->proxy_secret)!=0)goto done;
+            out->proxy_secret_len=sizeof(out->proxy_secret);
         } else if(!*value||copy_value(dst,cap,value)!=0)goto done;
         if(bit==K_STATUS)have_status=1;
         if(bit==K_DC_MAP)have_dc_map=1;
