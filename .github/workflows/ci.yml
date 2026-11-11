@@ -233,14 +233,12 @@ jobs:
           node-version: '24'
       - name: Install BusyBox
         run: |
-          . /etc/os-release
-          sources="$RUNNER_TEMP/d2o-busybox.list"
-          # Use the signed Ubuntu archive directly so runner mirror selection
-          # cannot route this install through an unavailable security mirror.
-          printf 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu/ %s main universe\n' "$VERSION_CODENAME" > "$sources"
-          apt_options=(-o "Dir::Etc::sourcelist=$sources" -o Dir::Etc::sourceparts=- -o Acquire::Retries=2)
-          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update -qq
-          sudo apt-get "${apt_options[@]}" install -y -qq busybox
+          # Extract the static binary from the official BusyBox image.
+          image='docker.io/library/busybox:1.37.0-musl@sha256:5624bb6777cf469b1fb50ae3f981b15d2715ee2fffaf20b9998cfb7843726835'
+          container=$(docker create "$image")
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:/bin/busybox" "$RUNNER_TEMP/busybox"
+          sudo install -m 0755 "$RUNNER_TEMP/busybox" /usr/bin/busybox
           busybox ash -c ':'
       # Integration tests run against built code, not source. The controller
       # handshake test starts the real core/d2kc.
