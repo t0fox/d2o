@@ -127,17 +127,35 @@ int tg_config_read(const char *path,tg_config *out) {
            K_WS_ROUTING=1u<<11,K_WS_HEDGE_DELAY=1u<<12,K_WS_HEDGE_LIMIT=1u<<13,
            K_DEFAULT_DOMAINS=1u<<14,K_CF_CACHE=1u<<15,
            K_DIAGNOSTIC_DIRECT_TCP=1u<<16,K_ROUTE_ONLY=1u<<17,
-           K_TCP_FALLBACK_TIMEOUT=1u<<18 };
+           K_TCP_FALLBACK_TIMEOUT=1u<<18,K_DC_ENDPOINTS=1u<<19,
+           K_CONN_MODE=1u<<20,K_CONN_LIMIT=1u<<21 };
+    if(!path||!out)return -1;
+    const struct {
+        const char *key;
+        uint32_t *value;
+        uint32_t default_value;
+    } timers[] = {
+        {"TG_HANDSHAKE_TIMEOUT", &out->handshake_timeout_secs, 10},
+        {"TG_WS_CONNECT_TIMEOUT", &out->ws_connect_timeout_secs, 10},
+        {"TG_WS_FAIL_PROBE_TIMEOUT", &out->ws_fail_probe_timeout_secs, 2},
+        {"TG_CF_CONNECT_TIMEOUT", &out->cf_connect_timeout_secs, 10},
+        {"TG_WS_FAIL_COOLDOWN", &out->ws_fail_cooldown_secs, 30},
+        {"TG_WS_REDIRECT_COOLDOWN", &out->ws_redirect_cooldown_secs, 300},
+        {"TG_IP_FAIL_COOLDOWN", &out->ip_fail_cooldown_secs, 3600},
+        {"TG_CF_FAIL_COOLDOWN", &out->cf_fail_cooldown_secs, 60}
+    };
     FILE *f;char line[2048],state_dir[512]="/opt/d2k/state";unsigned seen=0;int rc=-1;
     int have_status=0,have_dc_map=0,have_stats_socket=0;
     int have_cf_cache=0;
-    if(!path||!out)return -1;
     memset(out,0,sizeof(*out));out->listen_port=1443;
     out->ws_routing=TG_WS_ROUTING_ADAPTIVE;
     out->ws_hedge_delay_ms=125;
     out->ws_hedge_limit=8;
     out->default_domains=1;
     out->tcp_fallback_timeout_secs=10;
+    out->connection_limit=32;
+    for (size_t i=0; i<sizeof(timers)/sizeof(timers[0]); ++i)
+        *timers[i].value=timers[i].default_value;
     if(copy_value(out->ca_bundle,sizeof(out->ca_bundle),"/opt/d2k/files/tg-roots.pem")||
        copy_value(out->status_path,sizeof(out->status_path),"/opt/d2k/state/telegram.status")||
        copy_value(out->dc_map_path,sizeof(out->dc_map_path),"/opt/d2k/state/telegram-dc-map.json")||
@@ -156,6 +174,9 @@ int tg_config_read(const char *path,tg_config *out) {
         else if(strcmp(key,"TG_PORT")==0)bit=K_PORT;
         else if(strcmp(key,"TG_MODE")==0)bit=K_MODE;
         else if(strcmp(key,"TG_DC_MAP_PATH")==0){bit=K_DC_MAP;dst=out->dc_map_path;cap=sizeof(out->dc_map_path);}
+        else if(strcmp(key,"TG_DC_MAP_ENDPOINTS_PATH")==0){bit=K_DC_ENDPOINTS;dst=out->dc_map_endpoints_path;cap=sizeof(out->dc_map_endpoints_path);}
+        else if(strcmp(key,"TG_CONNECTION_MODE")==0)bit=K_CONN_MODE;
+        else if(strcmp(key,"TG_CONNECTION_LIMIT")==0)bit=K_CONN_LIMIT;
         else if(strcmp(key,"TG_STATS_SOCKET")==0){bit=K_STATS_SOCKET;dst=out->stats_socket_path;cap=sizeof(out->stats_socket_path);}
         else if(strcmp(key,"TG_CF_WORKER_DOMAIN")==0)bit=K_CF_WORKER;
         else if(strcmp(key,"TG_CF_DOMAIN")==0)bit=K_CF_PROXY;
@@ -169,7 +190,18 @@ int tg_config_read(const char *path,tg_config *out) {
         else if(strcmp(key,"TG_ROUTE_ONLY")==0)bit=K_ROUTE_ONLY;
         else if(strcmp(key,"TG_CF_DOMAIN_CACHE_PATH")==0){bit=K_CF_CACHE;dst=out->cf_domain_cache_path;cap=sizeof(out->cf_domain_cache_path);}
         else if(strcmp(key,"STATE_DIR")==0){bit=K_STATE;dst=state_dir;cap=sizeof(state_dir);}
-        if(!bit)continue;
+        if(!bit) {
+            for (size_t i=0; i<sizeof(timers)/sizeof(timers[0]); ++i) {
+                if(strcmp(key,timers[i].key)!=0)continue;
+                bit=1u<<(22u+i);
+                if ((seen & bit) || normalize_shell_value(value)!=0 ||
+                    parse_bounded_uint(value,86400,timers[i].value)!=0 ||
+                    !*timers[i].value)goto done;
+                seen |= bit;
+                break;
+            }
+            continue;
+        }
         if (seen & bit) { goto done; }
         seen |= bit;
         if(normalize_shell_value(value)!=0)goto done;
@@ -212,6 +244,11 @@ int tg_config_read(const char *path,tg_config *out) {
             if(parse_boolean(value,&out->diagnostic_direct_tcp)!=0)goto done;
         } else if(bit==K_TCP_FALLBACK_TIMEOUT) {
             if(parse_bounded_uint(value,3600,&out->tcp_fallback_timeout_secs)!=0)goto done;
+        } else if(bit==K_CONN_MODE) {
+            if(strcmp(value,"manual")==0)out->manual_connection_limit=1;
+            else if(strcmp(value,"auto")!=0)goto done;
+        } else if(bit==K_CONN_LIMIT) {
+            if(parse_bounded_uint(value,128,&out->connection_limit)!=0||!out->connection_limit)goto done;
         } else if(bit==K_ROUTE_ONLY) {
             if(strcmp(value,"auto")==0)out->route_only=TG_ROUTE_ONLY_AUTO;
             else if(strcmp(value,"direct")==0)out->route_only=TG_ROUTE_ONLY_DIRECT;
@@ -231,6 +268,8 @@ int tg_config_read(const char *path,tg_config *out) {
     if(!have_dc_map&&snprintf(out->dc_map_path,sizeof(out->dc_map_path),"%s/telegram-dc-map.json",state_dir)>=(int)sizeof(out->dc_map_path))goto done;
     if(!have_stats_socket&&snprintf(out->stats_socket_path,sizeof(out->stats_socket_path),"%s/telegram.stats.sock",state_dir)>=(int)sizeof(out->stats_socket_path))goto done;
     if(!have_cf_cache&&snprintf(out->cf_domain_cache_path,sizeof(out->cf_domain_cache_path),"%s/telegram-cf-domains.cache",state_dir)>=(int)sizeof(out->cf_domain_cache_path))goto done;
+    if(!(seen & K_DC_ENDPOINTS)&&snprintf(out->dc_map_endpoints_path,sizeof(out->dc_map_endpoints_path),"%s/telegram-dc-endpoints.tsv",state_dir)>=(int)sizeof(out->dc_map_endpoints_path))goto done;
+    if(out->dc_map_endpoints_path[0]!='/')goto done;
     if(out->ca_bundle[0]!='/'||out->status_path[0]!='/'||out->dc_map_path[0]!='/'||out->stats_socket_path[0]!='/'||out->cf_domain_cache_path[0]!='/')goto done;
     rc=0;
 done:

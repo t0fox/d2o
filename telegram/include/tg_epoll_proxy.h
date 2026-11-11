@@ -173,6 +173,7 @@ typedef struct {
     int require_socket_mark;
     int enforce_self_dial;
     int enable_direct_wss;
+    uint16_t direct_wss_port;
     SSL_CTX *tls_context;
     const tg_config *routing_config;
     tg_cf_domain_pool *cf_domain_pool;
@@ -187,6 +188,9 @@ typedef struct {
 } tg_epoll_proxy_config;
 
 tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config);
+/* The caller owns both the current and replacement descriptors. */
+#define TG_EPOLL_REBIND_LISTENER (-2)
+int tg_epoll_proxy_set_listener(tg_epoll_proxy *server, int listener_fd);
 int tg_epoll_proxy_step(tg_epoll_proxy *server, int timeout_ms);
 void tg_epoll_proxy_destroy(tg_epoll_proxy *server);
 size_t tg_epoll_proxy_active_connections(const tg_epoll_proxy *server);

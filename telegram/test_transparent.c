@@ -191,7 +191,8 @@ static void test_exact_tcpo_secret_is_used_for_original_destination_only(void) {
         .has_snapshot = 1,
     };
     const uint16_t ports[] = {443};
-    const char *cidrs[] = {"149.154.0.0/16"};
+    /* A verified exact address can arrive outside the bootstrap CIDRs. */
+    const char *cidrs[] = {"91.108.56.0/22"};
     tg_transparent_policy policy = {
         .map_store = &store,
         .allowed_ports = ports,

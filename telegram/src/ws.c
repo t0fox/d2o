@@ -286,6 +286,15 @@ int tg_ws_upgrade_feed(tg_ws_upgrade_state *state, const uint8_t *data,
             memcmp(state->response + state->response_len - (sizeof(end) - 1u),
                    end, sizeof(end) - 1u) == 0) {
             state->response[state->response_len] = '\0';
+            const char *line = state->response;
+            if (state->response_len >= 13 && !strncmp(line, "HTTP/1.", 7) &&
+                (line[7] == '0' || line[7] == '1') && line[8] == ' ' &&
+                line[9] >= '1' && line[9] <= '5' &&
+                line[10] >= '0' && line[10] <= '9' &&
+                line[11] >= '0' && line[11] <= '9' &&
+                (line[12] == ' ' || line[12] == '\r'))
+                state->http_status = (unsigned)(line[9] - '0') * 100u +
+                    (unsigned)(line[10] - '0') * 10u + (unsigned)(line[11] - '0');
             if (validate_upgrade_response(state) != 0) {
                 state->failed = 1;
                 return -1;

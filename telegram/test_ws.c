@@ -56,6 +56,22 @@ int main(void) {
     test_nip_host_to_ipv4();
     test_masked_client_frame();
     test_server_frame_bounds();
+    const char *responses[] = {
+        "HTTP/1.1 302 Found\r\nLocation: /\r\n\r\n",
+        "HTTP/1.1 503 Service Unavailable\r\n\r\n",
+        "HTTP/1.1 503X malformed\r\n\r\n"
+    };
+    const unsigned statuses[] = {302, 503, 0};
+    for (size_t i = 0; i < sizeof(statuses) / sizeof(statuses[0]); ++i) {
+        tg_ws_upgrade_state state = {0};
+        size_t len, consumed;
+        assert(tg_ws_upgrade_start(&state, "example.org", "/apiws") == 0);
+        assert(tg_ws_upgrade_pending(&state, &len));
+        assert(tg_ws_upgrade_advance(&state, len) == 0);
+        assert(tg_ws_upgrade_feed(&state, (const uint8_t *)responses[i],
+                                  strlen(responses[i]), &consumed) == -1);
+        assert(state.http_status == statuses[i]);
+    }
     puts("Тесты WebSocket framing и nip.io: ок");
     return 0;
 }

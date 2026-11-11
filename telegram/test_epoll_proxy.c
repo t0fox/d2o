@@ -42,6 +42,16 @@ int __real_epoll_ctl(int epoll_fd, int operation, int fd,
                      struct epoll_event *event);
 int __real_clock_gettime(clockid_t clock_id, struct timespec *time);
 
+static int accept_error;
+int __real_accept4(int fd, struct sockaddr *address, socklen_t *length, int flags);
+int __wrap_accept4(int fd, struct sockaddr *address, socklen_t *length, int flags) {
+    if (accept_error) {
+        errno = accept_error;
+        return -1;
+    }
+    return __real_accept4(fd, address, length, flags);
+}
+
 static atomic_uint_fast64_t test_monotonic_offset_ms;
 
 int __wrap_clock_gettime(clockid_t clock_id, struct timespec *time) {
@@ -656,16 +666,6 @@ static void *serve_direct_wss(void *opaque) {
     assert(fd >= 0);
     fixture->accepted_count = 1;
     serve_direct_wss_connection(fixture, fd);
-    return NULL;
-}
-
-static void *serve_hedged_wss(void *opaque) {
-    wss_server_fixture *fixture = opaque;
-    int first = accept(fixture->listener, NULL, NULL);
-    assert(first >= 0);
-    fixture->accepted_count = 1;
-    fixture->expected_sni = "kws4-1.web.telegram.org";
-    serve_direct_wss_connection(fixture, first);
     return NULL;
 }
 
@@ -1685,7 +1685,7 @@ static void test_epoll_wss_transport_ack_keeps_route_selected(void) {
 }
 
 static void test_epoll_hedged_wss_commits_one_route_before_payload(
-    tg_mtproto_proto proto) {
+    tg_mtproto_proto proto, int adaptive) {
     char directory[] = "/tmp/d2k-tg-wss-hedge-XXXXXX";
     char cert_path[256], key_path[256];
     assert(mkdtemp(directory) != NULL);
@@ -1708,6 +1708,7 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
                               .key_path = key_path,
                               .expect_binary_subprotocol = 1};
     atomic_init(&wss.complete, 0);
+    wss.expected_sni = adaptive ? "kws4-1.cfproxy.test" : "kws4-1.web.telegram.org";
     uint8_t handshake[64];
     make_wss_test_handshake(proto, 4, 1, handshake);
     memcpy(wss.handshake, handshake, sizeof(handshake));
@@ -1730,7 +1731,7 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     tg_mtproto_ctr_destroy(&decrypt);
     tg_mtproto_ctr_destroy(&encrypt);
     pthread_t wss_thread;
-    assert(pthread_create(&wss_thread, NULL, serve_hedged_wss, &wss) == 0);
+    assert(pthread_create(&wss_thread, NULL, serve_direct_wss, &wss) == 0);
 
     int listener = create_listener(&proxy_port);
     proxy_fixture fixture = {0};
@@ -1739,7 +1740,13 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     SSL_CTX *tls_context = tg_tls_client_context(cert_path);
     assert(tls_context);
     tg_config routing = {0};
-    routing.ws_routing = TG_WS_ROUTING_HEDGED;
+    routing.ws_routing = adaptive ? TG_WS_ROUTING_ADAPTIVE : TG_WS_ROUTING_HEDGED;
+    if (adaptive) {
+        routing.cf_proxy_domain_count = 1;
+        strcpy(routing.cf_proxy_domains[0], "cfproxy.test");
+        set_ipv4(&fixture.direct_upstream, "192.0.2.200", 443);
+        hold_pending_connect = 1;
+    }
     routing.ws_hedge_delay_ms = 125;
     routing.ws_hedge_limit = 1;
     tg_epoll_proxy_config config = {
@@ -1753,7 +1760,10 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
         .tls_context = tls_context,
         .routing_config = &routing,
         .original_destination = original_destination,
-        .select_target = select_target,
+        .select_target = adaptive ? NULL : select_target,
+        .select_route = adaptive ? select_pending_test_route : NULL,
+        .resolve_domain = adaptive ? resolve_test_route_domain : NULL,
+        .route_context = &fixture,
         .context = &fixture,
     };
     tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
@@ -1790,9 +1800,13 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     assert(session->id > 0 && session->has_dc && session->dc == 4);
     assert(session->has_media && session->is_media);
     assert(session->stage == TG_ROUTE_SESSION_STAGE_FIRST_WSS_BINARY_RESPONSE);
-    assert(session->direct_state == TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
-    assert(session->direct_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
-    assert(session->selected_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
+    if (adaptive) {
+        assert(session->fallback_state == TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
+        assert(session->selected_transport == TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_PROXY);
+    } else {
+        assert(session->direct_state == TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
+        assert(session->selected_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
+    }
     assert(session->telegram_response_seen);
     assert(session->bytes_from_clients >= wss.expected_packet_len);
     assert(session->bytes_from_upstreams >= wss.response_packet_len);
@@ -1845,7 +1859,10 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     atomic_store(&runner.stop, 1);
     assert(pthread_join(proxy_thread, NULL) == 0);
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
-    assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 1);
+    assert(route_stats.wss_attempts == (adaptive ? 2u : 1u) &&
+           route_stats.wss_responses == 1);
+    hold_pending_connect = 0;
+    pending_connect_fd = -1;
     tg_epoll_proxy_destroy(proxy);
     close(listener);
     close(wss.listener);
@@ -3133,8 +3150,52 @@ static void test_epoll_wss_sends_ping(void) {
     assert(rmdir(directory) == 0);
 }
 
+static void test_listener_recovery_preserves_runtime(void) {
+    uint16_t port, replacement_port;
+    int listener = create_listener(&port);
+    proxy_fixture fixture = {0};
+    set_ipv4(&fixture.original, "149.154.167.51", 443);
+    tg_epoll_proxy_config config = {
+        .listener_fd = listener, .queue_bytes = 4096,
+        .memory_budget_bytes = 1024 * 1024, .configured_max_connections = 4,
+        .handshake_timeout_ms = 1000, .idle_timeout_ms = 5000,
+        .original_destination = original_destination, .select_target = select_target,
+        .context = &fixture
+    };
+    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+    assert(proxy);
+    int pending = connect_to_listener(port);
+    accept_error = EMFILE;
+    for (unsigned i = 0; i < 6; ++i) {
+        assert(tg_epoll_proxy_step(proxy, 0) >= 0);
+        atomic_fetch_add(&test_monotonic_offset_ms, 501u);
+        assert(tg_epoll_proxy_step(proxy, 0) >= 0);
+    }
+    accept_error = EIO;
+    for (unsigned i = 0; i < 4; ++i) {
+        assert(tg_epoll_proxy_step(proxy, 0) >= 0);
+        atomic_fetch_add(&test_monotonic_offset_ms, 51u);
+        assert(tg_epoll_proxy_step(proxy, 0) >= 0);
+    }
+    assert(tg_epoll_proxy_step(proxy, 0) == TG_EPOLL_REBIND_LISTENER);
+    assert(tg_epoll_proxy_set_listener(proxy, -1) == 0);
+    close(listener);
+    close(pending);
+    accept_error = 0;
+    int replacement = create_listener(&replacement_port);
+    assert(tg_epoll_proxy_set_listener(proxy, replacement) == 0);
+    int client = connect_to_listener(replacement_port);
+    assert(tg_epoll_proxy_step(proxy, 100) > 0);
+    assert(tg_epoll_proxy_active_connections(proxy) == 1);
+    close(client);
+    tg_epoll_proxy_destroy(proxy);
+    close(replacement);
+    atomic_store(&test_monotonic_offset_ms, 0);
+}
+
 int main(void) {
     (void)signal(SIGPIPE, SIG_IGN);
+    test_listener_recovery_preserves_runtime();
     test_epoll_bridge_preserves_handshake_and_half_close();
     test_epoll_many_concurrent_tcp_clients();
     test_pending_tcp_connect_expires_before_idle_timeout();
@@ -3147,10 +3208,11 @@ int main(void) {
     test_self_dial_target_is_rejected();
     test_epoll_wss_forwards_unrecognized_binary_response();
     test_epoll_wss_transport_ack_keeps_route_selected();
-    test_epoll_hedged_wss_commits_one_route_before_payload(TG_MTPROTO_ABRIDGED);
-    test_epoll_hedged_wss_commits_one_route_before_payload(TG_MTPROTO_INTERMEDIATE);
+    test_epoll_hedged_wss_commits_one_route_before_payload(TG_MTPROTO_ABRIDGED, 0);
+    test_epoll_hedged_wss_commits_one_route_before_payload(TG_MTPROTO_INTERMEDIATE, 0);
+    test_epoll_hedged_wss_commits_one_route_before_payload(TG_MTPROTO_INTERMEDIATE, 1);
     test_epoll_hedged_wss_commits_one_route_before_payload(
-        TG_MTPROTO_PADDED_INTERMEDIATE);
+        TG_MTPROTO_PADDED_INTERMEDIATE, 0);
     test_epoll_wss_partial_request_is_not_replayed();
     test_epoll_wss_partial_response_does_not_replay_request();
     test_epoll_cf_worker_uses_raw_stream_framing();

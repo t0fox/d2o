@@ -30,6 +30,7 @@ typedef struct {
     char ca_bundle[512];
     char status_path[512];
     char dc_map_path[512];
+    char dc_map_endpoints_path[512];
     char cf_domain_cache_path[512];
     char stats_socket_path[108];
     char cf_worker_domains[TG_CONFIG_MAX_CF_WORKER_DOMAINS][TG_CONFIG_DOMAIN_SIZE];
@@ -42,6 +43,16 @@ typedef struct {
     uint32_t ws_hedge_limit;
     int diagnostic_direct_tcp;
     uint32_t tcp_fallback_timeout_secs;
+    uint32_t connection_limit;
+    int manual_connection_limit;
+    uint32_t handshake_timeout_secs;
+    uint32_t ws_connect_timeout_secs;
+    uint32_t ws_fail_probe_timeout_secs;
+    uint32_t cf_connect_timeout_secs;
+    uint32_t ws_fail_cooldown_secs;
+    uint32_t ws_redirect_cooldown_secs;
+    uint32_t ip_fail_cooldown_secs;
+    uint32_t cf_fail_cooldown_secs;
     int cf_balance;
     int default_domains;
     uint16_t listen_port;

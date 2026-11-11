@@ -4,6 +4,9 @@ set -eu
 
 SET4=d2k_tg_dc
 SET6=d2k_tg_dc6
+PAIR4=d2k_tg_pair4
+PAIR6=d2k_tg_pair6
+MANIFEST=${TG_DC_MAP_ENDPOINTS_PATH:-/opt/d2k/state/telegram-dc-endpoints.tsv}
 PORT=1443
 TCP_PORTS="443 5222"
 OUTBOUND_MARK=0x31
@@ -26,8 +29,56 @@ if [ -z "$FW" ]; then
 fi
 NFT_TABLE=d2k_tg
 
+load_pairs() {
+    PAIRS=
+    [ -e "$MANIFEST" ] || return 0
+    [ -f "$MANIFEST" ] || return 1
+    PAIRS=$(awk -v allowed="$TCP_PORTS" '
+        BEGIN { split(allowed, ports); for (i in ports) valid[ports[i]]=1 }
+        NR == 1 {
+            if (NF != 3 || $1 != "z2k-tg-dc-options-v1" ||
+                $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/ || $2 < 1 || $3 < 1) exit 1
+            header=1; next
+        }
+        {
+            if (NR > 1025 || NF != 2 || !($2 in valid)) { invalid=1; exit 1 }
+            if (index($1, ":")) {
+                if ($1 !~ /^[[:xdigit:]:]+$/ || $1 ~ /:::/ || length($1) > 39) { invalid=1; exit 1 }
+                family=6
+            } else {
+                if (split($1, octet, ".") != 4) { invalid=1; exit 1 }
+                for (i=1; i<=4; i++)
+                    if (octet[i] !~ /^[0-9]+$/ || octet[i] > 255) { invalid=1; exit 1 }
+                family=4
+            }
+            print family, $1, $2
+        }
+        END { if (!header || invalid || NR < 2) exit 1 }
+    ' "$MANIFEST") || return 1
+}
+
+pair_elements() {
+    printf '%s\n' "$PAIRS" | awk -v family="$1" -v separator="$2" '
+        $1 == family { if (n++) printf ", "; printf "%s%s%s", $2, separator, $3 }
+    '
+}
+
+nft_pair_sets() {
+    [ -n "$PAIRS" ] || return 0
+    for family in 4 6; do
+        elements=$(pair_elements "$family" ' . ')
+        printf '\tset tg_pair%s { type ipv%s_addr . inet_service;' "$family" "$family"
+        [ -z "$elements" ] || printf ' elements = { %s };' "$elements"
+        printf ' }\n'
+    done
+}
+
 nft_list() { printf '%s' "$1" | sed 's/ /, /g'; }
 nft_redirects() {
+    if [ -n "$PAIRS" ]; then
+        printf '\t\tip daddr . tcp dport @tg_pair4 redirect to :%s\n' "$PORT"
+        printf '\t\tip6 daddr . tcp dport @tg_pair6 redirect to :%s\n' "$PORT"
+    fi
     for port in $TCP_PORTS; do
         printf '\t\tip daddr @tg4 tcp dport %s redirect to :%s\n' "$port" "$PORT"
         printf '\t\tip6 daddr @tg6 tcp dport %s redirect to :%s\n' "$port" "$PORT"
@@ -41,6 +92,7 @@ nft_ruleset() {
 table inet $NFT_TABLE {
 	set tg4 { type ipv4_addr; flags interval; elements = { $(nft_list "$CIDRS4") }; }
 	set tg6 { type ipv6_addr; flags interval; elements = { $(nft_list "$CIDRS6") }; }
+	$(nft_pair_sets)
 	chain pre {
 		type nat hook prerouting priority dstnat - 1; policy accept;
 		$(nft_redirects)
@@ -50,13 +102,38 @@ table inet $NFT_TABLE {
 		meta mark $OUTBOUND_MARK return
 		$(nft_redirects)
 	}
+	chain input {
+		type filter hook input priority -1; policy accept;
+		tcp dport $PORT ct status dnat accept
+		tcp dport $PORT drop
+	}
 }
 EOF2
 }
 
 nft_installed() {
     listed=$(nft list table inet "$NFT_TABLE" 2>/dev/null) || return 1
-    [ "$(printf '%s\n' "$listed" | grep -c "redirect to :$PORT")" -eq 8 ] || return 1
+    count=8
+    if [ -n "$PAIRS" ]; then
+        count=12
+        for family in 4 6; do
+            printf '%s\n' "$listed" | grep -q "set tg_pair$family {" || return 1
+            [ "$(printf '%s\n' "$listed" | grep -c "tcp dport @tg_pair$family redirect to :$PORT")" -eq 2 ] || return 1
+            actual=$(printf '%s\n' "$listed" | awk -v set="tg_pair$family" '
+                $1 == "set" { active=($2 == set); collecting=0 }
+                active && /elements =/ { collecting=1; sub(/^.*elements = *[{]/, "") }
+                active && collecting {
+                    if (index($0,"}")) { sub(/}.*/, ""); collecting=0 }
+                    print
+                }
+            ' | tr ',' '\n' | awk 'NF == 3 { print $1, $2, $3 }' | sort)
+            expected=$(printf '%s\n' "$PAIRS" | awk -v family="$family" '$1 == family { print $2, ".", $3 }' | sort)
+            [ "$actual" = "$expected" ] || return 1
+        done
+    fi
+    [ "$(printf '%s\n' "$listed" | grep -c "redirect to :$PORT")" -eq "$count" ] || return 1
+    printf '%s\n' "$listed" | grep -qF "tcp dport $PORT ct status dnat accept" || return 1
+    printf '%s\n' "$listed" | grep -qF "tcp dport $PORT drop" || return 1
     for port in $TCP_PORTS; do
         [ "$(printf '%s\n' "$listed" | grep -cF "tcp dport $port redirect to :$PORT")" -eq 4 ] || return 1
     done
@@ -112,11 +189,53 @@ delete_nat_rule() {
     done
 }
 
+ensure_ipset_pairs() {
+    pair_ipt=$1 pair_set=$2 pair_family=$3 pair_version=$4
+    wanted=$(printf '%s\n' "$PAIRS" | awk -v version="$pair_version" '
+        $1 == version { print $2 ",tcp:" $3 }
+    ' | sort)
+    if [ -z "$wanted" ]; then
+        remove_ipset_pairs "$pair_ipt" "$pair_set"
+        return
+    fi
+    ipset create "$pair_set" hash:ip,port family "$pair_family" -exist 2>/dev/null || return 1
+    current=$(ipset save "$pair_set" 2>/dev/null | awk '$1 == "add" { print $3 }' | sort)
+    if [ "$wanted" != "$current" ]; then
+        temporary="d2k_tg_${pair_version}_$$"
+        if ! {
+            printf 'create %s hash:ip,port family %s\n' "$temporary" "$pair_family"
+            printf '%s\n' "$wanted" | awk -v set="$temporary" '{ print "add", set, $1 }'
+            printf 'swap %s %s\n' "$temporary" "$pair_set"
+        } | ipset restore; then
+            ipset destroy "$temporary" 2>/dev/null || true
+            return 1
+        fi
+        ipset destroy "$temporary" 2>/dev/null || return 1
+    fi
+    for pair_chain in PREROUTING OUTPUT; do
+        set -- -p tcp -m set --match-set "$pair_set" dst,dst
+        if [ "$pair_chain" = OUTPUT ]; then set -- "$@" -m mark ! --mark "$OUTBOUND_MARK"; fi
+        set -- "$@" -j REDIRECT --to-port "$PORT"
+        "$pair_ipt" -t nat -C "$pair_chain" "$@" ||
+            "$pair_ipt" -t nat -I "$pair_chain" 1 "$@" || return 1
+    done
+}
+
+remove_ipset_pairs() {
+    delete_nat_rule "$1" PREROUTING -p tcp -m set --match-set "$2" dst,dst \
+        -j REDIRECT --to-port "$PORT" || return 1
+    delete_nat_rule "$1" OUTPUT -p tcp -m set --match-set "$2" dst,dst \
+        -m mark ! --mark "$OUTBOUND_MARK" -j REDIRECT --to-port "$PORT" || return 1
+    if command -v ipset >/dev/null 2>&1 && ipset save "$2" 2>/dev/null | grep -q "^create $2 "; then
+        ipset destroy "$2" || return 1
+    fi
+}
+
 ensure4() {
     command -v ipset >/dev/null 2>&1 || return 1
     ipset create "$SET4" hash:net -exist 2>/dev/null || return 1
     for c in $CIDRS4; do ipset add "$SET4" "$c" -exist 2>/dev/null || return 1; done
-    ensure_redirects ipt "$SET4"
+    ensure_redirects ipt "$SET4" && ensure_ipset_pairs ipt "$PAIR4" inet 4
 }
 
 ensure6() {
@@ -131,10 +250,11 @@ ensure6() {
     command -v ipset >/dev/null 2>&1 || return 0
     ipset create "$SET6" hash:net family inet6 -exist 2>/dev/null || return 0
     for c in $CIDRS6; do ipset add "$SET6" "$c" -exist 2>/dev/null || return 0; done
-    ensure_redirects ip6t "$SET6"
+    ensure_redirects ip6t "$SET6" && ensure_ipset_pairs ip6t "$PAIR6" inet6 6
 }
 
 start() {
+    load_pairs || return 1
     if [ "$FW" = nft ]; then
         ipt_stop
         nft_up || return 1
@@ -149,6 +269,7 @@ start() {
 }
 
 heal() {
+    load_pairs || return 1
     if [ "$FW" = nft ]; then
         nft_installed || nft_up
     else
@@ -177,8 +298,10 @@ remove_redirects() {
 ipt_stop() {
     command -v iptables >/dev/null 2>&1 || return 0
     remove_redirects ipt "$SET4"
+    remove_ipset_pairs ipt "$PAIR4" || true
     if command -v ip6tables >/dev/null 2>&1; then
         remove_redirects ip6t "$SET6"
+        remove_ipset_pairs ip6t "$PAIR6" || true
         for chain in FORWARD OUTPUT; do
             while ip6t -C "$chain" -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset; do
                 ip6t -D "$chain" -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset || break

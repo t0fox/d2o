@@ -25,6 +25,7 @@ typedef struct {
     char response[TG_WS_UPGRADE_MAX_HEADER + 1u];
     size_t response_len;
     int complete, failed;
+    unsigned http_status;
 } tg_ws_upgrade_state;
 
 int tg_ws_upgrade_start(tg_ws_upgrade_state *state, const char *host_header,

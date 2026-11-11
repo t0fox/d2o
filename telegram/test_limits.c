@@ -45,6 +45,12 @@ int main(void) {
     test_connection_budget_respects_memory_and_configured_cap();
     test_reserved_resources_and_invalid_inputs_fail_closed();
     test_runtime_memory_budget_tracks_router_ram();
+    const size_t mib = 1024u * 1024u;
+    assert(tg_limits_policy_connections(1024, 128*mib, 64*mib, 32) == 32);
+    assert(tg_limits_policy_connections(1024, 128*mib, 64*mib, 16) == 16);
+    assert(tg_limits_policy_connections(128, 128*mib, 64*mib, 128) == 14);
+    assert(tg_limits_policy_connections(1024, 128*mib, 16*mib, 32) == 0);
+    assert(tg_limits_policy_connections(32, 128*mib, 64*mib, 32) == 0);
     puts("Тесты лимитов Telegram runtime: ок");
     return 0;
 }

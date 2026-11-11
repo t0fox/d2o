@@ -82,7 +82,9 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
           "TG_CF_BALANCE=1\nTG_WS_ROUTING=cf-first\n"
           "TG_WS_HEDGE_DELAY_MS=250\nTG_WS_HEDGE_LIMIT=4\n"
           "TG_DEFAULT_DOMAINS=1\nTG_DIAGNOSTIC_DIRECT_TCP=yes\n"
-          "TG_ROUTE_ONLY=worker\n", file);
+          "TG_ROUTE_ONLY=worker\nTG_CONNECTION_MODE=manual\n"
+          "TG_CONNECTION_LIMIT=75\nTG_WS_REDIRECT_COOLDOWN=350\n"
+          "TG_DC_MAP_ENDPOINTS_PATH=/tmp/custom-endpoints.tsv\n", file);
     assert(fclose(file) == 0);
 
     tg_config config;
@@ -95,6 +97,9 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
     assert(config.cf_proxy_domain_count == 2);
     assert(strcmp(config.cf_proxy_domains[0], "edge.example") == 0);
     assert(config.ws_routing == TG_WS_ROUTING_CF_FIRST);
+    assert(config.manual_connection_limit && config.connection_limit == 75);
+    assert(config.ws_redirect_cooldown_secs == 350 && config.ws_connect_timeout_secs == 10);
+    assert(strcmp(config.dc_map_endpoints_path, "/tmp/custom-endpoints.tsv") == 0);
     assert(config.route_only == TG_ROUTE_ONLY_WORKER);
     assert(config.ws_hedge_delay_ms == 250 && config.ws_hedge_limit == 4);
     tg_config_clean(&config);

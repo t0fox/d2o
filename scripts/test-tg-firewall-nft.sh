@@ -46,7 +46,7 @@ printf "DISTRIB_ID='OpenWrt'\n" > "$TMP/openwrt_release"
 tg() {
     bindir=$1; shift
     env PATH="$bindir:/usr/bin:/bin" NFT_STATE="$TMP/nft" IPT_LOG="$TMP/ipt.log" \
-        D2K_OPENWRT_RELEASE="$TMP/openwrt_release" "$@"
+        D2K_OPENWRT_RELEASE="$TMP/openwrt_release" TG_DC_MAP_ENDPOINTS_PATH="$TMP/endpoints" "$@"
 }
 table() { cat "$TMP/nft/inet_d2k_tg" 2>/dev/null; }
 
@@ -82,6 +82,28 @@ sed '/meta mark 0x31 return/d' "$TMP/nft/inet_d2k_tg" > "$TMP/x" && mv "$TMP/x" 
 tg "$TMP/nftonly" sh "$TGFW" heal || fail "heal with a lost outbound mark exemption"
 [ "$(table | grep -c 'meta mark 0x31 return')" -eq 1 ] || fail "heal did not restore the outbound mark exemption"
 ok "heal leaves a healthy table alone and restores a lost one"
+
+printf '%s\n' 'z2k-tg-dc-options-v1 10 11' '149.154.175.50 443' '2001:67c:4e8:f002::a 5222' > "$TMP/endpoints"
+tg "$TMP/nftonly" sh "$TGFW" heal || fail "cannot install exact DC pairs"
+r=$(table)
+want '149.154.175.50 . 443'
+want '2001:67c:4e8:f002::a . 5222'
+want 'tcp dport 1443 ct status dnat accept'
+want 'tcp dport 1443 drop'
+: > "$TMP/nft/calls"
+tg "$TMP/nftonly" sh "$TGFW" heal || fail "cannot heal exact DC pairs"
+! grep -q '^-f' "$TMP/nft/calls" || fail "heal reloaded unchanged DC pairs"
+printf '%s\n' 'z2k-tg-dc-options-v1 12 13' '149.154.175.51 5222' > "$TMP/endpoints"
+tg "$TMP/nftonly" sh "$TGFW" heal || fail "cannot refresh exact DC pairs"
+r=$(table)
+want '149.154.175.51 . 5222'
+! printf '%s\n' "$r" | grep -qF '149.154.175.50 . 443' || fail "heal retained a stale DC pair"
+printf '%s\n' 'malformed manifest' > "$TMP/endpoints"
+if tg "$TMP/nftonly" sh "$TGFW" heal; then fail "heal accepted a malformed manifest"; fi
+[ "$(table)" = "$r" ] || fail "malformed manifest replaced live rules"
+rm "$TMP/endpoints"
+tg "$TMP/nftonly" sh "$TGFW" heal || fail "cannot return to bootstrap"
+ok "dynamic IPv4/IPv6 pairs refresh atomically and reject malformed snapshots"
 
 printf 'table inet fw4 {\n}\n' > "$TMP/nft/inet_fw4"
 tg "$TMP/nftonly" sh "$TGFW" stop || fail "stop"
@@ -150,8 +172,33 @@ EOF
 done
 cat > "$TMP/iptablesok/ipset" <<'EOF'
 #!/bin/sh
+set -eu
 printf 'ipset %s\n' "$*" >> "$IPT_LOG"
-exit 0
+case "$1" in
+    create) touch "$IPT_STATE/set-$2" ;;
+    add) : ;;
+    save)
+        [ -f "$IPT_STATE/set-$2" ] || exit 1
+        printf 'create %s hash:ip,port\n' "$2"
+        awk -v set="$2" '{ print "add", set, $0 }' "$IPT_STATE/set-$2"
+        ;;
+    restore)
+        while read -r op name value _; do
+            case "$op" in
+                create) touch "$IPT_STATE/set-$name" ;;
+                add) printf '%s\n' "$value" >> "$IPT_STATE/set-$name" ;;
+                swap)
+                    cp "$IPT_STATE/set-$value" "$IPT_STATE/swap"
+                    mv "$IPT_STATE/set-$name" "$IPT_STATE/set-$value"
+                    mv "$IPT_STATE/swap" "$IPT_STATE/set-$name"
+                    ;;
+                *) exit 1 ;;
+            esac
+        done
+        ;;
+    destroy) rm -f "$IPT_STATE/set-$2" ;;
+    *) exit 1 ;;
+esac
 EOF
 cat > "$TMP/iptablesok/conntrack" <<'EOF'
 #!/bin/sh
@@ -161,7 +208,8 @@ EOF
 chmod +x "$TMP/iptablesok/ipset" "$TMP/iptablesok/conntrack"
 tg_iptables() {
     env PATH="$TMP/iptablesok:/usr/bin:/bin" IPT_STATE="$TMP/iptables-state" \
-        IPT_LOG="$TMP/ipt-ok.log" D2K_OPENWRT_RELEASE="$TMP/no-openwrt" "$@"
+        IPT_LOG="$TMP/ipt-ok.log" D2K_OPENWRT_RELEASE="$TMP/no-openwrt" \
+        TG_DC_MAP_ENDPOINTS_PATH="$TMP/endpoints" "$@"
 }
 : > "$TMP/ipt-ok.log"
 # Simulate a legacy install where a recreated REDIRECT precedes the bypass.
@@ -182,10 +230,24 @@ tg_iptables sh "$TGFW" heal || fail "не удалось восстановит�
 ! grep -q -- '-j REJECT' "$TMP/iptables-state/ip6tables" || fail "legacy-правила всё ещё отклоняют IPv6"
 [ "$(grep -c 'REDIRECT --to-port 1443' "$TMP/iptables-state/iptables")" -eq 4 ] || fail "не хватает перенаправлений IPv4 для legacy-правил"
 [ "$(grep -c 'REDIRECT --to-port 1443' "$TMP/iptables-state/ip6tables")" -eq 4 ] || fail "не хватает перенаправлений IPv6 для legacy-правил"
+printf '%s\n' 'z2k-tg-dc-options-v1 10 11' '149.154.175.50 443' '2001:67c:4e8:f002::a 5222' > "$TMP/endpoints"
+tg_iptables sh "$TGFW" heal || fail "legacy exact pairs did not load"
+[ "$(cat "$TMP/iptables-state/set-d2k_tg_pair4")" = '149.154.175.50,tcp:443' ] || fail "wrong legacy IPv4 pair"
+[ "$(cat "$TMP/iptables-state/set-d2k_tg_pair6")" = '2001:67c:4e8:f002::a,tcp:5222' ] || fail "wrong legacy IPv6 pair"
+grep -q 'OUTPUT .* d2k_tg_pair4 dst,dst -m mark ! --mark 0x31 -j REDIRECT' "$TMP/iptables-state/iptables" || fail "legacy pair output can loop"
+: > "$TMP/ipt-ok.log"
+tg_iptables sh "$TGFW" heal || fail "legacy exact pairs did not heal"
+! grep -q '^ipset restore' "$TMP/ipt-ok.log" || fail "legacy heal reloaded unchanged pairs"
+printf '%s\n' 'z2k-tg-dc-options-v1 12 13' '149.154.175.51 5222' > "$TMP/endpoints"
+tg_iptables sh "$TGFW" heal || fail "legacy pair refresh failed"
+[ "$(cat "$TMP/iptables-state/set-d2k_tg_pair4")" = '149.154.175.51,tcp:5222' ] || fail "legacy stale pair remained"
+[ ! -e "$TMP/iptables-state/set-d2k_tg_pair6" ] || fail "legacy stale IPv6 set remained"
 tg_iptables sh "$TGFW" stop || fail "не удалось остановить legacy iptables"
 [ ! -s "$TMP/iptables-state/iptables" ] || fail "после остановки остались перенаправления Telegram IPv4"
 [ ! -s "$TMP/iptables-state/ip6tables" ] || fail "после остановки остались перенаправления Telegram IPv6"
-ok "legacy iptables перенаправляет IPv4/IPv6 и корректно удаляет правила"
+[ ! -e "$TMP/iptables-state/set-d2k_tg_pair4" ] || fail "legacy stop retained pair set"
+rm "$TMP/endpoints"
+ok "legacy iptables refreshes exact IPv4/IPv6 pairs and removes owned rules"
 
 # Keenetic: no openwrt_release — iptables as before, nft never called.
 : > "$TMP/nft/calls"

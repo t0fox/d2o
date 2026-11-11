@@ -34,7 +34,6 @@
 #include <string.h>
 #include <sys/socket.h>
 #if defined(__linux__)
-#include <sys/sysinfo.h>
 #endif
 #include <time.h>
 #include <unistd.h>
@@ -50,30 +49,19 @@
 static const char *health_path = "/tmp/d2k/d2ktg.health";
 static volatile sig_atomic_t stop_requested;
 
-#if defined(__linux__)
-static size_t memory_bytes_from_sysinfo(uint64_t units,
-                                        unsigned int unit) {
-    if (!unit || units > UINT64_MAX / unit) return SIZE_MAX;
-    uint64_t bytes = units * unit;
-    return bytes > SIZE_MAX ? SIZE_MAX : (size_t)bytes;
-}
-#endif
-
-static size_t proxy_memory_budget(void) {
-#if defined(__linux__)
-    struct sysinfo info;
-    if (sysinfo(&info) == 0 && info.mem_unit) {
-        uint64_t available_pages = (uint64_t)info.freeram + info.bufferram;
-        size_t total_bytes = memory_bytes_from_sysinfo(info.totalram,
-                                                      info.mem_unit);
-        size_t available_bytes = memory_bytes_from_sysinfo(available_pages,
-                                                           info.mem_unit);
-        size_t budget = tg_limits_runtime_memory_budget(total_bytes,
-                                                        available_bytes);
-        if (budget) return budget;
+static void read_memory_budget(size_t *total, size_t *available) {
+    FILE *file = fopen("/proc/meminfo", "r");
+    if (!file) return;
+    char line[160];
+    while (fgets(line, sizeof(line), file)) {
+        unsigned long long kib;
+        if (sscanf(line, "MemTotal: %llu kB", &kib) == 1)
+            *total = kib > SIZE_MAX / 1024u ? SIZE_MAX : (size_t)kib * 1024u;
+        else if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1)
+            *available = kib > SIZE_MAX / 1024u ? SIZE_MAX : (size_t)kib * 1024u;
+        if (*total && *available) break;
     }
-#endif
-    return 32u * 1024u * 1024u;
+    fclose(file);
 }
 
 static void on_signal(int signo) { (void)signo;stop_requested=1; }
@@ -385,6 +373,12 @@ static int run_local_daemon(const char *config_path) {
         log_msg("не удалось загрузить проверенный пул CF-доменов");
         goto done;
     }
+    const tg_dc_snapshot *snapshot = tg_dc_map_store_current(&map_store);
+    if (snapshot && tg_dc_write_endpoint_manifest(cfg.dc_map_endpoints_path,
+            snapshot, allowed_ports, sizeof(allowed_ports) / sizeof(allowed_ports[0]),
+            now) != 0)
+        log_msg("не удалось записать пары IP:порт Telegram для firewall");
+    if (!snapshot) (void)unlink(cfg.dc_map_endpoints_path);
     int initial_refresh_due = tg_dc_map_store_refresh_due(
         &map_store, now, TG_DC_REFRESH_SECS);
     next_dc_refresh_at = initial_refresh_due ? now : now + TG_DC_REFRESH_SECS;
@@ -409,17 +403,23 @@ static int run_local_daemon(const char *config_path) {
         .allowed_cidrs = allowed_cidrs,
         .allowed_cidr_count = sizeof(allowed_cidrs) / sizeof(allowed_cidrs[0])
     };
+    size_t total_memory = 0, available_memory = 0;
+    read_memory_budget(&total_memory, &available_memory);
+    size_t max_connections = tg_limits_policy_connections(tg_limits_soft_nofile(),
+        total_memory, available_memory, cfg.manual_connection_limit
+            ? cfg.connection_limit : 32u);
     tg_epoll_proxy_config proxy_config = {
         .listener_fd = listener,
         .queue_bytes = 64u * 1024u,
-        .memory_budget_bytes = proxy_memory_budget(),
-        .configured_max_connections = 64,
-        .handshake_timeout_ms = 5000,
+        .memory_budget_bytes = tg_limits_runtime_memory_budget(total_memory, available_memory),
+        .configured_max_connections = max_connections,
+        .handshake_timeout_ms = cfg.handshake_timeout_secs * 1000u,
         .idle_timeout_ms = 300000,
         .socket_mark = TG_OUTBOUND_SOCKET_MARK,
         .require_socket_mark = 1,
         .enforce_self_dial = 1,
         .enable_direct_wss = 1,
+        .direct_wss_port = 443,
         .tls_context = tls_context,
         .routing_config = &cfg,
         .cf_domain_pool = &cf_domain_pool,
@@ -447,11 +447,36 @@ static int run_local_daemon(const char *config_path) {
     (void)write_status(cfg.status_path, "local\n");
     log_msg("локальный Telegram TCP-прокси запущен через epoll");
     rc = 0;
+    uint64_t rebind_at_ms = 0;
+    unsigned rebind_attempt = 0;
     while (!stop_requested) {
+        if (listener < 0 && monotonic_ms() >= rebind_at_ms) {
+            listener = create_local_listener(cfg.listen_port);
+            if (listener >= 0 && tg_epoll_proxy_set_listener(proxy, listener) == 0) {
+                log_msg("listener Telegram восстановлен");
+            } else {
+                if (listener >= 0) close(listener);
+                listener = -1;
+                if (++rebind_attempt == 5) {
+                    log_msg("исчерпаны попытки восстановления listener Telegram");
+                    rc = 1;
+                    break;
+                }
+                rebind_at_ms = monotonic_ms() + (100u << rebind_attempt);
+            }
+        }
         if (stats_socket.fd >= 0 &&
             tg_stats_socket_serve(&stats_socket, proxy) != 0)
             log_msg("ошибка обслуживания локального socket статистики Telegram");
-        if (tg_epoll_proxy_step(proxy, 1000) < 0) {
+        int step_result = tg_epoll_proxy_step(proxy, listener < 0 ? 100 : 1000);
+        if (step_result == TG_EPOLL_REBIND_LISTENER) {
+            log_msg("ошибки accept: восстанавливается listener Telegram");
+            (void)tg_epoll_proxy_set_listener(proxy, -1);
+            close(listener);
+            listener = -1;
+            rebind_attempt = 0;
+            rebind_at_ms = monotonic_ms() + 100u;
+        } else if (step_result < 0) {
             log_msg("ошибка epoll runtime локального Telegram-прокси");
             rc = 1;
             break;
@@ -463,6 +488,10 @@ static int run_local_daemon(const char *config_path) {
         int refresh_result = finish_dc_refresh(&refresh_job, &map_store,
                                                 refresh_now);
         if (refresh_result > 0) {
+            if (tg_dc_write_endpoint_manifest(cfg.dc_map_endpoints_path,
+                    tg_dc_map_store_current(&map_store), allowed_ports,
+                    sizeof(allowed_ports) / sizeof(allowed_ports[0]), refresh_now) != 0)
+                log_msg("не удалось обновить пары IP:порт Telegram для firewall");
             next_dc_refresh_at = refresh_now + TG_DC_REFRESH_SECS;
             log_msg("карта Telegram обновлена по подтверждённому help.getConfig");
         } else if (refresh_result < 0) {

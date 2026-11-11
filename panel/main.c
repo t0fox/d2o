@@ -77,6 +77,10 @@ static int known_key(const char *key) {
         "TG_MODE", "TG_DC_MAP_PATH", "TG_RELAY_URL", "TG_RELAY_SECRET", "TG_IDENTITY", "TG_CA_BUNDLE",
         "TG_STATUS", "TG_STATS_SOCKET", "TG_PORT", "TG_ENROLL_PORT",
         "TG_DIAGNOSTIC_DIRECT_TCP", "TG_TCP_FALLBACK_TIMEOUT",
+        "TG_DC_MAP_ENDPOINTS_PATH", "TG_CONNECTION_MODE", "TG_CONNECTION_LIMIT",
+        "TG_HANDSHAKE_TIMEOUT", "TG_WS_CONNECT_TIMEOUT", "TG_CF_CONNECT_TIMEOUT",
+        "TG_WS_FAIL_COOLDOWN", "TG_WS_REDIRECT_COOLDOWN", "TG_WS_FAIL_PROBE_TIMEOUT",
+        "TG_IP_FAIL_COOLDOWN", "TG_CF_FAIL_COOLDOWN",
         "TG_CF_WORKER_DOMAIN",
         /* Читает files/S99d2k (разгрузка PPE на Keenetic); панели значение
            не нужно, но ключ законный и пишется установщиком. */

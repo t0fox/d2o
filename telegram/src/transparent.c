@@ -57,12 +57,17 @@ static int destination_allowed(const tg_transparent_policy *policy,
         policy->allowed_cidr_count > TG_TRANSPARENT_MAX_CIDRS ||
         tg_listener_is_self_dial_addr(destination, NULL, 0))
         return 0;
-    int port_allowed = 0, cidr_allowed = 0;
+    int port_allowed = 0;
     for (size_t i = 0; i < policy->allowed_port_count; ++i)
         if (policy->allowed_ports[i] == destination->port) port_allowed = 1;
+    return port_allowed;
+}
+
+static int destination_in_cidrs(const tg_transparent_policy *policy,
+                                const tg_listener_destination *destination) {
     for (size_t i = 0; i < policy->allowed_cidr_count; ++i)
-        if (cidr_matches(policy->allowed_cidrs[i], destination)) cidr_allowed = 1;
-    return port_allowed && cidr_allowed;
+        if (cidr_matches(policy->allowed_cidrs[i], destination)) return 1;
+    return 0;
 }
 
 static int parse_client_handshake(const tg_transparent_policy *policy,
@@ -121,6 +126,9 @@ int tg_transparent_select_route(
      * was supplied. Never grant an arbitrary address a WSS/CF route. */
     if (result != TG_DC_LOOKUP_OK &&
         !(result == TG_DC_LOOKUP_NOT_LISTED && parsed.dc_id == 0))
+        return -1;
+    if (!(result == TG_DC_LOOKUP_OK && source == TG_DC_MAP_OFFICIAL) &&
+        !destination_in_cidrs(policy, original))
         return -1;
     memset(selection, 0, sizeof(*selection));
     selection->upstream = *original;
