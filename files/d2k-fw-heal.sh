@@ -89,9 +89,6 @@ rc=$?
 rmdir "$HEAL_LOCK" 2>/dev/null
 
 if [ "$rc" = 0 ]; then
-    # reapply restores the cached exclusions before reconnecting NFQUEUE.
-    # Refresh now in case the firewall rebuild coincided with an IP change.
-    "$INIT_SCRIPT" dns-ensure >/dev/null 2>&1
     echo "d2k: правила снесены извне и восстановлены сторожем" >&2
 fi
 exit "$rc"
