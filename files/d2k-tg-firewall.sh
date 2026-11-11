@@ -81,20 +81,42 @@ nft_up() {
     return "$rc"
 }
 
+ensure_redirects() {
+    tg_ipt=$1
+    tg_set=$2
+    for tg_port in $TCP_PORTS; do
+        for tg_chain in PREROUTING OUTPUT; do
+            set -- -p tcp --dport "$tg_port" -m set --match-set "$tg_set" dst
+            # Keep the exclusion on each OUTPUT rule. A heal can insert a
+            # missing rule above the old standalone RETURN.
+            if [ "$tg_chain" = OUTPUT ]; then
+                set -- "$@" -m mark ! --mark "$OUTBOUND_MARK"
+            fi
+            set -- "$@" -j REDIRECT --to-port "$PORT"
+            "$tg_ipt" -t nat -C "$tg_chain" "$@" ||
+                "$tg_ipt" -t nat -I "$tg_chain" 1 "$@" || return 1
+            "$tg_ipt" -t nat -C "$tg_chain" "$@" || return 1
+        done
+        delete_nat_rule "$tg_ipt" OUTPUT -p tcp --dport "$tg_port" \
+            -m set --match-set "$tg_set" dst -j REDIRECT --to-port "$PORT" || return 1
+    done
+    delete_nat_rule "$tg_ipt" OUTPUT -m mark --mark "$OUTBOUND_MARK" \
+        -m comment --comment "$OUTBOUND_COMMENT" -j RETURN
+}
+
+delete_nat_rule() {
+    tg_delete_ipt=$1
+    shift
+    while "$tg_delete_ipt" -t nat -C "$@"; do
+        "$tg_delete_ipt" -t nat -D "$@" || return 1
+    done
+}
+
 ensure4() {
     command -v ipset >/dev/null 2>&1 || return 1
     ipset create "$SET4" hash:net -exist 2>/dev/null || return 1
     for c in $CIDRS4; do ipset add "$SET4" "$c" -exist 2>/dev/null || return 1; done
-    for port in $TCP_PORTS; do
-        for chain in PREROUTING OUTPUT; do
-            ipt -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" ||
-                ipt -t nat -I "$chain" 1 -p tcp --dport "$port" -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || return 1
-            ipt -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || return 1
-        done
-    done
-    ipt -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN ||
-        ipt -t nat -I OUTPUT 1 -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || return 1
-    ipt -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || return 1
+    ensure_redirects ipt "$SET4"
 }
 
 ensure6() {
@@ -109,17 +131,7 @@ ensure6() {
     command -v ipset >/dev/null 2>&1 || return 0
     ipset create "$SET6" hash:net family inet6 -exist 2>/dev/null || return 0
     for c in $CIDRS6; do ipset add "$SET6" "$c" -exist 2>/dev/null || return 0; done
-    for port in $TCP_PORTS; do
-        for chain in PREROUTING OUTPUT; do
-            ip6t -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET6" dst -j REDIRECT --to-port "$PORT" ||
-                ip6t -t nat -I "$chain" 1 -p tcp --dport "$port" -m set --match-set "$SET6" dst -j REDIRECT --to-port "$PORT" || return 1
-            ip6t -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET6" dst -j REDIRECT --to-port "$PORT" || return 1
-        done
-    done
-    ip6t -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN ||
-        ip6t -t nat -I OUTPUT 1 -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || return 1
-    ip6t -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || return 1
-    return 0
+    ensure_redirects ip6t "$SET6"
 }
 
 start() {
@@ -146,29 +158,27 @@ heal() {
 
 # Снятие iptables-правил — и на Keenetic, и на OpenWrt как остаток установки
 # времён Entware. Без iptables здесь нечего делать.
-ipt_stop() {
-    command -v iptables >/dev/null 2>&1 || return 0
+remove_redirects() {
+    tg_remove_ipt=$1
+    tg_remove_set=$2
     for port in $TCP_PORTS; do
         for chain in PREROUTING OUTPUT; do
-            while ipt -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT"; do
-                ipt -t nat -D "$chain" -p tcp --dport "$port" -m set --match-set "$SET4" dst -j REDIRECT --to-port "$PORT" || break
-            done
+            delete_nat_rule "$tg_remove_ipt" "$chain" -p tcp --dport "$port" \
+                -m set --match-set "$tg_remove_set" dst -j REDIRECT --to-port "$PORT" || true
         done
+        delete_nat_rule "$tg_remove_ipt" OUTPUT -p tcp --dport "$port" \
+            -m set --match-set "$tg_remove_set" dst -m mark ! --mark "$OUTBOUND_MARK" \
+            -j REDIRECT --to-port "$PORT" || true
     done
-    while ipt -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN; do
-        ipt -t nat -D OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || break
-    done
+    delete_nat_rule "$tg_remove_ipt" OUTPUT -m mark --mark "$OUTBOUND_MARK" \
+        -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || true
+}
+
+ipt_stop() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    remove_redirects ipt "$SET4"
     if command -v ip6tables >/dev/null 2>&1; then
-        for port in $TCP_PORTS; do
-            for chain in PREROUTING OUTPUT; do
-                while ip6t -t nat -C "$chain" -p tcp --dport "$port" -m set --match-set "$SET6" dst -j REDIRECT --to-port "$PORT"; do
-                    ip6t -t nat -D "$chain" -p tcp --dport "$port" -m set --match-set "$SET6" dst -j REDIRECT --to-port "$PORT" || break
-                done
-            done
-        done
-        while ip6t -t nat -C OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN; do
-            ip6t -t nat -D OUTPUT -m mark --mark "$OUTBOUND_MARK" -m comment --comment "$OUTBOUND_COMMENT" -j RETURN || break
-        done
+        remove_redirects ip6t "$SET6"
         for chain in FORWARD OUTPUT; do
             while ip6t -C "$chain" -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset; do
                 ip6t -D "$chain" -p tcp -m set --match-set "$SET6" dst -j REJECT --reject-with tcp-reset || break

@@ -15,10 +15,11 @@ static void test_config_values_and_legacy_fields(void) {
           "TG_RELAY_SECRET='old-secret'\nTG_IDENTITY=/opt/d2k/state/tg.identity\n"
           "TG_CA_BUNDLE=/opt/d2k/files/tg-roots.pem\n"
           "TG_STATUS=/opt/d2k/state/telegram.status\nTG_PORT=1443\n"
-          "TG_ENROLL_PORT=9443\n",f);assert(fclose(f)==0);
+          "TG_ENROLL_PORT=9443\nTG_PROXY_SECRET=old-manual-key\n"
+          "TG_LISTEN_FAKETLS_DOMAIN=old.example\n",f);assert(fclose(f)==0);
     tg_config cfg;assert(tg_config_read(path,&cfg)==0);unlink(path);
     assert(cfg.enabled==1&&cfg.local_mode&&cfg.listen_port==1443);
-    assert(!cfg.diagnostic_direct_tcp);
+    assert(!cfg.diagnostic_direct_tcp && cfg.tcp_fallback_timeout_secs == 10);
     assert(strcmp(cfg.ca_bundle,"/opt/d2k/files/tg-roots.pem")==0);
     assert(strcmp(cfg.status_path,"/opt/d2k/state/telegram.status")==0);
     assert(strcmp(cfg.stats_socket_path,"/opt/d2k/state/telegram.stats.sock")==0);
@@ -44,11 +45,11 @@ static void test_local_mode_needs_no_relay_url_or_secret(void) {
     tg_config_clean(&cfg);
 
     f=fopen(path,"w");assert(f);
-    fputs("TG_ENABLED=1\nTG_MODE=local\nSTATE_DIR=/tmp/tg-state\nTG_DEFAULT_DOMAINS=0\n",f);
+    fputs("TG_ENABLED=1\nTG_MODE=local\nSTATE_DIR=/tmp/tg-state\nTG_DEFAULT_DOMAINS=0\nTG_TCP_FALLBACK_TIMEOUT=0\n",f);
     assert(fclose(f)==0);
     assert(tg_config_read(path,&cfg)==0);
     assert(strcmp(cfg.stats_socket_path,"/tmp/tg-state/telegram.stats.sock")==0);
-    assert(!cfg.default_domains);
+    assert(!cfg.default_domains && cfg.tcp_fallback_timeout_secs == 0);
     tg_config_clean(&cfg);
     unlink(path);
 }
@@ -81,9 +82,7 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
           "TG_CF_BALANCE=1\nTG_WS_ROUTING=cf-first\n"
           "TG_WS_HEDGE_DELAY_MS=250\nTG_WS_HEDGE_LIMIT=4\n"
           "TG_DEFAULT_DOMAINS=1\nTG_DIAGNOSTIC_DIRECT_TCP=yes\n"
-          "TG_ROUTE_ONLY=worker\n"
-          "TG_PROXY_SECRET=00112233445566778899aabbccddeeff\n"
-          "TG_LISTEN_FAKETLS_DOMAIN=CDN.Example.Test\n", file);
+          "TG_ROUTE_ONLY=worker\n", file);
     assert(fclose(file) == 0);
 
     tg_config config;
@@ -98,29 +97,7 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
     assert(config.ws_routing == TG_WS_ROUTING_CF_FIRST);
     assert(config.route_only == TG_ROUTE_ONLY_WORKER);
     assert(config.ws_hedge_delay_ms == 250 && config.ws_hedge_limit == 4);
-    assert(config.proxy_secret_count == 1);
-    assert(config.proxy_secrets[0][0] == 0x00 &&
-           config.proxy_secrets[0][15] == 0xff);
-    assert(strcmp(config.faketls_domain, "cdn.example.test") == 0);
     tg_config_clean(&config);
-
-    file = fopen(path, "w");
-    assert(file);
-    fputs("TG_ENABLED=1\nTG_MODE=local\n"
-          "TG_PROXY_SECRET=00112233445566778899aabbccddeeff,"
-          "ffeeddccbbaa99887766554433221100\n", file);
-    assert(fclose(file) == 0);
-    assert(tg_config_read(path, &config) == 0);
-    assert(config.proxy_secret_count == 2);
-    assert(config.proxy_secrets[1][0] == 0xff &&
-           config.proxy_secrets[1][15] == 0x00);
-    tg_config_clean(&config);
-
-    file = fopen(path, "w");
-    assert(file);
-    fputs("TG_LISTEN_FAKETLS_DOMAIN=not a domain\n", file);
-    assert(fclose(file) == 0);
-    assert(tg_config_read(path, &config) != 0);
 
     file = fopen(path, "w");
     assert(file);
@@ -143,18 +120,6 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
     file = fopen(path, "w");
     assert(file);
     fputs("TG_ROUTE_ONLY=unknown\n", file);
-    assert(fclose(file) == 0);
-    assert(tg_config_read(path, &config) != 0);
-
-    file = fopen(path, "w");
-    assert(file);
-    fputs("TG_PROXY_SECRET=0011223344556677\n", file);
-    assert(fclose(file) == 0);
-    assert(tg_config_read(path, &config) != 0);
-
-    file = fopen(path, "w");
-    assert(file);
-    fputs("TG_PROXY_SECRET=00112233445566778899aabbccddeefg\n", file);
     assert(fclose(file) == 0);
     assert(tg_config_read(path, &config) != 0);
     unlink(path);

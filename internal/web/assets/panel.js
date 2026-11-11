@@ -1989,16 +1989,6 @@
     actions.setAttribute("data-tg-actions", "");
     top.append(title, actions);
 
-    var proxyLink = el(doc, "div", "tg-proxy-link");
-    proxyLink.setAttribute("data-tg-proxy-link", "");
-    var linkValue = el(doc, "code", "tg-proxy-link-value", "");
-    linkValue.setAttribute("data-tg-link-value", "");
-    var copyLink = el(doc, "button", "tg-proxy-link-copy", "Скопировать ссылку");
-    copyLink.type = "button";
-    copyLink.setAttribute("data-control", "telegram-copy-link");
-    copyLink.setAttribute("data-tg-copy-link", "");
-    proxyLink.append(linkValue, copyLink);
-
     var summary = el(doc, "div", "tg-flow-summary");
     var lastSuccess = el(doc, "p", "tg-flow-last-success", "Подтверждённый обмен пока не зафиксирован");
     lastSuccess.setAttribute("data-tg-last-success", "");
@@ -2194,7 +2184,7 @@
       }
       metrics.appendChild(metric);
     });
-    root.append(top, proxyLink, summary, routeChoice, metrics, diagnostics, help, map, caption);
+    root.append(top, summary, routeChoice, metrics, diagnostics, help, map, caption);
     if (global.D2kTelegramFlow && global.D2kTelegramFlow.mountTelegramFlow) {
       root.__flow = global.D2kTelegramFlow.mountTelegramFlow(canvas);
     }
@@ -2365,8 +2355,7 @@
       state = flow.state === "active" || flow.state === "mixed" ? st
         : flow.state === "searching" ? "connecting" : flow.state;
     var key = JSON.stringify([state, snap.telegram_enabled, snap.telegram_configured, stats,
-      snap.telegram_route_only, snap.telegram_proxy_link, snap.controls_enabled, busy,
-      this.pending, stale]);
+      snap.telegram_route_only, snap.controls_enabled, busy, this.pending, stale]);
     if (!force && body.__d2kKey === key) return;
     var focused = doc.activeElement && body.contains(doc.activeElement)
       ? doc.activeElement.getAttribute("data-control") : null;
@@ -2381,9 +2370,6 @@
         actions: scene.querySelector("[data-tg-actions]"),
         routeLock: scene.querySelector("[data-tg-route-lock]"),
         routeSelect: scene.querySelector("[data-tg-route-select]"),
-        proxyLink: scene.querySelector("[data-tg-proxy-link]"),
-        linkValue: scene.querySelector("[data-tg-link-value]"),
-        copyLink: scene.querySelector("[data-tg-copy-link]"),
       };
       body.replaceChildren(scene);
       if (ui.scene.__flow) ui.scene.__flow.attach();
@@ -2395,35 +2381,6 @@
       });
       ui.routeSelect.addEventListener("change", function () {
         if (ui.routeLock.checked) self.applyTelegramRoute(ui.routeSelect.value);
-      });
-    }
-    if (!ui.copyLink.__bound) {
-      ui.copyLink.__bound = true;
-      ui.copyLink.addEventListener("click", function () {
-        var link = ui.copyLink.__link || "";
-        if (!link) return;
-        var copied = function () {
-          self.flash = { tone: "info", text: "Ссылка tg://proxy скопирована", at: Date.now() };
-          self.renderNotice();
-        };
-        var fallback = function () {
-          try {
-            var range = doc.createRange();
-            range.selectNodeContents(ui.linkValue);
-            var selection = doc.getSelection();
-            selection.removeAllRanges();
-            selection.addRange(range);
-            if (doc.execCommand && doc.execCommand("copy")) { copied(); return; }
-          } catch (e) { /* ниже покажем ошибку */ }
-          self.flash = { tone: "bad", text: "Не удалось скопировать ссылку", at: Date.now() };
-          self.renderNotice();
-        };
-        if (self.win.navigator && self.win.navigator.clipboard &&
-            self.win.navigator.clipboard.writeText) {
-          self.win.navigator.clipboard.writeText(link).then(copied).catch(fallback);
-        } else {
-          fallback();
-        }
       });
     }
     var lockedRoute = str(snap.telegram_route_only);
@@ -2443,13 +2400,6 @@
       "При включении C11 будет использовать только выбранный маршрут и перезапустится.");
     ui.lamp.setAttribute("data-tone", telegramDisplayTone(st, stats, flow, stale));
     ui.lamp.setAttribute("aria-label", telegramDisplayStatus(st, stats, flow, stale));
-    var proxyLink = snap.telegram_proxy_link ? str(snap.telegram_proxy_link) : "";
-    ui.copyLink.__link = proxyLink;
-    ui.copyLink.disabled = !proxyLink || busy;
-    ui.linkValue.textContent = proxyLink ||
-      "Ссылка появится после создания TG_PROXY_SECRET";
-    if (proxyLink) ui.proxyLink.removeAttribute("hidden");
-    else ui.proxyLink.setAttribute("hidden", "");
     var buttons = [];
     if (snap.controls_enabled) {
       if (snap.telegram_enabled) {

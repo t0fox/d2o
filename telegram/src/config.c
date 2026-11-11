@@ -88,41 +88,6 @@ static int parse_domain_list(char domains[][TG_CONFIG_DOMAIN_SIZE],
     return 0;
 }
 
-static int hex_digit(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-static int parse_proxy_secrets(
-    const char *value, uint8_t out[][16], size_t *out_count) {
-    if (!value || !out || !out_count) return -1;
-    size_t count = 0;
-    const char *p = value;
-    for (;;) {
-        while (*p == ' ' || *p == '\t' || *p == ',') ++p;
-        if (!*p) break;
-        const char *start = p;
-        while (*p && *p != ',') ++p;
-        const char *end = p;
-        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) --end;
-        if (end - start != 32 || count >= TG_CONFIG_MAX_PROXY_SECRETS)
-            return -1;
-        for (size_t i = 0; i < 16; ++i) {
-            int high = hex_digit(start[2 * i]);
-            int low = hex_digit(start[2 * i + 1]);
-            if (high < 0 || low < 0) return -1;
-            out[count][i] = (uint8_t)((high << 4) | low);
-        }
-        ++count;
-        if (*p == ',') ++p;
-    }
-    if (!count) return -1;
-    *out_count = count;
-    return 0;
-}
-
 static int parse_boolean(const char *value, int *out) {
     if (strcmp(value, "1") == 0 || strcmp(value, "yes") == 0) *out = 1;
     else if (strcmp(value, "0") == 0 || strcmp(value, "no") == 0) *out = 0;
@@ -162,7 +127,7 @@ int tg_config_read(const char *path,tg_config *out) {
            K_WS_ROUTING=1u<<11,K_WS_HEDGE_DELAY=1u<<12,K_WS_HEDGE_LIMIT=1u<<13,
            K_DEFAULT_DOMAINS=1u<<14,K_CF_CACHE=1u<<15,
            K_DIAGNOSTIC_DIRECT_TCP=1u<<16,K_ROUTE_ONLY=1u<<17,
-           K_PROXY_SECRET=1u<<18,K_FAKETLS_DOMAIN=1u<<19 };
+           K_TCP_FALLBACK_TIMEOUT=1u<<18 };
     FILE *f;char line[2048],state_dir[512]="/opt/d2k/state";unsigned seen=0;int rc=-1;
     int have_status=0,have_dc_map=0,have_stats_socket=0;
     int have_cf_cache=0;
@@ -172,6 +137,7 @@ int tg_config_read(const char *path,tg_config *out) {
     out->ws_hedge_delay_ms=125;
     out->ws_hedge_limit=8;
     out->default_domains=1;
+    out->tcp_fallback_timeout_secs=10;
     if(copy_value(out->ca_bundle,sizeof(out->ca_bundle),"/opt/d2k/files/tg-roots.pem")||
        copy_value(out->status_path,sizeof(out->status_path),"/opt/d2k/state/telegram.status")||
        copy_value(out->dc_map_path,sizeof(out->dc_map_path),"/opt/d2k/state/telegram-dc-map.json")||
@@ -199,9 +165,8 @@ int tg_config_read(const char *path,tg_config *out) {
         else if(strcmp(key,"TG_WS_HEDGE_LIMIT")==0)bit=K_WS_HEDGE_LIMIT;
         else if(strcmp(key,"TG_DEFAULT_DOMAINS")==0)bit=K_DEFAULT_DOMAINS;
         else if(strcmp(key,"TG_DIAGNOSTIC_DIRECT_TCP")==0)bit=K_DIAGNOSTIC_DIRECT_TCP;
+        else if(strcmp(key,"TG_TCP_FALLBACK_TIMEOUT")==0)bit=K_TCP_FALLBACK_TIMEOUT;
         else if(strcmp(key,"TG_ROUTE_ONLY")==0)bit=K_ROUTE_ONLY;
-        else if(strcmp(key,"TG_PROXY_SECRET")==0)bit=K_PROXY_SECRET;
-        else if(strcmp(key,"TG_LISTEN_FAKETLS_DOMAIN")==0)bit=K_FAKETLS_DOMAIN;
         else if(strcmp(key,"TG_CF_DOMAIN_CACHE_PATH")==0){bit=K_CF_CACHE;dst=out->cf_domain_cache_path;cap=sizeof(out->cf_domain_cache_path);}
         else if(strcmp(key,"STATE_DIR")==0){bit=K_STATE;dst=state_dir;cap=sizeof(state_dir);}
         if(!bit)continue;
@@ -245,6 +210,8 @@ int tg_config_read(const char *path,tg_config *out) {
             if(parse_boolean(value,&out->default_domains)!=0)goto done;
         } else if(bit==K_DIAGNOSTIC_DIRECT_TCP) {
             if(parse_boolean(value,&out->diagnostic_direct_tcp)!=0)goto done;
+        } else if(bit==K_TCP_FALLBACK_TIMEOUT) {
+            if(parse_bounded_uint(value,3600,&out->tcp_fallback_timeout_secs)!=0)goto done;
         } else if(bit==K_ROUTE_ONLY) {
             if(strcmp(value,"auto")==0)out->route_only=TG_ROUTE_ONLY_AUTO;
             else if(strcmp(value,"direct")==0)out->route_only=TG_ROUTE_ONLY_DIRECT;
@@ -252,11 +219,6 @@ int tg_config_read(const char *path,tg_config *out) {
             else if(strcmp(value,"cf-proxy")==0)out->route_only=TG_ROUTE_ONLY_CF_PROXY;
             else if(strcmp(value,"tcp")==0)out->route_only=TG_ROUTE_ONLY_TCP;
             else goto done;
-        } else if(bit==K_PROXY_SECRET) {
-            if(parse_proxy_secrets(value,out->proxy_secrets,
-                                   &out->proxy_secret_count)!=0)goto done;
-        } else if(bit==K_FAKETLS_DOMAIN) {
-            if(normalize_domain(value,out->faketls_domain)!=0)goto done;
         } else if(!*value||copy_value(dst,cap,value)!=0)goto done;
         if(bit==K_STATUS)have_status=1;
         if(bit==K_DC_MAP)have_dc_map=1;

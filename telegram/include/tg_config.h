@@ -7,7 +7,6 @@
 #define TG_CONFIG_DOMAIN_SIZE 254u
 #define TG_CONFIG_MAX_CF_WORKER_DOMAINS 8u
 #define TG_CONFIG_MAX_CF_PROXY_DOMAINS 32u
-#define TG_CONFIG_MAX_PROXY_SECRETS 8u
 #define TG_OUTBOUND_SOCKET_MARK 0x31u
 
 typedef enum {
@@ -42,16 +41,10 @@ typedef struct {
     uint32_t ws_hedge_delay_ms;
     uint32_t ws_hedge_limit;
     int diagnostic_direct_tcp;
+    uint32_t tcp_fallback_timeout_secs;
     int cf_balance;
     int default_domains;
     uint16_t listen_port;
-    /* Optional Telegram MTProto proxy secrets (16 bytes each). With at least
-       one secret the listener accepts direct tg://proxy clients as well as
-       transparent connections. */
-    uint8_t proxy_secrets[TG_CONFIG_MAX_PROXY_SECRETS][16];
-    size_t proxy_secret_count;
-    /* Optional FakeTLS camouflage domain for the local MTProto listener. */
-    char faketls_domain[TG_CONFIG_DOMAIN_SIZE];
 } tg_config;
 
 /* Strictly reads only Telegram-owned keys; unknown D2K config keys are ignored. */

@@ -37,7 +37,7 @@ exit 1
   fixture('scripts/architecture.sh', '#!/bin/sh\nprintf "amd64\\n"\n');
   for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, '#!/bin/sh\nexit 0\n');
   fixture('builds/d2kpanel-linux-amd64', '#!/bin/sh\necho features=telegram-control\n');
-  fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=telegram-local-tcp-epoll,telegram-local-proxy,telegram-faketls,instagram-ip-probe,meta-hosts-v3\n');
+  fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=telegram-local-tcp-epoll,instagram-ip-probe,meta-hosts-v3\n');
   fixture('builds/d2kd-linux-amd64', '#!/bin/sh\nexit 0\n');
   for (const name of ['d2kc','d2kfetch']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
   fixture('files/S99d2k', '#!/bin/sh\nprintf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
@@ -76,7 +76,11 @@ exit 1
   // Upgrade from a release that shipped the port-80 proxy (task 51): its binary goes away.
   fs.mkdirSync(path.join(tmp, 'opt/sbin'), { recursive: true });
   fs.writeFileSync(path.join(tmp, 'opt/sbin/d2khttp'), '#!/bin/sh\nexit 2\n', { mode: 0o755 });
+  // Minimal Keenetic BusyBox images may omit od. Transparent install needs no secret.
+  fs.writeFileSync(path.join(tmp, 'bin/od'), '#!/bin/sh\nexit 127\n', { mode: 0o755 });
   const installOut = run('install');
+  const configPath = path.join(tmp, 'opt/d2k/config');
+  assert.doesNotMatch(fs.readFileSync(configPath, 'utf8'), /^TG_PROXY_SECRET=/m);
   assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2khttp')), 'upgrade must remove the old d2khttp proxy binary');
   // The first DNS refresh (15 names, possibly silent edges) must not hold the
   // installer: the service's scheduler runs it in the background with a log.
@@ -103,7 +107,7 @@ exit 1
   // A d2ktg without the 15-name certificate check would silently skip WhatsApp/fbcdn.
   const tgFixture = path.join(tmp, 'source/builds/d2ktg-linux-amd64');
   const tgCurrent = fs.readFileSync(tgFixture);
-  fs.writeFileSync(tgFixture, '#!/bin/sh\necho features=telegram-local-tcp-epoll,telegram-local-proxy,instagram-ip-probe,meta-hosts-v2\n');
+  fs.writeFileSync(tgFixture, '#!/bin/sh\necho features=telegram-local-tcp-epoll,instagram-ip-probe,meta-hosts-v2\n');
   const stale = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
   assert.notEqual(stale.status, 0, 'installer must reject a d2ktg without the Meta host list check');
   assert.match(stale.stdout + stale.stderr, /d2ktg устарел/);

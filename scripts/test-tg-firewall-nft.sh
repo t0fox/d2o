@@ -164,11 +164,21 @@ tg_iptables() {
         IPT_LOG="$TMP/ipt-ok.log" D2K_OPENWRT_RELEASE="$TMP/no-openwrt" "$@"
 }
 : > "$TMP/ipt-ok.log"
+# Simulate a legacy install where a recreated REDIRECT precedes the bypass.
+printf '%s\n' \
+    'nat OUTPUT -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443' \
+    'nat OUTPUT -m mark --mark 0x31 -m comment --comment d2k-tg-outbound -j RETURN' \
+    > "$TMP/iptables-state/iptables"
 tg_iptables sh "$TGFW" start || fail "не удалось запустить legacy iptables"
 grep -q 'ip6tables -w -t nat -I PREROUTING 1 -p tcp --dport 443 -m set --match-set d2k_tg_dc6 dst -j REDIRECT --to-port 1443' "$TMP/ipt-ok.log" \
     || fail "legacy-правила не перенаправляют IPv6-трафик Telegram"
-grep -q 'ip6tables -w -t nat -I OUTPUT 1 -m mark --mark 0x31 -m comment --comment d2k-tg-outbound -j RETURN' "$TMP/ipt-ok.log" \
-    || fail "legacy-правила не исключают помеченные IPv6-соединения прокси"
+for tool in iptables ip6tables; do
+    [ "$(grep -c 'nat OUTPUT .* -m mark ! --mark 0x31 -j REDIRECT' "$TMP/iptables-state/$tool")" -eq 2 ] ||
+        fail "$tool: каждое перенаправление OUTPUT должно исключать исходящие соединения прокси"
+done
+! grep -q 'nat OUTPUT .* dst -j REDIRECT\|d2k-tg-outbound' "$TMP/iptables-state/iptables" ||
+    fail "старые правила OUTPUT остались после перехода"
+tg_iptables sh "$TGFW" heal || fail "не удалось восстановить legacy iptables"
 ! grep -q -- '-j REJECT' "$TMP/iptables-state/ip6tables" || fail "legacy-правила всё ещё отклоняют IPv6"
 [ "$(grep -c 'REDIRECT --to-port 1443' "$TMP/iptables-state/iptables")" -eq 4 ] || fail "не хватает перенаправлений IPv4 для legacy-правил"
 [ "$(grep -c 'REDIRECT --to-port 1443' "$TMP/iptables-state/ip6tables")" -eq 4 ] || fail "не хватает перенаправлений IPv6 для legacy-правил"
