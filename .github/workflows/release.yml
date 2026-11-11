@@ -81,17 +81,19 @@ jobs:
         run: |
           set -euo pipefail
           # apt-get в этом окружении зависает на update (три таймаута по
-          # 240 с в логе 11.11.2026). QEMU берём статическим бинарником:
-          # обновление индексов apt для него не нужно, а -cpu и -L он
-          # поддерживает так же, как пакет qemu-user.
+          # 240 с в логе 11.11.2026). Берём статический qemu-user-static из
+          # Arch: 7.2 из multiarch падал SIGSEGV на aarch64-бинаре, 11.1.3
+          # запускает его штатно (проверено локально).
           dest="${RUNNER_TEMP}/qemu"
           mkdir -p "$dest"
+          pkg=qemu-user-static-11.1.3-1-x86_64.pkg.tar.zst
+          url="https://geo.mirror.pkgbuild.com/extra/os/x86_64/$pkg"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+            -o "$dest/qemu.pkg.tar.zst" "$url"
+          tar --zstd -xf "$dest/qemu.pkg.tar.zst" -C "$dest"
           for arch in aarch64 arm mips mipsel mips64el ppc64 riscv64 i386 x86_64; do
-            url="https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/qemu-${arch}-static.tar.gz"
-            curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
-              -o "$dest/$arch.tgz" "$url"
-            tar -xzf "$dest/$arch.tgz" -C "$dest"
-            sudo install -m 0755 "$dest/qemu-${arch}-static" "/usr/local/bin/qemu-${arch}"
+            sudo install -m 0755 "$dest/usr/bin/qemu-${arch}-static" \
+              "/usr/local/bin/qemu-${arch}"
           done
           for tool in file readelf make python3 node; do
             command -v "$tool" >/dev/null || {
