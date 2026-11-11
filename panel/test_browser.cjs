@@ -165,7 +165,7 @@ function diagnosticFixture(kind='full'){
 let ws,diagnosticsReply=null;
 async function main(){
  let port;
- for(let i=0;i<100;i++){try{port=fs.readFileSync(path.join(profile,'DevToolsActivePort'),'utf8').split('\n')[0];break}catch{}await new Promise(r=>setTimeout(r,100))}
+ for(let i=0;i<100;i++){try{const activePort=fs.readFileSync(path.join(profile,'DevToolsActivePort'),'utf8').split('\n')[0];if(activePort){port=activePort;break}}catch{}await new Promise(r=>setTimeout(r,100))}
  if(!port)throw Error('Headless browser unavailable: '+chromeError);
  const tab=await(await fetch('http://127.0.0.1:'+port+'/json/new?about:blank',{method:'PUT'})).json();
  ws=new WebSocket(tab.webSocketDebuggerUrl);await new Promise((r,j)=>{ws.onopen=r;ws.onerror=j});

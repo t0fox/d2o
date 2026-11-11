@@ -291,9 +291,11 @@ grep -q '"controls_enabled":true' /tmp/d2k-panel-status.json || fail "loopback-�
 grep -q '"telegram_enabled":true' /tmp/d2k-panel-status.json || fail "API считает включённый Telegram выключенным"
 grep -q '"telegram_configured":true' /tmp/d2k-panel-status.json || fail "API не распознал локальный режим Telegram"
 grep -q '"telegram_status":"local"' /tmp/d2k-panel-status.json || fail "панель не показала запущенный локальный прокси"
-if grep -q 'TG_RELAY_SECRET\|relay_secret\|telegram.*secret' /tmp/d2k-panel-status.json; then
+if grep -q 'TG_RELAY_SECRET\|relay_secret' /tmp/d2k-panel-status.json; then
     fail "API раскрыл поле или значение секрета ретранслятора"
 fi
+grep -q '"telegram_proxy_link":"tg://proxy?' /tmp/d2k-panel-status.json ||
+    fail "API не отдал ссылку локального Telegram-прокси"
 panel_curl -fsS http://127.0.0.1:8090/ | grep -q 'id="app"' || fail "C-панель не отдала главную страницу через LAN-привязку"
 panel_curl -fsS http://127.0.0.1:8090/assets/gsap.js -o /tmp/d2k-gsap.js || fail "C-панель не отдала библиотеку анимаций"
 panel_curl -fsS http://127.0.0.1:8090/assets/telegram-flow.js -o /tmp/d2k-telegram-flow.js || fail "C-панель не отдала анимацию Telegram"
