@@ -22,7 +22,7 @@ jobs:
   plan:
     name: Plan — is there anything to release
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       release: ${{ steps.plan.outputs.release }}
@@ -62,7 +62,7 @@ jobs:
     name: Build — ${{ matrix.arch }}
     needs: plan
     if: needs.plan.outputs.release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: true
@@ -79,8 +79,26 @@ jobs:
           persist-credentials: false
       - name: QEMU and tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq make python3 qemu-user binutils file nodejs
+          set -euo pipefail
+          APT_OPTS=(
+            -o Acquire::Retries=5
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+            -o DPkg::Lock::Timeout=120
+          )
+          for attempt in 1 2 3; do
+            if timeout 240 sudo apt-get "${APT_OPTS[@]}" update -qq; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::apt-get update failed after 3 attempts"
+              exit 1
+            fi
+            echo "apt-get update failed (attempt $attempt); retrying"
+            sleep 15
+          done
+          timeout 300 sudo apt-get "${APT_OPTS[@]}" install -y -qq \
+            make python3 qemu-user binutils file nodejs
       # No cache in a release build: a cache hit would skip the SHA-256 check.
       - uses: ./.github/actions/setup-zig
         with:
@@ -108,7 +126,7 @@ jobs:
   publish:
     name: Publish — sign and release
     needs: [plan, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: d2o-signing
     permissions:
