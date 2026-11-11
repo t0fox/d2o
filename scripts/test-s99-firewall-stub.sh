@@ -44,6 +44,9 @@ done
 [ $# -eq 0 ] || spec=$(printf '%s ' "$@" | sed -e 's/ $//' -e 's/-m tcp //' -e 's/"//g')
 # Чужой процесс держит блокировку xtables: настоящий iptables 1.4.21 без -w
 # отвечает сразу кодом 4, с -w ждёт её (поле 15.10.2026, Keenetic).
+if [ "${NO_ADDRTYPE:-0}" = 1 ]; then
+    case " $spec " in *" -m addrtype "*) exit 1 ;; esac
+fi
 if [ "${STUB_XTABLES_BUSY:-0}" = 1 ] && [ "$wait_lock" = 0 ]; then
     echo "Another app is currently holding the xtables lock. Perhaps you want to use the -w option?" >&2
     exit 4
@@ -60,7 +63,18 @@ f=$dir/$chain
 case "$op" in
     -N) [ ! -e "$f" ] || exit 1; : > "$f"; : > "$f.user" ;;
     -A) [ -e "$f" ] || exit 1; printf '%s\n' "$spec" >> "$f" ;;
-    -I) [ -e "$f" ] || exit 1; { printf '%s\n' "$spec"; cat "$f"; } > "$f.new"; mv "$f.new" "$f" ;;
+    -I) [ -e "$f" ] || exit 1
+        case "$chain:$spec" in
+            "POSTROUTING:-j D2K_OUT")
+                if [ "$tool" = iptables ] && [ -n "${EXPECT_DOH_BEFORE_HOOK:-}" ]; then
+                    grep -qF -- "-d $EXPECT_DOH_BEFORE_HOOK --dport 443" "$dir/D2K_OUT" || {
+                        echo "DoH was missing when the NFQUEUE hook attached" >&2; exit 1; }
+                fi ;;
+            D2K_IN:*) if [ -n "${FAIL_DOH_IN:-}" ] && [ "$spec" = "-p udp -s $FAIL_DOH_IN -d 192.0.2.1 --sport 443 -j RETURN" ]; then
+                exit 1
+            fi ;;
+        esac
+        { printf '%s\n' "$spec"; cat "$f"; } > "$f.new"; mv "$f.new" "$f" ;;
     -C) [ -e "$f" ] && grep -qxF -- "$spec" "$f" ;;
     -D) [ -e "$f" ] && grep -qxF -- "$spec" "$f" || exit 1
         awk -v s="$spec" '!d && $0==s {d=1; next} {print}' "$f" > "$f.new"; mv "$f.new" "$f" ;;
@@ -255,6 +269,20 @@ ok "explicit user proxy gate is excluded"
 # круге сторожа; неразрешившееся имя прежних правил не снимает.
 cat > "$TMP/bin/ndmc" <<'NDMC'
 #!/bin/sh
+[ ! -f "$NDMC_FAIL" ] || { echo 'command temporarily unavailable'; exit 0; }
+if [ "${NDMC_NO_ANNOTATIONS:-0}" = 1 ]; then
+    case "$2" in
+        'show dns-proxy') echo 'dns_server = 127.0.0.1:40508 .' ;;
+        'show running-config')
+            printf 'dns-proxy
+    https upstream "https://doh.test/dns-query" dnsm
+!
+'
+            ;;
+        *) exit 1 ;;
+    esac
+    exit
+fi
 printf '\033[K\n     proxy-status: \n              proxy-name: System\n\n'
 printf 'timeout = 7000\n'
 printf 'dns_server = 127.0.0.1:40508 . # https://doh.test/dns-query@dnsm\n'
@@ -265,7 +293,27 @@ NDMC
 cat > "$TMP/bin/nslookup" <<'NSL'
 #!/bin/sh
 [ "$1" = doh.test ] || exit 1
-[ -f "$NSL_FAIL" ] && exit 1
+case "$2" in
+    127.0.0.1)
+        if [ -f "$NSL_FAIL" ]; then
+            if [ "${NSL_HANG:-0}" = 1 ]; then
+                : > "$NSL_LOOKUP_STARTED"
+                exec sleep 15
+            fi
+            exit 1
+        fi ;;
+
+    8.8.8.8|1.1.1.1)
+        [ -s "$NSL_BOOTSTRAP" ] || exit 1
+        printf 'Server: %s
+Address: %s:53
+
+Name: doh.test
+' "$2" "$2"
+        sed 's/^/Address: /' "$NSL_BOOTSTRAP"
+        exit 0 ;;
+    *) exit 1 ;;
+esac
 printf 'Server:    127.0.0.1\nAddress 1: 127.0.0.1 localhost\n\nName:      doh.test\n'
 i=1; for a in $(cat "$NSL_ADDRS"); do printf 'Address %d: %s\n' $i "$a"; i=$((i+1)); done
 NSL
@@ -278,17 +326,33 @@ dns_before_queue() { # <tool> <chain> <spec>
         END { exit !seen }'
 }
 rm -rf "$TMP/fw" "$TMP/run/dns-excl"; mkdir -p "$TMP/fw"
-S99_SNIPPET='fw_up && fw_installed' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail" \
+mkdir -p "$TMP/proc/net"
+cat > "$TMP/proc/net/fib_trie" <<'ROUTES'
+Local:
+    |-- 192.0.2.1
+       /32 host LOCAL
+    |-- 192.0.2.80
+       /32 link UNICAST
+    |-- 127.0.0.1
+       /32 host LOCAL
+ROUTES
+printf '20010db8000000000000000000000001 01 80 00 80 wan
+' > "$TMP/proc/net/if_inet6"
+export NO_ADDRTYPE=1
+export NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail" NSL_BOOTSTRAP="$TMP/nsl-bootstrap" NDMC_FAIL="$TMP/ndmc-fail"
+S99_SNIPPET='fw_up && fw_installed' s99 EXPECT_DOH_BEFORE_HOOK=198.51.100.7 \
     || fail "fw_up with router DNS exclusions failed"
 for want in "iptables 198.51.100.7 443" "ip6tables 2001:db8::7 443" "iptables 9.9.9.9 853" \
             "iptables 192.0.2.53 5353"; do
     # Разбиение по словам намеренное: «инструмент адрес порт» в одной строке.
     # shellcheck disable=SC2086
     set -- $want
+    router=192.0.2.1
+    [ "$1" != ip6tables ] || router=2001:0db8:0000:0000:0000:0000:0000:0001
     for pr in tcp udp; do
-        dns_before_queue "$1" D2K_OUT "-p $pr -d $2 --dport $3 -j RETURN" \
+        dns_before_queue "$1" D2K_OUT "-p $pr -s $router -d $2 --dport $3 -j RETURN" \
             || fail "$1: no $pr RETURN to router DNS $2:$3 before the queue"
-        dns_before_queue "$1" D2K_IN "-p $pr -s $2 --sport $3 -j RETURN" \
+        dns_before_queue "$1" D2K_IN "-p $pr -s $2 -d $router --sport $3 -j RETURN" \
             || fail "$1: no $pr RETURN from router DNS $2:$3 before the queue"
     done
 done
@@ -297,25 +361,125 @@ if rules iptables mangle | grep -q '127.0.0.1 --dport 40508\|198.51.100.11'; the
 fi
 # DoH сменил адрес — старое снято, новое стоит.
 printf '198.51.100.8\n' > "$TMP/nsl-addrs"
-S99_SNIPPET='dns_excl_sync' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail"
-dns_before_queue iptables D2K_OUT "-p tcp -d 198.51.100.8 --dport 443 -j RETURN" \
+S99_SNIPPET='dns_excl_sync' s99
+dns_before_queue iptables D2K_OUT "-p tcp -s 192.0.2.1 -d 198.51.100.8 --dport 443 -j RETURN" \
     || fail "a new DoH address was not excluded"
 if rules iptables mangle | grep -q '198.51.100.7'; then fail "a stale DoH address stayed excluded"; fi
 if rules ip6tables mangle | grep -q '2001:db8::7'; then fail "a stale IPv6 DoH address stayed excluded"; fi
 # Имя сейчас не разрешилось — прежнее исключение остаётся.
 : > "$TMP/nsl-fail"
-S99_SNIPPET='dns_excl_sync' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail"
-dns_before_queue iptables D2K_OUT "-p tcp -d 198.51.100.8 --dport 443 -j RETURN" \
+S99_SNIPPET='dns_excl_sync' s99
+dns_before_queue iptables D2K_OUT "-p tcp -s 192.0.2.1 -d 198.51.100.8 --dport 443 -j RETURN" \
     || fail "a failed lookup removed the DoH exclusion"
 rm -f "$TMP/nsl-fail"
+# The router's recursive DoH is still down after the upstream's IP rotated.
+# An independent bootstrap lookup can resolve the new edge.
+: > "$TMP/nsl-fail"
+printf '198.51.100.9
+2001:db8::9
+' > "$TMP/nsl-bootstrap"
+S99_SNIPPET='dns_excl_sync' s99 NSL_HANG=1 NSL_LOOKUP_STARTED="$TMP/nsl-started" &
+refresh=$!
+attempt=0
+while [ ! -f "$TMP/nsl-started" ] && [ "$attempt" -lt 50 ]; do
+    sleep 0.1
+    attempt=$((attempt + 1))
+done
+[ -f "$TMP/nsl-started" ] || fail "timeout fixture did not start"
+[ ! -d "$TMP/fw.lock" ] || fail "DoH timeout held the firewall operation lock"
+wait "$refresh" || fail "bootstrap refresh did not recover from the timeout"
+grep -qx 'doh.test 198.51.100.9 443' "$TMP/run/dns-excl" \
+    || fail "rotated DoH IPv4 address was not discovered with local DNS down"
+grep -qx 'doh.test 2001:db8::9 443' "$TMP/run/dns-excl" \
+    || fail "rotated DoH IPv6 address was not discovered with local DNS down"
+! grep -q '198.51.100.8' "$TMP/run/dns-excl" || fail "bootstrap retained the superseded address"
+rm -f "$TMP/nsl-fail" "$TMP/nsl-bootstrap"
 # Сброс извне снёс исключение — круг сторожа его возвращает.
-FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -D D2K_OUT -p tcp -d 9.9.9.9 --dport 853 -j RETURN
-S99_SNIPPET='dns_excl_sync' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail"
-dns_before_queue iptables D2K_OUT "-p tcp -d 9.9.9.9 --dport 853 -j RETURN" \
+FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -D D2K_OUT -p tcp -s 192.0.2.1 -d 9.9.9.9 --dport 853 -j RETURN
+S99_SNIPPET='dns_excl_sync' s99
+dns_before_queue iptables D2K_OUT "-p tcp -s 192.0.2.1 -d 9.9.9.9 --dport 853 -j RETURN" \
     || fail "the watchdog round did not restore a lost DNS exclusion"
-S99_SNIPPET='fw_down' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail"
-rm -f "$TMP/bin/ndmc" "$TMP/bin/nslookup" "$TMP/run/dns-excl"
-ok "router DNS servers (DoH, DoT, plain) from ndmc are excluded both ways, kept fresh"
+# Execute the real watchdog with the same test firewall in each process.
+cat > "$TMP/heal-init" <<'INIT'
+#!/bin/sh
+. "$TEST_DIR/s99funcs.sh"
+PATH="$TEST_DIR/bin:$PATH"
+RUN=$TEST_DIR/run; FW_V4ONLY=$RUN/fw-ipv4-only; FW_LOCK=$TEST_DIR/fw.lock; PROC_DIR=$TEST_DIR/proc
+case "$1" in
+    status)
+        echo 'датапат: работает'
+        if fw_installed; then echo 'правила: стоят'; fi ;;
+    ppe-ensure) exit 0 ;;
+    reapply) fw_up ;;
+    dns-ensure) dns_excl_sync ;;
+esac
+INIT
+chmod +x "$TMP/heal-init"
+heal_round() {
+    env FW_STATE="$TMP/fw" TEST_DIR="$TMP" INIT_SCRIPT="$TMP/heal-init" \
+        HEAL_LOCK="$TMP/heal.lock" HEAL_LAST="$TMP/heal.last" MIN_INTERVAL=0 \
+        "$@" sh "$ROOT/files/d2k-fw-heal.sh"
+}
+
+# Lose NDM and the whole firewall during the DNS outage. The rebuilt hooks
+# must use the cached addresses even before the first successful discovery.
+: > "$TMP/ndmc-fail"
+S99_SNIPPET='fw_down' s99
+heal_round EXPECT_DOH_BEFORE_HOOK=198.51.100.8 || fail "watchdog failed to rebuild the firewall from cache"
+dns_before_queue iptables D2K_OUT '-p tcp -s 192.0.2.1 -d 198.51.100.8 --dport 443 -j RETURN' \
+    || fail "watchdog lost the cached DoH route when NDM was unavailable"
+rules iptables mangle > "$TMP/fw-before-heal"
+heal_round || fail "restarted watchdog failed"
+rules iptables mangle > "$TMP/fw-after-heal"
+cmp -s "$TMP/fw-before-heal" "$TMP/fw-after-heal" || fail "restarted watchdog changed healthy rules"
+rm -f "$TMP/ndmc-fail"
+
+# Heal rebuilds using the old IP and then discovers the rotated IP in the
+# same run, even though the local resolver is still timing out.
+: > "$TMP/nsl-fail"
+printf '198.51.100.9\n2001:db8::9\n' > "$TMP/nsl-bootstrap"
+S99_SNIPPET='fw_down' s99
+heal_round EXPECT_DOH_BEFORE_HOOK=198.51.100.8 || fail "watchdog failed during DoH rotation"
+dns_before_queue ip6tables D2K_IN '-p udp -s 2001:db8::9 -d 2001:0db8:0000:0000:0000:0000:0000:0001 --sport 443 -j RETURN' \
+    || fail "watchdog rebuild did not also refresh the rotated IPv6 address"
+rm -f "$TMP/nsl-fail" "$TMP/nsl-bootstrap"
+
+# Changing endpoints never drops working exclusions before all replacements
+# have been added, even if one of the four firewall updates fails.
+printf '198.51.100.10\n2001:db8::10\n' > "$TMP/nsl-addrs"
+if S99_SNIPPET='dns_excl_sync' s99 FAIL_DOH_IN=198.51.100.10; then
+    fail "partial DoH rule update reported success"
+fi
+dns_before_queue iptables D2K_OUT '-p tcp -s 192.0.2.1 -d 198.51.100.9 --dport 443 -j RETURN' \
+    || fail "failed DoH rotation dropped the previous edge"
+heal_round || fail "watchdog failed to retry a partial DoH rule update"
+dns_before_queue iptables D2K_IN '-p udp -s 198.51.100.10 -d 192.0.2.1 --sport 443 -j RETURN' \
+    || fail "failed DoH reply rule was not repaired"
+! rules iptables mangle | grep -q '198.51.100.9' || fail "the superseded edge survived a successful retry"
+
+# Some NDM versions omit the explanatory comment from the DNS proxy status.
+printf '198.51.100.12\n' > "$TMP/nsl-addrs"
+heal_round NDMC_NO_ANNOTATIONS=1 || fail "watchdog failed with unannotated NDM output"
+grep -qx 'doh.test 198.51.100.12 443' "$TMP/run/dns-excl" \
+    || fail "configured DoH URL was not discovered from running-config"
+if rules iptables mangle | awk '
+    /--[ds]port 443 -j RETURN/ && !(/ -s / && / -d /) { found = 1 }
+    END { exit !found }'; then
+    fail "an address-only bypass would exclude forwarded HTTPS to the same address"
+fi
+! rules iptables mangle | grep -q '192.0.2.80' || fail "a LAN peer was treated as a router address"
+
+# WAN renew changes the local tuple as well as the remote one.
+sed 's/192\.0\.2\.1$/192.0.2.2/' "$TMP/proc/net/fib_trie" > "$TMP/proc/net/fib_trie.new"
+mv "$TMP/proc/net/fib_trie.new" "$TMP/proc/net/fib_trie"
+heal_round NDMC_NO_ANNOTATIONS=1
+dns_before_queue iptables D2K_OUT '-p tcp -s 192.0.2.2 -d 198.51.100.12 --dport 443 -j RETURN' \
+    || fail "the new WAN IP did not get its DoH exception"
+! rules iptables mangle | grep -q '192\.0\.2\.1 ' || fail "the old WAN IP still has a DoH exception"
+S99_SNIPPET='fw_down' s99
+rm -f "$TMP/bin/ndmc" "$TMP/bin/nslookup" "$TMP/run/dns-excl" "$TMP/run/dns-excl-rules" "$TMP/run/dns-excl-rules.check"
+unset NSL_ADDRS NSL_FAIL NSL_BOOTSTRAP NDMC_FAIL NO_ADDRTYPE
+ok "router-only DNS exceptions work without addrtype and survive address rotation, outages and firewall rebuilds"
 
 # A working ip6tables whose rule fails half-way is still a real error: both
 # families roll back, as before.

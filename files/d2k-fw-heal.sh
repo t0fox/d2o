@@ -89,6 +89,9 @@ rc=$?
 rmdir "$HEAL_LOCK" 2>/dev/null
 
 if [ "$rc" = 0 ]; then
+    # The cached DoH rules were installed before the NFQUEUE hooks. Refresh
+    # the upstreams now in case NDM also changed the DNS configuration.
+    "$INIT_SCRIPT" dns-ensure >/dev/null 2>&1
     echo "d2k: правила снесены извне и восстановлены сторожем" >&2
 fi
 exit "$rc"

@@ -457,6 +457,11 @@ fw_family_up() (
         "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -s "$GATE_IP" --sport "$GATE_PORT" -j RETURN || return 1
     fi
 
+    if [ -n "${2:-}" ]; then
+        dns_excl_apply "$fw_tool" -A "$2" ||
+            say "исключения DNS роутера не полностью установлены ($fw_tool)"
+    fi
+
     # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
     # останавливать его (§10). Это касается и UDP-правил ниже в той же мере,
     # что и TCP: без --queue-bypass там остановка датапата обрывает весь QUIC
@@ -595,9 +600,9 @@ ppe_down() {
 # IPv4 и предупреждает: IPv6-трафик идёт мимо d2k, как без него. Любой иной
 # отказ IPv6 — настоящая ошибка, и fw_up откатывает оба семейства.
 fw_up_unlocked() {
-    fw_family_up iptables || return 1
+    fw_family_up iptables "${1:-}" || return 1
     rc6=0
-    fw_family_up ip6tables || rc6=$?
+    fw_family_up ip6tables "${1:-}" || rc6=$?
     case $rc6 in
         0) rm -f "$FW_V4ONLY" ;;
         3)
@@ -888,94 +893,287 @@ fw_lock_release() {
     rmdir "$FW_LOCK"
 }
 
-# DNS РОУТЕРА — НЕ ЦЕЛЬ. Поле 15.10.2026: Keenetic резолвит через DoH
-# (https-dns-proxy → geohide.ru:443), и этот поток шёл через очередь D2K как
-# обычный TLS; прокси при всплесках запросов копил зависшие и падал («too
-# many», 2275 ошибок за утро). DNS роутера, какой бы ни был заведён — DoH, DoT
-# или обычный на нестандартном порту, — исключается по адресу и порту: RETURN
-# в обе стороны раньше очереди, по TCP и по UDP (DoH поверх HTTP/3, DoQ).
-# Источник — `ndmc show dns-proxy`: строки dns_server, где после «#» стоит
-# настоящий сервер, а до «#» — локальный прокси (127.0.0.1, не исключается)
-# или сам сервер. Имена DoH разрешаются через DNS роутера на каждом круге
-# сторожа; неразрешившееся имя прежних правил не снимает. Без ndmc (OpenWrt)
-# исключать нечего — список пуст.
+# Keenetic's local resolver must reach its upstreams outside NFQUEUE.
+# The loopback port in show dns-proxy is IPC; its comment names the upstream.
+# Older NDM output can omit the comments, so also read its configured URLs
+# when an unannotated loopback helper is present.
 dns_upstreams() {
-    command -v ndmc >/dev/null 2>&1 || return 0
-    ndmc -c "show dns-proxy" 2>/dev/null | tr -d '\033\r' | awk '
-        function emit(s, def,    host, port, t) {
-            host = s; port = def; t = s
+    local dns_status dns_config
+    dns_status=$(LD_LIBRARY_PATH='' ndmc -c "show dns-proxy" 2>/dev/null) || return 1
+    printf '%s\n' "$dns_status" | grep -Eq 'proxy-config:|^[[:space:]]*dns_server[[:space:]]*=' ||
+        return 1
+    dns_config=
+    if printf '%s\n' "$dns_status" | awk '
+        $1 == "dns_server" && $2 == "=" &&
+        $3 ~ /^(127\.|\[?::1\]?(:|$))/ && $0 !~ /#[[:space:]]*[^[:space:]]/ { found = 1 }
+        END { exit !found }'; then
+        dns_config=$(LD_LIBRARY_PATH='' ndmc -c "show running-config" 2>/dev/null) || return 1
+        printf '%s\n' "$dns_config" | grep -Eq '^(!|system |interface |dns-proxy([[:space:]]|$))' ||
+            return 1
+    fi
+    printf '%s\n%s\n' "$dns_status" "$dns_config" | tr -d '\033\r' | awk '
+        function emit(s, port,    host, t) {
+            host = s; t = s
             if (s ~ /^\[/) {
                 sub(/^\[/, "", host); sub(/\].*/, "", host)
                 if (s ~ /\]:[0-9]+$/) { port = s; sub(/.*\]:/, "", port) }
             } else if (gsub(/:/, ":", t) == 1) {
                 sub(/:.*/, "", host); port = s; sub(/.*:/, "", port)
             }
-            if (host != "" && port ~ /^[0-9]+$/) print host, port
+            host = tolower(host)
+            sub(/\.$/, "", host)
+            if ((host ~ /^[a-z0-9][a-z0-9.-]*$/ || host ~ /^[0-9a-f:]+:[0-9a-f:.]*$/) &&
+                host !~ /^(127\.|::1$|localhost$)/ && port ~ /^[0-9]+$/ && port + 0 > 0 && port + 0 < 65536)
+                print host, port + 0
+        }
+        function upstream(s,    port) {
+            gsub(/^"|"$/, "", s)
+            if (s ~ /^https:\/\//) {
+                sub(/^https:\/\//, "", s); sub(/[\/?#@].*/, "", s); port = 443
+            } else {
+                sub(/^(tls|quic):\/\//, "", s); sub(/@.*/, "", s); port = 853
+            }
+            emit(s, port)
         }
         $1 == "dns_server" && $2 == "=" {
-            a = $3
-            if (a !~ /^127\./ && a !~ /^\[?::1\]?(:|$)/) emit(a, 53)
-            c = ""
-            for (i = 4; i < NF; i++) if ($i == "#") { c = $(i + 1); break }
-            if (c == "") next
-            sub(/@.*/, "", c)
-            if (c ~ /^https:\/\//) { sub(/^https:\/\//, "", c); sub(/\/.*/, "", c); emit(c, 443) }
-            else { sub(/^tls:\/\//, "", c); emit(c, 853) }
+            emit($3, 53)
+            if (match($0, /#[[:space:]]*[^[:space:]]+/)) {
+                s = substr($0, RSTART, RLENGTH); sub(/^#[[:space:]]*/, "", s); upstream(s)
+            }
+        }
+        /^dns-proxy[[:space:]]*$/ { proxy = 1; next }
+        /^[^[:space:]]/ { proxy = 0 }
+        $1 == "dns-proxy" && $2 == "https" && $3 == "upstream" { upstream($4) }
+        proxy && $1 == "https" && $2 == "upstream" { upstream($3) }
+    ' | sort -u
+}
+
+dns_lookup_addresses() {
+    # A failed local resolver must not tie up the firewall operation. BusyBox
+    # can print both numbered Address entries and unnumbered Address: lines.
+    {
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 2 nslookup "$1" "$2"
+        elif command -v busybox >/dev/null 2>&1 && busybox --list | grep -qx timeout; then
+            busybox timeout 2 nslookup "$1" "$2"
+        else
+            nslookup "$1" "$2"
+        fi
+    } 2>/dev/null | awk '
+        /^Name:[[:space:]]/ { answer = 1; next }
+        !answer { next }
+        $1 == "Address:" { ip = $2 }
+        $1 == "Address" && $2 ~ /^[0-9]+:$/ { ip = $3 }
+        ip != "" {
+            if (ip ~ /^[0-9a-fA-F:]+:[0-9a-fA-F:.]*$/ && ip != "::1") print tolower(ip)
+            if (ip ~ /^[0-9.]+$/ && split(ip, octet, ".") == 4 &&
+                octet[1] + 0 != 127 && octet[1] + 0 != 0 && octet[1] + 0 < 224 &&
+                octet[2] + 0 <= 255 && octet[3] + 0 <= 255 && octet[4] + 0 <= 255) print ip
+            ip = ""
         }'
 }
-dns_excl_rule() { # <-D|-A> <адрес> <порт>
-    dx_tool=iptables
-    case $2 in *:*) dx_tool=ip6tables; [ ! -f "$FW_V4ONLY" ] || return 0 ;; esac
-    for dx_pr in tcp udp; do
-        for dx_dir in out in; do
-            if [ "$dx_dir" = out ]; then set -- "$1" "$2" "$3" "$CHAIN_OUT" -d --dport
-            else set -- "$1" "$2" "$3" "$CHAIN_IN" -s --sport; fi
-            if [ "$1" = -D ]; then
-                while "$dx_tool" -t mangle -C "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN 2>/dev/null; do
-                    "$dx_tool" -t mangle -D "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN || break
-                done
+
+dns_excl_discover() { # <previous state>
+    local upstreams host port ips ip
+    upstreams=$(dns_upstreams) || return 1
+    while read -r host port; do
+        [ -n "$host" ] || continue
+        case "$host" in
+            *:* ) ips=$host ;;
+            *[!0-9.]*)
+                ips=$(dns_lookup_addresses "$host" 127.0.0.1)
+                # Public bootstrap resolvers are contacted only on failure. The
+                # query contains the upstream hostname, never a client's name.
+                [ -n "$ips" ] || ips=$(dns_lookup_addresses "$host" 8.8.8.8)
+                [ -n "$ips" ] || ips=$(dns_lookup_addresses "$host" 1.1.1.1)
+                ;;
+            *) ips=$host ;;
+        esac
+        if [ -n "$ips" ]; then
+            for ip in $ips; do printf '%s %s %s\n' "$host" "$ip" "$port"; done
+        elif [ -f "$1" ]; then
+            awk -v h="$host" -v p="$port" '$1 == h && $3 == p' "$1"
+        fi
+    done <<EOF
+$upstreams
+EOF
+    return 0
+}
+
+# Match both IPs to keep traffic forwarded to the same CDN edge in NFQUEUE.
+# Keenetic ships kernels without xt_addrtype, including ones with IPv6 mangle.
+# The IPv4 LOCAL host routes and IPv6 interface addresses work without it.
+dns_router_addresses() {
+    local interfaces
+    if [ -r "$PROC_DIR/net/fib_trie" ]; then
+        awk '
+            $1 == "|--" { ip = $2 }
+            $1 == "/32" && $2 == "host" && $3 == "LOCAL" &&
+            ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && ip !~ /^127\./ && !seen[ip]++ { print ip }
+        ' "$PROC_DIR/net/fib_trie" || return 1
+    else
+        interfaces=$(ip -4 addr show 2>/dev/null) || return 1
+        printf '%s\n' "$interfaces" | awk '$1 == "inet" && $2 !~ /^127\./ { sub(/\/.*/, "", $2); print $2 }'
+    fi
+    if [ -r "$PROC_DIR/net/if_inet6" ]; then
+        awk '
+            length($1) == 32 && $1 !~ /[^0-9a-f]/ && $1 != "00000000000000000000000000000001" {
+                ip = substr($1, 1, 4)
+                for (i = 5; i <= 32; i += 4) ip = ip ":" substr($1, i, 4)
+                if (!seen[ip]++) print ip
+            }
+        ' "$PROC_DIR/net/if_inet6"
+    fi
+}
+
+dns_excl_targets() { # <discovered upstreams file>
+    local addresses
+    [ -s "$1" ] || return 0
+    addresses=$(dns_router_addresses) || return 1
+    [ -n "$addresses" ] || return 1
+    printf '%s\n' "$addresses" | awk '
+        FILENAME != "-" { if (NF == 3) upstream[$2 " " $3] = ($2 ~ /:/); next }
+        NF == 1 { for (edge in upstream) if (upstream[edge] == ($1 ~ /:/)) print $1, edge }
+    ' "$1" - | sort -u
+}
+
+dns_excl_rule() { # <tool> <-A|-I|-D> <router IP> <upstream IP> <port>
+    local tool op router upstream port proto dir rc failed
+    tool=$1; op=$2; router=$3; upstream=$4; port=$5
+    failed=0
+    for proto in tcp udp; do
+        for dir in out in; do
+            if [ "$dir" = out ]; then
+                set -- "$CHAIN_OUT" -p "$proto" -s "$router" -d "$upstream" --dport "$port" -j RETURN
             else
-                "$dx_tool" -t mangle -C "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN 2>/dev/null ||
-                    "$dx_tool" -t mangle -I "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN
+                set -- "$CHAIN_IN" -p "$proto" -s "$upstream" -d "$router" --sport "$port" -j RETURN
             fi
+            if [ "$op" = -A ]; then
+                "$tool" -t mangle -A "$@" || failed=1
+                continue
+            fi
+            rc=0
+            "$tool" -t mangle -C "$@" 2>/dev/null || rc=$?
+            case "$op:$rc" in
+                -I:0|-D:1) ;;
+                -I:1|-D:0) "$tool" -t mangle "$op" "$@" || failed=1 ;;
+                *) failed=1 ;;
+            esac
         done
     done
+    return "$failed"
 }
-dns_excl_sync_unlocked() { # [fresh] — цепочки только что собраны заново
-    [ "$FW_BACKEND" = iptables ] || return 0
-    dx_state=$RUN/dns-excl
-    dx_new=$dx_state.new
-    dns_upstreams | while read -r dx_h dx_p; do
-        case $dx_h in
-            *:*|*[!0-9.]*) ;;
-            *) echo "$dx_h $dx_h $dx_p"; continue ;;
-        esac
-        case $dx_h in *:*) echo "$dx_h $dx_h $dx_p"; continue ;; esac
-        dx_ips=$(nslookup "$dx_h" 127.0.0.1 2>/dev/null |
-            awk '/^Name:/ { n = 1; next } n && /^Address/ { print $3 }')
-        if [ -n "$dx_ips" ]; then
-            for dx_ip in $dx_ips; do echo "$dx_h $dx_ip $dx_p"; done
-        elif [ -f "$dx_state" ]; then
-            awk -v h="$dx_h" '$1 == h' "$dx_state"
-        fi
-    done | sort -u > "$dx_new"
-    if [ "${1:-}" != fresh ] && [ -f "$dx_state" ]; then
-        while read -r dx_h dx_ip dx_p; do
-            awk -v a="$dx_ip" -v p="$dx_p" '$2 == a && $3 == p { f = 1 } END { exit !f }' "$dx_new" ||
-                dns_excl_rule -D "$dx_ip" "$dx_p"
-        done < "$dx_state"
+
+dns_excl_apply() { # <tool> <-A|-I|-D> <rules>
+    local router upstream port tool rc
+    rc=0
+    while read -r router upstream port; do
+        [ -n "$router" ] || continue
+        tool=iptables
+        case "$router" in *:*) tool=ip6tables ;; esac
+        [ "$tool" = "$1" ] || continue
+        dns_excl_rule "$tool" "$2" "$router" "$upstream" "$port" || rc=1
+    done <<EOF
+$3
+EOF
+    return "$rc"
+}
+
+dns_excl_live() { # <-I|-D> <rules>
+    local rc
+    rc=0
+    dns_excl_apply iptables "$1" "$2" || rc=1
+    if [ ! -f "$FW_V4ONLY" ]; then
+        dns_excl_apply ip6tables "$1" "$2" || rc=1
     fi
-    while read -r dx_h dx_ip dx_p; do dns_excl_rule -A "$dx_ip" "$dx_p"; done < "$dx_new"
-    mv -f "$dx_new" "$dx_state"
+    return "$rc"
 }
+
+dns_excl_save() { # <upstream state file> <discovered upstreams>
+    printf '%s\n' "$2" | awk 'NF == 3' | sort -u > "$1.new" || return 1
+    if cmp -s "$1.new" "$1"; then
+        rm -f "$1.new"
+    else
+        mv -f "$1.new" "$1"
+    fi
+}
+
+# Compare the two chains per family on steady-state ticks. Checking each
+# individual rule is only necessary after an address or firewall change.
+dns_excl_ruleset() {
+    local tool
+    for tool in iptables ip6tables; do
+        [ "$tool" != ip6tables ] || [ ! -f "$FW_V4ONLY" ] || continue
+        "$tool" -t mangle -S "$CHAIN_OUT" && "$tool" -t mangle -S "$CHAIN_IN" || return 1
+    done
+}
+
+dns_excl_sync_unlocked() {
+    local upstreams state targets previous ruleset stale rc
+    upstreams=$RUN/dns-excl
+    state=$RUN/dns-excl-rules
+    if ! targets=$(dns_excl_targets "$upstreams"); then
+        [ -r "$state" ] || return 1
+        targets=$(cat "$state") || return 1
+        dns_excl_live -I "$targets"
+        return
+    fi
+    previous=$(cat "$state" 2>/dev/null || true)
+    if [ "$targets" = "$previous" ]; then
+        [ -n "$targets" ] || return 0
+        if [ -s "$state.check" ] && ruleset=$(dns_excl_ruleset 2>/dev/null) &&
+            [ "$ruleset" = "$(cat "$state.check")" ]; then
+            return 0
+        fi
+    fi
+    rm -f "$state.check"
+    rc=0
+    if ! dns_excl_live -I "$targets"; then
+        rc=1
+    elif [ -s "$state" ]; then
+        stale=$(printf '%s\n' "$targets" |
+            awk 'FILENAME == "-" { kept[$0] = 1; next } !($0 in kept)' - "$state") || return 1
+        dns_excl_live -D "$stale" || rc=1
+    fi
+    # Keep ownership after a partial update so a later pass can remove
+    # stale rules. Never delete working rules until replacements are in place.
+    if [ "$rc" -ne 0 ] && [ -s "$state" ]; then
+        targets=$({ printf '%s\n' "$targets"; cat "$state"; } | awk 'NF' | sort -u)
+    fi
+    if [ "$targets" != "$previous" ]; then
+        printf '%s\n' "$targets" > "$state.new" && mv -f "$state.new" "$state" || rc=1
+    fi
+    if [ "$rc" = 0 ] && [ -n "$targets" ] && ruleset=$(dns_excl_ruleset 2>/dev/null); then
+        printf '%s\n' "$ruleset" > "$state.check" || true
+    fi
+    return "$rc"
+}
+
+dns_excl_enabled() {
+    [ "$FW_BACKEND" = iptables ] && command -v ndmc >/dev/null 2>&1
+}
+
 dns_excl_sync() {
+    local state previous discovered found rc
+    dns_excl_enabled || return 0
+    state=$RUN/dns-excl
+    previous=$(cat "$state" 2>/dev/null || true)
+    # A stalled DoH must not hold the lock needed to stop or rebuild
+    # the firewall. Keep a concurrent refresh's result if it got here first.
+    found=0
+    discovered=$(dns_excl_discover "$state") && found=1
     fw_lock_acquire || return 1
-    dns_excl_sync_unlocked
-    fw_lock_release
+    rc=0
+    if [ "$found" = 1 ] && [ "$previous" = "$(cat "$state" 2>/dev/null || true)" ]; then
+        dns_excl_save "$state" "$discovered" || rc=1
+    fi
+    dns_excl_sync_unlocked || rc=1
+    fw_lock_release || return 1
+    return "$rc"
 }
 
 fw_up() {
-    local rc
+    local rc targets discovered
     fw_lock_acquire || return 1
     if [ "$FW_BACKEND" = nft ]; then
         # Остатки iptables (установка времён Entware) снимаются; таблица nft
@@ -989,10 +1187,29 @@ fw_up() {
             rc=1
         fi
     else
+        targets=
+        if dns_excl_enabled; then
+            if [ ! -f "$RUN/dns-excl" ] && discovered=$(dns_excl_discover "$RUN/dns-excl"); then
+                dns_excl_save "$RUN/dns-excl" "$discovered" ||
+                    say "не удалось сохранить адреса DNS роутера"
+            fi
+            if ! targets=$(dns_excl_targets "$RUN/dns-excl"); then
+                targets=$(cat "$RUN/dns-excl-rules" 2>/dev/null) ||
+                    say "локальные адреса для исключения DNS пока недоступны"
+            fi
+        fi
         fw_down_unlocked
-        if fw_up_unlocked; then
+        if fw_up_unlocked "$targets"; then
             rc=0
-            dns_excl_sync_unlocked fresh || say "исключение DNS роутера встало не целиком"
+            # fw_family_up has already inserted the DNS rules before attaching
+            # NFQUEUE. Save their ownership for the next in-place refresh.
+            if dns_excl_enabled; then
+                rm -f "$RUN/dns-excl-rules.check"
+                if ! { printf '%s\n' "$targets" > "$RUN/dns-excl-rules.new" &&
+                    mv -f "$RUN/dns-excl-rules.new" "$RUN/dns-excl-rules"; }; then
+                    say "не удалось сохранить состояние правил DNS"
+                fi
+            fi
         else
             fw_down_unlocked
             rc=1
@@ -1669,7 +1886,7 @@ case "$1" in
     reapply) reapply ;;
     clear-found) clear_found ;;
     ppe-ensure) ppe_ensure ;;
-    dns-ensure) if running "$DP_PID" && fw_installed; then dns_excl_sync; fi ;;
+    dns-ensure) if dns_excl_enabled && running "$DP_PID" && fw_installed; then dns_excl_sync; fi ;;
     ppe-remove) d2k_ppe_remove ;;
     ppe-status)
         command -v d2k_ppe_status >/dev/null 2>&1 || die "нет $PPE_LIB"
