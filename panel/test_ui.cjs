@@ -94,19 +94,28 @@ assert.equal(ui.dnsProtocolLabel('', 6, 853), 'DoT');
 assert.equal(ui.dnsProtocolLabel('', 17, 853), 'DoQ');
 assert.deepEqual(['doh', 'dot', 'doq'].map(p => ui.dnsProtocolClass(p, p === 'doq' ? 17 : 6, p === 'doh' ? 443 : 853)),
   ['dns-protocol-doh', 'dns-protocol-dot', 'dns-protocol-doq'], 'each encrypted DNS protocol gets a distinct color class');
+assert.deepEqual(ui.dnsProtocolCounts([
+  { protocol: 'doh' }, { protocol: 'doh' }, { protocol: 'dot' }, { protocol: 'doq' }, { protocol: 'unknown' }
+]), { doh: 2, dot: 1, doq: 1 }, 'simultaneous DNS protocols count independently');
+assert.equal(ui.dnsServiceStateLabel('direct_ok'), 'DNS-ответ подтверждён · без обхода');
+assert.equal(ui.dnsServiceStateLabel('bypass_ok'), 'DNS-ответ подтверждён · обход применён');
+assert.equal(ui.dnsServiceStateLabel('plan_applied'), 'План применён · DNS-ответ ещё не подтверждён');
+assert.equal(ui.dnsServiceStateLabel('failed'), 'DNS-ответ не получен');
+assert.equal(ui.dnsServiceStateLabel('no_bypass'), 'Обход не найден');
+assert.equal(ui.dnsServiceStateLabel('future-state'), 'Обнаружен · статус не измерен', 'unknown state stays conservative');
 assert.equal(ui.dnsProtocolLabel('', 6, 443), '', 'ordinary HTTPS must not be guessed as DoH');
 assert.equal(ui.dnsProtocolLabel('', 17, 443), '', 'ordinary QUIC must not be guessed as DoQ');
 {
   const services = [
-    { protocol: 'doh', host: 'cloudflare-dns.com', port: 443, source: 'https-dns-proxy' },
+    { protocol: 'doh', host: 'cloudflare-dns.com', port: 443, source: 'https-dns-proxy', state: 'direct_ok' },
     { protocol: 'doh', host: 'dns.google', port: 443, source: 'https-dns-proxy' },
     { protocol: 'doh', host: 'dns.quad9.net', port: 443, source: 'https-dns-proxy' },
     { protocol: 'doh', host: 'dns.adguard-dns.com', port: 443, source: 'https-dns-proxy' },
-    { protocol: 'dot', host: 'one.one.one.one', port: 853, source: 'dnsproxy' },
+    { protocol: 'dot', host: 'one.one.one.one', port: 853, source: 'dnsproxy', state: 'bypass_ok', status_reason: 'ответ DNS подтверждён на соединении с планом' },
     { protocol: 'dot', host: 'dns.google', port: 853, source: 'dnsproxy' },
     { protocol: 'dot', host: 'dns.quad9.net', port: 853, source: 'dnsproxy' },
     { protocol: 'dot', host: 'dns.adguard-dns.com', port: 853, source: 'dnsproxy' },
-    { protocol: 'doq', host: 'dns.adguard-dns.com', port: 853, source: 'dnsproxy' },
+    { protocol: 'doq', host: 'dns.adguard-dns.com', port: 853, source: 'dnsproxy', state: 'failed', status_reason: 'тайм-аут DNS-запроса' },
     { protocol: 'doq', host: 'unfiltered.adguard-dns.com', port: 853, source: 'dnsproxy' },
   ];
   const m = ui.model({ snapshot: snap({ dns_services: services }), knowledge: { linked: true, searches: [
@@ -115,7 +124,13 @@ assert.equal(ui.dnsProtocolLabel('', 17, 443), '', 'ordinary QUIC must not be gu
     { target: 'dot.example', family: 4, transport: 6, ip: '192.0.2.10', port: 853 },
     { target: 'doq.example', family: 6, transport: 17, ip: '2001:db8::10', port: 853 },
   ] } });
-  assert.deepEqual(m.dnsServices, services);
+  assert.deepEqual(m.dnsServices.map(s => [s.protocol, s.host, s.port, s.state]), services.map(s => [s.protocol, s.host, s.port, s.state || 'detected']));
+  assert.deepEqual(m.dnsProtocolCounts, { doh: 4, dot: 4, doq: 2 });
+  assert.equal(m.dnsServices[0].state, 'direct_ok');
+  assert.equal(m.dnsServices[4].state, 'bypass_ok');
+  assert.equal(m.dnsServices[4].status_reason, 'ответ DNS подтверждён на соединении с планом');
+  assert.equal(m.dnsServices[8].state, 'failed');
+  assert.equal(m.dnsServices[1].status_reason, 'Настройка найдена; проверка DNS-ответа ещё не выполнялась.');
   assert.deepEqual(services.map(s => ui.dnsProtocolLabel(s.protocol, s.protocol === 'doq' ? 17 : 6, s.port)),
     ['DoH', 'DoH', 'DoH', 'DoH', 'DoT', 'DoT', 'DoT', 'DoT', 'DoQ', 'DoQ']);
   assert.equal(ui.dnsProtocolLabel(m.searches[0].dns_protocol, 6, 443), '', 'a configured DoH hostname does not label an ordinary TLS search as DoH');

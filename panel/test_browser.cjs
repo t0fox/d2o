@@ -184,6 +184,20 @@ async function main(){
  const until=async(expr,msg)=>{for(let i=0;i<160;i++){if(await evaluate(expr))return;await wait(50)}throw Error(msg)};
  await call('Page.enable');await call('Runtime.enable');
  await call('Page.addScriptToEvaluateOnNewDocument',{source:`(()=>{
+  const nativeFetch=window.fetch.bind(window);
+  const dnsServices=[
+   {protocol:'doh',host:'resolver-a.example.test',port:443,sni:'resolver-a.example.test',source:'https-dns-proxy',state:'direct_ok',status_reason:'DNS-ответ подтверждён без обхода'},
+   {protocol:'dot',host:'resolver-b.example.test',port:853,sni:'resolver-b.example.test',source:'dnsproxy',state:'bypass_ok',status_reason:'DNS-ответ подтверждён с применённой стратегией'},
+   {protocol:'doq',host:'resolver-c.example.test',port:853,sni:'resolver-c.example.test',source:'doqd',state:'failed',status_reason:'DNS-ответ не получен'},
+   {protocol:'doh',host:'resolver-d.example.test',port:8443,sni:'resolver-d.example.test',source:'https-dns-proxy',state:'checking',status_reason:'Проверяется'}
+  ];
+  window.fetch=(input,init)=>nativeFetch(input,init).then(async response=>{
+   const url=typeof input==='string'?input:input.url;
+   if(new URL(url,location.href).pathname!=='/api/status')return response;
+   const body=await response.clone().json();
+   body.snapshot=body.snapshot||{};body.snapshot.dns_services=dnsServices;
+   return new Response(JSON.stringify(body),{status:response.status,headers:{'Content-Type':'application/json'}});
+  });
   const arc=CanvasRenderingContext2D.prototype.arc;
   const fillRect=CanvasRenderingContext2D.prototype.fillRect;
   window.__tgStartupParticles=[];
@@ -209,6 +223,18 @@ async function main(){
   await call('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});
   await call('Page.navigate',{url:panel.url});
   await until('document.querySelectorAll(".search").length===2','C API must populate the live searches');
+  await until('!document.querySelector("#dns-services").hidden','discovered DNS services get their own pinned section');
+  assert.equal(await evaluate('document.querySelector("#nav-dns-link").hidden'),false,'DNS section appears in panel navigation only after discovery');
+  assert.equal(await evaluate('document.querySelector("#nav-dns").textContent'),'4','navigation shows all simultaneous DNS endpoints');
+  assert.equal(await evaluate('document.querySelectorAll("#dns-services-list .dns-service").length'),4,'DoH, DoT and DoQ endpoints remain visible together');
+  assert.equal(await evaluate('document.querySelectorAll("#dns-services-list .dns-protocol-doh").length'),2,'multiple DoH endpoints are supported');
+  assert.equal(await evaluate('document.querySelectorAll("#dns-services-list .dns-protocol-dot").length'),1,'DoT is separately colored');
+  assert.equal(await evaluate('document.querySelectorAll("#dns-services-list .dns-protocol-doq").length'),1,'DoQ is separately colored');
+  assert.match(await evaluate('document.querySelector("#dns-services-summary").textContent'),/DoH 2 · DoT 1 · DoQ 1/,'simultaneous protocol combination is summarized');
+  assert.match(await evaluate('document.querySelector("#dns-services-list").textContent'),/DNS-ответ подтверждён · без обхода/,'direct DNS success is explicit');
+  assert.match(await evaluate('document.querySelector("#dns-services-list").textContent'),/DNS-ответ подтверждён · обход применён/,'DNS success with an applied bypass is explicit');
+  assert.match(await evaluate('document.querySelector("#dns-services-list").textContent'),/DNS-ответ не получен/,'failed DNS is explicit');
+  assert.equal(await evaluate('document.querySelector("#dns-services-list .dns-service-state.dns-status-direct-ok")!==null'),true,'service state gets its own status color class');
   await evaluate('document.fonts.ready');
   assert.equal(await evaluate('document.fonts.check("700 24px Onest")'),true,'C CSP must load the bundled text face');
   try {

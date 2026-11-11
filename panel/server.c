@@ -1559,7 +1559,7 @@ static int dns_services_write(panel_dns_service *items, size_t count,
     out[0] = '['; out[1] = '\0';
     for (size_t i = 0; i < count; i++) {
         int n = snprintf(out + used, out_cap - used,
-            "%s{\"protocol\":\"%s\",\"host\":\"%s\",\"port\":%u,\"sni\":\"%s\",\"source\":\"%s\"}",
+            "%s{\"protocol\":\"%s\",\"host\":\"%s\",\"port\":%u,\"sni\":\"%s\",\"source\":\"%s\",\"state\":\"detected\",\"status_reason\":\"Настройка обнаружена; проверка DNS-ответа ещё не выполнялась.\"}",
             i ? "," : "", items[i].protocol, items[i].host, items[i].port,
             items[i].sni, items[i].source ? items[i].source : "");
         if (n < 0 || (size_t)n >= out_cap - used) { out[0] = '\0'; return -1; }

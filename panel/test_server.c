@@ -139,6 +139,7 @@ static void test_dns_service_config_classification(void) {
     while ((at = strstr(at, "\"protocol\":")) != NULL) { services++; at++; }
     assert(services == 14);
     assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"cloudflare-dns.com\",\"port\":443") != NULL);
+    assert(strstr(json, "\"state\":\"detected\",\"status_reason\":\"Настройка обнаружена; проверка DNS-ответа ещё не выполнялась.\"") != NULL);
     assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"dns.google\",\"port\":443") != NULL);
     assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"dns.quad9.net\",\"port\":443") != NULL);
     assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"dns.adguard-dns.com\",\"port\":443") != NULL);

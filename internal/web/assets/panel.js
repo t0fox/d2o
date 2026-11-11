@@ -69,6 +69,25 @@
     t.classList.add(dnsProtocolClass(protocol, transport, port));
     return t;
   }
+  function dnsServiceState(state) {
+    return ["detected", "checking", "direct_ok", "plan_applied", "bypass_ok", "failed", "no_bypass"].indexOf(state) >= 0
+      ? state : "detected";
+  }
+  function dnsServiceStateLabel(state) {
+    return ({ detected: "Обнаружен · статус не измерен", checking: "Проверяется",
+      direct_ok: "DNS-ответ подтверждён · без обхода",
+      plan_applied: "План применён · DNS-ответ ещё не подтверждён",
+      bypass_ok: "DNS-ответ подтверждён · обход применён",
+      failed: "DNS-ответ не получен", no_bypass: "Обход не найден" })[dnsServiceState(state)];
+  }
+  function dnsServiceStateClass(state) { return "dns-status-" + dnsServiceState(state).replace(/_/g, "-"); }
+  function dnsProtocolCounts(services) {
+    var counts = { doh: 0, dot: 0, doq: 0 };
+    list(services).forEach(function (service) {
+      if (service && Object.prototype.hasOwnProperty.call(counts, service.protocol)) counts[service.protocol]++;
+    });
+    return counts;
+  }
   function familyLabel(f) { return f === 6 ? "IPv6" : f === 4 ? "IPv4" : "IP?"; }
   function targetLabel(t) {
     if (t === "@discord-voice") return "Голос Discord";
@@ -259,6 +278,12 @@
     var dnsServices = list(snap.dns_services).filter(function (x) {
       return x && (x.protocol === "doh" || x.protocol === "dot" || x.protocol === "doq") &&
         typeof x.host === "string" && num(x.port) !== null;
+    }).map(function (x) {
+      var service = Object.assign({}, x, { state: dnsServiceState(x.state) });
+      service.status_reason = str(x.status_reason).slice(0, 200);
+      if (service.state === "detected" && !service.status_reason)
+        service.status_reason = "Настройка найдена; проверка DNS-ответа ещё не выполнялась.";
+      return service;
     });
     var searches = linked ? list(k.searches) : [];
     var QUEUED = "ожидает безопасного слота замера";
@@ -266,7 +291,7 @@
     var m = {
       snap: snap, k: k, linked: linked, engine: engine,
       fresh: snap.live_fresh !== false,
-      searches: searches, dnsServices: dnsServices, hunting: active.length,
+      searches: searches, dnsServices: dnsServices, dnsProtocolCounts: dnsProtocolCounts(dnsServices), hunting: active.length,
       running: searches.filter(function (s) { return s.phase !== QUEUED; }),
       queued: searches.filter(function (s) { return s.phase === QUEUED; }),
       groups: list(k.groups), boxes: list(k.boxes),
@@ -1321,11 +1346,14 @@
   };
 
   App.prototype.renderDnsServices = function (m) {
-    var box = this.$("dns-services-box"), listNode = this.$("dns-services"), doc = this.doc;
+    var box = this.$("dns-services"), listNode = this.$("dns-services-list"), summary = this.$("dns-services-summary"), doc = this.doc;
     if (!box || !listNode) return;
     var services = m.dnsServices || [];
     box.hidden = services.length === 0;
     if (!services.length) { listNode.replaceChildren(); listNode.__d2kKey = "none"; return; }
+    var counts = m.dnsProtocolCounts || dnsProtocolCounts(services);
+    if (summary) summary.textContent = [counts.doh ? "DoH " + counts.doh : "", counts.dot ? "DoT " + counts.dot : "",
+      counts.doq ? "DoQ " + counts.doq : ""].filter(Boolean).join(" · ") + " · всего " + services.length;
     var key = JSON.stringify(services);
     if (listNode.__d2kKey === key) return;
     listNode.__d2kKey = key;
@@ -1337,9 +1365,16 @@
       var source = ({ "https-dns-proxy": "https-dns-proxy", dnsproxy: "dnsproxy",
         "keenetic-system": "DNS-прокси Keenetic", doqd: "doqd", "keenetic-doq-web": "keenetic-doq-web" })[service.source] || service.source || "конфигурации";
       var protocolTag = dnsProtocolTag(doc, service.protocol, service.protocol === "doq" ? 17 : 6, service.port);
-      add(row, protocolTag, el(doc, "span", "mono", address),
+      var main = el(doc, "div", "dns-service-main");
+      add(main, protocolTag, el(doc, "span", "mono", address));
+      var meta = el(doc, "div", "dns-service-meta");
+      add(meta,
         service.sni && service.sni !== service.host ? el(doc, "span", "mono dns-service-sni", "SNI " + service.sni) : null,
         el(doc, "span", "dns-service-source", "источник: " + source));
+      var state = tag(doc, dnsServiceStateLabel(service.state), "mute");
+      state.classList.add("dns-service-state", dnsServiceStateClass(service.state));
+      add(row, main, state, meta,
+        service.status_reason ? el(doc, "span", "dns-service-reason", service.status_reason) : null);
       listNode.appendChild(row);
     });
   };
@@ -2597,6 +2632,9 @@
       if (tone) n.setAttribute("data-tone", tone); else n.removeAttribute("data-tone");
     }.bind(this);
     set("nav-now", !m.engine ? "стоп" : !m.linked ? "нет связи" : m.hunting ? String(m.hunting) : "", m.hunting ? "live" : null);
+    var dnsLink = this.$("nav-dns-link");
+    if (dnsLink) dnsLink.hidden = !m.dnsServices.length;
+    set("nav-dns", m.dnsServices.length ? String(m.dnsServices.length) : "");
     set("nav-families", m.groups.length ? String(m.groups.length) : "");
     set("nav-boxes", m.boxes.length ? String(m.boxes.length) : "");
     var tg = m.snap.telegram_status;
@@ -2688,7 +2726,7 @@
   };
 
   var api = {
-    model: model, coveredBy: coveredBy, familyStatus: familyStatus, slotsView: slotsView, trackFor: trackFor, shapeLabel: shapeLabel, dnsProtocolLabel: dnsProtocolLabel, dnsProtocolClass: dnsProtocolClass,
+    model: model, coveredBy: coveredBy, familyStatus: familyStatus, slotsView: slotsView, trackFor: trackFor, shapeLabel: shapeLabel, dnsProtocolLabel: dnsProtocolLabel, dnsProtocolClass: dnsProtocolClass, dnsServiceStateLabel: dnsServiceStateLabel, dnsServiceStateClass: dnsServiceStateClass, dnsProtocolCounts: dnsProtocolCounts,
     planGist: planGist, plural: plural, duration: duration,
     telegramRouteName: telegramRouteName,
     telegramFailureStage: telegramFailureStage,

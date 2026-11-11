@@ -368,12 +368,30 @@ main { min-width: 0; padding-bottom: 80px; }
 .slot-note { font-size: 0.8125rem; color: var(--ink-3); }
 
 .searches { margin-top: 8px; }
-.dns-services-box { margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--rule); }
-.dns-services-box > p { max-width: 72ch; color: var(--ink-3); font-size: .875rem; }
+.dns-services-note { margin-top: 0; max-width: 72ch; color: var(--ink-3); font-size: .875rem; }
 .dns-services { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
-.dns-service { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 10px 0; border-bottom: 1px solid var(--rule); }
+.dns-service { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px 16px; padding: 14px 0; border-bottom: 1px solid var(--rule); }
+.dns-service-main, .dns-service-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; min-width: 0; }
+.dns-service-state { justify-self: end; }
+.dns-service-reason { grid-column: 1 / -1; color: var(--ink-3); font-size: .8125rem; }
 .dns-service-source { color: var(--ink-3); font-size: .8125rem; }
 .dns-service-sni { color: var(--ink-2); }
+.tag.dns-status-detected { background: var(--paper-2); border-color: var(--rule); color: var(--ink-3); }
+.tag.dns-status-checking { background: #fff2d9; border-color: #efd08a; color: #805600; }
+.tag.dns-status-direct-ok { background: #dff1df; border-color: #b6dcb8; color: #27642b; }
+.tag.dns-status-bypass-ok { background: #d8f0eb; border-color: #a4d9ce; color: #12675e; }
+.tag.dns-status-plan-applied { background: #e0e8ff; border-color: #b5c7ff; color: #234eb2; }
+.tag.dns-status-failed { background: #ffe1df; border-color: #f5b7b2; color: #a02620; }
+.tag.dns-status-no-bypass { background: #fff0df; border-color: #f0c8a1; color: #8d4c12; }
+@media (prefers-color-scheme: dark) {
+  .tag.dns-status-detected { background: #252a34; border-color: #414957; color: #b8c0ce; }
+  .tag.dns-status-checking { background: #3d321c; border-color: #705b2d; color: #eed18d; }
+  .tag.dns-status-direct-ok { background: #1c3522; border-color: #315e39; color: #a7dfad; }
+  .tag.dns-status-bypass-ok { background: #17352f; border-color: #2b6258; color: #9de0d2; }
+  .tag.dns-status-plan-applied { background: #1d2a4c; border-color: #334d88; color: #a9bfff; }
+  .tag.dns-status-failed { background: #431f21; border-color: #753b3f; color: #ffb8b4; }
+  .tag.dns-status-no-bypass { background: #3a2a1d; border-color: #68452c; color: #efbd91; }
+}
 
 .search {
   display: grid;
