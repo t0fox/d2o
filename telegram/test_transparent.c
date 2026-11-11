@@ -74,13 +74,15 @@ static void test_known_dc_is_validated_and_target_is_preserved(void) {
 }
 
 static void test_local_proxy_secret_selects_dc_without_original(void) {
-    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN], secret[16];
+    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN], secrets[2][16];
     assert(unhex("0001020304050607000102030405060708090a0b0c0d0e0f"
                  "101112131415161718191a1b1c1d1e1f0001020304050607"
                  "08090a0b0c0d0e0f7c380b6e418caed2",
                  handshake, sizeof(handshake)) == sizeof(handshake));
+    assert(unhex("000102030405060708090a0b0c0d0e0f",
+                 secrets[0], sizeof(secrets[0])) == sizeof(secrets[0]));
     assert(unhex("101112131415161718191a1b1c1d1e1f",
-                 secret, sizeof(secret)) == sizeof(secret));
+                 secrets[1], sizeof(secrets[1])) == sizeof(secrets[1]));
     const uint16_t ports[] = {443};
     const char *cidrs[] = {"149.154.0.0/16"};
     tg_dc_map_store store = {0};
@@ -90,8 +92,8 @@ static void test_local_proxy_secret_selects_dc_without_original(void) {
         .allowed_port_count = 1,
         .allowed_cidrs = cidrs,
         .allowed_cidr_count = 1,
-        .local_secret = secret,
-        .local_secret_len = sizeof(secret),
+        .local_secrets = (const uint8_t (*)[16])secrets,
+        .local_secret_count = 2,
     };
     tg_listener_destination original;
     destination(&original, "127.0.0.1", 1443);
@@ -104,6 +106,9 @@ static void test_local_proxy_secret_selects_dc_without_original(void) {
     assert(selected.upstream.port == 443);
     assert(selected.upstream.family == AF_INET);
     assert(!selected.tcp_only);
+    assert(selected.local_secret_len == sizeof(secrets[1]));
+    assert(memcmp(selected.local_secret, secrets[1],
+                  sizeof(secrets[1])) == 0);
 }
 
 static void test_policy_rejects_wrong_port_cidr_and_unlisted_dc(void) {

@@ -108,10 +108,13 @@ int tg_transparent_select_route(
     /* Direct tg://proxy clients carry the proxy secret in their obfuscated2
        handshake. They have no useful original destination, so accept them
        before the transparent-destination checks. */
-    if (policy->local_secret_len) {
-        tg_mtproto_init local;
-        if (tg_mtproto_parse_secret(handshake, policy->local_secret,
-                                    policy->local_secret_len, &local) == 0) {
+    if (policy->local_secret_count && policy->local_secrets) {
+        for (size_t i = 0; i < policy->local_secret_count; ++i) {
+            tg_mtproto_init local;
+            if (tg_mtproto_parse_secret(handshake, policy->local_secrets[i],
+                                        sizeof(policy->local_secrets[i]),
+                                        &local) != 0)
+                continue;
             tg_dc_endpoint endpoint;
             if (tg_dc_map_store_resolve_id(policy->map_store, now,
                                            local.dc_id, local.is_media,
@@ -127,6 +130,9 @@ int tg_transparent_select_route(
             selection->proto = local.proto;
             selection->tcp_only = endpoint.cdn || endpoint.tcpo_only;
             selection->local_proxy = 1;
+            memcpy(selection->local_secret, policy->local_secrets[i],
+                   sizeof(selection->local_secret));
+            selection->local_secret_len = sizeof(selection->local_secret);
             return 0;
         }
     }

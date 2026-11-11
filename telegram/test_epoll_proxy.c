@@ -3,6 +3,7 @@
 
 void tg_epoll_proxy_test_set_ping_interval_ms(uint64_t interval_ms);
 #include "tg_mtproto.h"
+#include "tg_faketls.h"
 #include "tg_stats_socket.h"
 #include "tg_tls.h"
 #include "tg_ws.h"
@@ -46,6 +47,44 @@ static size_t unhex(const char *text, uint8_t *out, size_t cap) {
         out[i] = (uint8_t)value;
     }
     return n / 2;
+}
+
+static void send_all_fd(int fd, const uint8_t *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, data + sent, len - sent, 0);
+        assert(n > 0);
+        sent += (size_t)n;
+    }
+}
+
+static void recv_all_fd(int fd, uint8_t *data, size_t len) {
+    size_t received = 0;
+    while (received < len) {
+        ssize_t n = recv(fd, data + received, len - received, 0);
+        assert(n > 0);
+        received += (size_t)n;
+    }
+}
+
+static void tls_write_record(int fd, uint8_t type, const uint8_t *payload,
+                             size_t len) {
+    assert(len <= 16384);
+    uint8_t header[5] = {type, 0x03, 0x03,
+                         (uint8_t)(len >> 8), (uint8_t)len};
+    send_all_fd(fd, header, sizeof(header));
+    send_all_fd(fd, payload, len);
+}
+
+static size_t tls_read_record(int fd, uint8_t *type, uint8_t *payload,
+                              size_t capacity) {
+    uint8_t header[5];
+    recv_all_fd(fd, header, sizeof(header));
+    size_t len = ((size_t)header[3] << 8) | header[4];
+    assert(len <= capacity);
+    recv_all_fd(fd, payload, len);
+    *type = header[0];
+    return len;
 }
 
 int __real_connect(int fd, const struct sockaddr *address, socklen_t length);
@@ -105,8 +144,8 @@ typedef struct {
     size_t resolve_calls;
     size_t cf_proxy_a_resolve_calls;
     size_t cf_proxy_b_resolve_calls;
-    uint8_t local_secret[16];
-    size_t local_secret_len;
+    uint8_t local_secrets[2][16];
+    size_t local_secret_count;
     atomic_int fail_cf_proxy_a_dns;
     atomic_int dns_ready;
 } proxy_fixture;
@@ -317,15 +356,22 @@ static int select_local_proxy_route(
     tg_mtproto_init parsed;
     (void)original;
     ++fixture->routes;
-    if (tg_mtproto_parse_secret(handshake, fixture->local_secret,
-                                fixture->local_secret_len, &parsed) != 0)
-        return -1;
-    selection->upstream = fixture->worker_upstream;
-    selection->dc_id = parsed.dc_id;
-    selection->is_media = parsed.is_media;
-    selection->proto = parsed.proto;
-    selection->local_proxy = 1;
-    return 0;
+    for (size_t i = 0; i < fixture->local_secret_count; ++i) {
+        if (tg_mtproto_parse_secret(handshake, fixture->local_secrets[i],
+                                    sizeof(fixture->local_secrets[i]),
+                                    &parsed) != 0)
+            continue;
+        selection->upstream = fixture->worker_upstream;
+        selection->dc_id = parsed.dc_id;
+        selection->is_media = parsed.is_media;
+        selection->proto = parsed.proto;
+        selection->local_proxy = 1;
+        memcpy(selection->local_secret, fixture->local_secrets[i],
+               sizeof(selection->local_secret));
+        selection->local_secret_len = sizeof(selection->local_secret);
+        return 0;
+    }
+    return -1;
 }
 
 static int create_listener(uint16_t *port) {
@@ -3193,7 +3239,7 @@ static void test_epoll_wss_sends_ping(void) {
     assert(rmdir(directory) == 0);
 }
 
-static void run_local_proxy_bridge(int packet_framing) {
+static void run_local_proxy_bridge(int packet_framing, int faketls) {
     char directory[] = "/tmp/d2k-tg-local-XXXXXX";
     char cert_path[256], key_path[256];
     assert(mkdtemp(directory) != NULL);
@@ -3270,8 +3316,13 @@ static void run_local_proxy_bridge(int packet_framing) {
     proxy_fixture fixture = {0};
     set_ipv4(&fixture.worker_upstream, "127.0.0.1", ws_port);
     fixture.upstream = fixture.worker_upstream;
-    memcpy(fixture.local_secret, secret, sizeof(secret));
-    fixture.local_secret_len = sizeof(secret);
+    uint8_t wrong_secret[16];
+    assert(unhex("000102030405060708090a0b0c0d0e0f",
+                 wrong_secret, sizeof(wrong_secret)) ==
+           sizeof(wrong_secret));
+    memcpy(fixture.local_secrets[0], wrong_secret, sizeof(wrong_secret));
+    memcpy(fixture.local_secrets[1], secret, sizeof(secret));
+    fixture.local_secret_count = 2;
     SSL_CTX *tls_context = tg_tls_client_context(cert_path);
     assert(tls_context);
     tg_config routing = {0};
@@ -3283,8 +3334,12 @@ static void run_local_proxy_bridge(int packet_framing) {
         memcpy(routing.cf_worker_domains[0], "worker.test",
                sizeof("worker.test"));
     }
-    memcpy(routing.proxy_secret, secret, sizeof(secret));
-    routing.proxy_secret_len = sizeof(secret);
+    if (faketls) {
+        snprintf(routing.faketls_domain, sizeof(routing.faketls_domain),
+                 "cdn.example.test");
+        routing.proxy_secret_count = 1;
+        memcpy(routing.proxy_secrets[0], secret, sizeof(secret));
+    }
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
@@ -3320,12 +3375,22 @@ static void run_local_proxy_bridge(int packet_framing) {
     assert(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                       sizeof(timeout)) == 0);
     assert(connect(client, (struct sockaddr *)&address, sizeof(address)) == 0);
-    size_t sent = 0;
-    while (sent < sizeof(secret_handshake)) {
-        ssize_t n = send(client, secret_handshake + sent,
-                         sizeof(secret_handshake) - sent, 0);
-        assert(n > 0);
-        sent += (size_t)n;
+    if (faketls) {
+        uint8_t hello[1024], record[8192], record_type = 0;
+        size_t hello_len = 0, record_len = 0;
+        assert(tg_faketls_build_client_hello("cdn.example.test", secret,
+                                             sizeof(secret), hello,
+                                             sizeof(hello), &hello_len) == 0);
+        send_all_fd(client, hello, hello_len);
+        do {
+            record_len = tls_read_record(client, &record_type, record,
+                                         sizeof(record));
+        } while (record_type != 0x17);
+        (void)record_len;
+        tls_write_record(client, 0x17, secret_handshake,
+                         sizeof(secret_handshake));
+    } else {
+        send_all_fd(client, secret_handshake, sizeof(secret_handshake));
     }
     tg_mtproto_ctr client_dec = {0}, client_enc = {0};
     assert(tg_mtproto_build_client_ciphers(secret_handshake, secret,
@@ -3334,19 +3399,22 @@ static void run_local_proxy_bridge(int packet_framing) {
     uint8_t wire[sizeof(plaintext)];
     memcpy(wire, plaintext, plaintext_len);
     assert(tg_mtproto_ctr_xor(&client_dec, wire, plaintext_len) == 0);
-    sent = 0;
-    while (sent < plaintext_len) {
-        ssize_t n = send(client, wire + sent, plaintext_len - sent, 0);
-        assert(n > 0);
-        sent += (size_t)n;
-    }
+    if (faketls)
+        tls_write_record(client, 0x17, wire, plaintext_len);
+    else
+        send_all_fd(client, wire, plaintext_len);
     uint8_t response[sizeof(response_plain)];
-    size_t received = 0;
-    while (received < response_len) {
-        ssize_t n = recv(client, response + received,
-                         response_len - received, 0);
-        assert(n > 0);
-        received += (size_t)n;
+    if (faketls) {
+        uint8_t record[8192], record_type = 0;
+        size_t record_len = 0;
+        do {
+            record_len = tls_read_record(client, &record_type, record,
+                                         sizeof(record));
+        } while (record_type != 0x17);
+        assert(record_len == response_len);
+        memcpy(response, record, response_len);
+    } else {
+        recv_all_fd(client, response, response_len);
     }
     assert(tg_mtproto_ctr_xor(&client_enc, response, response_len) == 0);
     assert(memcmp(response, response_plain, response_len) == 0);
@@ -3364,11 +3432,19 @@ static void run_local_proxy_bridge(int packet_framing) {
 }
 
 static void test_local_proxy_secret_bridges_transport(void) {
-    run_local_proxy_bridge(0);
+    run_local_proxy_bridge(0, 0);
 }
 
 static void test_local_proxy_packet_framing(void) {
-    run_local_proxy_bridge(1);
+    run_local_proxy_bridge(1, 0);
+}
+
+static void test_local_proxy_faketls(void) {
+    run_local_proxy_bridge(0, 1);
+}
+
+static void test_local_proxy_faketls_packet_framing(void) {
+    run_local_proxy_bridge(1, 1);
 }
 
 int main(void) {
@@ -3394,6 +3470,8 @@ int main(void) {
     test_epoll_cf_worker_uses_raw_stream_framing();
     test_local_proxy_secret_bridges_transport();
     test_local_proxy_packet_framing();
+    test_local_proxy_faketls();
+    test_local_proxy_faketls_packet_framing();
     test_epoll_wss_sends_ping();
     test_async_route_dns_waits_before_worker();
     test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing();

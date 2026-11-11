@@ -82,7 +82,8 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
           "TG_WS_HEDGE_DELAY_MS=250\nTG_WS_HEDGE_LIMIT=4\n"
           "TG_DEFAULT_DOMAINS=1\nTG_DIAGNOSTIC_DIRECT_TCP=yes\n"
           "TG_ROUTE_ONLY=worker\n"
-          "TG_PROXY_SECRET=00112233445566778899aabbccddeeff\n", file);
+          "TG_PROXY_SECRET=00112233445566778899aabbccddeeff\n"
+          "TG_LISTEN_FAKETLS_DOMAIN=CDN.Example.Test\n", file);
     assert(fclose(file) == 0);
 
     tg_config config;
@@ -97,9 +98,29 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
     assert(config.ws_routing == TG_WS_ROUTING_CF_FIRST);
     assert(config.route_only == TG_ROUTE_ONLY_WORKER);
     assert(config.ws_hedge_delay_ms == 250 && config.ws_hedge_limit == 4);
-    assert(config.proxy_secret_len == 16);
-    assert(config.proxy_secret[0] == 0x00 && config.proxy_secret[15] == 0xff);
+    assert(config.proxy_secret_count == 1);
+    assert(config.proxy_secrets[0][0] == 0x00 &&
+           config.proxy_secrets[0][15] == 0xff);
+    assert(strcmp(config.faketls_domain, "cdn.example.test") == 0);
     tg_config_clean(&config);
+
+    file = fopen(path, "w");
+    assert(file);
+    fputs("TG_ENABLED=1\nTG_MODE=local\n"
+          "TG_PROXY_SECRET=00112233445566778899aabbccddeeff,"
+          "ffeeddccbbaa99887766554433221100\n", file);
+    assert(fclose(file) == 0);
+    assert(tg_config_read(path, &config) == 0);
+    assert(config.proxy_secret_count == 2);
+    assert(config.proxy_secrets[1][0] == 0xff &&
+           config.proxy_secrets[1][15] == 0x00);
+    tg_config_clean(&config);
+
+    file = fopen(path, "w");
+    assert(file);
+    fputs("TG_LISTEN_FAKETLS_DOMAIN=not a domain\n", file);
+    assert(fclose(file) == 0);
+    assert(tg_config_read(path, &config) != 0);
 
     file = fopen(path, "w");
     assert(file);

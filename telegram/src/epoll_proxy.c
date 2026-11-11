@@ -6,6 +6,7 @@
 #include "tg_route_plan.h"
 #include "tg_route_dns.h"
 #include "tg_mtproto_splitter.h"
+#include "tg_faketls.h"
 #include "tg_tls.h"
 #include "tg_ws.h"
 #include "tg_memory_budget.h"
@@ -115,6 +116,14 @@ struct proxy_connection {
     tg_mtproto_ctr local_encrypt;
     tg_mtproto_ctr relay_encrypt;
     tg_mtproto_ctr relay_decrypt;
+    /* Optional FakeTLS camouflage on the local listener. */
+    int faketls;
+    int faketls_state;
+    int faketls_data_phase;
+    uint8_t faketls_secret[16];
+    uint8_t faketls_rx[TG_FAKETLS_MAX_RECORD];
+    size_t faketls_rx_len;
+    byte_queue faketls_pending;
     tg_mtproto_splitter splitter;
     tg_mtproto_proto wss_proto;
     tg_route_plan route_plan;
@@ -275,6 +284,11 @@ static int hedge_promote_candidate(proxy_connection *candidate);
 static void advance_half_closes(proxy_connection *connection);
 static int progress_wss(proxy_connection *connection, uint32_t events);
 static int establish_wss_stream(proxy_connection *connection);
+static int receive_client_faketls(proxy_connection *connection);
+static int drain_faketls_pending(proxy_connection *connection);
+static int queue_client_bytes(proxy_connection *connection,
+                              const uint8_t *data, size_t length,
+                              size_t max_capacity);
 
 static uint64_t monotonic_ms(void) {
     struct timespec now;
@@ -655,6 +669,7 @@ static void connection_close(proxy_connection *connection) {
     if (connection->ws_pump_ready) tg_ws_pump_destroy(&connection->ws_pump);
     if (connection->splitter_ready)
         tg_mtproto_splitter_destroy(&connection->splitter);
+    queue_release(connection, &connection->faketls_pending);
     tg_mtproto_ctr_destroy(&connection->client_decrypt);
     tg_mtproto_ctr_destroy(&connection->client_encrypt);
     tg_mtproto_ctr_destroy(&connection->server_decrypt);
@@ -1840,6 +1855,8 @@ static int hedge_launch_next(proxy_connection *parent) {
         candidate->route_is_media = parent->route_is_media;
         candidate->route_tcp_only = parent->route_tcp_only;
         candidate->wss_proto = parent->wss_proto;
+        candidate->faketls = parent->faketls;
+        candidate->faketls_data_phase = parent->faketls_data_phase;
         memcpy(candidate->handshake, parent->handshake,
                sizeof(candidate->handshake));
         int dns_failure = 0, route_cooldown = 0;
@@ -2065,6 +2082,10 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
         connection_close(parent);
         return 0;
     }
+    if (parent->faketls && drain_faketls_pending(parent) != 0) {
+        connection_close(parent);
+        return 0;
+    }
     advance_half_closes(parent);
     connection_update(parent);
     return 0;
@@ -2148,15 +2169,13 @@ static int route_after_handshake(proxy_connection *connection) {
     connection->route_failure_recorded = 0;
     connection->wss_proto = selection.proto;
     if (selection.local_proxy) {
-        const tg_config *routing = server->config.routing_config;
-        if (!routing || !routing->proxy_secret_len ||
-            routing->proxy_secret_len > sizeof(connection->local_secret))
+        if (selection.local_secret_len != sizeof(connection->local_secret))
             return -1;
         memcpy(connection->client_handshake, connection->handshake,
                sizeof(connection->client_handshake));
-        memcpy(connection->local_secret, routing->proxy_secret,
-               routing->proxy_secret_len);
-        connection->local_secret_len = routing->proxy_secret_len;
+        memcpy(connection->local_secret, selection.local_secret,
+               sizeof(connection->local_secret));
+        connection->local_secret_len = selection.local_secret_len;
         if (tg_mtproto_build_client_ciphers(
                 connection->client_handshake, connection->local_secret,
                 connection->local_secret_len, &connection->local_decrypt,
@@ -2230,7 +2249,203 @@ static int route_after_handshake(proxy_connection *connection) {
     return 0;
 }
 
+static int handle_client_payload(proxy_connection *connection,
+                                 uint8_t *buffer, size_t length) {
+    size_t queue_limit = connection->server->config.queue_bytes;
+    if (connection->faketls &&
+        ((connection->direct_wss && connection->wss_phase != WSS_READY) ||
+         connection->route_dns_pending)) {
+        if (queue_append_grow(connection, &connection->faketls_pending,
+                              buffer, length, queue_limit) != 0)
+            return -1;
+        return 0;
+    }
+    if (connection->direct_wss && connection->wss_phase != WSS_READY) {
+        if (queue_append_grow(connection, &connection->to_upstream, buffer,
+                              length, queue_limit) != 0)
+            return -1;
+        connection->wss_client_payload_started = 1;
+        return 0;
+    }
+    if (connection->route_racing) {
+        if (queue_append_grow(connection, &connection->to_upstream, buffer,
+                              length, queue_limit) != 0)
+            return -1;
+        connection->wss_client_payload_started = 1;
+        for (size_t i = 0; i < 2; ++i) {
+            proxy_connection *candidate = connection->hedges[i];
+            if (!candidate || candidate->wss_phase != WSS_READY) continue;
+            if (hedge_promote_candidate(candidate) != 0) {
+                hedge_fail_candidate(candidate);
+                if (connection->closed) return -1;
+            }
+            break;
+        }
+        return 0;
+    }
+    if (connection->direct_wss
+            ? queue_wss_replay_payload(connection, buffer, length) != 0
+            : process_client_payload(connection, buffer, length) != 0)
+        return -1;
+    return 0;
+}
+
+static int handle_client_bytes(proxy_connection *connection,
+                               uint8_t *buffer, size_t length) {
+    add_bytes(&connection->server->bytes_from_clients, length);
+    route_session_add_bytes(connection, 1, length);
+    connection->last_activity_ms = monotonic_ms();
+    if (!connection->handshake_done) {
+        size_t remaining = sizeof(connection->handshake) - connection->handshake_len;
+        size_t take = length < remaining ? length : remaining;
+        memcpy(connection->handshake + connection->handshake_len, buffer, take);
+        connection->handshake_len += take;
+        if (connection->handshake_len == sizeof(connection->handshake)) {
+            if (route_after_handshake(connection) != 0) {
+                if (!connection->route_failure_recorded)
+                    route_failure_record(connection, connection->route_kind,
+                                         TG_EPOLL_FAILURE_SETUP);
+                return -1;
+            }
+            if (take < length)
+                return handle_client_payload(connection, buffer + take,
+                                             length - take);        }
+        if (connection->route_dns_pending) return 0;
+        return 0;
+    }
+    return handle_client_payload(connection, buffer, length);
+}
+
+static int drain_faketls_pending(proxy_connection *connection) {
+    if (!connection->faketls_pending.len) return 0;
+    if (connection->route_dns_pending ||
+        (connection->direct_wss && connection->wss_phase != WSS_READY))
+        return 0;
+    uint8_t chunk[TG_EPOLL_IO_CHUNK];
+    while (connection->faketls_pending.len) {
+        size_t n = connection->faketls_pending.len;
+        if (n > sizeof(chunk)) n = sizeof(chunk);
+        memcpy(chunk, connection->faketls_pending.data +
+                       connection->faketls_pending.head, n);
+        if (handle_client_payload(connection, chunk, n) != 0) return -1;
+        connection->faketls_pending.head += n;
+        connection->faketls_pending.len -= n;
+    }
+    queue_release(connection, &connection->faketls_pending);
+    return 0;
+}
+
+static int faketls_process_record(proxy_connection *connection) {
+    if (connection->faketls_rx_len < 5) return 0;
+    size_t payload_len = ((size_t)connection->faketls_rx[3] << 8) |
+                         connection->faketls_rx[4];
+    if (payload_len >
+        TG_FAKETLS_MAX_RECORD_PAYLOAD + TG_FAKETLS_READ_HEADROOM)
+        return -1;
+    size_t record_len = 5 + payload_len;
+    if (connection->faketls_rx_len < record_len) return 0;
+    uint8_t type = connection->faketls_rx[0];
+    uint8_t *payload = connection->faketls_rx + 5;
+    if (connection->faketls_state == 0) {
+        if (type != 0x16) return -1;
+        const tg_config *cfg = connection->server->config.routing_config;
+        if (!cfg || !cfg->faketls_domain[0] || !cfg->proxy_secret_count)
+            return -1;
+        tg_faketls_client_hello hello;
+        size_t matched = cfg->proxy_secret_count;
+        for (size_t i = 0; i < cfg->proxy_secret_count; ++i) {
+            if (tg_faketls_parse_client_hello(
+                    connection->faketls_rx, record_len, cfg->proxy_secrets[i],
+                    sizeof(cfg->proxy_secrets[i]), &hello) == 0) {
+                matched = i;
+                break;
+            }
+        }
+        if (matched == cfg->proxy_secret_count || !hello.has_hostname ||
+            strcmp(hello.hostname, cfg->faketls_domain) != 0)
+            return -1;
+        memcpy(connection->faketls_secret, cfg->proxy_secrets[matched],
+               sizeof(connection->faketls_secret));
+        uint8_t server_hello[4608];
+        size_t server_len = 0;
+        if (tg_faketls_build_server_hello(
+                connection->faketls_secret,
+                sizeof(connection->faketls_secret), &hello, server_hello,
+                sizeof(server_hello), &server_len) != 0)
+            return -1;
+        if (queue_append_grow(connection, &connection->to_client, server_hello,
+                              server_len, TG_MTPROTO_MAX_PACKET) != 0)
+            return -1;
+        connection->faketls_state = 1;
+    } else if (type == 0x14) {
+        /* ChangeCipherSpec is ignored in both handshake and data phases. */
+    } else if (type != 0x17) {
+        return -1;
+    } else if (payload_len) {
+        if (handle_client_bytes(connection, payload, payload_len) != 0)
+            return -1;
+        if (connection->faketls_state == 1 && connection->handshake_done) {
+            connection->faketls_state = 2;
+            connection->faketls_data_phase = 1;
+        }
+    }
+    memmove(connection->faketls_rx, connection->faketls_rx + record_len,
+            connection->faketls_rx_len - record_len);
+    connection->faketls_rx_len -= record_len;
+    return 0;
+}
+
+static int receive_client_faketls(proxy_connection *connection) {
+    for (;;) {
+        while (connection->faketls_rx_len >= 5) {
+            size_t payload_len = ((size_t)connection->faketls_rx[3] << 8) |
+                                 connection->faketls_rx[4];
+            if (payload_len >
+                TG_FAKETLS_MAX_RECORD_PAYLOAD + TG_FAKETLS_READ_HEADROOM)
+                return -1;
+            if (connection->faketls_rx_len < 5 + payload_len) break;
+            if (faketls_process_record(connection) != 0) return -1;
+        }
+        if (drain_faketls_pending(connection) != 0) return -1;
+        if (connection->direct_wss &&
+            (connection->wss_phase != WSS_READY ||
+             connection->ws_pump.tx_memory_bytes != 0))
+            return 0;
+        size_t queue_limit = connection->server->config.queue_bytes;
+        if (connection->handshake_done) {
+            size_t pending_free = connection->faketls_pending.len < queue_limit
+                ? queue_limit - connection->faketls_pending.len : 0;
+            if (!pending_free) return 0;
+        }
+        size_t capacity = sizeof(connection->faketls_rx) -
+                          connection->faketls_rx_len;
+        if (!capacity) return -1;
+        ssize_t n = recv(connection->client_fd,
+                         connection->faketls_rx + connection->faketls_rx_len,
+                         capacity, 0);
+        if (n > 0) {
+            connection->faketls_rx_len += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
+            if (!connection->handshake_done) return -1;
+            if (connection->direct_wss &&
+                connection->wss_phase != WSS_READY) {
+                clear_route_attempt(connection, 0);
+                if (start_next_route(connection) != 0) return -1;
+            }
+            connection->client_eof = 1;
+            advance_half_closes(connection);
+            return 0;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return -1;
+    }
+}
+
 static int receive_client(proxy_connection *connection) {
+    if (connection->faketls) return receive_client_faketls(connection);
     uint8_t buffer[TG_EPOLL_IO_CHUNK];
     for (;;) {
         if (connection->route_dns_pending) return 0;
@@ -2261,44 +2476,8 @@ static int receive_client(proxy_connection *connection) {
             set_tcp_quickack(connection->client_fd);
         ssize_t n = recv(connection->client_fd, buffer, capacity, 0);
         if (n > 0) {
-            add_bytes(&connection->server->bytes_from_clients, (size_t)n);
-            route_session_add_bytes(connection, 1, (size_t)n);
-            connection->last_activity_ms = monotonic_ms();
-            if (!connection->handshake_done) {
-                memcpy(connection->handshake + connection->handshake_len,
-                       buffer, (size_t)n);
-                connection->handshake_len += (size_t)n;
-                if (connection->handshake_len == sizeof(connection->handshake) &&
-                    route_after_handshake(connection) != 0) {
-                    if (!connection->route_failure_recorded)
-                        route_failure_record(connection, connection->route_kind,
-                                             TG_EPOLL_FAILURE_SETUP);
-                    return -1;
-                }
-                if (connection->route_dns_pending) return 0;
-            } else if (connection->route_racing) {
-                if (queue_append_grow(connection, &connection->to_upstream,
-                                     buffer, (size_t)n,
-                                     connection->server->config.queue_bytes) != 0)
-                    return -1;
-                connection->wss_client_payload_started = 1;
-                for (size_t i = 0; i < 2; ++i) {
-                    proxy_connection *candidate = connection->hedges[i];
-                    if (!candidate || candidate->wss_phase != WSS_READY)
-                        continue;
-                    if (hedge_promote_candidate(candidate) != 0) {
-                        hedge_fail_candidate(candidate);
-                        if (connection->closed) return -1;
-                    }
-                    break;
-                }
-            } else if (connection->direct_wss
-                           ? queue_wss_replay_payload(connection, buffer,
-                                                      (size_t)n) != 0
-                           : process_client_payload(connection, buffer,
-                                                    (size_t)n) != 0) {
+            if (handle_client_bytes(connection, buffer, (size_t)n) != 0)
                 return -1;
-            }
             continue;
         }
         if (n == 0) {
@@ -2337,8 +2516,8 @@ static int receive_upstream(proxy_connection *connection) {
                  tg_mtproto_ctr_xor(&connection->local_encrypt, buffer,
                                     (size_t)n) != 0))
                 return -1;
-            if (queue_append_grow(connection, &connection->to_client,
-                                  buffer, (size_t)n, queue_limit) != 0)
+            if (queue_client_bytes(connection, buffer, (size_t)n,
+                                   queue_limit) != 0)
                 return -1;
             continue;
         }
@@ -2628,6 +2807,32 @@ cleanup:
     return result;
 }
 
+static int queue_client_bytes(proxy_connection *connection,
+                              const uint8_t *data, size_t length,
+                              size_t max_capacity) {
+    if (!connection->faketls || !connection->faketls_data_phase)
+        return queue_append_grow(connection, &connection->to_client, data,
+                                 length, max_capacity);
+    size_t offset = 0;
+    while (offset < length) {
+        size_t chunk = length - offset;
+        if (chunk > TG_FAKETLS_MAX_RECORD_PAYLOAD)
+            chunk = TG_FAKETLS_MAX_RECORD_PAYLOAD;
+        if (connection->to_client.len > max_capacity ||
+            chunk + 5 > max_capacity - connection->to_client.len)
+            return -1;
+        uint8_t header[5] = {0x17, 0x03, 0x03,
+                             (uint8_t)(chunk >> 8), (uint8_t)chunk};
+        if (queue_append_grow(connection, &connection->to_client, header,
+                              sizeof(header), max_capacity) != 0 ||
+            queue_append_grow(connection, &connection->to_client,
+                              data + offset, chunk, max_capacity) != 0)
+            return -1;
+        offset += chunk;
+    }
+    return 0;
+}
+
 static int queue_wss_response(void *opaque, const uint8_t *payload,
                               size_t payload_len) {
     proxy_connection *connection = opaque;
@@ -2679,9 +2884,8 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
                                payload_len) != 0)
             return -1;
     }
-    if (queue_append_grow(connection, &connection->to_client,
-                          payload, payload_len,
-                          TG_MTPROTO_MAX_PACKET) != 0)
+    if (queue_client_bytes(connection, payload, payload_len,
+                           TG_MTPROTO_MAX_PACKET) != 0)
         return -1;
     add_bytes(&connection->server->bytes_from_upstreams, payload_len);
     route_session_add_bytes(connection, 0, payload_len);
@@ -2732,6 +2936,8 @@ static int establish_wss_stream(proxy_connection *connection) {
     connection->next_ping_ms = connection->last_activity_ms +
                                ws_ping_interval_ms;
     if (flush_wss_replay(connection) != 0) return -1;
+    if (connection->faketls && drain_faketls_pending(connection) != 0)
+        return -1;
     return 0;
 }
 
@@ -2967,6 +3173,11 @@ static void upstream_event(proxy_connection *connection, uint32_t events) {
         if (!connection->direct_wss)
             route_session_event(connection, connection->route_kind,
                                 TG_ROUTE_SESSION_CONNECTED);
+        if (connection->faketls && !connection->direct_wss &&
+            drain_faketls_pending(connection) != 0) {
+            connection_close(connection);
+            return;
+        }
         if (connection->direct_wss && prepare_wss_tls(connection) != 0) {
             if (connection->hedge_parent) {
                 hedge_fail_candidate(connection);
@@ -3116,6 +3327,9 @@ static void accept_clients(tg_epoll_proxy *server) {
         connection->upstream_fd = -1;
         connection->route_health_index = -1;
         connection->original = original;
+        connection->faketls = server->config.accept_direct_clients &&
+            server->config.routing_config &&
+            server->config.routing_config->faketls_domain[0] != '\0';
         connection->accepted_at_us = monotonic_us();
         connection->handshake_deadline_ms = monotonic_ms() +
                                             server->config.handshake_timeout_ms;

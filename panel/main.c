@@ -76,7 +76,7 @@ static int known_key(const char *key) {
         "CONNBYTES", "VOICE_PORTS", "VOICE_CONNBYTES", "TG_ENABLED",
         "TG_MODE", "TG_DC_MAP_PATH", "TG_RELAY_URL", "TG_RELAY_SECRET", "TG_IDENTITY", "TG_CA_BUNDLE",
         "TG_STATUS", "TG_STATS_SOCKET", "TG_PORT", "TG_ENROLL_PORT",
-        "TG_PROXY_SECRET",
+        "TG_PROXY_SECRET", "TG_LISTEN_FAKETLS_DOMAIN",
         "TG_DIAGNOSTIC_DIRECT_TCP",
         "TG_CF_WORKER_DOMAIN",
         /* Читает files/S99d2k (разгрузка PPE на Keenetic); панели значение

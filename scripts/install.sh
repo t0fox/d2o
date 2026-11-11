@@ -547,6 +547,10 @@ case "$TG_VERSION" in
     *) die "скачанный d2ktg устарел: в нём нет локального MTProto-прокси с секретом" ;;
 esac
 case "$TG_VERSION" in
+    *telegram-faketls*) ;;
+    *) die "скачанный d2ktg устарел: в нём нет FakeTLS-камуфляжа локального прокси" ;;
+esac
+case "$TG_VERSION" in
     *instagram-ip-probe*) ;;
     *) die "скачанный d2ktg устарел: нет проверки доступности Instagram IP" ;;
 esac

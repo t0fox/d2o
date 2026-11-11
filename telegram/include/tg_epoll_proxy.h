@@ -152,8 +152,11 @@ typedef struct {
     int is_media;
     tg_mtproto_proto proto;
     int tcp_only;
-    /* Direct tg://proxy client accepted on the local listener. */
+    /* Direct tg://proxy client accepted on the local listener, and the
+       secret that matched its handshake. */
     int local_proxy;
+    uint8_t local_secret[16];
+    size_t local_secret_len;
 } tg_epoll_route_selection;
 
 typedef int (*tg_epoll_select_route_fn)(

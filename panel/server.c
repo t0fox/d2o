@@ -444,11 +444,12 @@ static void telegram_route_only_value(const d2k_panel_config *cfg,
    one d2ktg reads from TG_PROXY_SECRET; it is only exposed inside this link,
    which the owner copies into Telegram. */
 static int telegram_proxy_link_value(const d2k_panel_config *cfg,
-                                     char out[256]) {
+                                     char out[1024]) {
     out[0] = '\0';
     if (!cfg || !cfg->config_path) return 0;
     char secret[33] = {0};
     char listen[128] = {0};
+    char faketls_domain[254] = {0};
     int port = 1443;
     FILE *f = fopen(cfg->config_path, "r");
     if (!f) return 0;
@@ -474,11 +475,15 @@ static int telegram_proxy_link_value(const d2k_panel_config *cfg,
             eq++;
         }
         if (strcmp(p, "TG_PROXY_SECRET") == 0) {
-            size_t n = strlen(eq);
+            size_t n = strcspn(eq, ",");
+            while (n > 0 && (eq[n - 1] == ' ' || eq[n - 1] == '\t')) --n;
             int valid = n == 32;
             for (size_t i = 0; valid && i < n; ++i)
                 if (!isxdigit((unsigned char)eq[i])) valid = 0;
-            if (valid) memcpy(secret, eq, n + 1);
+            if (valid) {
+                memcpy(secret, eq, n);
+                secret[n] = '\0';
+            }
         } else if (strcmp(p, "TG_PORT") == 0) {
             char *tail = NULL;
             long value = strtol(eq, &tail, 10);
@@ -486,6 +491,8 @@ static int telegram_proxy_link_value(const d2k_panel_config *cfg,
                 port = (int)value;
         } else if (strcmp(p, "PANEL_LISTEN") == 0) {
             snprintf(listen, sizeof(listen), "%s", eq);
+        } else if (strcmp(p, "TG_LISTEN_FAKETLS_DOMAIN") == 0) {
+            snprintf(faketls_domain, sizeof(faketls_domain), "%s", eq);
         }
     }
     fclose(f);
@@ -503,9 +510,31 @@ static int telegram_proxy_link_value(const d2k_panel_config *cfg,
         if (h[0] && strcmp(h, "0.0.0.0") != 0 && strcmp(h, "::") != 0)
             snprintf(host, sizeof(host), "%s", h);
     }
-    int n = snprintf(out, 256, "tg://proxy?server=%s&port=%d&secret=%s",
+    int n = snprintf(out, 1024, "tg://proxy?server=%s&port=%d&secret=%s",
                      host, port, secret);
-    return n > 0 && (size_t)n < 256;
+    if (n <= 0 || (size_t)n >= 1024) return 0;
+    if (faketls_domain[0]) {
+        for (size_t i = 0; faketls_domain[i]; ++i) {
+            unsigned char c = (unsigned char)faketls_domain[i];
+            if (c >= 'A' && c <= 'Z')
+                faketls_domain[i] = (char)(c + ('a' - 'A'));
+        }
+        char faketls_secret[2 + 32 + 2 * 253 + 1];
+        int used = snprintf(faketls_secret, sizeof(faketls_secret), "ee%s",
+                            secret);
+        if (used <= 0 || (size_t)used >= sizeof(faketls_secret)) return 0;
+        for (size_t i = 0; faketls_domain[i]; ++i) {
+            if ((size_t)used + 2 >= sizeof(faketls_secret)) return 0;
+            static const char hex[] = "0123456789abcdef";
+            faketls_secret[used++] = hex[(unsigned char)faketls_domain[i] >> 4];
+            faketls_secret[used++] = hex[(unsigned char)faketls_domain[i] & 15];
+        }
+        faketls_secret[used] = '\0';
+        n = snprintf(out, 1024,
+                     "tg://proxy?server=%s&port=%d&secret=%s",
+                     host, port, faketls_secret);
+    }
+    return n > 0 && (size_t)n < 1024;
 }
 
 static void telegram_status_value(const d2k_panel_config *cfg,int enabled,int configured,int *running,char out[24]) {
@@ -1441,7 +1470,7 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     int queue = cfg ? cfg->queue_num : 2000;
     int telegram_enabled=0,telegram_configured=0,telegram_running=0;char telegram_status[24];
     char telegram_route_only[16];
-    char telegram_proxy_link[256];
+    char telegram_proxy_link[1024];
     char telegram_stats[TELEGRAM_STATS_MAX];
     telegram_config_flags(cfg,&telegram_enabled,&telegram_configured);
     telegram_route_only_value(cfg, telegram_route_only);
