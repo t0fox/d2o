@@ -81,24 +81,48 @@ jobs:
         run: |
           set -euo pipefail
           APT_OPTS=(
-            -o Acquire::Retries=5
+            -o Acquire::ForceIPv4=true
+            -o Acquire::Retries=3
             -o Acquire::http::Timeout=30
             -o Acquire::https::Timeout=30
             -o DPkg::Lock::Timeout=120
           )
+          # GitHub's azure mirror иногда зависает; archive.ubuntu.com —
+          # канонический запасной вариант. IPv4 обязателен: сломанный IPv6
+          # на runner'е даёт ровно такое зависание без вывода.
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
+              /etc/apt/sources.list.d/ubuntu.sources
+          fi
           for attempt in 1 2 3; do
-            if timeout 240 sudo apt-get "${APT_OPTS[@]}" update -qq; then
+            if timeout 120 sudo apt-get "${APT_OPTS[@]}" update -qq 2>&1 | tee /tmp/apt-update.log; then
               break
             fi
             if [ "$attempt" -eq 3 ]; then
               echo "::error::apt-get update failed after 3 attempts"
+              sed -n '1,25p' /tmp/apt-update.log | while IFS= read -r line; do
+                echo "::error::$line"
+              done
               exit 1
             fi
             echo "apt-get update failed (attempt $attempt); retrying"
-            sleep 15
+            sleep 10
           done
-          timeout 300 sudo apt-get "${APT_OPTS[@]}" install -y -qq \
-            make python3 qemu-user binutils file nodejs
+          for attempt in 1 2 3; do
+            if timeout 300 sudo apt-get "${APT_OPTS[@]}" install -y -qq \
+              make python3 qemu-user binutils file nodejs 2>&1 | tee /tmp/apt-install.log; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::apt-get install failed after 3 attempts"
+              sed -n '1,25p' /tmp/apt-install.log | while IFS= read -r line; do
+                echo "::error::$line"
+              done
+              exit 1
+            fi
+            echo "apt-get install failed (attempt $attempt); retrying"
+            sleep 10
+          done
       # No cache in a release build: a cache hit would skip the SHA-256 check.
       - uses: ./.github/actions/setup-zig
         with:
