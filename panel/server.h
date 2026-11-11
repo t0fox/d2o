@@ -36,6 +36,15 @@ typedef struct {
 /* Reap the bounded background service command without blocking HTTP. */
 void d2k_panel_control_tick(void);
 
+/* Read-only DNS discovery for OpenWrt and Keenetic. Keenetic status is from
+   `ndmc show dns-proxy`; URL credentials and query parameters are omitted. */
+int d2k_panel_dns_services_json(const char *https_dns_proxy_path,
+                                const char *dnsproxy_path,
+                                const char *doqd_config_path,
+                                const char *doqd_source,
+                                const char *keenetic_dns_proxy_status,
+                                char *out, size_t out_cap);
+
 /* Serve one bounded HTTP/1.1 request on an already accepted socket. */
 int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg);
 

@@ -84,6 +84,87 @@ static void rewrite_file(const char *path,const char *contents) {
     FILE *f=fopen(path,"w");assert(f);assert(fwrite(contents,1,strlen(contents),f)==strlen(contents));assert(fclose(f)==0);
 }
 
+static void test_dns_service_config_classification(void) {
+    char doh[] = "/tmp/d2k-panel-doh-uci.XXXXXX";
+    char secure[] = "/tmp/d2k-panel-dnsproxy-uci.XXXXXX";
+    char doqd[] = "/tmp/d2k-panel-doqd.conf.XXXXXX";
+    char json[4096];
+    write_temp_file(doh,
+        "config https-dns-proxy\n"
+        " option resolver_url 'https://user:secret@cloudflare-dns.com/dns-query?token=hidden'\n"
+        "config https-dns-proxy\n"
+        " option resolver_url 'https://dns.google/dns-query'\n"
+        "config https-dns-proxy\n"
+        " option resolver_url 'https://dns.quad9.net/dns-query'\n"
+        "config https-dns-proxy\n"
+        " option resolver_url 'https://dns.adguard-dns.com/dns-query'\n"
+        " option resolver_url 'http://plain.example/dns-query'\n");
+    write_temp_file(secure,
+        "config dnsproxy 'global'\n"
+        " option enabled '1'\n"
+        "config dnsproxy 'servers'\n"
+        " list upstream 'tls://one.one.one.one'\n"
+        " list upstream 'tls://dns.google'\n"
+        " list upstream 'tls://dns.quad9.net'\n"
+        " list upstream 'tls://dns.adguard-dns.com'\n"
+        " list upstream 'quic://dns.adguard-dns.com'\n"
+        " list upstream 'quic://unfiltered.adguard-dns.com'\n");
+    write_temp_file(doqd,
+        "listen 127.0.0.1:5354\n"
+        "hosts builtin\n"
+        "upstream quic://dns.quad9.net\n"
+        "fallback quic://p0.freedns.controld.com\n"
+        "bootstrap 1.1.1.1\n");
+    const char *keenetic_status =
+        "proxy-tls:\n"
+        "  server-tls:\n"
+        "    address: 1.1.1.1\n"
+        "    port: 853\n"
+        "    sni: cloudflare-dns.com\n"
+        "  server-tls:\n"
+        "    address: 8.8.8.8\n"
+        "    port: 853\n"
+        "    sni: dns.google\n"
+        "proxy-tls-filters:\n"
+        "proxy-https:\n"
+        "  server-https:\n"
+        "    uri: https://cloudflare-dns.com/dns-query?token=secret\n"
+        "  server-https:\n"
+        "    uri: https://dns.google/dns-query\n"
+        "proxy-https-filters:\n";
+    assert(d2k_panel_dns_services_json(doh, secure, doqd, "keenetic-doq-web",
+                                       keenetic_status, json, sizeof json) == 0);
+    const char *at = json;
+    unsigned services = 0;
+    while ((at = strstr(at, "\"protocol\":")) != NULL) { services++; at++; }
+    assert(services == 14);
+    assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"cloudflare-dns.com\",\"port\":443") != NULL);
+    assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"dns.google\",\"port\":443") != NULL);
+    assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"dns.quad9.net\",\"port\":443") != NULL);
+    assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"dns.adguard-dns.com\",\"port\":443") != NULL);
+    assert(strstr(json, "\"protocol\":\"dot\",\"host\":\"one.one.one.one\",\"port\":853") != NULL);
+    assert(strstr(json, "\"protocol\":\"dot\",\"host\":\"dns.google\",\"port\":853") != NULL);
+    assert(strstr(json, "\"protocol\":\"dot\",\"host\":\"dns.quad9.net\",\"port\":853") != NULL);
+    assert(strstr(json, "\"protocol\":\"dot\",\"host\":\"dns.adguard-dns.com\",\"port\":853") != NULL);
+    assert(strstr(json, "\"protocol\":\"doq\",\"host\":\"dns.adguard-dns.com\",\"port\":853") != NULL);
+    assert(strstr(json, "\"protocol\":\"doq\",\"host\":\"unfiltered.adguard-dns.com\",\"port\":853") != NULL);
+    assert(strstr(json, "\"protocol\":\"doq\",\"host\":\"dns.quad9.net\",\"port\":853") != NULL);
+    assert(strstr(json, "\"protocol\":\"doq\",\"host\":\"p0.freedns.controld.com\",\"port\":853") != NULL);
+    assert(strstr(json, "\"protocol\":\"dot\",\"host\":\"1.1.1.1\",\"port\":853,\"sni\":\"cloudflare-dns.com\",\"source\":\"keenetic-system\"") != NULL);
+    assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"cloudflare-dns.com\",\"port\":443") != NULL);
+    assert(strstr(json, "\"source\":\"keenetic-doq-web\"") != NULL);
+    assert(!strstr(json, "secret") && !strstr(json, "hidden"));
+    assert(!strstr(json, "plain.example"));
+    rewrite_file(secure,
+        "config dnsproxy 'global'\n"
+        " option enabled '0'\n"
+        "config dnsproxy 'servers'\n"
+        " list upstream 'tls://disabled.example'\n");
+    assert(d2k_panel_dns_services_json(doh, secure, doqd, "doqd", NULL, json, sizeof json) == 0);
+    assert(strstr(json, "\"protocol\":\"doh\"") && !strstr(json, "disabled.example"));
+    unlink(doh); unlink(secure); unlink(doqd);
+}
+
 static void test_api_exposes_live_knowledge(void) {
     char live[] = "/tmp/d2k-panel-live.XXXXXX";
     write_temp_file(live, "{\"linked\":true,\"link_note\":\"\",\"boxes\":[],\"searches\":[],\"targets\":0,\"confirms\":0,\"probes_used\":0,\"client_unfit\":0}");
@@ -112,6 +193,7 @@ static void test_api_exposes_live_knowledge(void) {
     assert(strstr(response, "HTTP/1.1 200 OK") != NULL);
     assert(strstr(response, "Content-Type: application/json; charset=utf-8") != NULL);
     assert(strstr(response, "\"snapshot\":{\"taken\":") != NULL);
+    assert(strstr(response, "\"dns_services\":[") != NULL);
     assert(strstr(response, "\"version\":\"test-version\"") != NULL);
     assert(strstr(response, "\"unknown_keys\":[\"FUTURE_OPTION\"]") != NULL);
     assert(strstr(response, "\"linked\":true") != NULL);
@@ -865,6 +947,7 @@ static void test_diagnostic_history_controls_and_download(void) {
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    test_dns_service_config_classification();
     test_diagnostic_history_controls_and_download();
     test_api_exposes_live_knowledge();
     test_invalid_live_json_is_not_reported_as_empty_knowledge();

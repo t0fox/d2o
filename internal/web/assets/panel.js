@@ -51,6 +51,24 @@
     if (transport === 6) return "TCP";
     return "протокол не указан";
   }
+  function dnsProtocolLabel(protocol, transport, port) {
+    var p = str(protocol).toLowerCase();
+    if (p === "doh" || p === "dot" || p === "doq") return p === "doh" ? "DoH" : p === "dot" ? "DoT" : "DoQ";
+    if (num(port) === 853 && transport === 6) return "DoT";
+    if (num(port) === 853 && transport === 17) return "DoQ";
+    return "";
+  }
+  function dnsProtocolClass(protocol, transport, port) {
+    var label = dnsProtocolLabel(protocol, transport, port);
+    return label ? "dns-protocol-" + label.toLowerCase() : "";
+  }
+  function dnsProtocolTag(doc, protocol, transport, port) {
+    var label = dnsProtocolLabel(protocol, transport, port);
+    if (!label) return null;
+    var t = tag(doc, label, "live");
+    t.classList.add(dnsProtocolClass(protocol, transport, port));
+    return t;
+  }
   function familyLabel(f) { return f === 6 ? "IPv6" : f === 4 ? "IPv4" : "IP?"; }
   function targetLabel(t) {
     if (t === "@discord-voice") return "Голос Discord";
@@ -238,13 +256,17 @@
     var k = (status && status.knowledge) || {};
     var linked = !!k.linked;
     var engine = !!snap.engine_running;
+    var dnsServices = list(snap.dns_services).filter(function (x) {
+      return x && (x.protocol === "doh" || x.protocol === "dot" || x.protocol === "doq") &&
+        typeof x.host === "string" && num(x.port) !== null;
+    });
     var searches = linked ? list(k.searches) : [];
     var QUEUED = "ожидает безопасного слота замера";
     var active = searches.filter(function (s) { return s.phase !== "подтверждено, смотрим живой трафик"; });
     var m = {
       snap: snap, k: k, linked: linked, engine: engine,
       fresh: snap.live_fresh !== false,
-      searches: searches, hunting: active.length,
+      searches: searches, dnsServices: dnsServices, hunting: active.length,
       running: searches.filter(function (s) { return s.phase !== QUEUED; }),
       queued: searches.filter(function (s) { return s.phase === QUEUED; }),
       groups: list(k.groups), boxes: list(k.boxes),
@@ -1202,6 +1224,7 @@
 
   App.prototype.renderSearches = function (m) {
     var doc = this.doc, self = this;
+    this.renderDnsServices(m);
     var listNode = this.$("searches");
     if (!m.linked || !m.engine) {
       section(listNode, "absent:" + m.engine + ":" + m.linked, function () {
@@ -1297,6 +1320,30 @@
     }
   };
 
+  App.prototype.renderDnsServices = function (m) {
+    var box = this.$("dns-services-box"), listNode = this.$("dns-services"), doc = this.doc;
+    if (!box || !listNode) return;
+    var services = m.dnsServices || [];
+    box.hidden = services.length === 0;
+    if (!services.length) { listNode.replaceChildren(); listNode.__d2kKey = "none"; return; }
+    var key = JSON.stringify(services);
+    if (listNode.__d2kKey === key) return;
+    listNode.__d2kKey = key;
+    listNode.replaceChildren();
+    services.forEach(function (service) {
+      var row = el(doc, "li", "dns-service");
+      var address = service.host.indexOf(":") >= 0 ? "[" + service.host + "]:" + service.port
+        : service.host + ":" + service.port;
+      var source = ({ "https-dns-proxy": "https-dns-proxy", dnsproxy: "dnsproxy",
+        "keenetic-system": "DNS-прокси Keenetic", doqd: "doqd", "keenetic-doq-web": "keenetic-doq-web" })[service.source] || service.source || "конфигурации";
+      var protocolTag = dnsProtocolTag(doc, service.protocol, service.protocol === "doq" ? 17 : 6, service.port);
+      add(row, protocolTag, el(doc, "span", "mono", address),
+        service.sni && service.sni !== service.host ? el(doc, "span", "mono dns-service-sni", "SNI " + service.sni) : null,
+        el(doc, "span", "dns-service-source", "источник: " + source));
+      listNode.appendChild(row);
+    });
+  };
+
   App.prototype.updateQueue = function (li, queued) {
     var doc = this.doc, self = this;
     var key = JSON.stringify(queued.map(function (s) { return [s.target, s.family, s.transport, s.ip, s.port, s.since]; }));
@@ -1310,7 +1357,9 @@
         var row = el(doc, "li");
         var wait = el(doc, "span", "queue-wait");
         wait.__since = parseTime(s.since);
+        var dns = dnsProtocolLabel(s.dns_protocol, s.transport, s.port);
         add(row, el(doc, "span", "queue-target", targetLabel(s.target)),
+          dns ? dnsProtocolTag(doc, s.dns_protocol, s.transport, s.port) : null,
           tag(doc, shapeLabel(s.shape, s.transport)), tag(doc, familyLabel(s.family)), wait);
         ul.appendChild(row);
       });
@@ -1345,12 +1394,14 @@
   App.prototype.updateSearch = function (li, s) {
     var doc = this.doc, p = li.__parts;
     p.target.textContent = targetLabel(s.target);
-    var metaKey = JSON.stringify([s.shape, s.transport, s.family, s.ip, s.port, s.source, s.attempts, s.probes]);
+    var dns = dnsProtocolLabel(s.dns_protocol, s.transport, s.port);
+    var metaKey = JSON.stringify([s.shape, s.transport, s.family, s.ip, s.port, dns, s.source, s.attempts, s.probes]);
     if (p.meta.__d2kKey !== metaKey) {
       p.meta.__d2kKey = metaKey;
       var addr = s.ip ? (s.family === 6 ? "[" + s.ip + "]" : s.ip) + (s.port ? ":" + s.port : "") : "";
       p.meta.replaceChildren();
       add(p.meta,
+        dns ? dnsProtocolTag(doc, s.dns_protocol, s.transport, s.port) : null,
         tag(doc, shapeLabel(s.shape, s.transport)),
         tag(doc, familyLabel(s.family)),
         addr ? el(doc, "span", "mono", addr) : null,
@@ -2637,7 +2688,7 @@
   };
 
   var api = {
-    model: model, coveredBy: coveredBy, familyStatus: familyStatus, slotsView: slotsView, trackFor: trackFor, shapeLabel: shapeLabel,
+    model: model, coveredBy: coveredBy, familyStatus: familyStatus, slotsView: slotsView, trackFor: trackFor, shapeLabel: shapeLabel, dnsProtocolLabel: dnsProtocolLabel, dnsProtocolClass: dnsProtocolClass,
     planGist: planGist, plural: plural, duration: duration,
     telegramRouteName: telegramRouteName,
     telegramFailureStage: telegramFailureStage,
