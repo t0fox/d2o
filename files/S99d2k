@@ -1424,24 +1424,49 @@ telegram_start() {
     mkdir -p "$RUN" "$LOG" "$(dirname "$TG_STATUS")" || return 1
     prepare_runtime
     start_log_maintenance
+    tg_start_rc=0
+    telegram_launch || tg_start_rc=$?
+    if [ "$tg_start_rc" -eq 0 ]; then
+        telegram_start_watchdog
+    else
+        telegram_start_watchdog --retry-start
+    fi
+    return "$tg_start_rc"
+}
+
+telegram_start_watchdog() {
+    if [ -x "$TG_WATCHDOG" ] && ! running "$TG_WD_PID"; then
+        TG_WATCHDOG_HEALTH="$RUNTIME_DIR/d2ktg.health" \
+            spawn_daemon -S -b -m -p "$TG_WD_PID" -x "$TG_WATCHDOG" -- "$@" \
+            || say "Telegram health watchdog не запустился"
+    fi
+}
+
+telegram_launch() {
     if running "$TG_PID"; then
         if [ -x "$TG_FIREWALL" ]; then "$TG_FIREWALL" heal || true; fi
         return 0
     fi
     stop_pidfile "$TG_PID" || return 1
     write_telegram_status starting || return 1
+    rm -f "$RUNTIME_DIR/d2ktg.health"
     set -- --health-file "$RUNTIME_DIR/d2ktg.health"
     spawn_daemon -S -b -m -p "$TG_PID" -x "$TGBIN" -- \
         --config "$CONF" "$@" --log "$LOG/telegram.log" || { write_telegram_status error; return 1; }
-    i=0
-    while [ $i -lt 50 ]; do
-        if running "$TG_PID" && [ "$(cat "$TG_STATUS" 2>/dev/null)" = local ]; then
+    tg_wait=0
+    tg_ready=0
+    while [ "$tg_wait" -lt 50 ]; do
+        tg_state=$(cat "$TG_STATUS" 2>/dev/null)
+        [ "$tg_state" != error ] || break
+        if [ "$tg_state" = local ] && running "$TG_PID"; then
+            tg_ready=1
             break
         fi
-        i=$((i + 1)); sleep 0.1 2>/dev/null || sleep 1
+        tg_wait=$((tg_wait + 1)); sleep 0.1 2>/dev/null || sleep 1
     done
-    if [ "$i" -eq 50 ]; then
+    if [ "$tg_ready" -eq 0 ]; then
         stop_pidfile "$TG_PID"
+        if [ -x "$TG_FIREWALL" ]; then "$TG_FIREWALL" stop || true; fi
         say "d2ktg не подтвердил готовность listener — см. $LOG/telegram.log"
         write_telegram_status error
         return 1
@@ -1455,10 +1480,6 @@ telegram_start() {
         }
     else
         stop_pidfile "$TG_PID" || return 1; write_telegram_status error; say "нет правил Telegram firewall $TG_FIREWALL"; return 1
-    fi
-    if [ -x "$TG_WATCHDOG" ] && ! running "$TG_WD_PID"; then
-        spawn_daemon -S -b -m -p "$TG_WD_PID" -x "$TG_WATCHDOG" \
-            || say "Telegram health watchdog не запустился"
     fi
     say "локальный Telegram TCP-прокси запущен на :$TG_PORT"
 }

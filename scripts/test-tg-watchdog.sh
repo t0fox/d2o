@@ -77,4 +77,18 @@ set -e
 [ "$rc" -eq 124 ] || fail "watchdog завершился с кодом $rc вместо работы в цикле"
 [ "$(wc -l < "$WATCHDOG_INIT_CALLS")" -eq 1 ] ||
     fail "лимит рестартов не остановил повторные попытки"
+rm -f "$WATCHDOG_INIT_CALLS" "$WATCHDOG_FIREWALL_CALLS"
+set +e
+timeout 2 env \
+    TG_WATCHDOG_DIR="$TMP/d2k" \
+    TG_WATCHDOG_INIT="$TMP/init" \
+    TG_WATCHDOG_HEALTH="$TMP/missing-health" \
+    sh "$WATCHDOG" --retry-start >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 124 ] || fail "сторож завершился после холодного запуска"
+[ "$(cat "$WATCHDOG_INIT_CALLS")" = telegram-restart ] ||
+    fail "после отказа первого запуска сторож не повторил запуск сразу"
+[ ! -s "$WATCHDOG_FIREWALL_CALLS" ] ||
+    fail "сторож установил redirect, пока listener не готов"
 printf 'Тесты Telegram watchdog: ок\n'

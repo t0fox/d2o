@@ -46,6 +46,38 @@ engine_stop
 printf '{}' > "$LIVE"
 stop
 [ ! -f "$LM_PID" ] && [ ! -f "$LIVE" ] || exit 44
+TG_ENABLED=1
+TGBIN=/bin/true
+TG_WATCHDOG=/bin/true
+TG_FIREWALL=$TEST_DIR/firewall
+cat > "$TG_FIREWALL" <<'SH'
+#!/bin/sh
+printf '%s\\n' "$1" >> "$TEST_DIR/telegram-firewall"
+SH
+chmod +x "$TG_FIREWALL"
+launch_state=error
+spawn_daemon() {
+    case " $* " in
+        *" $TG_WD_PID "*)
+            printf '%s %s\\n' "$TG_WATCHDOG_HEALTH" "$*" >> "$TEST_DIR/telegram-watchdog"
+            : > "$TG_WD_PID"
+            ;;
+        *" $TG_PID "*)
+            write_telegram_status "$launch_state"
+            [ "$launch_state" != local ] || : > "$TG_PID"
+            ;;
+    esac
+}
+if telegram_start; then exit 45; fi
+[ -f "$TG_WD_PID" ] && [ ! -f "$TG_PID" ] || exit 46
+[ "$(cat "$TEST_DIR/telegram-firewall")" = stop ] || exit 47
+grep -q "^$RUNTIME_DIR/d2ktg.health .*--retry-start$" "$TEST_DIR/telegram-watchdog" || exit 48
+launch_state=local
+telegram_restart || exit 49
+[ -f "$TG_PID" ] && [ "$(cat "$TG_STATUS")" = local ] || exit 50
+[ "$(tail -n 1 "$TEST_DIR/telegram-firewall")" = start ] || exit 51
+[ "$(wc -l < "$TEST_DIR/telegram-watchdog")" -eq 1 ] || exit 52
+
 `;
   fs.writeFileSync(path.join(tmp, 'harness'), harness);
   const result = spawnSync('/bin/sh', [path.join(tmp, 'harness')], {
@@ -62,7 +94,7 @@ stop
   assert(controller.includes(`--catalog ${tmp}/d2k/state/catalog.json`), 'persistent catalog location must stay unchanged');
   assert.equal(fs.statSync(path.join(tmp, 'runtime')).mode & 0o777, 0o700, 'runtime directory must be private');
   assert.equal(calls.filter(x => x.includes('-- run')).length, 1, 'maintenance must start once for engine and panel');
-  console.log('runtime snapshot paths and engine-stop maintenance: PASS');
+  console.log('runtime snapshot paths, engine-stop maintenance and Telegram cold-start retry: PASS');
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

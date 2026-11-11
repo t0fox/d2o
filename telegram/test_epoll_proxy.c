@@ -26,6 +26,8 @@ void tg_epoll_proxy_test_set_ping_interval_ms(uint64_t interval_ms);
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
@@ -3240,8 +3242,44 @@ static void test_listener_recovery_preserves_runtime(void) {
     atomic_store(&test_monotonic_offset_ms, 0);
 }
 
+static void test_small_fd_limit_keeps_a_client_slot(void) {
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        const struct rlimit fd_limit = {.rlim_cur = 48, .rlim_max = 48};
+        assert(setrlimit(RLIMIT_NOFILE, &fd_limit) == 0);
+        uint16_t port;
+        int listener = create_listener(&port);
+        SSL_CTX *tls_context = SSL_CTX_new(TLS_client_method());
+        assert(tls_context);
+        const tg_config routing = {.ws_hedge_limit = 8};
+        tg_epoll_proxy_config config = {
+            .listener_fd = listener,
+            .queue_bytes = 65536,
+            .memory_budget_bytes = 8u * 1024u * 1024u,
+            .configured_max_connections = 1,
+            .handshake_timeout_ms = 1000,
+            .idle_timeout_ms = 5000,
+            .enable_direct_wss = 1,
+            .tls_context = tls_context,
+            .routing_config = &routing,
+            .select_target = select_target
+        };
+        tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+        assert(proxy && tg_epoll_proxy_max_connections(proxy) == 1);
+        tg_epoll_proxy_destroy(proxy);
+        SSL_CTX_free(tls_context);
+        close(listener);
+        _exit(0);
+    }
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 int main(void) {
     (void)signal(SIGPIPE, SIG_IGN);
+    test_small_fd_limit_keeps_a_client_slot();
     test_listener_recovery_preserves_runtime();
     test_adaptive_races_alternates_in_both_wss_branches();
     test_epoll_bridge_preserves_handshake_and_half_close();

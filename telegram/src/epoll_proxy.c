@@ -203,6 +203,7 @@ typedef struct {
     int started;
     int stopping;
     size_t count;
+    size_t capacity;
     worker_pool_entry entries[TG_WORKER_POOL_MAX];
     SSL_CTX *tls_context;
     uint32_t socket_mark;
@@ -1290,7 +1291,8 @@ static void *worker_pool_thread(void *opaque) {
                 ++i;
             }
         }
-        for (size_t i = 0; i < pool->dc_count && !have_missing; ++i) {
+        for (size_t i = 0; pool->count < pool->capacity &&
+                         i < pool->dc_count && !have_missing; ++i) {
             int found = 0;
             for (size_t j = 0; j < pool->count; ++j)
                 if (pool->entries[j].dc_id == pool->dcs[i] &&
@@ -1338,7 +1340,7 @@ static void *worker_pool_thread(void *opaque) {
         pthread_mutex_lock(&pool->lock);
         pool->failures[missing_index] = 0;
         pool->retry_at[missing_index] = 0;
-        if (pool->stopping || pool->count >= TG_WORKER_POOL_MAX) {
+        if (pool->stopping || pool->count >= pool->capacity) {
             pthread_mutex_unlock(&pool->lock);
             worker_pool_entry_close(&entry);
             continue;
@@ -1354,8 +1356,9 @@ static void *worker_pool_thread(void *opaque) {
     return NULL;
 }
 
-static worker_pool *worker_pool_start(const tg_epoll_proxy_config *config) {
-    if (!config || !config->routing_config || !config->tls_context ||
+static worker_pool *worker_pool_start(const tg_epoll_proxy_config *config,
+                                      size_t capacity) {
+    if (!capacity || !config || !config->routing_config || !config->tls_context ||
         !config->enable_direct_wss || config->resolve_domain ||
         !config->routing_config->cf_worker_domain_count)
         return NULL;
@@ -1364,6 +1367,7 @@ static worker_pool *worker_pool_start(const tg_epoll_proxy_config *config) {
         return NULL;
     worker_pool *pool = calloc(1, sizeof(*pool));
     if (!pool) return NULL;
+    pool->capacity = capacity < TG_WORKER_POOL_MAX ? capacity : TG_WORKER_POOL_MAX;
     pool->tls_context = config->tls_context;
     pool->socket_mark = config->socket_mark;
     pool->require_socket_mark = config->require_socket_mark;
@@ -3470,12 +3474,13 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config) {
         }
         memory_per_connection += TG_WS_PUMP_RX_INITIAL;
     }
+    size_t hedge_limit = config->routing_config
+        ? config->routing_config->ws_hedge_limit : 0;
+    if (hedge_limit > config->configured_max_connections)
+        hedge_limit = config->configured_max_connections;
     size_t max_connections = tg_limits_auto_max_connections(
-        tg_limits_soft_nofile(), config->memory_budget_bytes,
-        memory_per_connection,
-        config->routing_config
-            ? config->routing_config->ws_hedge_limit * (TG_HEDGE_CANDIDATES - 1u) : 0,
-        config->configured_max_connections);
+        tg_limits_soft_nofile(), config->memory_budget_bytes, memory_per_connection,
+        hedge_limit * (TG_HEDGE_CANDIDATES - 1u), config->configured_max_connections);
     if (!max_connections) {
         errno = ENOMEM;
         return NULL;
@@ -3517,7 +3522,7 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config) {
                                                config->cf_domain_pool);
         }
     }
-    server->worker_pool = worker_pool_start(&server->config);
+    server->worker_pool = worker_pool_start(&server->config, max_connections / 2u);
     if (set_nonblocking(server->listener_fd) != 0) goto fail;
     server->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (server->epoll_fd < 0) goto fail;

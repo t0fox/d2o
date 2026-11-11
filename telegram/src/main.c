@@ -33,8 +33,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#if defined(__linux__)
-#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -48,21 +46,6 @@
 
 static const char *health_path = "/tmp/d2k/d2ktg.health";
 static volatile sig_atomic_t stop_requested;
-
-static void read_memory_budget(size_t *total, size_t *available) {
-    FILE *file = fopen("/proc/meminfo", "r");
-    if (!file) return;
-    char line[160];
-    while (fgets(line, sizeof(line), file)) {
-        unsigned long long kib;
-        if (sscanf(line, "MemTotal: %llu kB", &kib) == 1)
-            *total = kib > SIZE_MAX / 1024u ? SIZE_MAX : (size_t)kib * 1024u;
-        else if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1)
-            *available = kib > SIZE_MAX / 1024u ? SIZE_MAX : (size_t)kib * 1024u;
-        if (*total && *available) break;
-    }
-    fclose(file);
-}
 
 static void on_signal(int signo) { (void)signo;stop_requested=1; }
 
@@ -361,6 +344,22 @@ static int run_local_daemon(const char *config_path) {
         tg_config_clean(&cfg);
         return 0;
     }
+    size_t total_memory, available_memory;
+    FILE *meminfo = fopen("/proc/meminfo", "r");
+    tg_limits_read_meminfo(meminfo, &total_memory, &available_memory);
+    if (meminfo) fclose(meminfo);
+    size_t fd_limit = tg_limits_soft_nofile();
+    char resource_note[192];
+    size_t max_connections = tg_limits_policy_connections(fd_limit,
+        total_memory, available_memory, cfg.manual_connection_limit
+            ? cfg.connection_limit : 32u);
+    if (!max_connections) {
+        snprintf(resource_note, sizeof(resource_note),
+                 "нет бюджета запуска: RAM %zu/%zu КиБ доступно, FD %zu",
+                 available_memory / 1024u, total_memory / 1024u, fd_limit);
+        log_msg(resource_note);
+        goto done;
+    }
     int64_t now = (int64_t)time(NULL);
     if (!cfg.local_mode || tg_dc_map_store_init(&map_store, cfg.dc_map_path) != 0 ||
         tg_dc_map_store_load(&map_store, now) != 0) {
@@ -403,11 +402,6 @@ static int run_local_daemon(const char *config_path) {
         .allowed_cidrs = allowed_cidrs,
         .allowed_cidr_count = sizeof(allowed_cidrs) / sizeof(allowed_cidrs[0])
     };
-    size_t total_memory = 0, available_memory = 0;
-    read_memory_budget(&total_memory, &available_memory);
-    size_t max_connections = tg_limits_policy_connections(tg_limits_soft_nofile(),
-        total_memory, available_memory, cfg.manual_connection_limit
-            ? cfg.connection_limit : 32u);
     tg_epoll_proxy_config proxy_config = {
         .listener_fd = listener,
         .queue_bytes = 64u * 1024u,
@@ -431,7 +425,11 @@ static int run_local_daemon(const char *config_path) {
     };
     proxy = tg_epoll_proxy_create(&proxy_config);
     if (!proxy) {
-        log_msg("не удалось запустить epoll-прокси с безопасным лимитом ресурсов");
+        snprintf(resource_note, sizeof(resource_note),
+                 "не удалось запустить epoll-прокси: %s; лимит %zu, RAM %zu/%zu КиБ доступно, FD %zu",
+                 strerror(errno), max_connections, available_memory / 1024u,
+                 total_memory / 1024u, fd_limit);
+        log_msg(resource_note);
         goto done;
     }
     if (tg_stats_socket_open(&stats_socket, cfg.stats_socket_path) != 0)
@@ -445,7 +443,11 @@ static int run_local_daemon(const char *config_path) {
     (void)signal(SIGPIPE, SIG_IGN);
     stop_requested = 0;
     (void)write_status(cfg.status_path, "local\n");
-    log_msg("локальный Telegram TCP-прокси запущен через epoll");
+    snprintf(resource_note, sizeof(resource_note),
+             "локальный Telegram TCP-прокси запущен, лимит %zu, RAM %zu/%zu КиБ доступно, FD %zu",
+             tg_epoll_proxy_max_connections(proxy), available_memory / 1024u,
+             total_memory / 1024u, fd_limit);
+    log_msg(resource_note);
     rc = 0;
     uint64_t rebind_at_ms = 0;
     unsigned rebind_attempt = 0;
@@ -512,8 +514,8 @@ static int run_local_daemon(const char *config_path) {
         int ready = d2k_runtime_listener_ready(listener);
         (void)d2k_runtime_heartbeat(health_path, NULL, 0, ready, ready);
     }
-    (void)write_status(cfg.status_path, rc == 0 ? "stopped\n" : "error\n");
 done:
+    (void)write_status(cfg.status_path, rc == 0 ? "stopped\n" : "error\n");
     stop_dc_refresh(&refresh_job);
     tg_stats_socket_close(&stats_socket);
     tg_epoll_proxy_destroy(proxy);

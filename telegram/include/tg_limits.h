@@ -2,7 +2,9 @@
 #define D2K_TG_LIMITS_H
 
 #include <stddef.h>
+#include <stdio.h>
 
+void tg_limits_read_meminfo(FILE *file, size_t *total, size_t *available);
 size_t tg_limits_soft_nofile(void);
 size_t tg_limits_auto_max_connections(size_t fd_limit, size_t memory_budget,
                                      size_t bytes_per_connection,

@@ -2,6 +2,7 @@
 #include "tg_limits.h"
 
 #include <stdint.h>
+#include <string.h>
 #include <sys/resource.h>
 
 #define TG_LIMITS_DEFAULT_NOFILE 1024u
@@ -9,6 +10,40 @@
 #define TG_LIMITS_RESERVED_FDS 33u
 #define TG_LIMITS_FDS_PER_CONNECTION 2u
 #define TG_LIMITS_MEMORY_BUDGET_MAX (192u * 1024u * 1024u)
+
+void tg_limits_read_meminfo(FILE *file, size_t *total, size_t *available) {
+    *total = *available = 0;
+    if (!file) return;
+
+    size_t free_bytes = 0, buffers = 0, cache = 0, shared = 0;
+    int have_available = 0;
+    char line[160];
+    while (fgets(line, sizeof(line), file)) {
+        unsigned long long kib;
+        char field[32], unit[4];
+        if (sscanf(line, "%31[^:]: %llu %3s", field, &kib, unit) != 3 ||
+            strcmp(unit, "kB") != 0)
+            continue;
+        size_t bytes = kib > SIZE_MAX / 1024u ? SIZE_MAX : (size_t)kib * 1024u;
+        if (strcmp(field, "MemTotal") == 0) *total = bytes;
+        else if (strcmp(field, "MemAvailable") == 0) {
+            *available = bytes;
+            have_available = 1;
+        } else if (strcmp(field, "MemFree") == 0) free_bytes = bytes;
+        else if (strcmp(field, "Buffers") == 0) buffers = bytes;
+        else if (strcmp(field, "Cached") == 0) cache = bytes;
+        else if (strcmp(field, "Shmem") == 0) shared = bytes;
+        if (*total && have_available) break;
+    }
+    if (!have_available && free_bytes <= *total) {
+        /* Older router kernels omit MemAvailable. Discount file cache and
+         * exclude tmpfs instead of treating Cached as entirely reclaimable. */
+        *available = free_bytes;
+        size_t file_cache = cache > shared ? (cache - shared) / 2u : 0;
+        if (buffers <= *total - *available) *available += buffers;
+        if (file_cache <= *total - *available) *available += file_cache;
+    }
+}
 
 size_t tg_limits_soft_nofile(void) {
     struct rlimit limit;
@@ -45,8 +80,12 @@ size_t tg_limits_policy_connections(size_t fd_limit, size_t total_bytes,
     size_t fd_slots = usable_fds > 32u ? (usable_fds - 32u) / 5u : 0;
     size_t reserved = total_bytes / 5u;
     if (available_bytes / 2u > reserved) reserved = available_bytes / 2u;
-    size_t memory_slots = available_bytes > reserved
-        ? (available_bytes - reserved) / (1024u * 1024u) : 0;
+    /* Cold boot may have less RAM free than the nominal reserve alone.
+     * Leave at least 3/4 of available memory for the system under pressure
+     * and admit only whole slots from the remaining quarter. */
+    size_t max_reserve = available_bytes - available_bytes / 4u;
+    if (reserved > max_reserve) reserved = max_reserve;
+    size_t memory_slots = (available_bytes - reserved) / (1024u * 1024u);
     if (cap > fd_slots) cap = fd_slots;
     return cap < memory_slots ? cap : memory_slots;
 }

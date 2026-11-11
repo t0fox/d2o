@@ -113,12 +113,16 @@ if [ -r "$STATE" ]; then
     is_uint "$failures" || failures=0
 fi
 mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
+if [ "${1:-}" = --retry-start ]; then
+    # S99d2k has already observed and cleaned up the failed cold start.
+    failures=$FAILURE_LIMIT
+fi
 
 while :; do
-    if [ -x "$DIR/d2k-tg-firewall.sh" ]; then
-        "$DIR/d2k-tg-firewall.sh" heal >/dev/null 2>&1 || true
-    fi
     if health_is_fresh; then
+        if [ -x "$DIR/d2k-tg-firewall.sh" ]; then
+            "$DIR/d2k-tg-firewall.sh" heal >/dev/null 2>&1 || true
+        fi
         failures=0
         rm -f "$STATE" "$LIMITED"
     else
