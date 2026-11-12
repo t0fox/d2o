@@ -946,6 +946,125 @@
     }
   };
 
+  function createWorkerSetup(doc, win) {
+    var section = el(doc, "section", "tg-worker-setup");
+    var title = el(doc, "h3", "", "Настройка Cloudflare Worker");
+    var intro = el(doc, "p", "", "Стандартный Worker Flowseal подходит для TCP 443. Для TCP 5222 нужен Worker D2O.");
+    var steps = el(doc, "ol");
+    [
+      "В Cloudflare откройте Workers & Pages, создайте Worker и перейдите в Edit code. Вставьте код ниже и нажмите Deploy.",
+      "Для TCP 5222 добавьте в Settings → Variables and Secrets переменную D2O_TG_5222_TARGETS типа Text. Вставьте скопированные IP и нажмите Deploy.",
+      "Скопируйте hostname workers.dev из Cloudflare и добавьте его в поле «Домен Worker» в этом окне."
+    ].forEach(function (text) { steps.appendChild(el(doc, "li", "", text)); });
+
+    var actions = el(doc, "div", "tg-worker-setup-actions");
+    var copyCode = el(doc, "button", "btn", "Скопировать код Worker");
+    var download = el(doc, "a", "btn", "Скачать .js");
+    var copyIPs = el(doc, "button", "btn", "Скопировать IP для TCP 5222");
+    copyCode.type = copyIPs.type = "button";
+    download.download = "worker.js";
+    actions.append(copyCode, download, copyIPs);
+
+    var mapStatus = el(doc, "p", "tg-worker-map-status");
+    var assetStatus = el(doc, "p", "tg-worker-copy-message");
+    var sourceLink = el(doc, "a", "", "Открыть исходник на GitHub");
+    sourceLink.href = "https://github.com/t0fox/d2o/blob/main/telegram/cloudflare/worker.js";
+    sourceLink.target = "_blank";
+    sourceLink.rel = "noopener noreferrer";
+    var message = el(doc, "p", "tg-worker-copy-message");
+    var field = el(doc, "textarea", "tg-worker-copy-field");
+    mapStatus.setAttribute("role", "status");
+    assetStatus.setAttribute("role", "status");
+    message.setAttribute("role", "status");
+    field.readOnly = true;
+    field.rows = 4;
+    field.spellcheck = false;
+    field.wrap = "off";
+    section.append(title, intro, steps, actions, assetStatus, sourceLink, mapStatus, message, field);
+
+    var sourceData = doc.getElementById("tg-worker-source");
+    var source = sourceData ? sourceData.textContent : "";
+    var targets = "", request = 0;
+    copyCode.disabled = !source;
+    download.hidden = sourceLink.hidden = true;
+    if (source) {
+      download.href = win.URL.createObjectURL(new win.Blob([source], { type: "text/javascript;charset=utf-8" }));
+      download.hidden = false;
+    } else {
+      assetStatus.textContent = "Код Worker недоступен в этой версии страницы.";
+      sourceLink.hidden = false;
+    }
+    function copy(text, label) {
+      if (!text) return;
+      var current = request;
+      var trigger = doc.activeElement;
+      field.hidden = true;
+      message.textContent = "";
+      function selectedCopy() {
+        if (current !== request) return;
+        field.value = text;
+        field.setAttribute("aria-label", label);
+        field.hidden = false;
+        field.focus();
+        field.select();
+        var copied = false;
+        try { copied = doc.execCommand("copy"); } catch (_) { /* Use the visible selection. */ }
+        if (copied) {
+          field.hidden = true;
+          if (trigger) trigger.focus();
+          message.textContent = "Скопировано. Вставьте в Cloudflare.";
+        } else {
+          message.textContent = "Текст выделен. Нажмите Ctrl+C или ⌘+C для копирования.";
+        }
+      }
+      var clipboard = win.navigator && win.navigator.clipboard;
+      if (!clipboard || typeof clipboard.writeText !== "function") {
+        selectedCopy();
+        return;
+      }
+      try {
+        clipboard.writeText(text).then(function () {
+          if (current === request) message.textContent = "Скопировано. Вставьте в Cloudflare.";
+        }, selectedCopy);
+      } catch (_) { selectedCopy(); }
+    }
+    copyCode.addEventListener("click", function () { copy(source, "Код Worker"); });
+    copyIPs.addEventListener("click", function () { copy(targets, "IP для TCP 5222"); });
+
+    function refresh() {
+      var current = ++request;
+      targets = "";
+      copyIPs.disabled = field.hidden = true;
+      field.value = "";
+      message.textContent = "";
+      mapStatus.textContent = "Читаем карту DC…";
+      mapStatus.removeAttribute("data-tone");
+      win.fetch("/api/telegram/worker-targets", { cache: "no-store" }).then(function (reply) {
+        if (!reply.ok) throw new Error("DC map");
+        return reply.json();
+      }).then(function (map) {
+        if (current !== request) return;
+        if (!map || (map.status !== "current" && map.status !== "expired") ||
+            !Array.isArray(map.addresses) || map.count !== map.addresses.length) throw new Error("DC map");
+        var date = new Date(map.fetched_at * 1000);
+        var fetched = Number.isFinite(date.getTime()) ? date.toLocaleString("ru-RU") : "неизвестно";
+        var state = map.last_good ? "Резервная подтверждённая карта DC" : "Подтверждённая карта DC";
+        mapStatus.textContent = state + " от " + fetched + " · IP для TCP 5222 — " + map.count + ".";
+        if (map.status === "expired") mapStatus.textContent += " Срок действия карты истёк.";
+        if (!map.count) mapStatus.textContent += " В карте нет адресов для TCP 5222.";
+        if (map.status === "expired" || !map.count) mapStatus.setAttribute("data-tone", "warn");
+        targets = map.addresses.join(",");
+        copyIPs.disabled = !targets;
+      }).catch(function () {
+        if (current !== request) return;
+        mapStatus.setAttribute("data-tone", "warn");
+        mapStatus.textContent = "Подтверждённая карта DC недоступна. Дождитесь обновления карты и откройте окно снова.";
+      });
+    }
+
+    return { section: section, refresh: refresh };
+  }
+
   App.prototype.openTelegramWorkers = function () {
     var self = this, doc = this.doc;
     if (this.pending) return;
@@ -954,6 +1073,7 @@
       dialog.setAttribute("aria-labelledby", "tg-worker-title");
       var heading = el(doc, "h2", "", "Мои Workers");
       heading.id = "tg-worker-title";
+      this.workerSetup = createWorkerSetup(doc, this.win);
       var intro = el(doc, "p", "tg-worker-intro", "Добавьте до 8 доменов Cloudflare Worker. Настройки сохранятся и перезапустят только C11.");
       var listNode = el(doc, "ul", "tg-worker-list");
       listNode.setAttribute("data-worker-list", "");
@@ -980,7 +1100,7 @@
       save.setAttribute("data-worker-save", "");
       var footer = el(doc, "div", "tg-worker-footer");
       footer.append(cancel, save);
-      dialog.append(heading, intro, listNode, field, addButton, note, message, footer);
+      dialog.append(heading, this.workerSetup.section, intro, listNode, field, addButton, note, message, footer);
       doc.body.appendChild(dialog);
       function addDomain() {
         var domain = normalizeWorkerInput(input.value);
@@ -1004,6 +1124,7 @@
     var message = dialog.querySelector(".tg-worker-message");
     message.textContent = "Загружаем список…";
     if (typeof dialog.showModal === "function") dialog.showModal();
+    this.workerSetup.refresh();
     this.win.fetch("/api/telegram/workers", { cache: "no-store" })
       .then(function (reply) {
         return reply.json().then(function (body) {

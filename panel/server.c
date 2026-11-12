@@ -4,6 +4,7 @@
 #include "server.h"
 #include "../runtime/d2k_diagnostics_files.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -163,9 +164,9 @@ static int json_valid_object(const char *p, const char *end) {
     return r.p == r.end;
 }
 
-static int json_top_value(const char *json, const char *wanted,
-                          const char **value, size_t *value_len) {
-    json_reader r = { .p = json, .end = json + strlen(json), .depth = 0 };
+static int json_object_value(const char *json, const char *end, const char *wanted,
+                             const char **value, size_t *value_len) {
+    json_reader r = { .p = json, .end = end, .depth = 0 };
     json_ws(&r);
     if (r.p >= r.end || *r.p++ != '{') { return 0; }
     json_ws(&r);
@@ -192,6 +193,11 @@ static int json_top_value(const char *json, const char *wanted,
         json_ws(&r);
     }
     return 0;
+}
+
+static int json_top_value(const char *json, const char *wanted,
+                          const char **value, size_t *value_len) {
+    return json_object_value(json, json + strlen(json), wanted, value, value_len);
 }
 
 static int json_top_true(const char *json, const char *key) {
@@ -635,7 +641,7 @@ static int worker_domain_add(tg_worker_domain domains[TG_WORKER_MAX],
     return 0;
 }
 
-static int worker_line(const char *line, size_t length) {
+static int config_line_matches(const char *line, size_t length, const char *key) {
     size_t start = 0, end = length;
     while (start < end && (line[start] == ' ' || line[start] == '\t')) start++;
     if (start == end || line[start] == '#') return 0;
@@ -643,9 +649,12 @@ static int worker_line(const char *line, size_t length) {
     if (!equal) return 0;
     end = (size_t)(equal - line);
     while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t')) end--;
-    static const char key[] = "TG_CF_WORKER_DOMAIN";
-    return end - start == sizeof key - 1 &&
-           memcmp(line + start, key, sizeof key - 1) == 0;
+    size_t key_len = strlen(key);
+    return end - start == key_len && memcmp(line + start, key, key_len) == 0;
+}
+
+static int worker_line(const char *line, size_t length) {
+    return config_line_matches(line, length, "TG_CF_WORKER_DOMAIN");
 }
 
 static int worker_domains_from_config(const char *path,
@@ -1214,8 +1223,8 @@ static int read_request(int fd, char *buf, size_t cap, size_t *used) {
     return *used + 1 >= cap ? 1 : -1;
 }
 
-static int json_object_file(const char *path, char **out, size_t *out_len) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+static int json_object_file(const char *path, int flags, char **out, size_t *out_len) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | flags);
     if (fd < 0) { return -1; }
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 1 ||
@@ -1293,7 +1302,167 @@ static void buf_json_string(panel_buf *b, const char *s) {
     buf_puts(b, "\"");
 }
 
-/* Cache validator for catalog content, not a security/authentication token. */
+#define WORKER_DC_MAX_ENDPOINTS 512u
+typedef struct {
+    char addresses[WORKER_DC_MAX_ENDPOINTS][INET6_ADDRSTRLEN];
+    size_t count;
+    long long fetched_at, expires;
+} worker_dc_targets;
+
+static int telegram_dc_map_path(const d2k_panel_config *cfg, char *path, size_t cap) {
+    const char *state = cfg && cfg->state_dir && *cfg->state_dir
+        ? cfg->state_dir : "/opt/d2k/state";
+    int n = snprintf(path, cap, "%s/telegram-dc-map.json", state);
+    if (n < 0 || (size_t)n >= cap) return -1;
+    if (!cfg || !cfg->config_path) return 0;
+    FILE *config = fopen(cfg->config_path, "r");
+    if (!config) return 0;
+    char line[2048];
+    int rc = 0;
+    while (fgets(line, sizeof line, config)) {
+        size_t len = strlen(line);
+        if (!config_line_matches(line, len, "TG_DC_MAP_PATH")) continue;
+        char *value = strchr(line, '=') + 1;
+        while (isspace((unsigned char)*value)) ++value;
+        char *end = value + strlen(value);
+        while (end > value && isspace((unsigned char)end[-1])) --end;
+        if (end - value >= 2 &&
+            ((*value == '\'' && end[-1] == '\'') || (*value == '"' && end[-1] == '"'))) {
+            ++value;
+            --end;
+        }
+        size_t size = (size_t)(end - value);
+        if (*value != '/' || size >= cap) rc = -1;
+        else {
+            memcpy(path, value, size);
+            path[size] = '\0';
+        }
+        break;
+    }
+    fclose(config);
+    return rc;
+}
+
+static int read_dc_timestamp(const char *json, const char *field, long long *out) {
+    char digits[21], *end;
+    if (telegram_stats_number(json, field, digits) != 0) return -1;
+    errno = 0;
+    *out = strtoll(digits, &end, 10);
+    return errno || *end || *out <= 0 ? -1 : 0;
+}
+
+static int append_dc_target(const char *endpoint, const char *end, worker_dc_targets *targets) {
+    const char *port, *value;
+    size_t port_len, value_len;
+    if (!json_object_value(endpoint, end, "port", &port, &port_len)) return -1;
+    if (port_len != 4 || memcmp(port, "5222", 4) != 0) return 0;
+    if (!json_object_value(endpoint, end, "address", &value, &value_len) ||
+        value_len < 3 || value_len - 2 >= INET6_ADDRSTRLEN || *value != '"') return -1;
+
+    char address[INET6_ADDRSTRLEN];
+    memcpy(address, value + 1, value_len - 2);
+    address[value_len - 2] = '\0';
+    uint8_t bytes[16];
+    const uint8_t *ip = bytes;
+    int family = strchr(address, ':') ? AF_INET6 : AF_INET;
+    if (inet_pton(family, address, bytes) != 1) return -1;
+    static const uint8_t mapped_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (family == AF_INET6 && memcmp(bytes, mapped_prefix, sizeof mapped_prefix) == 0) {
+        family = AF_INET;
+        ip += sizeof mapped_prefix;
+    }
+    if (!inet_ntop(family, ip, address, sizeof address)) return -1;
+    for (size_t i = 0; i < targets->count; ++i)
+        if (strcmp(address, targets->addresses[i]) == 0) return 0;
+    snprintf(targets->addresses[targets->count++], sizeof address, "%s", address);
+    return 0;
+}
+
+static int parse_dc_targets(const char *json, long long now, worker_dc_targets *targets) {
+    const char *endpoints;
+    size_t len;
+    long long schema, config_date, dc;
+    targets->count = 0;
+    if (read_dc_timestamp(json, "schema_version", &schema) != 0 || schema != 1 ||
+        read_dc_timestamp(json, "fetched_at", &targets->fetched_at) != 0 ||
+        read_dc_timestamp(json, "config_date", &config_date) != 0 ||
+        read_dc_timestamp(json, "config_expires", &targets->expires) != 0 ||
+        read_dc_timestamp(json, "this_dc", &dc) != 0 || dc > 999 ||
+        targets->fetched_at > now + 300 || config_date > now + 300 ||
+        targets->expires <= config_date ||
+        !json_top_value(json, "endpoints", &endpoints, &len) ||
+        len < 2 || *endpoints != '[') return -1;
+
+    /* The file reader already validated JSON syntax. Iterate endpoint
+       objects within the top-level array and project only literal IPs. */
+    json_reader r = {.p = endpoints + 1, .end = endpoints + len - 1};
+    size_t entries = 0;
+    for (;;) {
+        json_ws(&r);
+        if (r.p == r.end) return 0;
+        const char *endpoint = r.p;
+        if (++entries > WORKER_DC_MAX_ENDPOINTS || *r.p != '{' ||
+            json_value(&r) != 0 || append_dc_target(endpoint, r.p, targets) != 0)
+            return -1;
+        json_ws(&r);
+        if (r.p == r.end) return 0;
+        if (*r.p++ != ',') return -1;
+    }
+}
+
+static int read_dc_targets(const char *path, long long now, worker_dc_targets *targets) {
+    char *json;
+    size_t len;
+    if (json_object_file(path, O_NOFOLLOW | O_NONBLOCK, &json, &len) != 0) return -1;
+    int rc = parse_dc_targets(json, now, targets);
+    free(json);
+    return rc;
+}
+
+static int api_telegram_worker_targets(int fd, const d2k_panel_config *cfg) {
+    static const char type[] = "application/json; charset=utf-8";
+    static const char no_store[] = "Cache-Control: no-store\r\n";
+    static const char unavailable[] =
+        "{\"status\":\"unavailable\",\"fetched_at\":null,\"count\":0,\"addresses\":[]}";
+    char path[1024], backup_path[sizeof path + sizeof ".last-good"];
+    if (telegram_dc_map_path(cfg, path, sizeof path) != 0)
+        return response_ex(fd, 200, "OK", type, no_store, unavailable, sizeof unavailable - 1);
+    worker_dc_targets *targets = malloc(sizeof *targets);
+    if (!targets)
+        return response_ex(fd, 503, "Service Unavailable", type, no_store,
+                           unavailable, sizeof unavailable - 1);
+    const long long now = (long long)time(NULL);
+    int backup = read_dc_targets(path, now, targets) != 0;
+    if (backup) {
+        snprintf(backup_path, sizeof backup_path, "%s.last-good", path);
+        if (read_dc_targets(backup_path, now, targets) != 0) {
+            free(targets);
+            return response_ex(fd, 200, "OK", type, no_store, unavailable, sizeof unavailable - 1);
+        }
+    }
+
+    size_t cap = targets->count * (INET6_ADDRSTRLEN + 3u) + 192u;
+    char *body = malloc(cap);
+    if (!body) {
+        free(targets);
+        return response_ex(fd, 503, "Service Unavailable", type, no_store,
+                           unavailable, sizeof unavailable - 1);
+    }
+    panel_buf out = {.p = body, .cap = cap};
+    buf_printf(&out, "{\"status\":\"%s\",\"fetched_at\":%lld,\"last_good\":%s,\"addresses\":[",
+               now >= targets->expires ? "expired" : "current",
+               targets->fetched_at, backup ? "true" : "false");
+    for (size_t i = 0; i < targets->count; ++i) {
+        if (i) buf_puts(&out, ",");
+        buf_json_string(&out, targets->addresses[i]);
+    }
+    buf_printf(&out, "],\"count\":%zu}", targets->count);
+    int rc = out.failed ? -1 : response_ex(fd, 200, "OK", type, no_store, body, out.len);
+    free(body);
+    free(targets);
+    return rc;
+}
+
 static int catalog_revision(const char *json, char out[17]) {
     const char *keys[] = { "boxes", "groups" };
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -1840,7 +2009,7 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
 static int api_status(int fd, const d2k_panel_config *cfg, const char *query) {
     char *live = NULL;
     size_t live_len = 0;
-    if (cfg && cfg->live_path && json_object_file(cfg->live_path, &live, &live_len) == 0) {
+    if (cfg && cfg->live_path && json_object_file(cfg->live_path, 0, &live, &live_len) == 0) {
         size_t cap = live_len + TELEGRAM_STATS_MAX + 16384;
         char *body = malloc(cap);
         if (!body) { free(live); return -1; }
@@ -2044,6 +2213,8 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
         return response(fd, 405, "Method Not Allowed", "text/plain; charset=utf-8", "method not allowed\n", 19);
     }
     if (strcmp(path, "/api/status") == 0) { return api_status(fd, cfg, query); }
+    if (strcmp(path, "/api/telegram/worker-targets") == 0)
+        return api_telegram_worker_targets(fd, cfg);
     if (strcmp(path, "/") == 0) {
         return static_file(fd, cfg, req, "index.html", "text/html; charset=utf-8");
     }
