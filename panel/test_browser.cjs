@@ -419,6 +419,7 @@ async function main(){
       assert.equal(scrolled,true,width+"px: long queue scrolls inside the results");
      }
     }
+    console.log("search layout",width+"px","stable across empty, live and queued snapshots");
    }
    await call("Emulation.setDeviceMetricsOverride",{width:1440,height:900,deviceScaleFactor:1,mobile:false});
    await evaluate('delete window.__searchLayoutFixture;document.dispatchEvent(new Event("visibilitychange"))');

@@ -301,7 +301,7 @@ svg { flex: none; }
   transform: scaleX(0); transform-origin: 0 50%; pointer-events: none;
 }
 .mast { position: sticky; }
-#nav-now { min-inline-size: 4ch; text-align: end; }
+#nav-now { min-inline-size: 2.5rem; text-align: end; }
 .index b[data-tone="live"] { color: var(--signal-ink); font-weight: 650; }
 .index b[data-tone="warn"] { color: var(--warn); font-weight: 650; }
 
