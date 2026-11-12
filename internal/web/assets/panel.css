@@ -321,7 +321,12 @@ main { min-width: 0; padding-bottom: 80px; }
 
 .sheet-now { padding-top: 40px; }
 
-.now-summary, .searches { overflow-wrap: anywhere; }
+/* Keep live status and results from resizing the sections below. */
+.now-summary { block-size: clamp(18rem, 26vw, 23rem); }
+.now-summary, .searches {
+  overflow-x: hidden; overflow-y: auto; scrollbar-gutter: stable;
+  overflow-wrap: anywhere;
+}
 
 .statement {
   font-size: clamp(2.75rem, 6.4vw, 5.5rem);
@@ -371,6 +376,8 @@ main { min-width: 0; padding-bottom: 80px; }
 .slot-note { font-size: 0.8125rem; color: var(--ink-3); }
 
 .searches {
+  block-size: clamp(14rem, 42vh, 24rem);
+  block-size: clamp(14rem, 42svh, 24rem);
   margin-top: 8px;
 }
 .dns-services-note { margin-top: 0; max-width: 72ch; color: var(--ink-3); font-size: .875rem; }
@@ -1115,6 +1122,7 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
   .wordmark { font-size: 1.375rem; }
   .mark { width: 30px; height: 30px; }
   .btn { padding: 0 14px; }
+  .now-summary { block-size: 21rem; }
   .statement { font-size: 2.625rem; }
   .lede { font-size: 1.0625rem; }
   .search { grid-template-columns: minmax(0, 1fr); }
