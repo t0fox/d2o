@@ -62,6 +62,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <ifaddrs.h>
 
 #include "d2k_compose.h"
 #include "d2k_compose_internal.h"
@@ -629,14 +630,16 @@ typedef enum {
     T_VOICE_TRIAL,
     /* Приём применился к потоку разговора — ждём по нему ответа сервера или
        молчания. */
-    T_VOICE_WATCH
+    T_VOICE_WATCH,
+    T_DNS_HEALTH
 } task_state;
 typedef char diagnostic_task_state_count_must_match[
-    (T_VOICE_WATCH + 1 == D2K_DIAG_TASK_STATE_COUNT) ? 1 : -1];
+    (T_DNS_HEALTH + 1 == D2K_DIAG_TASK_STATE_COUNT) ? 1 : -1];
 
 /* Что делает рабочий поток задачи. Потоки заводятся только под сетевые
    оракулы; управляющего сокета они не касаются (см. шапку d2k_sched.h). */
-typedef enum { JOB_NONE = 0, JOB_CLASSIFY, JOB_CONTACT, JOB_VERIFY, JOB_VOICE } task_job;
+typedef enum { JOB_NONE = 0, JOB_CLASSIFY, JOB_CONTACT, JOB_VERIFY, JOB_VOICE,
+               JOB_DNS_HEALTH } task_job;
 
 static int is_voice_class(const char *name, uint8_t transport);
 
@@ -647,6 +650,12 @@ typedef struct {
     uint8_t    family;
     char       ip[INET6_ADDRSTRLEN];
     uint16_t   port;
+    char       dns_protocol[4];
+    char       dns_host[D2K_DNS_HOST_MAX];
+    char       doh_path[D2K_DNS_PATH_MAX];
+    char       dns_bootstrap[D2K_DNS_BOOTSTRAP_MAX];
+    uint64_t   dns_service_generation;
+    int        dns_health_probe;
 
     int64_t    started_ms; /* active search/lifecycle budget begins on launch */
     int64_t    began_ms;   /* when this search began, for the card and verdict line only (task 49) */
@@ -1267,6 +1276,27 @@ enum {
 
 #define AREA_RETRY_BASE_MS 15000LL
 #define AREA_RETRY_MAX_MS 300000LL
+#define DNS_HEALTH_INTERVAL_MS (5LL * 60 * 1000)
+#define DNS_HEALTH_RETRY_MS (60LL * 1000)
+#define DNS_HEALTH_TIMEOUT_MS 4000
+
+typedef enum {
+    DNS_SERVICE_DETECTED = 0,
+    DNS_SERVICE_CHECKING,
+    DNS_SERVICE_DIRECT_OK,
+    DNS_SERVICE_FAILED
+} dns_service_state;
+
+typedef struct {
+    uint64_t generation;
+    char ip[INET6_ADDRSTRLEN];
+    char applied_plan_id[2 * D2K_PLAN_ID_LEN + 1];
+    dns_service_state state;
+    int tcp_reachable, tls_handshake, http_status, dns_answer, plan_applied;
+    uint32_t attempts;
+    int64_t checked_ms, next_check_ms, plan_applied_ms;
+    char reason[384];
+} dns_service_live;
 
 struct d2k_sched {
     d2k_diag_observer diagnostic;
@@ -1293,6 +1323,10 @@ struct d2k_sched {
     char         last_local_error_target[256];
 
     task         tasks[SCHED_MAX_TASKS];
+    d2k_dns_service dns_services[D2K_DNS_SERVICE_MAX];
+    dns_service_live dns_service_live[D2K_DNS_SERVICE_MAX];
+    size_t       dns_service_count;
+    uint64_t     dns_service_generation;
     d2k_ev       pending_voice_suspect;
     int          pending_voice_suspect_valid;
     seen_name    seen[SCHED_SEEN];
@@ -1810,6 +1844,29 @@ static void client_ip_of(const d2k_ev *ev, uint8_t ip[16]) {
     memcpy(ip, client, ev->family == 6 ? 16 : 4);
 }
 
+static int client_is_router_address(const d2k_ev *ev) {
+    struct ifaddrs *ifs = NULL;
+    uint8_t client[16];
+    int family = ev->family == 6 ? AF_INET6 : AF_INET;
+    client_ip_of(ev, client);
+    if (getifaddrs(&ifs) != 0) return 0;
+    int found = 0;
+    for (const struct ifaddrs *it = ifs; it; it = it->ifa_next) {
+        if (!it->ifa_addr || it->ifa_addr->sa_family != family) continue;
+        if (family == AF_INET) {
+            const struct sockaddr_in *a = (const struct sockaddr_in *)it->ifa_addr;
+            if (!memcmp(client, &a->sin_addr, 4)) { found = 1; break; }
+        } else {
+            const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)it->ifa_addr;
+            if (!memcmp(client, &a->sin6_addr, 16)) { found = 1; break; }
+        }
+    }
+    freeifaddrs(ifs);
+    return found;
+}
+
+static const char *recall(const d2k_sched *s, const d2k_ev *ev);
+
 static void server_of(const d2k_ev *ev, char *ip, size_t ipcap, uint16_t *port) {
     int is_low = server_is_low(ev);
     if (is_low) {
@@ -1819,6 +1876,58 @@ static void server_of(const d2k_ev *ev, char *ip, size_t ipcap, uint16_t *port) 
         (void)inet_ntop(ev->family == 6 ? AF_INET6 : AF_INET, ev->high_ip, ip, (socklen_t)ipcap);
         *port = ev->high_port;
     }
+}
+
+static void dns_service_observe(d2k_sched *s, const d2k_ev *ev, const char *name) {
+    if (!s->dns_service_count || !name || !name[0]) return;
+    char ip[INET6_ADDRSTRLEN] = "";
+    uint16_t port = 0;
+    server_of(ev, ip, sizeof ip, &port);
+    const d2k_dns_service *dns = d2k_dns_service_match(s->dns_services,
+        s->dns_service_count, name, ip, port, ev->transport);
+    if (!dns || !client_is_router_address(ev)) return;
+    size_t i = (size_t)(dns - s->dns_services);
+    dns_service_live *live = &s->dns_service_live[i];
+    if (strcmp(live->ip, ip) != 0) {
+        live->generation = ++s->dns_service_generation;
+        if (!live->generation) live->generation = ++s->dns_service_generation;
+        snprintf(live->ip, sizeof live->ip, "%s", ip);
+        live->state = DNS_SERVICE_DETECTED;
+        live->tcp_reachable = live->tls_handshake = live->http_status = live->dns_answer = 0;
+        live->plan_applied = 0;
+        live->applied_plan_id[0] = '\0';
+        live->plan_applied_ms = 0;
+        live->checked_ms = 0;
+        live->next_check_ms = s->now_ms;
+        live->reason[0] = '\0';
+    }
+}
+
+static void dns_service_note_applied(d2k_sched *s, const d2k_ev *ev) {
+    uint8_t trial = 0, plan = 0;
+    for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) trial |= ev->trial_id[i];
+    for (size_t i = 0; i < D2K_PLAN_ID_LEN; i++) plan |= ev->plan_id[i];
+    if (trial || !plan) return; /* candidate trials are not live DNS connections */
+    const char *name = recall(s, ev);
+    if ((!name || !name[0]) && ev->name[0]) name = ev->name;
+    if (!name || !name[0] || !client_is_router_address(ev)) return;
+    char ip[INET6_ADDRSTRLEN] = "";
+    uint16_t port = 0;
+    server_of(ev, ip, sizeof ip, &port);
+    const d2k_dns_service *dns = d2k_dns_service_match(s->dns_services,
+        s->dns_service_count, name, ip, port, ev->transport);
+    if (!dns) return;
+    size_t index = (size_t)(dns - s->dns_services);
+    dns_service_live *live = &s->dns_service_live[index];
+    if (strcmp(live->ip, ip) != 0) dns_service_observe(s, ev, name);
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < D2K_PLAN_ID_LEN; i++) {
+        live->applied_plan_id[2 * i] = hex[ev->plan_id[i] >> 4];
+        live->applied_plan_id[2 * i + 1] = hex[ev->plan_id[i] & 15];
+    }
+    live->applied_plan_id[2 * D2K_PLAN_ID_LEN] = '\0';
+    live->plan_applied = 1;
+    live->plan_applied_ms = s->now_ms;
 }
 
 static int same_flow(const seen_name *s, const d2k_ev *ev) {
@@ -2192,7 +2301,8 @@ static void stall_budgets_push(d2k_sched *s) {
 
 static task *task_of(d2k_sched *s, const char *name, uint8_t transport, uint8_t family) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        if (s->tasks[i].state != T_FREE && s->tasks[i].transport == transport &&
+        if (s->tasks[i].state != T_FREE && s->tasks[i].state != T_DNS_HEALTH &&
+            s->tasks[i].transport == transport &&
             s->tasks[i].family == (family ? family : 4) &&
             strcmp(s->tasks[i].name, name) == 0) {
             return &s->tasks[i];
@@ -2786,6 +2896,51 @@ static void *worker_run_body(void *vp) {
         return NULL;
     }
 
+    if (t->job == JOB_DNS_HEALTH) {
+        d2k_ver_result vr;
+        int fd = a_use_fd;
+        char resolved_ip[INET6_ADDRSTRLEN];
+        int resolved = t->dns_bootstrap[0] &&
+            d2k_dns_resolve_bootstrap(t->dns_host, t->dns_bootstrap,
+                                      s->measure_mark, resolved_ip, sizeof resolved_ip);
+        if (resolved) snprintf(t->ip, sizeof t->ip, "%s", resolved_ip);
+        if (!t->ip[0]) {
+            memset(&vr, 0, sizeof vr); vr.fd = -1; vr.name_ok = -1;
+            vr.local_refusal = 1;
+            snprintf(vr.reason, sizeof vr.reason,
+                     "DNS: endpoint IP не получен от настроенного bootstrap DNS");
+        } else {
+            if (fd < 0) {
+                uint16_t sport = 0;
+                if (d2k_sched_bind_hook(t->transport, strchr(t->ip, ':') ? 6 : 4,
+                                        &fd, &sport) != 0 || fd < 0)
+                    fd = -1;
+                else if (s->measure_mark && d2k_sched_mark_hook(fd, s->measure_mark) != 0) {
+                    close(fd); fd = -1;
+                }
+            }
+            if (fd < 0) {
+                memset(&vr, 0, sizeof vr); vr.fd = -1; vr.name_ok = -1;
+                vr.local_refusal = 1;
+                snprintf(vr.reason, sizeof vr.reason,
+                         "DNS: локально не удалось подготовить сокет проверки");
+            } else if (!strcmp(t->dns_protocol, "doh")) {
+                vr = d2k_verify_doh_on(fd, t->ip, t->port, t->name,
+                                       t->doh_path, DNS_HEALTH_TIMEOUT_MS, 0);
+            } else {
+                vr = d2k_verify_dns_on(fd, t->ip, t->port, t->name,
+                    DNS_HEALTH_TIMEOUT_MS, 0, t->transport, 0, NULL, 0);
+            }
+        }
+        pthread_mutex_lock(&s->mu);
+        t->ver = vr;
+        t->res_ready = 1;
+        pthread_mutex_unlock(&s->mu);
+        ssize_t ignored = write(s->wake[1], "w", 1);
+        (void)ignored;
+        return NULL;
+    }
+
     if (t->job == JOB_VERIFY) {
         /* Испытание кандидата: своё рукопожатие TLS 1.3 своим ключом и
            настоящий запрос (d2k_verify.h). Блокирует НА СЕКУНДЫ — потому и
@@ -2839,7 +2994,13 @@ static void *worker_run_body(void *vp) {
             /* Свидетеля нет: кандидат проверяется теми же байтами клиента. */
             vr = d2k_sched_replay_ver_hook(a_use_fd, t->ip, t->port, trig.bytes, trig.len,
                                            SCHED_VERIFY_STEP_MS);
-        } else if (t->port == 853 && (t->transport == 17 || !t->ech_offer)) {
+        } else if (!strcmp(t->dns_protocol, "doh") && t->transport == 6) {
+            vr = d2k_verify_doh_on(a_use_fd, t->ip, t->port,
+                t->by_addr ? NULL : t->name, t->doh_path,
+                SCHED_VERIFY_STEP_MS, trig.len);
+        } else if ((!strcmp(t->dns_protocol, "dot") || !strcmp(t->dns_protocol, "doq") ||
+                    (t->port == 853 && (t->transport == 17 || !t->ech_offer))) &&
+                   (t->transport == 17 || !t->ech_offer)) {
             if (t->transport == 6 &&
                 d2k_hello_alpn(trig.bytes, trig.len, alpn, sizeof alpn, &alpn_len) < 0)
                 alpn_len = 0;
@@ -3362,9 +3523,10 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     a->trig_snapped = t->trig_snapped;
     /* Сокет вопроса забирается ЗДЕСЬ, в главном потоке, и поле задачи
        очищается сразу: два владельца одного дескриптора — двойное закрытие. */
-    a->use_fd = job == JOB_CONTACT ? t->prop_bound_fd : job == JOB_VERIFY ? t->probe_fd : -1;
+    a->use_fd = job == JOB_CONTACT ? t->prop_bound_fd :
+                (job == JOB_VERIFY || job == JOB_DNS_HEALTH) ? t->probe_fd : -1;
     if (job == JOB_CONTACT) { t->prop_bound_fd = -1; contact_close(t); }
-    if (job == JOB_VERIFY) { t->probe_fd = -1; }
+    if (job == JOB_VERIFY || job == JOB_DNS_HEALTH) { t->probe_fd = -1; }
     t->job = job;
     t->worker_owner=s;
     t->worker_started_ms=sched_mono_ms();
@@ -5618,6 +5780,42 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     return s;
 }
 
+void d2k_sched_set_dns_services(d2k_sched *s, const d2k_dns_service *items, size_t count) {
+    if (!s) return;
+    if (count > D2K_DNS_SERVICE_MAX) count = D2K_DNS_SERVICE_MAX;
+    d2k_dns_service next[D2K_DNS_SERVICE_MAX] = {0};
+    dns_service_live live[D2K_DNS_SERVICE_MAX] = {{0}};
+    size_t next_count = items ? count : 0;
+    for (size_t i = 0; i < next_count; i++) {
+        next[i] = items[i];
+        size_t old = s->dns_service_count;
+        for (size_t j = 0; j < s->dns_service_count; j++) {
+            const d2k_dns_service *a = &s->dns_services[j], *b = &next[i];
+            if (a->port == b->port && !strcmp(a->protocol, b->protocol) &&
+                !strcmp(a->host, b->host) && !strcmp(a->sni, b->sni) &&
+                !strcmp(a->path, b->path) && !strcmp(a->source, b->source) &&
+                !strcmp(a->bootstrap_dns, b->bootstrap_dns)) {
+                old = j;
+                break;
+            }
+        }
+        if (old < s->dns_service_count) {
+            live[i] = s->dns_service_live[old];
+        } else {
+            live[i].generation = ++s->dns_service_generation;
+            if (!live[i].generation) live[i].generation = ++s->dns_service_generation;
+            struct in_addr v4;
+            struct in6_addr v6;
+            if (inet_pton(AF_INET, next[i].host, &v4) == 1 ||
+                inet_pton(AF_INET6, next[i].host, &v6) == 1)
+                snprintf(live[i].ip, sizeof live[i].ip, "%s", next[i].host);
+        }
+    }
+    s->dns_service_count = next_count;
+    memcpy(s->dns_services, next, sizeof next);
+    memcpy(s->dns_service_live, live, sizeof live);
+}
+
 void d2k_sched_set_measure_mark(d2k_sched *s, uint32_t mark) {
     if (s) { s->measure_mark = mark; }
 }
@@ -5709,6 +5907,7 @@ static const char *task_phase(const task *t) {
     case T_VOICE_MEASURE: return "измеряем живой голосовой поток";
     case T_VOICE_TRIAL:   return "приём голоса стоит, ждём разговора";
     case T_VOICE_WATCH:   return "приём применился к разговору, ждём ответа сервера";
+    case T_DNS_HEALTH:    return "проверяем DNS-ответ";
     default:              return "заводим поиск";
     }
 }
@@ -5816,6 +6015,7 @@ static void live_autopick_status(d2k_sched *s, char reason[128], char target[256
 }
 
 static void write_live_groups(FILE *f, const d2k_sched *s);
+static void write_live_dns_services(FILE *f, const d2k_sched *s);
 
 void d2k_sched_diagnostics(d2k_sched *s,d2k_diag_observer fn,void *ctx) {
     if(s){s->diagnostic=fn;s->diagnostic_ctx=ctx;}
@@ -5829,6 +6029,7 @@ static const char *worker_type(const task *t) {
     case JOB_VERIFY:return "VERIFY";
     case JOB_CONTACT:return "CONTACT";
     case JOB_VOICE:return "VOICE";
+    case JOB_DNS_HEALTH:return "DNS_HEALTH";
     default:return "UNKNOWN";
     }
 }
@@ -5942,6 +6143,7 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
             fputs("\"level_name\": ", f); json_str(f, level_name(bd->level));
             fprintf(f, ", \"successes\": %d, ", bd->successes);
             fputs("\"confirmed\": ", f); json_time(f, bd->confirmed);
+            fputs(", \"plan_id\": ", f); json_str(f, bd->plan_id);
             fprintf(f, ", \"enabled\": %s, \"recheck\": %s}", bd->enabled ? "true" : "false",
                     bd->recheck_since ? "true" : "false");
         }
@@ -5950,6 +6152,7 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
     fputs(s->cat->n_boxes ? "\n  ],\n" : "],\n", f);
 
     write_live_groups(f, s);
+    write_live_dns_services(f, s);
     fputs("  \"searches\": [", f);
     int first = 1;
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
@@ -6444,6 +6647,110 @@ static void write_live_groups(FILE *f, const d2k_sched *s) {
         fputs("]}", f);
     }
     fputs(count ? "\n  ],\n" : "],\n", f);
+}
+
+static void write_live_dns_services(FILE *f, const d2k_sched *s) {
+    fputs("  \"dns_services\": [", f);
+    for (size_t i = 0; i < s->dns_service_count; i++) {
+        const d2k_dns_service *dns = &s->dns_services[i];
+        const dns_service_live *live = &s->dns_service_live[i];
+        const task *t = NULL;
+        for (size_t j = 0; j < SCHED_MAX_TASKS; j++) {
+            const task *candidate = &s->tasks[j];
+            if (candidate->state == T_FREE || candidate->state == T_DNS_HEALTH ||
+                !candidate->dns_protocol[0] ||
+                strcmp(candidate->dns_protocol, dns->protocol) || candidate->port != dns->port)
+                continue;
+            if ((dns->sni[0] && !strcasecmp(candidate->name, dns->sni)) ||
+                !strcasecmp(candidate->name, dns->host) || !strcasecmp(candidate->ip, dns->host)) {
+                t = candidate; break;
+            }
+        }
+        const char *state = "detected";
+        const char *reason = live->ip[0]
+            ? "Адрес endpoint обнаружен; автоматическая проверка ожидает очереди."
+            : "Конфигурация найдена; ожидается наблюдение реального адреса endpoint.";
+        int candidate_applied = 0, candidate_answer = 0, answered = live->dns_answer;
+        int tcp_reachable = live->tcp_reachable, tls_handshake = live->tls_handshake;
+        int http_status = live->http_status;
+        char reason_buf[320];
+        if (t) {
+            candidate_applied = t->ver_ok;
+            answered = answered || t->ver.dns_reply;
+            candidate_answer = candidate_applied && answered;
+            tcp_reachable = t->ver.level >= D2K_VER_TRANSPORT;
+            tls_handshake = t->ver.level >= D2K_VER_HANDSHAKE;
+            http_status = t->ver.status;
+        }
+        if (candidate_answer) {
+            state = "bypass_ok";
+            reason = "Плановый DoH-зонд получил корректный DNS-ответ; применение к обычному потоку показывается отдельно.";
+        } else if (live->state == DNS_SERVICE_CHECKING) {
+            state = "checking";
+            reason = live->reason;
+        } else if (live->state == DNS_SERVICE_DIRECT_OK) {
+            state = "direct_ok";
+            reason = live->reason;
+        } else if (t && (t->state == T_VERIFY || t->state == T_VERIFY_WAIT || t->state == T_TRIAL_SETTLE)) {
+            state = "checking";
+            reason = candidate_applied ?
+                "План применён к пробному соединению D2O; корректный DNS-ответ ещё не подтверждён." :
+                "Проверяется кандидат штатным конвейером D2O.";
+        } else if (live->plan_applied) {
+            state = "plan_applied";
+            if (live->state == DNS_SERVICE_FAILED)
+                snprintf(reason_buf, sizeof reason_buf,
+                         "Датапат подтвердил план %s на DNS-соединении; DNS-ответ не подтверждён. Автопроверка: %.100s",
+                         live->applied_plan_id, live->reason);
+            else
+                snprintf(reason_buf, sizeof reason_buf,
+                         "Датапат подтвердил план %s на DNS-соединении; DNS-ответ отдельно ещё не подтверждён.",
+                         live->applied_plan_id);
+            reason = reason_buf;
+        } else if (t && t->state == T_RESTING) {
+            state = "no_bypass";
+            reason = t->ver.reason[0] ? t->ver.reason : "Подбор завершён без подтверждённого плана.";
+        } else if (live->state == DNS_SERVICE_FAILED) {
+            state = "failed";
+            reason = live->reason;
+        } else if (t) {
+            state = "checking";
+            reason = "Подозрение передано в штатный конвейер D2O.";
+        }
+        uint8_t transport = !strcmp(dns->protocol, "doq") ? 17 : 6;
+        uint8_t family = live->ip[0] && strchr(live->ip, ':') ? 6 : 4;
+        const char *target = dns->sni[0] ? dns->sni : dns->host;
+        const d2k_cat_binding *binding = live_binding_for(s, target, transport, family);
+        if (i) fputc(',', f);
+        fputs("\n    {\"protocol\": ", f); json_str(f, dns->protocol);
+        fputs(", \"host\": ", f); json_str(f, dns->host);
+        fprintf(f, ", \"port\": %u, \"sni\": ", (unsigned)dns->port); json_str(f, dns->sni);
+        fputs(", \"path\": ", f);
+        char safe_path[D2K_DNS_PATH_MAX];
+        size_t path_len = strcspn(dns->path, "?");
+        if (path_len >= sizeof safe_path) path_len = sizeof safe_path - 1;
+        memcpy(safe_path, dns->path, path_len); safe_path[path_len] = '\0';
+        json_str(f, safe_path);
+        fputs(", \"source\": ", f); json_str(f, dns->source);
+        fputs(", \"state\": ", f); json_str(f, state);
+        fputs(", \"status_reason\": ", f); json_str(f, reason);
+        fputs(", \"resolved_ip\": ", f); json_str(f, live->ip);
+        fputs(", \"checked_at\": ", f);
+        if (live->checked_ms > 0) json_time(f, wall_s(s, live->checked_ms));
+        else fputs("null", f);
+        fprintf(f, ", \"direct_tcp_reachable\": %s, \"direct_tls_handshake\": %s, \"http_status\": %d, \"check_attempts\": %u",
+                tcp_reachable ? "true" : "false", tls_handshake ? "true" : "false",
+                http_status, live->attempts);
+        fputs(", \"known_plan_id\": ", f); json_str(f, binding ? binding->plan_id : "");
+        fputs(", \"applied_plan_id\": ", f); json_str(f, live->applied_plan_id);
+        fputs(", \"plan_applied_at\": ", f);
+        if (live->plan_applied_ms > 0) json_time(f, wall_s(s, live->plan_applied_ms));
+        else fputs("null", f);
+        fprintf(f, ", \"plan_applied\": %s, \"candidate_plan_applied\": %s, \"dns_answer_via_plan\": %s, \"dns_answer_confirmed\": %s}",
+                live->plan_applied ? "true" : "false", candidate_applied ? "true" : "false",
+                candidate_answer ? "true" : "false", answered ? "true" : "false");
+    }
+    fputs(s->dns_service_count ? "\n  ],\n" : "],\n", f);
 }
 
 /* One outstanding identified area command. Remember installed state only
@@ -8572,6 +8879,15 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev, int replayed) {
     }
     t->rx_volume_only = late_app_rst;
     server_of(ev, t->ip, sizeof t->ip, &t->port);
+    if (client_is_router_address(ev)) {
+        dns_service_observe(s, ev, name);
+        const d2k_dns_service *dns = d2k_dns_service_match(s->dns_services,
+            s->dns_service_count, name, t->ip, t->port, t->transport);
+        if (dns) {
+            snprintf(t->dns_protocol, sizeof t->dns_protocol, "%s", dns->protocol);
+            snprintf(t->doh_path, sizeof t->doh_path, "%s", dns->path);
+        }
+    }
     if (is_voice_class(t->name, t->transport)) {
         uint8_t target_ip[4];
         memcpy(t->voice_flow.a_ip, ev->low_ip, sizeof t->voice_flow.a_ip);
@@ -10341,6 +10657,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
     switch (ev->kind) {
     case D2K_EV_HELLO:
         remember(s, ev);
+        dns_service_observe(s, ev, ev->name);
         return 0;
     case D2K_EV_ACK:
         if (s->area_command && ev->code == s->area_command &&
@@ -10456,6 +10773,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         return 0;
     }
     case D2K_EV_APPLIED:
+        dns_service_note_applied(s, ev);
         on_applied(s, ev);
         return 0;
     case D2K_EV_REFUSED:
@@ -10794,6 +11112,114 @@ static void voice_pending_dispatch(d2k_sched *s) {
     (void)on_suspect(s, &ev, 1);
 }
 
+static dns_service_live *dns_live_generation(d2k_sched *s, uint64_t generation) {
+    for (size_t i = 0; i < s->dns_service_count; i++)
+        if (s->dns_service_live[i].generation == generation) return &s->dns_service_live[i];
+    return NULL;
+}
+
+static void dns_health_finish(d2k_sched *s, task *t, int64_t now_ms) {
+    int ready;
+    pthread_mutex_lock(&s->mu);
+    ready = t->res_ready;
+    pthread_mutex_unlock(&s->mu);
+    if (!ready || join_worker(t) != 0) return;
+    dns_service_live *live = dns_live_generation(s, t->dns_service_generation);
+    int bootstrap = t->dns_bootstrap[0] != '\0';
+    if (live && ((bootstrap && t->ip[0]) ||
+                 (t->ip[0] && (!live->ip[0] || !strcmp(live->ip, t->ip))) ||
+                 (!t->ip[0] && !live->ip[0]))) {
+        if (t->ip[0] && (bootstrap || !live->ip[0]) && strcmp(live->ip, t->ip) != 0) {
+            snprintf(live->ip, sizeof live->ip, "%s", t->ip);
+            live->plan_applied = 0;
+            live->applied_plan_id[0] = '\0';
+            live->plan_applied_ms = 0;
+        }
+        live->checked_ms = now_ms;
+        live->tcp_reachable = t->ver.level >= D2K_VER_TRANSPORT;
+        live->tls_handshake = t->ver.level >= D2K_VER_HANDSHAKE;
+        live->http_status = t->ver.status;
+        live->dns_answer = t->ver.dns_reply;
+        live->state = t->ver.dns_reply ? DNS_SERVICE_DIRECT_OK : DNS_SERVICE_FAILED;
+        live->next_check_ms = now_ms + (t->ver.dns_reply ? DNS_HEALTH_INTERVAL_MS : DNS_HEALTH_RETRY_MS);
+        if (t->ver.dns_reply) {
+            snprintf(live->reason, sizeof live->reason, "%s", t->ver.reason);
+        } else if (t->ver.status == 413) {
+            snprintf(live->reason, sizeof live->reason,
+                     "HTTP 413: это ошибка endpoint, а не доказательство DPI; подбор не запускается.");
+        } else {
+            snprintf(live->reason, sizeof live->reason,
+                     "DNS-ответ не подтверждён (%s); одиночная ошибка не считается блокировкой.",
+                     t->ver.reason[0] ? t->ver.reason : "причина не определена");
+        }
+    }
+    ver_close(t);
+    task_reset(s, t);
+}
+
+static void dns_health_start_due(d2k_sched *s, int64_t now_ms) {
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++)
+        if (s->tasks[i].state == T_DNS_HEALTH) return;
+    for (size_t i = 0; i < s->dns_service_count; i++) {
+        d2k_dns_service *dns = &s->dns_services[i];
+        dns_service_live *live = &s->dns_service_live[i];
+        int bootstrap = dns->bootstrap_dns[0] != '\0';
+        if ((!live->ip[0] && !bootstrap) || live->state == DNS_SERVICE_CHECKING ||
+            (live->next_check_ms && now_ms < live->next_check_ms)) continue;
+        task *t = task_free_slot(s);
+        if (!t) return;
+        task_reset(s, t);
+        uint8_t transport = !strcmp(dns->protocol, "doq") ? 17 : 6;
+        uint8_t family = live->ip[0] && strchr(live->ip, ':') ? 6 : 4;
+        int fd = -1;
+        uint16_t sport = 0;
+        if (!bootstrap && (d2k_sched_bind_hook(transport, family, &fd, &sport) != 0 || fd < 0)) {
+            live->state = DNS_SERVICE_FAILED;
+            live->checked_ms = now_ms;
+            live->next_check_ms = now_ms + DNS_HEALTH_RETRY_MS;
+            snprintf(live->reason, sizeof live->reason, "локальная ошибка: не удалось создать сокет проверки");
+            continue;
+        }
+        if (fd >= 0 && s->measure_mark && d2k_sched_mark_hook(fd, s->measure_mark) != 0) {
+            close(fd);
+            live->state = DNS_SERVICE_FAILED;
+            live->checked_ms = now_ms;
+            live->next_check_ms = now_ms + DNS_HEALTH_RETRY_MS;
+            snprintf(live->reason, sizeof live->reason, "локальная ошибка: не удалось пометить сокет проверки");
+            continue;
+        }
+        t->state = T_DNS_HEALTH;
+        t->dns_health_probe = 1;
+        t->dns_service_generation = live->generation;
+        t->transport = transport;
+        t->family = family;
+        t->port = dns->port;
+        t->probe_fd = fd;
+        if (live->ip[0]) snprintf(t->ip, sizeof t->ip, "%s", live->ip);
+        snprintf(t->name, sizeof t->name, "%s", dns->sni[0] ? dns->sni : dns->host);
+        snprintf(t->dns_protocol, sizeof t->dns_protocol, "%s", dns->protocol);
+        snprintf(t->dns_host, sizeof t->dns_host, "%s", dns->host);
+        snprintf(t->doh_path, sizeof t->doh_path, "%s", dns->path);
+        snprintf(t->dns_bootstrap, sizeof t->dns_bootstrap, "%s", dns->bootstrap_dns);
+        t->started_ms = t->began_ms = now_ms;
+        if (start_worker(s, t, JOB_DNS_HEALTH) != 0) {
+            live->state = DNS_SERVICE_FAILED;
+            live->checked_ms = now_ms;
+            live->next_check_ms = now_ms + DNS_HEALTH_RETRY_MS;
+            snprintf(live->reason, sizeof live->reason, "локальная ошибка: не удалось запустить проверку");
+            task_reset(s, t);
+            continue;
+        }
+        live->state = DNS_SERVICE_CHECKING;
+        live->tcp_reachable = live->tls_handshake = live->http_status = live->dns_answer = 0;
+        if (live->attempts < UINT32_MAX) live->attempts++;
+        snprintf(live->reason, sizeof live->reason, "%s",
+                 bootstrap ? "Получается IP endpoint через настроенный bootstrap DNS перед проверкой RFC 8484."
+                           : "Автоматически проверяется корректный DNS-ответ endpoint.");
+        return; /* одно сетевое DNS-испытание за раз */
+    }
+}
+
 int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     if (!s) { return 0; }
     /* Привязка монотонных часов к стенным делается ПО ПЕРВОМУ ТИКУ, а не при
@@ -10829,6 +11255,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
        Acknowledge that pause before applying any network/task deadline. */
     quic_yield_tick(s,now_ms);
     quic_deny_tick(s, now_ms);
+    dns_health_start_due(s, now_ms);
     /* Отказы узлов семейства стареют: узел, который неделю никто не встречал,
        ничего не говорит о плане (поле 06.10, googlevideo). Раз в час и сразу
        после запуска; при несинхронных часах d2k_group_expire не трогает ничего. */
@@ -10853,6 +11280,12 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
         if (t->state == T_FREE) { continue; }
+
+        if (t->state == T_DNS_HEALTH) {
+            dns_health_finish(s, t, now_ms);
+            if (t->state == T_FREE) moved++;
+            continue;
+        }
 
         if (t->state == T_QUEUED) {
             if (t->queued_ms == 0) { t->queued_ms = now_ms; }

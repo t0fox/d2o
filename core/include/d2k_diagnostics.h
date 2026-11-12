@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
-#define D2K_DIAG_TASK_STATE_COUNT 15
+#define D2K_DIAG_TASK_STATE_COUNT 16
 #define D2K_DIAG_LIMIT_CPU 1u
 #define D2K_DIAG_LIMIT_MEMORY 2u
 #define D2K_DIAG_LIMIT_CONNTRACK 4u

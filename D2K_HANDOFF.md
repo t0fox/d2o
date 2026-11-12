@@ -8,6 +8,92 @@
 
 ## 0. Фактическое состояние — читать первым
 
+### DoH: самостоятельное подтверждение DNS-ответа, 12.11.2026
+
+Рабочая копия основана на `main`/`774afa6`; в изменениях есть DNS-проверки и
+посторонние/предыдущие незакоммиченные файлы. На OpenWrt
+автоматическая проверка DoH теперь сама получает IP из настроенных числовых
+bootstrap DNS и выполняет RFC 8484 запрос. Успех требует HTTP 200,
+`application/dns-message`, полного тела и валидного DNS-ответа с ожидаемыми ID и
+вопросом; TLS или HTTP-статус отдельно не подтверждают работу. HTTP 413 и
+ошибка DNS-сообщения не являются доказательством блокировки.
+
+Поле: OpenWrt 25.12.6 aarch64, `https-dns-proxy` → настроенный Cloudflare
+Gateway endpoint. Live API и реальная панель показали
+`direct_ok`, IP `162.159.36.20`, HTTP 200 и «DoH: корректный RFC 8484 DNS-ответ»;
+`dns_answer_confirmed=true`, `plan_applied=false`, то есть прямой ответ проверен,
+план не применялся. Запросы клиента к `openwrt.org` вернули A и AAAA.
+Контроллер установлен атомарной заменой; PID `https-dns-proxy` и `dnsmasq` не
+менялись, DNS-службы не перезапускались. В панели состояние видно в разделе
+«Защищённый DNS».
+
+Проверки: `make -C core d2kc test-dns-config test-dns-health test-verify`,
+`make -C dnsprobe check`, `make -C datapath check` и `make -C detect check`
+прошли в WSL; ARM64 static build установлен и его SHA-256 сверена. Классификация
+конфигураций 10 провайдеров проверена; реальная DNS-доступность с этого
+маршрута была 8/10, два отказа — сетевые ограничения среды. Полный `make -C core
+check` не завершён: в WSL отсутствует Zig по заданному пути
+`/opt/homebrew/bin/zig`. Полный `make -C panel test` не завершён: в WSL нет
+Node.js; C-проверки панели прошли до вызова Node. GitHub CI остаётся обязательной
+проверкой перед выпуском.
+
+Не подтверждены: Keenetic/PPPoE, HTTP/2/ALPN, автоматический подбор и работа
+обхода на реально заблокированном DoH, а также персистентность IP после
+перезапуска. На этом OpenWrt endpoint ответил напрямую, поэтому отсутствие
+применённого плана — правильный результат. Релиз не выпускался.
+
+### DoH/DoT/DoQ: полевой замер и UCI, 10.11.2026
+
+Основание — `main` на локальном дереве; git в Windows PATH отсутствует,
+использован git из WSL; состояние не закоммичено. Добавлены:
+
+- `dnsprobe/` — отдельный C-измеритель: DoH (HTTP/1.1), DoT, plain UDP,
+  проверка id/вопроса/A-записей, режимы SNI `canon`/`dot`/`none`, `--expect`
+  против подмены, `search <manifest>` с повторами. Собирается отдельно, в
+  `d2kc` не входит.
+- `scripts/d2k-dns-apply.sh` — UCI: `https-dns-proxy` для DoH, `dnsproxy`
+  для DoT/DoQ, `dnsmasq server=127.0.0.1#PORT` или plain IP; резерв и
+  `--rollback`.
+- `scripts/d2k-dns-search-apply.sh` — подбор победителя и применение.
+- `docs/field/2026-11-10-doh-dot-router.md` — матрица и команды.
+
+Роутер: OpenWrt 25.12.6 aarch64; адреса стенда опущены. WSL имеет другой
+egress, поэтому его
+результаты не полевые. На роутере установлены `https-dns-proxy`,
+`dnsproxy`, `bind-dig`; после тестов UCI возвращался через `--rollback`.
+
+С роутера настоящий `wikipedia.org` (`185.15.59.224`) ответили: Comss (DoH),
+Xbox (DoH), WebShift (DoT), Null's (DoT), Bezmezhau (DoT, IP
+`31.58.216.201`), dns-ai (DoT, IP `194.87.196.13`); GeoHide — DoQ
+(`quic://geohide.ru`), DoH/DoT нестабильны (503/EOF). DoQ у Comss/dns-ai
+также проверен через `dnsproxy`.
+MagicDNS закрыт по IP: TCP 80/443/853 и UDP 53 к трём A не отвечают, ICMP
+проходит; клиентский SNI-приём не помогает. AstroCat
+(`dns.astracat.network`) не обслуживается: :80 отдаёт чужой сайт, :443/:853
+reset/timeout, авторитетные NS отдают те же A — это не подмена DNS.
+
+Важно: Comss/Xbox/WebShift/Null's/dns-ai переписывают `example.com` на
+`8.47.69.x`/`8.6.112.x` (подтверждено `dig +https`/`+tls`). Поэтому контроль
+— `wikipedia.org`; `dnsprobe --expect` помечает такой ответ `substituted`.
+
+Осталось: HTTP/2 в C-клиенте DoH (dns-ai/Null's/WebShift дают 505/400),
+DoQ в C-клиенте (пока только `dnsproxy`), повторяемость GeoHide и сервисная
+обвязка `d2k-dnsd` для постоянной работы. Коммита нет.
+
+Подбор доказан на управляемом SNI-цензоре: `dnsprobe/test/lab_sni.sh`
+сбрасывает ClientHello с SNI ровно `api.magicdns.ru` и пропускает
+`api.magicdns.ru.`; поиск печатает `canon -> reset`, `dot -> ok`,
+`winner=dot`. В поле тот же принцип виден по IP: `geo-bad`/`dnsai-tcp`
+получают timeout, `geo-good`/`dnsai-good-tcp` — `185.15.59.224`; GeoHide
+DoQ отвечает там, где DoH/DoT дают 503/EOF.
+
+На роутере оставлен рабочий DoH: `https-dns-proxy` → Comss
+(`https://dns.comss.one/dns-query`, `127.0.0.1:5053`), dnsmasq
+`noresolv=1`, `server=127.0.0.1#5053`; служба включена в автозапуск.
+Резерв конфигурации — `/etc/d2k/dns-backup`, откат —
+`/opt/d2k/dns/d2k-dns-apply.sh --rollback`. `dnsprobe` и оба скрипта
+лежат в `/opt/d2k/dns/`.
+
 ### YouTube и Discord: TCP-профили и обновление роутера, 07.11.2026
 
 Основание — `main`/`9b74cdbdef74513a14cbc1483409f5a251297834`; сейчас

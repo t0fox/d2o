@@ -467,6 +467,20 @@ static void diagnostic_tick(d2k_sched *s,int64_t now) {
     if(rename(tmp,path)){d2k_diag_record_write_error(diagnostics,"rename",errno);unlink(tmp);}
 }
 
+static void dns_services_refresh(d2k_sched *s, int64_t now) {
+    static int64_t retry_at;
+    d2k_dns_service items[D2K_DNS_SERVICE_MAX];
+    size_t count = 0;
+    if (!s || now < retry_at) return;
+    if (d2k_dns_services_read_system(items, D2K_DNS_SERVICE_MAX, &count) == 0) {
+        d2k_sched_set_dns_services(s, items, count);
+        retry_at = now + 30000;
+    } else {
+        /* Keep the last good endpoint set if ndmc is temporarily unavailable. */
+        retry_at = now + 30000;
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--version") == 0) { printf("d2kc release=%s wire=%u\n", D2K_RELEASE_ID, D2K_RUNTIME_WIRE); return 0; }
     int offline = d2k_runtime_offline(argc, argv, "d2kc", offline_self_check);
@@ -575,6 +589,7 @@ int main(int argc, char **argv) {
     d2k_raw_set_segment_max(d2k_arm_segment(greeting.send_maxlen));
 
     d2k_sched_set_say(s, sched_say, NULL);
+    dns_services_refresh(s, now_ms());
 
     /* Зонд HTTPS — с меткой зондов контроллера: через очередь, с уже
        подтверждённым планом имени, без нового обнаружения. */
@@ -850,6 +865,7 @@ int main(int argc, char **argv) {
             d2k_sched_tick(s, t);
             last_tick = t;
         }
+        dns_services_refresh(s, t);
 
         if (t - last_report >= REPORT_EVERY_MS) {
             size_t n_binds = 0, n_plans = 0;

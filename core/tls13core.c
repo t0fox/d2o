@@ -72,12 +72,18 @@ static int ascii_lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
  * расширяла бы совпадение там, где сегодня оно сузилось бы честно. */
 static int name_matches(const char *pat, size_t plen, const char *host) {
     size_t hlen = strlen(host);
+    /* FQDN с точкой на конце — то же имя (RFC 1035 §3.1). Это не поблажка
+       проверке: точка не добавляет метки, а лишь закрывает абсолютное имя.
+       Без нормализации SNI "name." и сертификат "name" считались бы разными,
+       и обход пословной блокировки имени не проходил бы проверку имени. */
+    while (plen > 0 && pat[plen - 1] == '.') { plen--; }
+    while (hlen > 0 && host[hlen - 1] == '.') { hlen--; }
     if (plen == 0 || hlen == 0) { return 0; }
     if (plen > 2 && pat[0] == '*' && pat[1] == '.') {
-        const char *dot = strchr(host, '.');
+        const char *dot = memchr(host, '.', hlen);
         if (!dot || dot == host) { return 0; }
         const char *rest = dot + 1;
-        size_t rlen = strlen(rest);
+        size_t rlen = hlen - (size_t)(rest - host);
         if (rlen != plen - 2) { return 0; }
         for (size_t i = 0; i < rlen; i++) {
             if (ascii_lower((unsigned char)rest[i]) != ascii_lower((unsigned char)pat[2 + i])) {

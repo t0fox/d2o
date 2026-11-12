@@ -233,7 +233,7 @@ async function main(){
   assert.equal(await evaluate('document.querySelectorAll("#dns-services-list .dns-protocol-dot").length'),1,'DoT is separately colored');
   assert.equal(await evaluate('document.querySelectorAll("#dns-services-list .dns-protocol-doq").length'),1,'DoQ is separately colored');
   assert.match(await evaluate('document.querySelector("#dns-services-summary").textContent'),/DoH 2 · DoT 1 · DoQ 1/,'simultaneous protocol combination is summarized');
-  assert.match(await evaluate('document.querySelector("#dns-services-list").textContent'),/DNS-ответ подтверждён · без обхода/,'direct DNS success is explicit');
+  assert.match(await evaluate('document.querySelector("#dns-services-list").textContent'),/DNS-ответ подтверждён · прямая проверка/,'direct DNS success is explicit');
   assert.match(await evaluate('document.querySelector("#dns-services-list").textContent'),/DNS-ответ подтверждён · обход применён/,'DNS success with an applied bypass is explicit');
   assert.match(await evaluate('document.querySelector("#dns-services-list").textContent'),/DNS-ответ не получен/,'failed DNS is explicit');
   assert.equal(await evaluate('document.querySelector("#dns-services-list .dns-service-state.dns-status-direct-ok")!==null'),true,'service state gets its own status color class');

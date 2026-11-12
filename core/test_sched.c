@@ -1958,6 +1958,10 @@ static void confirm_transport(d2k_catalog *cat, int link_fd, const char *target,
               strstr(body, "\"target\": \"") && strstr(body, target) &&
               strstr(body, "\"plan_id\": \"plan-"),
               "живой статус не называет подтверждённый Plan, из-за которого поиск ждёт");
+        const char *bindings = strstr(body, "\"bindings\": [");
+        const char *named_binding = bindings ? strstr(bindings, target) : NULL;
+        CHECK(named_binding && strstr(named_binding, "\"plan_id\": \"plan-"),
+              "live binding must export the exact confirmed plan ID");
         unlink(live_path);
     }
     d2k_sched_free(s);

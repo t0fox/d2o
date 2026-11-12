@@ -75,9 +75,9 @@
   }
   function dnsServiceStateLabel(state) {
     return ({ detected: "Обнаружен · статус не измерен", checking: "Проверяется",
-      direct_ok: "DNS-ответ подтверждён · без обхода",
+      direct_ok: "DNS-ответ подтверждён · прямая проверка",
       plan_applied: "План применён · DNS-ответ ещё не подтверждён",
-      bypass_ok: "DNS-ответ подтверждён · обход применён",
+      bypass_ok: "DNS-ответ подтверждён · план прошёл DoH-проверку",
       failed: "DNS-ответ не получен", no_bypass: "Обход не найден" })[dnsServiceState(state)];
   }
   function dnsServiceStateClass(state) { return "dns-status-" + dnsServiceState(state).replace(/_/g, "-"); }
@@ -275,7 +275,8 @@
     var k = (status && status.knowledge) || {};
     var linked = !!k.linked;
     var engine = !!snap.engine_running;
-    var dnsServices = list(snap.dns_services).filter(function (x) {
+    var dnsSource = linked && Array.isArray(k.dns_services) ? k.dns_services : snap.dns_services;
+    var dnsServices = list(dnsSource).filter(function (x) {
       return x && (x.protocol === "doh" || x.protocol === "dot" || x.protocol === "doq") &&
         typeof x.host === "string" && num(x.port) !== null;
     }).map(function (x) {
@@ -1491,6 +1492,14 @@
       var meta = el(doc, "div", "dns-service-meta");
       add(meta,
         service.sni && service.sni !== service.host ? el(doc, "span", "mono dns-service-sni", "SNI " + service.sni) : null,
+        service.resolved_ip ? el(doc, "span", "mono dns-service-sni", "IP " + service.resolved_ip) : null,
+        service.direct_tcp_reachable ? el(doc, "span", "dns-service-source", "TCP доступен") : null,
+        service.direct_tls_handshake ? el(doc, "span", "dns-service-source", "TLS установлен") : null,
+        num(service.http_status) > 0 ? el(doc, "span", "dns-service-source", "HTTP " + num(service.http_status)) : null,
+        num(service.check_attempts) > 0 ? el(doc, "span", "dns-service-source", "проверок " + num(service.check_attempts)) : null,
+        service.known_plan_id ? el(doc, "span", "dns-service-source", "план в каталоге " + service.known_plan_id) : null,
+        service.plan_applied && service.applied_plan_id ? el(doc, "span", "dns-service-source", "план на DNS-соединении " + service.applied_plan_id) : null,
+        service.candidate_plan_applied ? el(doc, "span", "dns-service-source", "план на пробном соединении D2O") : null,
         el(doc, "span", "dns-service-source", "источник: " + source));
       var state = tag(doc, dnsServiceStateLabel(service.state), "mute");
       state.classList.add("dns-service-state", dnsServiceStateClass(service.state));

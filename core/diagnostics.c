@@ -76,7 +76,7 @@ typedef struct {
 static const char *const task_state_names[D2K_DIAG_TASK_STATE_COUNT]={
     "free","queued","asking","shape_wait","props_contact","props_wait",
     "planning","trial_settle","verify","verify_wait","watching","resting",
-    "voice_measure","voice_trial","voice_watch"
+    "voice_measure","voice_trial","voice_watch","dns_health"
 };
 /* Два снимка на процесс; сырые карты памяти и имена файлов не сохраняются. */
 typedef struct {

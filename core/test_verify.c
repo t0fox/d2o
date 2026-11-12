@@ -816,8 +816,62 @@ static void test_rx_wire_progress(void) {
         d2k_verify_close(&r);stand_stop(&s);
     }
 }
+
+static void test_doh_response_parser(void) {
+    uint8_t dns[] = {
+        0x5a,0x71,0x81,0x80,0,1,0,1,0,0,0,0,
+        7,'e','x','a','m','p','l','e',3,'c','o','m',0,0,1,0,1,
+        0xc0,0x0c,0,1,0,1,0,0,0,60,0,4,93,184,216,34
+    };
+    uint8_t response[512];
+    d2k_ver_result result;
+    int header = snprintf((char *)response, sizeof response,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n"
+        "Content-Length: %zu\r\n\r\n", sizeof dns);
+    CHECK(header > 0 && (size_t)header + sizeof dns < sizeof response,
+          "DoH fixture header fits");
+    memcpy(response + header, dns, sizeof dns);
+    memset(&result, 0, sizeof result);
+    CHECK(d2k_verify_doh_response_parse(response, (size_t)header + sizeof dns,
+          0x5a71, &result) == 1 && result.status == 200 && result.dns_reply &&
+          result.body_complete && result.body_bytes == sizeof dns,
+          "RFC 8484 content-length response with matching DNS answer accepted");
+
+    static const char too_large[] = "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n";
+    memset(&result, 0, sizeof result);
+    CHECK(d2k_verify_doh_response_parse((const uint8_t *)too_large, sizeof too_large - 1,
+          0x5a71, &result) == 0 && result.status == 413 && !result.dns_reply && result.unsupported,
+          "HTTP 413 is a DoH application error, not a strategy-search signal");
+
+    dns[1] = 0x72;
+    header = snprintf((char *)response, sizeof response,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n"
+        "Content-Length: %zu\r\n\r\n", sizeof dns);
+    memcpy(response + header, dns, sizeof dns);
+    memset(&result, 0, sizeof result);
+    CHECK(d2k_verify_doh_response_parse(response, (size_t)header + sizeof dns,
+          0x5a71, &result) == 0 && !result.dns_reply && result.unsupported,
+          "HTTP 200 with mismatched DNS transaction ID is rejected without strategy proof");
+    dns[1] = 0x71;
+
+    header = snprintf((char *)response, sizeof response,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n");
+    size_t p = (size_t)header;
+    p += (size_t)snprintf((char *)response + p, sizeof response - p, "18\r\n");
+    memcpy(response + p, dns, 24); p += 24; memcpy(response + p, "\r\n", 2); p += 2;
+    p += (size_t)snprintf((char *)response + p, sizeof response - p, "15\r\n");
+    memcpy(response + p, dns + 24, sizeof dns - 24); p += sizeof dns - 24;
+    memcpy(response + p, "\r\n0\r\n\r\n", 7); p += 7;
+    memset(&result, 0, sizeof result);
+    CHECK(d2k_verify_doh_response_parse(response, p, 0x5a71, &result) == 1 &&
+          result.body_chunked && result.dns_reply && result.body_bytes == sizeof dns,
+          "HTTP chunked DoH DNS response is fully decoded and validated");
+}
+
 int main(int argc,char **argv) {
     test_rx_wire_progress();
+    test_doh_response_parser();
     if(argc==2&&!strcmp(argv[1],"--wire-progress-only"))return fails?1:0;
     const char *html = "<head><!-- <link rel='stylesheet' href='//bad.test/a.css'> -->"
         "<script>var x=\"<link rel='stylesheet' href='//bad.test/b.css'>\";</script>"

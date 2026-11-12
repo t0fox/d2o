@@ -1,0 +1,20 @@
+# Тестовый манифест подбора: service|host|ip|proto|path[|expect]
+# Запрос по умолчанию — wikipedia.org: example.com Smart DNS переписывают.
+# DoH: canon→dot→none; DoT: canon→none→dot. Первый ответ останавливает услугу.
+magicdns|api.magicdns.ru|45.88.163.92|plain|
+magicdns|api.magicdns.ru|109.120.177.170|doh|/sync
+magicdns|api.magicdns.ru|109.120.177.170|dot|
+comss|dns.comss.one|141.133.183.77|doh|/dns-query
+comss|dns.comss.one|141.133.183.77|dot|
+xbox|xbox-dns.ru|111.88.96.56|doh|/dns-query
+xbox|xbox-dns.ru|111.88.96.56|dot|
+webshift|d.webshiftvpn.ru|31.31.207.68|dot|
+webshift|d.webshiftvpn.ru|31.31.207.68|doh|/dns-query
+nulls|dns.nullsproxy.com|185.175.46.137|dot|
+nulls|dns.nullsproxy.com|185.175.46.137|doh|/dns-query
+geohide|geohide.ru|37.230.192.51|doh|/dns-query
+geohide|geohide.ru|37.230.192.51|dot|
+dnsai|dns.dns-ai.ru|194.87.196.13|dot|
+dnsai|dns.dns-ai.ru|194.87.196.13|doh|/dns-query
+bezmezhau|dns.bezmezhau.com|31.58.216.201|dot|
+bezmezhau|dns.bezmezhau.com|31.58.216.201|doh|/dns-query

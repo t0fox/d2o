@@ -27,6 +27,7 @@
 #endif
 
 #include <errno.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -2071,6 +2072,343 @@ static void dns_probe_result(d2k_ver_result *r, int valid, const char *protocol)
     } else {
         snprintf(r->reason, sizeof r->reason, "%s: нет подтверждённого DNS-ответа", protocol);
     }
+}
+
+#define DOH_HEADER_MAX 8192u
+#define DOH_BODY_MAX 4096u
+#define DOH_RESPONSE_MAX (DOH_HEADER_MAX + DOH_BODY_MAX * 2u)
+
+static int doh_header_value(char *line, char **name, char **value) {
+    char *colon = strchr(line, ':');
+    if (!colon) return 0;
+    *colon = '\0';
+    *name = line;
+    *value = colon + 1;
+    while (**value == ' ' || **value == '\t') (*value)++;
+    char *end = *value + strlen(*value);
+    while (end > *value && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+    return **name != '\0';
+}
+
+static int doh_parse_headers(const uint8_t *data, size_t len, int *status,
+                             size_t *body_len, int *has_length, int *chunked,
+                             int *content_type_ok) {
+    char text[DOH_HEADER_MAX + 1];
+    if (!data || !len || len > DOH_HEADER_MAX || !status || !body_len ||
+        !has_length || !chunked || !content_type_ok) return -1;
+    memcpy(text, data, len); text[len] = '\0';
+    char *line_end = strstr(text, "\r\n");
+    if (!line_end) return -1;
+    *line_end = '\0';
+    if (strncmp(text, "HTTP/1.1 ", 9) && strncmp(text, "HTTP/1.0 ", 9)) return -1;
+    if (!isdigit((unsigned char)text[9]) || !isdigit((unsigned char)text[10]) ||
+        !isdigit((unsigned char)text[11]) || (text[12] && text[12] != ' ')) return -1;
+    *status = (text[9] - '0') * 100 + (text[10] - '0') * 10 + text[11] - '0';
+    *body_len = 0; *has_length = 0; *chunked = 0; *content_type_ok = 0;
+    int have_transfer = 0;
+    char *p = line_end + 2;
+    while (*p) {
+        line_end = strstr(p, "\r\n");
+        char *next = line_end ? line_end + 2 : NULL;
+        if (line_end) *line_end = '\0';
+        else line_end = p + strlen(p);
+        if (!*p) break;
+        char *name, *value;
+        if (!doh_header_value(p, &name, &value)) return -1;
+        if (!strcasecmp(name, "Content-Type")) {
+            char *semi = strchr(value, ';');
+            if (semi) *semi = '\0';
+            char *end = value + strlen(value);
+            while (end > value && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+            if (*content_type_ok || strcasecmp(value, "application/dns-message")) return -1;
+            *content_type_ok = 1;
+        } else if (!strcasecmp(name, "Content-Length")) {
+            if (*has_length || !*value) return -1;
+            size_t n = 0;
+            for (const unsigned char *c = (const unsigned char *)value; *c; c++) {
+                if (!isdigit(*c) || n > (DOH_BODY_MAX - (size_t)(*c - '0')) / 10u) return -1;
+                n = n * 10u + (size_t)(*c - '0');
+            }
+            *body_len = n; *has_length = 1;
+        } else if (!strcasecmp(name, "Transfer-Encoding")) {
+            if (have_transfer || strcasecmp(value, "chunked")) return -1;
+            have_transfer = 1; *chunked = 1;
+        } else if (!strcasecmp(name, "Content-Encoding") &&
+                   strcasecmp(value, "identity")) return -1;
+        p = next ? next : line_end;
+    }
+    return (*has_length && *chunked) ? -1 : 0;
+}
+
+/* Returns 1 for a complete chunk stream, 0 when more TLS bytes are needed,
+ * and -1 for malformed or oversized framing. */
+static int doh_decode_chunked(const uint8_t *raw, size_t raw_len,
+                              uint8_t *body, size_t body_cap, size_t *body_len) {
+    size_t p = 0, used = 0;
+    for (;;) {
+        size_t line = p;
+        while (p + 1 < raw_len && !(raw[p] == '\r' && raw[p + 1] == '\n')) p++;
+        if (p + 1 >= raw_len) return 0;
+        size_t line_len = p - line;
+        if (!line_len || line_len > 64) return -1;
+        char number[65]; memcpy(number, raw + line, line_len); number[line_len] = '\0';
+        char *semi = strchr(number, ';'); if (semi) *semi = '\0';
+        char *tail = NULL;
+        unsigned long size = strtoul(number, &tail, 16);
+        if (tail == number || *tail || size > body_cap - used) return -1;
+        p += 2;
+        if (!size) {
+            if (p + 2 <= raw_len && raw[p] == '\r' && raw[p + 1] == '\n') {
+                *body_len = used; return 1;
+            }
+            for (size_t i = p; i + 3 < raw_len; i++)
+                if (raw[i] == '\r' && raw[i+1] == '\n' && raw[i+2] == '\r' && raw[i+3] == '\n') {
+                    *body_len = used; return 1;
+                }
+            return 0;
+        }
+        if (size > raw_len - p || raw_len - p - (size_t)size < 2) return 0;
+        memcpy(body + used, raw + p, (size_t)size); used += (size_t)size;
+        p += (size_t)size;
+        if (raw[p] != '\r' || raw[p + 1] != '\n') return -1;
+        p += 2;
+    }
+}
+
+static int doh_header_end(const uint8_t *buf, size_t len, size_t *sep) {
+    if (len < 4) return 0;
+    for (size_t i = 0; i + 3 < len; i++)
+        if (buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n') {
+            *sep = i; return 1;
+        }
+    return 0;
+}
+
+int d2k_verify_doh_response_parse(const uint8_t *response, size_t response_len,
+                                  uint16_t dns_id, d2k_ver_result *result) {
+    size_t sep = 0, body_off, body_len = 0, expected = 0;
+    int status = 0, has_length = 0, chunked = 0, type_ok = 0, complete = 0;
+    uint8_t body[DOH_BODY_MAX];
+    if (!result) return -1;
+    result->unsupported = 0;
+    if (!response || !doh_header_end(response, response_len, &sep) || sep > DOH_HEADER_MAX) {
+        result->unsupported = 1;
+        snprintf(result->reason, sizeof result->reason, "DoH: некорректные HTTP заголовки");
+        return -1;
+    }
+    if (doh_parse_headers(response, sep, &status, &expected, &has_length,
+                          &chunked, &type_ok) != 0) {
+        result->unsupported = 1;
+        snprintf(result->reason, sizeof result->reason, "DoH: некорректные HTTP заголовки");
+        return -1;
+    }
+    result->status = status;
+    if (status != 200) {
+        result->unsupported = 1;
+        snprintf(result->reason, sizeof result->reason, "DoH: HTTP %d", status);
+        return 0;
+    }
+    if (!type_ok || (!has_length && !chunked)) {
+        result->unsupported = 1;
+        snprintf(result->reason, sizeof result->reason, "DoH: неверный тип или framing ответа");
+        return -1;
+    }
+    body_off = sep + 4;
+    if (has_length) {
+        if (expected > DOH_BODY_MAX || response_len - body_off < expected) {
+            result->unsupported = 1;
+            snprintf(result->reason, sizeof result->reason, "DoH: неполный или слишком большой DNS body");
+            return -1;
+        }
+        body_len = expected;
+        memcpy(body, response + body_off, body_len);
+        complete = 1;
+    } else {
+        int decoded = doh_decode_chunked(response + body_off, response_len - body_off,
+                                         body, sizeof body, &body_len);
+        if (decoded < 0) {
+            result->unsupported = 1;
+            snprintf(result->reason, sizeof result->reason, "DoH: некорректный chunked body");
+            return -1;
+        }
+        complete = decoded;
+        if (!complete) return 0;
+    }
+    result->body_framing_valid = complete;
+    result->body_complete = complete;
+    result->body_has_length = has_length;
+    result->body_chunked = chunked;
+    result->body_bytes = body_len;
+    result->body_expected = has_length ? expected : body_len;
+    if (!dns_probe_reply(body, body_len, dns_id)) {
+        result->unsupported = 1;
+        snprintf(result->reason, sizeof result->reason, "DoH: HTTP завершён, DNS-ответ некорректен");
+        return 0;
+    }
+    result->dns_reply = 1;
+    result->level = D2K_VER_APPLICATION;
+    snprintf(result->reason, sizeof result->reason, "DoH: корректный RFC 8484 DNS-ответ");
+    return 1;
+}
+
+d2k_ver_result d2k_verify_doh_on(int use_fd, const char *ip, uint16_t port,
+                                 const char *sni, const char *path,
+                                 int deadline_ms, size_t hello_wire) {
+    d2k_ver_result r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1; r.name_ok = -1;
+    r.family = ip && strchr(ip, ':') ? 6 : 4;
+    int timeout = deadline_ms > 0 ? deadline_ms : 5000;
+    if (!ip || !ip[0] || !port || !path || path[0] != '/') {
+        if (use_fd >= 0) close(use_fd);
+        r.unsupported = 1;
+        snprintf(r.reason, sizeof r.reason, "DoH: неверный endpoint");
+        return r;
+    }
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        if (*p <= 32 || *p == 127 || *p == '\\' || *p == '"' || *p == '\r' || *p == '\n') {
+            if (use_fd >= 0) close(use_fd);
+            r.unsupported = 1;
+            snprintf(r.reason, sizeof r.reason, "DoH: недопустимый request target");
+            return r;
+        }
+    }
+    char err[160] = "";
+    int contact = verify_contact(use_fd, ip, port, 0, r.family, r.local_addr, &r.local_port, &r.fd);
+    if (contact != 0) {
+        r.local_refusal = contact == -2;
+        snprintf(r.reason, sizeof r.reason, "DoH: TCP endpoint недоступен");
+        return r;
+    }
+    r.level = D2K_VER_TRANSPORT;
+    if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);
+    d2k_tls *tls = NULL;
+    if (d2k_tls_connect(r.fd, sni, timeout, hello_wire, &tls, err, sizeof err) != 0) {
+        snprintf(r.reason, sizeof r.reason, "DoH: TLS: %.150s", err);
+        return r;
+    }
+    r.level = D2K_VER_HANDSHAKE;
+    r.negotiated_tls = d2k_tls_version(tls);
+    r.name_ok = d2k_tls_peer_name(tls);
+
+    char authority[INET6_ADDRSTRLEN + 24];
+    const char *host = sni && sni[0] ? sni : ip;
+    int ipv6_literal = strchr(host, ':') != NULL;
+    int hn = port == 443
+        ? snprintf(authority, sizeof authority, ipv6_literal ? "[%s]" : "%s", host)
+        : snprintf(authority, sizeof authority, ipv6_literal ? "[%s]:%u" : "%s:%u",
+                   host, (unsigned)port);
+    if (hn < 0 || (size_t)hn >= sizeof authority) {
+        d2k_tls_free(tls); snprintf(r.reason, sizeof r.reason, "DoH: Host слишком длинный"); return r;
+    }
+    for (const unsigned char *p = (const unsigned char *)host; *p; p++) {
+        if (!(isalnum(*p) || *p == '.' || *p == '-' || *p == ':' || *p == '%' || *p == '[' || *p == ']')) {
+            d2k_tls_free(tls); snprintf(r.reason, sizeof r.reason, "DoH: недопустимый Host"); return r;
+        }
+    }
+    uint8_t query[sizeof dns_query];
+    memcpy(query, dns_query, sizeof query);
+    query[2] = 0x5a; query[3] = 0x71;
+    char request[4096];
+    int request_len = snprintf(request, sizeof request,
+        "POST %s HTTP/1.1\r\nHost: %s\r\nAccept: application/dns-message\r\n"
+        "Content-Type: application/dns-message\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+        path, authority, sizeof query - 2);
+    if (request_len < 0 || (size_t)request_len + sizeof query - 2 >= sizeof request) {
+        d2k_tls_free(tls); snprintf(r.reason, sizeof r.reason, "DoH: запрос слишком длинный"); return r;
+    }
+    memcpy(request + request_len, query + 2, sizeof query - 2);
+    request_len += (int)(sizeof query - 2);
+    if (d2k_tls_write(tls, (const uint8_t *)request, (size_t)request_len, err, sizeof err) != 0) {
+        d2k_tls_free(tls); snprintf(r.reason, sizeof r.reason, "DoH: отправка: %.145s", err); return r;
+    }
+
+    uint8_t response[DOH_RESPONSE_MAX], body[DOH_BODY_MAX];
+    size_t used = 0, sep = 0;
+    int64_t deadline = verify_now_ms() + timeout;
+    while (!doh_header_end(response, used, &sep)) {
+        if (used == DOH_HEADER_MAX || used == sizeof response) break;
+        int64_t left = deadline - verify_now_ms();
+        if (left <= 0) break;
+        size_t ask = sizeof response - used;
+        if (ask > 1024) ask = 1024;
+        long n = d2k_tls_read(tls, response + used, ask, (int)left, err, sizeof err);
+        if (n <= 0 || (size_t)n > ask) break;
+        used += (size_t)n;
+    }
+    if (!doh_header_end(response, used, &sep) || sep > DOH_HEADER_MAX) {
+        d2k_tls_free(tls); snprintf(r.reason, sizeof r.reason, "DoH: HTTP заголовки не получены"); return r;
+    }
+    int has_length = 0, chunked = 0, type_ok = 0, status = 0;
+    size_t content_len = 0;
+    if (doh_parse_headers(response, sep, &status, &content_len, &has_length, &chunked, &type_ok) != 0) {
+        r.unsupported = 1;
+        d2k_tls_free(tls); snprintf(r.reason, sizeof r.reason, "DoH: некорректные HTTP заголовки"); return r;
+    }
+    r.status = status;
+    if (status != 200) {
+        r.unsupported = 1;
+        d2k_tls_free(tls); snprintf(r.reason, sizeof r.reason, "DoH: HTTP %d", status); return r;
+    }
+    if (!type_ok || (!has_length && !chunked) || (has_length && content_len > DOH_BODY_MAX)) {
+        r.unsupported = 1;
+        d2k_tls_free(tls); snprintf(r.reason, sizeof r.reason, "DoH: неверный тип или framing ответа"); return r;
+    }
+    size_t body_off = sep + 4, body_len = 0;
+    int complete = 0;
+    if (has_length) {
+        size_t total = body_off + content_len;
+        while (used < total && used < sizeof response) {
+            int64_t left = deadline - verify_now_ms();
+            if (left <= 0) break;
+            size_t ask = total - used;
+            if (ask > sizeof response - used) ask = sizeof response - used;
+            long n = d2k_tls_read(tls, response + used, ask, (int)left, err, sizeof err);
+            if (n <= 0 || (size_t)n > ask) break;
+            used += (size_t)n;
+        }
+        if (used >= total) { memcpy(body, response + body_off, content_len); body_len = content_len; complete = 1; }
+    } else {
+        for (;;) {
+            int decoded = doh_decode_chunked(response + body_off, used - body_off,
+                                             body, sizeof body, &body_len);
+            if (decoded > 0) { complete = 1; break; }
+            if (decoded < 0 || used == sizeof response) break;
+            int64_t left = deadline - verify_now_ms();
+            if (left <= 0) break;
+            size_t ask = sizeof response - used;
+            if (ask > 512) ask = 512;
+            long n = d2k_tls_read(tls, response + used, ask, (int)left, err, sizeof err);
+            if (n <= 0 || (size_t)n > ask) break;
+            used += (size_t)n;
+        }
+    }
+    d2k_tls_free(tls);
+    if (complete) {
+        d2k_ver_result parsed;
+        memset(&parsed, 0, sizeof parsed);
+        int valid = d2k_verify_doh_response_parse(response, used, 0x5a71, &parsed);
+        r.status = parsed.status;
+        r.body_framing_valid = parsed.body_framing_valid;
+        r.body_complete = parsed.body_complete;
+        r.body_has_length = parsed.body_has_length;
+        r.body_chunked = parsed.body_chunked;
+        r.body_bytes = parsed.body_bytes;
+        r.body_expected = parsed.body_expected;
+        r.unsupported = parsed.unsupported;
+        if (valid > 0 && r.name_ok != 0) {
+            r.level = D2K_VER_APPLICATION;
+            r.dns_reply = 1;
+            snprintf(r.reason, sizeof r.reason, "%s", parsed.reason);
+        } else {
+            if (valid > 0) r.unsupported = 1;
+            snprintf(r.reason, sizeof r.reason, "%s", valid > 0
+                     ? "DoH: имя TLS-сервера не совпало" : parsed.reason);
+        }
+    } else {
+        snprintf(r.reason, sizeof r.reason, "DoH: DNS body не завершён");
+    }
+    return r;
 }
 
 d2k_ver_result d2k_verify_dns_on(int use_fd, const char *ip, uint16_t port, const char *sni,

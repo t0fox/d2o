@@ -137,7 +137,7 @@ static void test_dns_service_config_classification(void) {
     const char *at = json;
     unsigned services = 0;
     while ((at = strstr(at, "\"protocol\":")) != NULL) { services++; at++; }
-    assert(services == 14);
+    assert(services == 15);
     assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"cloudflare-dns.com\",\"port\":443") != NULL);
     assert(strstr(json, "\"state\":\"detected\",\"status_reason\":\"Настройка обнаружена; проверка DNS-ответа ещё не выполнялась.\"") != NULL);
     assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"dns.google\",\"port\":443") != NULL);
@@ -151,7 +151,7 @@ static void test_dns_service_config_classification(void) {
     assert(strstr(json, "\"protocol\":\"doq\",\"host\":\"unfiltered.adguard-dns.com\",\"port\":853") != NULL);
     assert(strstr(json, "\"protocol\":\"doq\",\"host\":\"dns.quad9.net\",\"port\":853") != NULL);
     assert(strstr(json, "\"protocol\":\"doq\",\"host\":\"p0.freedns.controld.com\",\"port\":853") != NULL);
-    assert(strstr(json, "\"protocol\":\"dot\",\"host\":\"1.1.1.1\",\"port\":853,\"sni\":\"cloudflare-dns.com\",\"source\":\"keenetic-system\"") != NULL);
+    assert(strstr(json, "\"protocol\":\"dot\",\"host\":\"1.1.1.1\",\"port\":853,\"sni\":\"cloudflare-dns.com\",\"path\":\"/\",\"source\":\"keenetic-system\"") != NULL);
     assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"cloudflare-dns.com\",\"port\":443") != NULL);
     assert(strstr(json, "\"source\":\"keenetic-doq-web\"") != NULL);
     assert(!strstr(json, "secret") && !strstr(json, "hidden"));
@@ -163,12 +163,25 @@ static void test_dns_service_config_classification(void) {
         " list upstream 'tls://disabled.example'\n");
     assert(d2k_panel_dns_services_json(doh, secure, doqd, "doqd", NULL, json, sizeof json) == 0);
     assert(strstr(json, "\"protocol\":\"doh\"") && !strstr(json, "disabled.example"));
+    rewrite_file(secure,
+        "config dnsproxy 'global'\n"
+        " option enabled '1'\n"
+        " option upstream_mode 'parallel'\n"
+        "config dnsproxy 'servers'\n"
+        " list upstream 'tls://gateway.example'\n"
+        " list upstream 'https://gateway.example/dns-query'\n"
+        "config profile 'unused'\n"
+        " list upstream 'https://inactive.example/dns-query'\n");
+    assert(d2k_panel_dns_services_json(doh, secure, doqd, "doqd", NULL, json, sizeof json) == 0);
+    assert(strstr(json, "\"protocol\":\"dot\",\"host\":\"gateway.example\",\"port\":853") != NULL);
+    assert(strstr(json, "\"protocol\":\"doh\",\"host\":\"gateway.example\",\"port\":443") != NULL);
+    assert(!strstr(json, "inactive.example"));
     unlink(doh); unlink(secure); unlink(doqd);
 }
 
 static void test_api_exposes_live_knowledge(void) {
     char live[] = "/tmp/d2k-panel-live.XXXXXX";
-    write_temp_file(live, "{\"linked\":true,\"link_note\":\"\",\"boxes\":[],\"searches\":[],\"targets\":0,\"confirms\":0,\"probes_used\":0,\"client_unfit\":0}");
+    write_temp_file(live, "{\"linked\":true,\"link_note\":\"\",\"boxes\":[],\"dns_services\":[{\"protocol\":\"doh\",\"host\":\"runtime.example\",\"port\":443,\"state\":\"bypass_ok\"}],\"searches\":[],\"targets\":0,\"confirms\":0,\"probes_used\":0,\"client_unfit\":0}");
 
     static const char *unknown[] = { "FUTURE_OPTION" };
     d2k_panel_config cfg = {
@@ -195,6 +208,15 @@ static void test_api_exposes_live_knowledge(void) {
     assert(strstr(response, "Content-Type: application/json; charset=utf-8") != NULL);
     assert(strstr(response, "\"snapshot\":{\"taken\":") != NULL);
     assert(strstr(response, "\"dns_services\":[") != NULL);
+    assert(strstr(response, "runtime.example") != NULL && strstr(response, "bypass_ok") != NULL);
+    const char *snapshot_json = strstr(response, "\"snapshot\":");
+    const char *snapshot_dns = snapshot_json ? strstr(snapshot_json, "\"dns_services\":[") : NULL;
+    const char *knowledge_json = strstr(response, "\"knowledge\":");
+    const char *snapshot_runtime = snapshot_dns ? strstr(snapshot_dns, "runtime.example") : NULL;
+    const char *snapshot_bypass = snapshot_dns ? strstr(snapshot_dns, "bypass_ok") : NULL;
+    assert(snapshot_dns && knowledge_json && snapshot_dns < knowledge_json &&
+           snapshot_runtime && snapshot_bypass && snapshot_runtime < knowledge_json &&
+           snapshot_bypass < knowledge_json);
     assert(strstr(response, "\"version\":\"test-version\"") != NULL);
     assert(strstr(response, "\"unknown_keys\":[\"FUTURE_OPTION\"]") != NULL);
     assert(strstr(response, "\"linked\":true") != NULL);

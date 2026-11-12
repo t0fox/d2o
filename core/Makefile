@@ -83,6 +83,7 @@ HDR += include/d2k_resource.h
 HDR += include/d2k_http_reply.h
 HDR += include/d2k_domain.h include/d2k_groups.h
 HDR += include/d2k_diagnostics.h ../runtime/d2k_diagnostics_files.h
+HDR += ../runtime/d2k_dns_config.h
 diagnostics.o: diagnostics.c include/d2k_diagnostics.h
 SRC += domain.c groups.c udpplan.c udpruntime.c
 DIAG_SRC = diagnostics.c
@@ -875,11 +876,11 @@ cross: hello_profiles.inc
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_sched-a64 \
 		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
 		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
-		verify.c verify_quic_replay.c quicconn.c h3.c diagnostics.c $(filter-out test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
+		verify.c verify_quic_replay.c quicconn.c h3.c diagnostics.c ../runtime/d2k_dns_config.c $(filter-out test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_sched-mipsel \
 		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
 		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
-		verify.c verify_quic_replay.c quicconn.c h3.c diagnostics.c $(filter-out test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
+		verify.c verify_quic_replay.c quicconn.c h3.c diagnostics.c ../runtime/d2k_dns_config.c $(filter-out test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
 	@echo "== d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kask-a64 \
 		d2kask.c compose.c measured.c hello.c meas.c link.c || exit 1
@@ -896,11 +897,11 @@ cross: hello_profiles.inc
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-a64 \
 		d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
 		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
-		verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(filter-out d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
+		verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../runtime/d2k_dns_config.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(filter-out d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-mipsel \
 		d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
 		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
-		verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(filter-out d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
+		verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../runtime/d2k_dns_config.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(filter-out d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
 	@echo "== test_measured целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_measured-a64 \
 		test_measured.c compose.c measured.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c udpplan.c -lpthread || exit 1
@@ -963,12 +964,12 @@ ARCH ?= arm64
 .PHONY: release check-release
 d2kc-linux-arm64: release
 d2kfetch-linux-arm64: release
-release: hello_profiles.inc tcp1620_whitelist.inc
+release: hello_profiles.inc tcp1620_whitelist.inc ../runtime/d2k_dns_config.c ../runtime/d2k_dns_config.h
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -static -Wl,-S \
 		-o $(BUILDDIR)/d2kc-linux-$(ARCH) d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c \
 		crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c \
-		volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c udpplan.c udpruntime.c -lpthread
+		volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../runtime/d2k_dns_config.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c udpplan.c udpruntime.c -lpthread
 	@ls -l $(BUILDDIR)/d2kc-linux-$(ARCH)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -static -Wl,-S \
 		-o $(BUILDDIR)/d2kfetch-linux-$(ARCH) d2kfetch.c diagnostics.c verify.c verify_quic_replay.c volume.c quichello.c plantlv.c quicconn.c h3.c quicwire.c quicprobe.c quicsnap.c quicsnap_reseal.c quicarms.c ipfrag.c net4.c props.c \
@@ -1030,7 +1031,7 @@ test-sched-modes: test_sched sched.o quichello.o plantlv.o verify.o tls12.o p256
 SCHED_TEST_OBJ = httpsprobe.o httpsearch.o httpup_logic.o sched.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o \
     quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
     hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o \
-    x25519.o verify.o tls12.o p256.o quicconn.o h3.o
+    x25519.o verify.o tls12.o p256.o quicconn.o h3.o ../runtime/d2k_dns_config.o
 TESTS += test_sched_trial
 check: test-sched-trial
 .PHONY: test-sched-trial
@@ -1112,8 +1113,8 @@ TESTS += test_quicconn_rtx
 TESTS += test_quicconn6 test_volume test_volume_context test_httpup_logic
 TESTS += test_catalog_sync
 
-test_catalog_sync: test_catalog_sync.c $(SRC:.c=.o) $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< $(SRC:.c=.o) $(TEST_LDFLAGS)
+test_catalog_sync: test_catalog_sync.c $(SRC:.c=.o) ../runtime/d2k_dns_config.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(SRC:.c=.o) ../runtime/d2k_dns_config.o $(TEST_LDFLAGS)
 
 .PHONY: test-catalog-sync
 check: test-catalog-sync
@@ -1163,10 +1164,11 @@ $(DETECT_OBJ): FORCE
 
 d2kc: d2kc.c diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
       hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
-      $(DETECT_OBJ) $(HDR)
+      ../runtime/d2k_dns_config.o $(DETECT_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< httpsprobe.o httpsearch.o httpup_logic.o sched.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o \
 		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
-		$(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
+		../runtime/d2k_dns_config.o $(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c \
+		diagnostics.o udpplan.c udpruntime.c ../datapath/wire_udp.c -lpthread
 
 D2KFETCH_OBJ = verify.o verify_quic_replay.o volume.o quichello.o plantlv.o quicconn.o h3.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o \
 	compose.o measured.o hello.o meas.o link.o tls13.o tls12.o p256.o tls13core.o x25519.o crypto.o quic.o
@@ -1175,6 +1177,7 @@ d2kfetch: d2kfetch.c $(D2KFETCH_OBJ) $(HDR)
 
 clean:
 	rm -f *.o $(TESTS) d2kask d2kc d2kfetch hello_profiles.inc libd2k_udp.a
+	rm -f ../runtime/d2k_dns_config.o
 	rm -rf .udp-engine
 
 test_quic_original_arms: test_quic_original_arms.c quicarms.o $(HDR)
@@ -1192,8 +1195,8 @@ test-quic-strategy: test_quic_strategy
 check: test-quic-strategy
 TESTS += test_quic_strategy
 
-test_quic_run_order: test_quic_run_order.c $(SRC) $(HDR) hello_profiles.inc
-	$(CC) $(CFLAGS) -o $@ $< $(SRC) $(TEST_LDFLAGS)
+test_quic_run_order: test_quic_run_order.c $(SRC) ../runtime/d2k_dns_config.o $(HDR) hello_profiles.inc
+	$(CC) $(CFLAGS) -o $@ $< $(SRC) ../runtime/d2k_dns_config.o $(TEST_LDFLAGS)
 
 test_ipfrag: test_ipfrag.c ipfrag.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< ipfrag.o $(TEST_LDFLAGS)
@@ -1403,6 +1406,30 @@ clean: clean-sched-worker-lifecycle
 check: test-diagnostics-runtime
 test-diagnostics-runtime: test_diagnostics_runtime
 	./test_diagnostics_runtime
+
+TESTS += test_dns_config
+check: test-dns-config
+.PHONY: test-dns-config
+../runtime/d2k_dns_config.o: ../runtime/d2k_dns_config.c ../runtime/d2k_dns_config.h
+	$(CC) $(CFLAGS) -c $< -o $@
+test_dns_config: test_dns_config.c ../runtime/d2k_dns_config.o ../runtime/d2k_dns_config.h
+	$(CC) $(CFLAGS) -o $@ test_dns_config.c ../runtime/d2k_dns_config.o $(TEST_LDFLAGS)
+test-dns-config: test_dns_config
+	./test_dns_config
+
+TESTS += test_dns_health
+check: test-dns-health
+.PHONY: test-dns-health
+test_dns_health: test_dns_health.c $(SCHED_TEST_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(SCHED_TEST_OBJ) $(TEST_LDFLAGS)
+test-dns-health: test_dns_health
+	./test_dns_health
+
+.PHONY: test-dns-online
+test-dns-online: test_dns_online
+	./test_dns_online
+test_dns_online: test_dns_online.c ../runtime/d2k_dns_config.o $(D2KFETCH_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_dns_online.c ../runtime/d2k_dns_config.o $(D2KFETCH_OBJ) $(TEST_LDFLAGS) libd2k_udp.a
 test_diagnostics_runtime: test_diagnostics_runtime.c d2kc.c diagnostics.o $(SCHED_TEST_OBJ) $(DETECT_OBJ) libd2k_udp.a $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(SCHED_TEST_OBJ) $(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
 clean-diagnostics-runtime:

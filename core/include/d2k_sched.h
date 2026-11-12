@@ -61,6 +61,7 @@
 #include "d2k_verify.h"
 #include "d2k_volume.h"
 #include "d2k_voice.h"
+#include "../../runtime/d2k_dns_config.h"
 
 #include "d2k_diagnostics.h"
 typedef struct d2k_sched d2k_sched;
@@ -305,6 +306,7 @@ int d2k_sched_meminfo_parse(const char *text, uint64_t *avail_kb, uint64_t *tota
  * планировщик (его пишет на диск вызывающий, он же решает когда — см.
  * d2k_catalog_save), связь закрывает тот, кто открыл. */
 d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark);
+void d2k_sched_set_dns_services(d2k_sched *s, const d2k_dns_service *items, size_t count);
 
 /* Ставит датапату планы ВСЕХ подтверждённых привязок каталога.
  *

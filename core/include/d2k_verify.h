@@ -264,6 +264,15 @@ d2k_ver_result d2k_verify_dns_on(int use_fd, const char *ip, uint16_t port, cons
                                   int deadline_ms, size_t hello_wire, uint8_t transport,
                                   int tls12, const uint8_t *alpn, size_t alpn_len);
 
+/* RFC 8484 POST using HTTP/1.1 over the existing TLS client. Success requires
+ * a complete application/dns-message body that answers the exact DNS question. */
+d2k_ver_result d2k_verify_doh_on(int use_fd, const char *ip, uint16_t port,
+                                 const char *sni, const char *path,
+                                 int deadline_ms, size_t hello_wire);
+/* Pure HTTP/DNS response parser used by the network verifier and regression tests. */
+int d2k_verify_doh_response_parse(const uint8_t *response, size_t response_len,
+                                  uint16_t dns_id, d2k_ver_result *result);
+
 /* Зонд TLS 1.3 с ALPN КЛИЕНТА (alpn_list — protocol_name_list как на проводе,
  * alpn_len 0 — без ALPN, как у клиента без него) для протокола, который не
  * HTTP. Ведёт рукопожатие до проверенного Finished сервера и останавливается:

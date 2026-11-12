@@ -97,8 +97,8 @@ assert.deepEqual(['doh', 'dot', 'doq'].map(p => ui.dnsProtocolClass(p, p === 'do
 assert.deepEqual(ui.dnsProtocolCounts([
   { protocol: 'doh' }, { protocol: 'doh' }, { protocol: 'dot' }, { protocol: 'doq' }, { protocol: 'unknown' }
 ]), { doh: 2, dot: 1, doq: 1 }, 'simultaneous DNS protocols count independently');
-assert.equal(ui.dnsServiceStateLabel('direct_ok'), 'DNS-ответ подтверждён · без обхода');
-assert.equal(ui.dnsServiceStateLabel('bypass_ok'), 'DNS-ответ подтверждён · обход применён');
+assert.equal(ui.dnsServiceStateLabel('direct_ok'), 'DNS-ответ подтверждён · прямая проверка');
+assert.equal(ui.dnsServiceStateLabel('bypass_ok'), 'DNS-ответ подтверждён · план прошёл DoH-проверку');
 assert.equal(ui.dnsServiceStateLabel('plan_applied'), 'План применён · DNS-ответ ещё не подтверждён');
 assert.equal(ui.dnsServiceStateLabel('failed'), 'DNS-ответ не получен');
 assert.equal(ui.dnsServiceStateLabel('no_bypass'), 'Обход не найден');
@@ -137,6 +137,16 @@ assert.equal(ui.dnsProtocolLabel('', 17, 443), '', 'ordinary QUIC must not be gu
   assert.equal(ui.dnsProtocolLabel(m.searches[1].dns_protocol, 6, 443), '', 'Cloudflare IP alone must not classify a web target as DoH');
   assert.equal(ui.dnsProtocolLabel(m.searches[2].dns_protocol, 6, 853), 'DoT');
   assert.equal(ui.dnsProtocolLabel(m.searches[3].dns_protocol, 17, 853), 'DoQ');
+  const live = ui.model({ snapshot: snap({ dns_services: [services[1]] }), knowledge: {
+    linked: true, dns_services: [{ protocol: 'doh', host: 'dns.google', port: 443,
+      state: 'direct_ok', resolved_ip: '8.8.8.8', dns_answer_confirmed: true,
+      plan_applied: true, applied_plan_id: '00112233445566778899aabbccddeeff' }], searches: []
+  } });
+  assert.equal(live.dnsServices.length, 1);
+  assert.equal(live.dnsServices[0].state, 'direct_ok', 'live autonomous DNS result wins over config-only snapshot');
+  assert.equal(live.dnsServices[0].resolved_ip, '8.8.8.8');
+  assert.equal(live.dnsServices[0].plan_applied, true);
+  assert.equal(live.dnsServices[0].applied_plan_id, '00112233445566778899aabbccddeeff');
 }
 
 // Подтверждение семейства не зависит от установки общего правила.

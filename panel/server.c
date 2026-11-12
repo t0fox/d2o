@@ -2,6 +2,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "server.h"
+#include "../runtime/d2k_dns_config.h"
 #include "../runtime/d2k_diagnostics_files.h"
 
 #include <arpa/inet.h>
@@ -1486,6 +1487,7 @@ typedef struct {
     char protocol[4];
     char host[256];
     char sni[256];
+    char path[D2K_DNS_PATH_MAX];
     unsigned port;
     const char *source;
 } panel_dns_service;
@@ -1529,7 +1531,7 @@ static int uci_value(const char *line, const char *verb, const char *key,
     return n != 0;
 }
 
-static int uci_dnsproxy_global(const char *line) {
+static int uci_dnsproxy_section(const char *line, const char *section) {
     char type[80], name[80];
     const char *p = skip_space(line);
     if (strncmp(p, "config", 6) || (p[6] != ' ' && p[6] != '\t')) return 0;
@@ -1540,61 +1542,17 @@ static int uci_dnsproxy_global(const char *line) {
         name[n - 1] = '\0';
         memmove(name, name + 1, n - 1);
     }
-    return strcmp(name, "global") == 0;
+    return strcmp(name, section) == 0;
 }
 
 static int dns_uri(const char *uri, panel_dns_service *out, const char *source) {
-    const char *sep = strstr(uri, "://"), *authority, *end, *host, *port_at = NULL;
-    unsigned port = 0;
-    size_t host_len;
-    if (!sep) return 0;
-    size_t scheme_len = (size_t)(sep - uri);
-    if (scheme_len == 5 && !strncmp(uri, "https", 5)) {
-        memcpy(out->protocol, "doh", 4); port = 443;
-    } else if (scheme_len == 3 && !strncmp(uri, "tls", 3)) {
-        memcpy(out->protocol, "dot", 4); port = 853;
-    } else if (scheme_len == 4 && !strncmp(uri, "quic", 4)) {
-        memcpy(out->protocol, "doq", 4); port = 853;
-    } else return 0;
-    authority = sep + 3;
-    end = strpbrk(authority, "/?#");
-    if (!end) end = authority + strlen(authority);
-    host = authority;
-    for (const char *p = authority; p < end; p++) if (*p == '@') host = p + 1;
-    if (host >= end) return 0;
-    if (*host == '[') {
-        const char *close = memchr(host + 1, ']', (size_t)(end - host - 1));
-        if (!close) return 0;
-        host++;
-        host_len = (size_t)(close - host);
-        if (close + 1 < end) {
-            if (close[1] != ':') return 0;
-            port_at = close + 2;
-        }
-    } else {
-        const char *colon = NULL;
-        for (const char *p = host; p < end; p++) if (*p == ':') {
-            if (colon) return 0; /* IPv6 literals must use brackets. */
-            colon = p;
-        }
-        host_len = (size_t)((colon ? colon : end) - host);
-        if (colon) port_at = colon + 1;
-    }
-    if (!host_len || host_len >= sizeof out->host) return 0;
-    if (port_at) {
-        char *tail = NULL;
-        unsigned long v = strtoul(port_at, &tail, 10);
-        if (tail == port_at || tail != end || !v || v > 65535) return 0;
-        port = (unsigned)v;
-    }
-    for (size_t i = 0; i < host_len; i++) {
-        unsigned char c = (unsigned char)host[i];
-        if (!(isalnum(c) || c == '.' || c == '-' || c == ':' || c == '%')) return 0;
-        out->host[i] = (char)tolower(c);
-    }
-    out->host[host_len] = '\0';
-    memcpy(out->sni, out->host, host_len + 1);
-    out->port = port;
+    d2k_dns_service parsed;
+    if (!d2k_dns_uri_parse(uri, source, &parsed)) return 0;
+    memcpy(out->protocol, parsed.protocol, sizeof out->protocol);
+    memcpy(out->host, parsed.host, sizeof out->host);
+    memcpy(out->sni, parsed.sni, sizeof out->sni);
+    memcpy(out->path, parsed.path, sizeof out->path);
+    out->port = parsed.port;
     out->source = source;
     return 1;
 }
@@ -1616,7 +1574,8 @@ static void dns_service_add_candidate(panel_dns_service *items, size_t *count,
     if (*count >= PANEL_DNS_SERVICE_MAX || !candidate->host[0] || !candidate->port) return;
     for (size_t i = 0; i < *count; i++) {
         if (!strcmp(items[i].protocol, candidate->protocol) &&
-            !strcmp(items[i].host, candidate->host) && items[i].port == candidate->port) return;
+            !strcmp(items[i].host, candidate->host) && items[i].port == candidate->port &&
+            !strcmp(items[i].sni, candidate->sni) && !strcmp(items[i].path, candidate->path)) return;
     }
     items[(*count)++] = *candidate;
 }
@@ -1688,7 +1647,7 @@ static void dns_services_add_keenetic(const char *status,
         if (!strcmp(p, "proxy-https:")) { DNS_FLUSH_KEENETIC(); section = DNS_SECTION_HTTPS; server = DNS_SERVER_NONE; continue; }
         if (!strcmp(p, "proxy-tls-filters:") || !strcmp(p, "proxy-https-filters:")) { DNS_FLUSH_KEENETIC(); section = DNS_SECTION_NONE; server = DNS_SERVER_NONE; continue; }
         if (!strcmp(p, "server-tls:") && section == DNS_SECTION_TLS) {
-            DNS_FLUSH_KEENETIC(); memcpy(current.protocol, "dot", 4); current.port = 853; current.source = "keenetic-system"; server = DNS_SERVER_TLS; continue;
+            DNS_FLUSH_KEENETIC(); memcpy(current.protocol, "dot", 4); current.port = 853; memcpy(current.path, "/", 2); current.source = "keenetic-system"; server = DNS_SERVER_TLS; continue;
         }
         if (!strcmp(p, "server-https:") && section == DNS_SECTION_HTTPS) {
             DNS_FLUSH_KEENETIC(); memcpy(current.protocol, "doh", 4); current.port = 443; current.source = "keenetic-system"; server = DNS_SERVER_HTTPS; continue;
@@ -1726,9 +1685,10 @@ static int dns_services_write(panel_dns_service *items, size_t count,
     out[0] = '['; out[1] = '\0';
     for (size_t i = 0; i < count; i++) {
         int n = snprintf(out + used, out_cap - used,
-            "%s{\"protocol\":\"%s\",\"host\":\"%s\",\"port\":%u,\"sni\":\"%s\",\"source\":\"%s\",\"state\":\"detected\",\"status_reason\":\"Настройка обнаружена; проверка DNS-ответа ещё не выполнялась.\"}",
+            "%s{\"protocol\":\"%s\",\"host\":\"%s\",\"port\":%u,\"sni\":\"%s\",\"path\":\"%.*s\",\"source\":\"%s\",\"state\":\"detected\",\"status_reason\":\"Настройка обнаружена; проверка DNS-ответа ещё не выполнялась.\"}",
             i ? "," : "", items[i].protocol, items[i].host, items[i].port,
-            items[i].sni, items[i].source ? items[i].source : "");
+            items[i].sni, (int)strcspn(items[i].path, "?"), items[i].path,
+            items[i].source ? items[i].source : "");
         if (n < 0 || (size_t)n >= out_cap - used) { out[0] = '\0'; return -1; }
         used += (size_t)n;
     }
@@ -1744,7 +1704,7 @@ static int read_uci_dns_services(const char *path, const char *source,
     FILE *f;
     struct stat st;
     char line[2048], value[1024];
-    int enabled = !require_enabled, global = 0;
+    int enabled = !require_enabled, global = 0, servers = !require_enabled;
     if (!path || !(f = fopen(path, "r"))) return 0;
     if (fstat(fileno(f), &st) == 0 && (st.st_size < 0 || (uint64_t)st.st_size > PANEL_DNS_CONFIG_MAX)) {
         fclose(f);
@@ -1754,7 +1714,7 @@ static int read_uci_dns_services(const char *path, const char *source,
         while (fgets(line, sizeof line, f)) {
             const char *p = skip_space(line);
             if (!strncmp(p, "config", 6) && (p[6] == ' ' || p[6] == '\t'))
-                global = uci_dnsproxy_global(line);
+                global = uci_dnsproxy_section(line, "global");
             else if (global && uci_value(line, "option", "enabled", value, sizeof value) &&
                      !strcmp(value, "1")) enabled = 1;
         }
@@ -1762,6 +1722,14 @@ static int read_uci_dns_services(const char *path, const char *source,
         rewind(f);
     }
     while (fgets(line, sizeof line, f)) {
+        if (require_enabled) {
+            const char *p = skip_space(line);
+            if (!strncmp(p, "config", 6) && (p[6] == ' ' || p[6] == '\t')) {
+                servers = uci_dnsproxy_section(line, "servers");
+                continue;
+            }
+        }
+        if (!servers) continue;
         if (uci_value(line, verb, key, value, sizeof value))
             dns_service_add(items, count, value, source);
     }
@@ -1876,17 +1844,21 @@ static const char *doqd_source(void) {
 
 static void buf_live_knowledge(panel_buf *b, const char *json, size_t len,
                                int effective_linked, int slim) {
-    struct replacement { size_t offset, len; const char *text; } parts[3];
-    const char *keys[] = { "linked", "boxes", "groups" };
+    struct replacement { size_t offset, len; const char *text; size_t text_len; } parts[4];
+    const char *keys[] = { "linked", "boxes", "groups", "dns_services" };
     size_t count = 0;
-    for (size_t k = 0; k < 3; ++k) {
-        if (k && !slim) continue;
+    for (size_t k = 0; k < 4; ++k) {
+        if ((k == 1 || k == 2) && !slim) continue;
+        if (k == 3 && !effective_linked) continue;
         const char *value = NULL; size_t value_len = 0;
         if (!json_top_value(json, keys[k], &value, &value_len) ||
             value < json || (size_t)(value - json) > len ||
             value_len > len - (size_t)(value - json)) continue;
-        struct replacement part = { (size_t)(value - json), value_len,
-                                     k ? "null" : (effective_linked ? "true" : "false") };
+        const char *text = k == 0 ? (effective_linked ? "true" : "false") :
+                           (k == 3 ? value : "null");
+        size_t text_len = k == 0 ? (effective_linked ? 4u : 5u) :
+                          (k == 3 ? value_len : 4u);
+        struct replacement part = { (size_t)(value - json), value_len, text, text_len };
         size_t i = count++;
         while (i && parts[i - 1].offset > part.offset) { parts[i] = parts[i - 1]; --i; }
         parts[i] = part;
@@ -1894,7 +1866,7 @@ static void buf_live_knowledge(panel_buf *b, const char *json, size_t len,
     size_t offset = 0;
     for (size_t i = 0; i < count; ++i) {
         buf_add(b, json + offset, parts[i].offset - offset);
-        buf_puts(b, parts[i].text);
+        buf_add(b, parts[i].text, parts[i].text_len);
         offset = parts[i].offset + parts[i].len;
     }
     buf_add(b, json + offset, len - offset);
@@ -1912,7 +1884,8 @@ static void append_stage(panel_buf *b, const char *key, const char *title,
 
 static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
                             int linked, int have_catalog, int live_fresh,
-                            int engine_running, int controller_running) {
+                            int engine_running, int controller_running,
+                            const char *live_json) {
     time_t now = time(NULL);
     struct tm tmv;
     char now_iso[32], started_iso[32];
@@ -2002,7 +1975,11 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
         append_stage(b, "traffic", "Наблюдаемый трафик", 0,
                      "Нечем: контроллер не подключён к датапату. Это не «ноль соединений», а отсутствие измерения.", 1);
     }
-    buf_puts(b, "],\"dns_services\":"); buf_puts(b, dns_services);
+    buf_puts(b, "],\"dns_services\":");
+    const char *live_dns = NULL; size_t live_dns_len = 0;
+    if (linked && live_json && json_top_value(live_json, "dns_services", &live_dns, &live_dns_len))
+        buf_add(b, live_dns, live_dns_len);
+    else buf_puts(b, dns_services);
     buf_puts(b, "}");
 }
 
@@ -2029,7 +2006,7 @@ static int api_status(int fd, const d2k_panel_config *cfg, const char *query) {
                      engine_running && controller_running;
         int have_catalog = json_top_nonempty_string(live, "catalog_at");
         append_snapshot(&b, cfg, linked, have_catalog, live_fresh,
-                        engine_running, controller_running);
+                        engine_running, controller_running, linked ? live : NULL);
         buf_puts(&b, ",\"knowledge\":");
         char revision[17];
         int have_revision = catalog_revision(live, revision);
@@ -2059,7 +2036,7 @@ static int api_status(int fd, const d2k_panel_config *cfg, const char *query) {
     panel_buf b = { .p = body, .len = 0, .cap = cap, .failed = 0 };
     buf_puts(&b, "{\"snapshot\":");
     append_snapshot(&b, cfg, 0, 0, 0, engine_pid_running(cfg, NULL),
-                    controller_pid_running(cfg));
+                    controller_pid_running(cfg), NULL);
     buf_puts(&b, ",\"knowledge\":");
     buf_puts(&b, unavailable_knowledge);
     buf_puts(&b, "}");
