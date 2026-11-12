@@ -18,7 +18,6 @@ PROTO=
 HOST=
 IP=
 PATH_=/dns-query
-PORT=
 LISTEN=
 APPLY=0
 ROLLBACK=0
@@ -27,7 +26,7 @@ BACKUP=/etc/d2k/dns-backup
 usage() {
     cat >&2 <<'EOF'
 d2k-dns-apply.sh --proto doh|dot|doq|plain --host H [--ip IP] [--path P]
-                 [--port N] [--listen N] [--apply] [--rollback]
+                 [--listen N] [--apply] [--rollback]
 EOF
     exit 2
 }
@@ -38,7 +37,6 @@ while [ $# -gt 0 ]; do
     --host) HOST=${2:-}; shift 2 ;;
     --ip) IP=${2:-}; shift 2 ;;
     --path) PATH_=${2:-}; shift 2 ;;
-    --port) PORT=${2:-}; shift 2 ;;
     --listen) LISTEN=${2:-}; shift 2 ;;
     --apply) APPLY=1; shift ;;
     --rollback) ROLLBACK=1; shift ;;
