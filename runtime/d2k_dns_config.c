@@ -370,9 +370,10 @@ static void read_https(const char *path, d2k_dns_service *items, size_t cap, siz
             enabled = 1; n_urls = 0; bootstrap_dns[0] = '\0';
         } else if (in_section) {
             if (uci_value(line, "option", "enabled", value, sizeof value)) enabled = strcmp(value, "0") != 0;
-            else if (uci_value(line, "option", "bootstrap_dns", value, sizeof value) &&
-                     strlen(value) < sizeof bootstrap_dns)
-                snprintf(bootstrap_dns, sizeof bootstrap_dns, "%s", value);
+            else if (uci_value(line, "option", "bootstrap_dns", value, sizeof value)) {
+                size_t len = strlen(value);
+                if (len < sizeof bootstrap_dns) memcpy(bootstrap_dns, value, len + 1);
+            }
             else if (n_urls < sizeof urls / sizeof urls[0] &&
                      uci_value(line, "option", "resolver_url", value, sizeof value))
                 snprintf(urls[n_urls++], sizeof urls[0], "%s", value);
