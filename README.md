@@ -224,25 +224,20 @@ Cloudflare Proxy идёт первым. Worker обслуживает трафи
 
 ### Cloudflare Worker для Telegram
 
-Если Telegram и медиа уже работают через стандартный [Worker Flowseal](https://github.com/Flowseal/tg-ws-proxy/blob/main/docs/EN/CfWorker.md),
-оставьте его как есть. D2O использует прежний `/apiws` на TCP 443.
-**Worker D2O нужен для потоков, которым обязательно требуется TCP 5222.**
-Если Worker не подтвердил открытие 5222, D2O покажет причину в панели.
+Работающий [Worker Flowseal](https://github.com/Flowseal/tg-ws-proxy/blob/main/docs/EN/CfWorker.md)
+можно оставить для сообщений и медиа на TCP 443. Для соединений, которым
+требуется TCP 5222, разверните отдельный [Worker D2O](telegram/cloudflare/worker.js).
 
-1. В Cloudflare откройте **Workers & Pages → Create application**, создайте
-   отдельный **Worker** и откройте **Edit code**.
-2. Вставьте целиком [telegram/cloudflare/worker.js](telegram/cloudflare/worker.js)
-   и нажмите **Deploy**. В релизе тот же файл и инструкция лежат в
-   `d2k-telegram-worker.tar.gz`.
-3. Для 5222 добавьте в **Settings → Variables and Secrets** текстовую
-   переменную `D2O_TG_5222_TARGETS`. Укажите через запятую точные IP нужных DC из
-   подтверждённой карты `/opt/d2k/state/telegram-dc-map.json`, сверив порт 5222.
-   IPv6 указывайте без квадратных скобок. Примените изменения Worker.
-4. Скопируйте hostname вида `my-worker.account.workers.dev`.
-   В панели D2O откройте **Telegram → Мои Workers**, вставьте домен без
+1. В Cloudflare откройте **Workers & Pages**, создайте Worker, вставьте
+   `worker.js` в **Edit code** и нажмите **Deploy**.
+2. Для 5222 получите IP из подтверждённой карты DC на роутере и добавьте их
+   в текстовую переменную `D2O_TG_5222_TARGETS` в Cloudflare.
+3. В **Telegram → Мои Workers** укажите hostname `workers.dev` без
    `https://` и пути, затем нажмите **Добавить домен → Сохранить**.
 
-[Подробности проверки 443 и 5222](telegram/cloudflare/README.md).
+[Полный гайд](telegram/cloudflare/README.md) объясняет, как подключиться
+по SSH с Windows, Linux и macOS, получить список IP без Python и jq,
+развернуть Worker и проверить текст, фото, видео и маршруты.
 
 ## Discord voice
 
