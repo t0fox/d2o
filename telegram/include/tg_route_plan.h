@@ -30,6 +30,8 @@ uint32_t tg_route_websocket_dc(uint32_t dc_id);
 int tg_route_cf_proxy_hostname(uint32_t dc_id, int media_variant,
                                const char *domain, char *hostname,
                                size_t hostname_size);
+int tg_route_plan_build_cloudflare(int is_media, size_t worker_count,
+                                   size_t cf_domain_count, tg_route_plan *out);
 int tg_route_plan_build(uint32_t dc_id, int is_media,
                         tg_ws_routing_policy policy, int prefer_cf,
                         size_t worker_count, size_t cf_domain_count,

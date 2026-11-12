@@ -205,21 +205,44 @@ tail -n 100 /opt/d2k/log/update.log
 В d2o работает **`d2ktg` на C11**, а не Rust-прокси r2o. Он прозрачно принимает подходящие соединения Telegram через локальные правила и выбирает маршрут для Telegram DC1–DC5. Ручная настройка MTProxy в приложении обычно не требуется.
 
 1. Правила перенаправляют подходящий TCP-трафик на локальный listener; исходный адрес помогает определить DC.
-2. Прокси сверяет адрес и MTProto-рукопожатие, затем проверяет WSS-маршруты Telegram и предусмотренные Cloudflare Worker/CF-резервы.
+2. Прокси сверяет адрес и MTProto-рукопожатие, затем выбирает Cloudflare Proxy или Cloudflare Worker.
 3. Подтверждённые маршруты могут повторно использоваться; для отказов учитываются причина, задержка и cooldown.
 4. Прокси передаёт MTProto в обе стороны. Успешный HTTP 101 или доступный TCP-порт сам по себе не считается успешным MTProto-обменом.
 
-После отказа WSS прокси может подключиться напрямую к исходному IP и порту. `TG_TCP_FALLBACK_TIMEOUT` задаёт таймаут TCP-подключения в секундах (по умолчанию 10, значение 0 отключает резерв для WSS-маршрутов). Потоки, для которых разрешён только TCP, пересылаются к исходному назначению. Для резерва могут понадобиться доступные Cloudflare-адреса. **Состояние локального listener не доказывает, что Telegram или медиа работают в текущей сети.**
+Cloudflare Proxy идёт первым. Worker обслуживает трафик при задержке или
+отказе Proxy. Карта DC обновляется через Cloudflare с сохранением последней
+подтверждённой версии при сбое. Прежние ограничения `TG_ROUTE_ONLY=direct`
+и `TG_ROUTE_ONLY=tcp` читаются как `auto`.
 
-Диагностика DC, MTProto и WSS:
+Проверка получения карты DC через настроенный Cloudflare без записи результата:
 
 ```sh
-/opt/sbin/d2ktg --check-telegram-dc-matrix
-/opt/sbin/d2ktg --discover-telegram-dc-matrix
-/opt/sbin/d2ktg --check-telegram-wss-matrix
+/opt/sbin/d2ktg --check-telegram-dc-map /opt/d2k/config
 ```
 
-Результаты включают фазу отказа и могут зависеть от состояния сети. Описание портирования, проверок и известных ограничений — [матрица Telegram C11](docs/telegram-c11-port-matrix.md).
+Описание портирования, проверок и известных ограничений — [матрица Telegram C11](docs/telegram-c11-port-matrix.md).
+
+### Cloudflare Worker для Telegram
+
+Если Telegram и медиа уже работают через стандартный [Worker Flowseal](https://github.com/Flowseal/tg-ws-proxy/blob/main/docs/EN/CfWorker.md),
+оставьте его как есть. D2O использует прежний `/apiws` на TCP 443.
+**Worker D2O нужен для потоков, которым обязательно требуется TCP 5222.**
+Если Worker не подтвердил открытие 5222, D2O покажет причину в панели.
+
+1. В Cloudflare откройте **Workers & Pages → Create application**, создайте
+   отдельный **Worker** и откройте **Edit code**.
+2. Вставьте целиком [telegram/cloudflare/worker.js](telegram/cloudflare/worker.js)
+   и нажмите **Deploy**. В релизе тот же файл и инструкция лежат в
+   `d2k-telegram-worker.tar.gz`.
+3. Для 5222 добавьте в **Settings → Variables and Secrets** текстовую
+   переменную `D2O_TG_5222_TARGETS`. Укажите через запятую точные IP нужных DC из
+   подтверждённой карты `/opt/d2k/state/telegram-dc-map.json`, сверив порт 5222.
+   IPv6 указывайте без квадратных скобок. Примените изменения Worker.
+4. Скопируйте hostname вида `my-worker.account.workers.dev`.
+   В панели D2O откройте **Telegram → Мои Workers**, вставьте домен без
+   `https://` и пути, затем нажмите **Добавить домен → Сохранить**.
+
+[Подробности проверки 443 и 5222](telegram/cloudflare/README.md).
 
 ## Discord voice
 

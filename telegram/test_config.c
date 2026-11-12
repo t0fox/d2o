@@ -127,6 +127,15 @@ static void test_local_route_options_are_bounded_and_normalized(void) {
     fputs("TG_ROUTE_ONLY=unknown\n", file);
     assert(fclose(file) == 0);
     assert(tg_config_read(path, &config) != 0);
+    const char *legacy_locks[] = {"direct", "tcp"};
+    for (size_t i = 0; i < sizeof(legacy_locks) / sizeof(legacy_locks[0]); ++i) {
+        file = fopen(path, "w");
+        assert(file);
+        assert(fprintf(file, "TG_ROUTE_ONLY=%s\n", legacy_locks[i]) > 0);
+        assert(fclose(file) == 0);
+        assert(tg_config_read(path, &config) == 0);
+        assert(config.route_only == TG_ROUTE_ONLY_AUTO);
+    }
     unlink(path);
 }
 

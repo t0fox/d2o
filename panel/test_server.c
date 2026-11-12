@@ -475,7 +475,7 @@ static void test_telegram_route_only_is_validated_and_restarts_c11(void) {
     char marker[] = "/tmp/d2k-panel-route-marker.XXXXXX";
     write_temp_file(config, "MODE=apply\nTG_ENABLED=1\nTG_MODE=local\n"
                            "TG_CF_WORKER_DOMAIN=worker.example\n"
-                           "TG_ROUTE_ONLY=auto\n# комментарий\n");
+                           "TG_ROUTE_ONLY=tcp\n# комментарий\n");
     write_temp_file(marker, "");
     char service_script[512];
     int script_len = snprintf(service_script, sizeof service_script,
@@ -517,7 +517,7 @@ static void test_telegram_route_only_is_validated_and_restarts_c11(void) {
     fclose(f);
     assert(strcmp(action, "telegram-restart\n") == 0);
 
-    const char *invalid = "{\"route\":\"bogus\"}";
+    const char *invalid = "{\"route\":\"direct\"}";
     req_len = snprintf(req, sizeof req,
         "POST /api/telegram/route HTTP/1.1\r\nHost: localhost\r\n"
         "Origin: http://localhost\r\nContent-Type: application/json\r\n"

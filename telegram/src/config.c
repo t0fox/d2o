@@ -251,10 +251,10 @@ int tg_config_read(const char *path,tg_config *out) {
             if(parse_bounded_uint(value,128,&out->connection_limit)!=0||!out->connection_limit)goto done;
         } else if(bit==K_ROUTE_ONLY) {
             if(strcmp(value,"auto")==0)out->route_only=TG_ROUTE_ONLY_AUTO;
-            else if(strcmp(value,"direct")==0)out->route_only=TG_ROUTE_ONLY_DIRECT;
+            else if(strcmp(value,"direct")==0 || strcmp(value,"tcp")==0)
+                out->route_only=TG_ROUTE_ONLY_AUTO; /* Migrate saved route locks. */
             else if(strcmp(value,"worker")==0)out->route_only=TG_ROUTE_ONLY_WORKER;
             else if(strcmp(value,"cf-proxy")==0)out->route_only=TG_ROUTE_ONLY_CF_PROXY;
-            else if(strcmp(value,"tcp")==0)out->route_only=TG_ROUTE_ONLY_TCP;
             else goto done;
         } else if(!*value||copy_value(dst,cap,value)!=0)goto done;
         if(bit==K_STATUS)have_status=1;

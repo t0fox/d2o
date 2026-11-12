@@ -122,6 +122,8 @@ typedef struct {
     const char *expected_sni;
     const char *expected_path;
     int expect_binary_subprotocol;
+    const char *required_subprotocol;
+    int omit_subprotocol;
     int expect_no_browser_headers;
     int expect_ping_after_handshake;
     int arbitrary_response;
@@ -496,7 +498,12 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
         "GET %s HTTP/1.1\r\n", expected_path);
     assert(expected_request_len > 0 && (size_t)expected_request_len < sizeof(expected_request));
     assert(strncmp(request, expected_request, (size_t)expected_request_len) == 0);
-    if (expect_binary_subprotocol)
+    if (fixture->required_subprotocol) {
+        char header[128];
+        assert(snprintf(header, sizeof(header), "Sec-WebSocket-Protocol: %s\r\n",
+                        fixture->required_subprotocol) > 0);
+        assert(strstr(request, header));
+    } else if (expect_binary_subprotocol)
         assert(strstr(request, "Sec-WebSocket-Protocol: binary\r\n"));
     else
         assert(!strstr(request, "Sec-WebSocket-Protocol:"));
@@ -520,17 +527,27 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
     assert(EVP_EncodeBlock((unsigned char *)accept_value, digest,
                            (int)sizeof(digest)) == 28);
     accept_value[28] = '\0';
+    const char *protocol = fixture->omit_subprotocol ? NULL :
+        fixture->required_subprotocol ? fixture->required_subprotocol :
+        expect_binary_subprotocol ? "binary" : NULL;
     int response_len = snprintf(response, sizeof(response),
-        expect_binary_subprotocol
-        ? "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-          "Connection: Upgrade\r\nSec-WebSocket-Protocol: binary\r\n"
-          "Sec-WebSocket-Accept: %s\r\n\r\n"
-        : "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-          "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
-        accept_value);
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n%s%s%s\r\n",
+        accept_value, protocol ? "Sec-WebSocket-Protocol: " : "",
+        protocol ? protocol : "", protocol ? "\r\n" : "");
     assert(response_len > 0 && (size_t)response_len < sizeof(response));
     assert(ssl_write_exact(ssl, (const uint8_t *)response,
                            (size_t)response_len) == 0);
+    if (fixture->omit_subprotocol) {
+        uint8_t unexpected;
+        int rc = SSL_read(ssl, &unexpected, 1);
+        assert(rc <= 0 && SSL_get_error(ssl, rc) != SSL_ERROR_WANT_READ);
+        atomic_store(&fixture->complete, 1);
+        SSL_free(ssl);
+        close(fd);
+        SSL_CTX_free(context);
+        return;
+    }
 
     uint8_t payload[TG_MTPROTO_HANDSHAKE_LEN + 32u], opcode;
     size_t payload_len = 0;
@@ -1313,7 +1330,7 @@ static void test_route_dns_failure_skips_worker(void) {
     SSL_CTX_free(tls_context);
 }
 
-static void test_all_routes_unavailable_fail_closed(void) {
+static void test_all_routes_unavailable_fail_closed(int cloudflare_only) {
     uint16_t listen_port, closed_port;
     int listener = create_listener(&listen_port);
     int closed_listener = create_listener(&closed_port);
@@ -1325,6 +1342,7 @@ static void test_all_routes_unavailable_fail_closed(void) {
     set_ipv4(&fixture.upstream, "127.0.0.1", closed_port);
     SSL_CTX *tls_context = SSL_CTX_new(TLS_client_method());
     assert(tls_context);
+    const tg_config legacy = {.diagnostic_direct_tcp = 1, .tcp_fallback_timeout_secs = 10};
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
@@ -1333,6 +1351,8 @@ static void test_all_routes_unavailable_fail_closed(void) {
         .handshake_timeout_ms = 1000,
         .idle_timeout_ms = 5000,
         .enable_direct_wss = 1,
+        .cloudflare_only = cloudflare_only,
+        .routing_config = cloudflare_only ? &legacy : NULL,
         .tls_context = tls_context,
         .original_destination = original_destination,
         .select_target = select_target,
@@ -1358,13 +1378,17 @@ static void test_all_routes_unavailable_fail_closed(void) {
     assert(fixture.routes == 1);
     tg_epoll_proxy_stats stats;
     assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
-    assert(stats.wss_attempts == 2 && stats.wss_failures == 2 &&
-           stats.active_connections == 0);
-    assert(counted_connect_attempts == 2);
+    assert(stats.active_connections == 0 && stats.last_failure_dc == 4);
+    if (cloudflare_only) {
+        assert(counted_connect_attempts == 0 && stats.wss_attempts == 0);
+        assert(stats.last_failure_stage == TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE);
+    } else {
+        assert(counted_connect_attempts == 2);
+        assert(stats.wss_attempts == 2 && stats.wss_failures == 2);
+        assert(stats.last_failure_route == TG_ROUTE_DIRECT_WSS &&
+               stats.last_failure_stage == TG_EPOLL_FAILURE_TCP);
+    }
     counted_connect_port = 0;
-    assert(stats.last_failure_dc == 4 &&
-           stats.last_failure_route == TG_ROUTE_DIRECT_WSS &&
-           stats.last_failure_stage == TG_EPOLL_FAILURE_TCP);
     tg_epoll_proxy_destroy(proxy);
     close(listener);
     SSL_CTX_free(tls_context);
@@ -1861,8 +1885,10 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     atomic_store(&runner.stop, 1);
     assert(pthread_join(proxy_thread, NULL) == 0);
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
-    assert(route_stats.wss_attempts == (adaptive ? 2u : 1u) &&
-           route_stats.wss_responses == 1);
+    /* A slow test runner may launch the second direct candidate before
+     * the first TLS handshake finishes. Only one route can carry payload. */
+    assert(route_stats.wss_attempts >= (adaptive ? 2u : 1u) &&
+           route_stats.wss_attempts <= 2u && route_stats.wss_responses == 1);
     hold_pending_connect = 0;
     pending_connect_fd = -1;
     tg_epoll_proxy_destroy(proxy);
@@ -2071,7 +2097,28 @@ static void test_epoll_wss_partial_response_does_not_replay_request(void) {
     assert(rmdir(directory) == 0);
 }
 
-static void test_epoll_cf_worker_uses_raw_stream_framing(void) {
+static int select_raw_worker_endpoint(
+    void *opaque, const tg_listener_destination *original,
+    const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
+    tg_epoll_route_selection *selection) {
+    proxy_fixture *fixture = opaque;
+    tg_mtproto_init parsed;
+    ++fixture->routes;
+    if ((original->port != 443 && original->port != 5222) ||
+        tg_mtproto_parse_obfuscated2(handshake, &parsed) != 0)
+        return -1;
+    selection->dc_id = parsed.dc_id;
+    selection->is_media = parsed.is_media;
+    selection->tcp_only = 1;
+    selection->proto = parsed.proto;
+    selection->upstream = fixture->upstream;
+    return 0;
+}
+
+static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
+                                                        int legacy_worker,
+                                                        int slow_proxy, uint32_t dc,
+                                                        const char *dc_address) {
     char directory[] = "/tmp/d2k-tg-worker-XXXXXX";
     char cert_path[256], key_path[256];
     assert(mkdtemp(directory) != NULL);
@@ -2089,22 +2136,33 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(void) {
     EVP_PKEY_free(key);
 
     uint16_t ws_port, proxy_port;
+    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN];
+    make_wss_test_handshake(TG_MTPROTO_INTERMEDIATE, dc, 1, handshake);
+    char path[128];
+    int path_len = snprintf(path, sizeof(path), "%s?dst=%s&dc=%u&media=1",
+        raw_port == 5222 ? "/d2o/apiws/5222" : "/apiws",
+        raw_port ? "149.154.167.51" : dc_address, dc);
+    assert(path_len > 0 && (size_t)path_len < sizeof(path));
     wss_server_fixture worker = {
         .listener = create_listener(&ws_port),
         .cert_path = cert_path,
         .key_path = key_path,
         .expected_sni = "worker.test",
-        .expected_path = "/apiws?dst=149.154.167.91&dc=4&media=1",
+        .expected_path = path,
+        .required_subprotocol = raw_port == 5222 ? "d2o-tcp-5222-v1" : NULL,
+        .omit_subprotocol = legacy_worker,
         .expect_binary_subprotocol = 0,
         .expect_no_browser_headers = 1
     };
     atomic_init(&worker.complete, 0);
-    prepare_wss_response(&worker, test_handshake, TG_MTPROTO_INTERMEDIATE);
+    memcpy(worker.handshake, handshake, sizeof(handshake));
+    worker.handshake_len = sizeof(handshake);
+    prepare_wss_response(&worker, handshake, TG_MTPROTO_INTERMEDIATE);
     const uint8_t clear_packet[12] = {8,0,0,0,0x11,0x22,0x33,0x44,
                                       0x55,0x66,0x77,0x88};
     tg_mtproto_ctr decrypt = {0}, encrypt = {0};
     memcpy(worker.expected_packet, clear_packet, sizeof(clear_packet));
-    assert(tg_mtproto_direct_stream_ciphers(test_handshake, &decrypt,
+    assert(tg_mtproto_direct_stream_ciphers(handshake, &decrypt,
                                              &encrypt) == 0);
     assert(tg_mtproto_ctr_xor(&encrypt, worker.expected_packet,
                               sizeof(worker.expected_packet)) == 0);
@@ -2115,16 +2173,21 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(void) {
 
     int listener = create_listener(&proxy_port);
     proxy_fixture fixture = {0};
-    set_ipv4(&fixture.original, "149.154.167.51", 443);
+    set_ipv4(&fixture.original, "149.154.167.51", raw_port ? raw_port : 443);
     set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
     SSL_CTX *tls_context = tg_tls_client_context(cert_path);
     assert(tls_context);
     tg_config routing = {0};
-    routing.ws_routing = TG_WS_ROUTING_CF_FIRST;
+    uint16_t slow_port;
+    int slow_listener = slow_proxy ? create_listener(&slow_port) : -1;
+    routing.ws_routing = slow_proxy ? TG_WS_ROUTING_ADAPTIVE : TG_WS_ROUTING_CF_FIRST;
+    routing.ws_hedge_delay_ms = 25;
+    routing.ws_hedge_limit = 1;
     routing.cf_worker_domain_count = 1;
     memcpy(routing.cf_worker_domains[0], "worker.test", sizeof("worker.test"));
-    routing.cf_proxy_domain_count = 1;
-    memcpy(routing.cf_proxy_domains[0], "cfproxy.test", sizeof("cfproxy.test"));
+    routing.cf_proxy_domain_count = slow_proxy ? 1 : 0;
+    memcpy(routing.cf_proxy_domains[0], "cfproxy-b.test", sizeof("cfproxy-b.test"));
+    if (slow_proxy) set_ipv4(&fixture.cf_proxy_b_upstream, "127.0.0.1", slow_port);
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
@@ -2133,12 +2196,14 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(void) {
         .handshake_timeout_ms = 3000,
         .idle_timeout_ms = 5000,
         .enable_direct_wss = 1,
+        .cloudflare_only = 1,
         .tls_context = tls_context,
         .routing_config = &routing,
         .resolve_domain = resolve_test_route_domain,
         .route_context = &fixture,
         .original_destination = original_destination,
         .select_target = select_target,
+        .select_route = raw_port ? select_raw_worker_endpoint : NULL,
         .context = &fixture,
     };
     tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
@@ -2152,24 +2217,30 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(void) {
     struct timeval timeout = {.tv_sec = 5};
     assert(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                       sizeof(timeout)) == 0);
-    assert(send(client, test_handshake, sizeof(test_handshake), 0) ==
-           (ssize_t)sizeof(test_handshake));
+    assert(send(client, handshake, sizeof(handshake), 0) ==
+           (ssize_t)sizeof(handshake));
     assert(send(client, worker.expected_packet,
                 sizeof(worker.expected_packet), 0) ==
            (ssize_t)sizeof(worker.expected_packet));
     assert(shutdown(client, SHUT_WR) == 0);
-    uint8_t echoed[sizeof(worker.response_packet)];
-    size_t received = 0;
-    while (received < worker.response_packet_len) {
-        struct pollfd wait = {.fd = client, .events = POLLIN};
-        assert(poll(&wait, 1, 5000) > 0);
-        ssize_t n = recv(client, echoed + received,
-                         worker.response_packet_len - received, 0);
-        assert(n > 0);
-        received += (size_t)n;
+    if (legacy_worker) {
+        uint8_t unexpected;
+        ssize_t n = recv(client, &unexpected, 1, 0);
+        assert(n == 0 || (n < 0 && errno == ECONNRESET));
+    } else {
+        uint8_t echoed[sizeof(worker.response_packet)];
+        size_t received = 0;
+        while (received < worker.response_packet_len) {
+            struct pollfd wait = {.fd = client, .events = POLLIN};
+            assert(poll(&wait, 1, 5000) > 0);
+            ssize_t n = recv(client, echoed + received,
+                             worker.response_packet_len - received, 0);
+            assert(n > 0);
+            received += (size_t)n;
+        }
+        assert(memcmp(echoed, worker.response_packet,
+                      worker.response_packet_len) == 0);
     }
-    assert(memcmp(echoed, worker.response_packet,
-                  worker.response_packet_len) == 0);
     assert(pthread_join(worker_thread, NULL) == 0);
     assert(atomic_load(&worker.complete) == 1 && fixture.routes == 1);
     close(client);
@@ -2177,8 +2248,17 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(void) {
     assert(pthread_join(proxy_thread, NULL) == 0);
     tg_epoll_proxy_stats route_stats;
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
-    assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 1 &&
-           route_stats.cf_wss_responses == 1);
+    assert(route_stats.wss_attempts == (slow_proxy ? 2u : 1u));
+    if (legacy_worker) {
+        assert(route_stats.last_failure_route == TG_ROUTE_CF_WORKER);
+        assert(route_stats.last_failure_stage == TG_EPOLL_FAILURE_WORKER_PORT);
+    } else if (!raw_port) {
+        assert(route_stats.wss_responses == 1 && route_stats.cf_wss_responses == 1);
+    }
+    if (slow_proxy) {
+        assert(fixture.cf_proxy_b_resolve_calls == 1);
+        close(slow_listener);
+    }
     tg_epoll_proxy_destroy(proxy);
     close(listener);
     close(worker.listener);
@@ -3289,7 +3369,8 @@ int main(void) {
     test_invalid_handshake_fails_closed();
     test_client_disconnect_during_route_selection();
     test_route_dns_failure_skips_worker();
-    test_all_routes_unavailable_fail_closed();
+    test_all_routes_unavailable_fail_closed(0);
+    test_all_routes_unavailable_fail_closed(1);
     test_disabled_wss_does_not_enable_automatic_tcp();
     test_self_dial_target_is_rejected();
     test_epoll_wss_forwards_unrecognized_binary_response();
@@ -3301,7 +3382,17 @@ int main(void) {
         TG_MTPROTO_PADDED_INTERMEDIATE, 0);
     test_epoll_wss_partial_request_is_not_replayed();
     test_epoll_wss_partial_response_does_not_replay_request();
-    test_epoll_cf_worker_uses_raw_stream_framing();
+    static const struct { uint32_t dc; const char *address; } worker_dcs[] = {
+        {1, "149.154.175.50"}, {2, "149.154.167.51"}, {3, "149.154.175.100"},
+        {4, "149.154.167.91"}, {5, "149.154.171.5"}, {203, "91.105.192.100"}
+    };
+    for (size_t i = 0; i < sizeof(worker_dcs) / sizeof(worker_dcs[0]); ++i)
+        test_epoll_cf_worker_uses_raw_stream_framing(
+            0, 0, 0, worker_dcs[i].dc, worker_dcs[i].address);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 1, 4, "149.154.167.91");
+    test_epoll_cf_worker_uses_raw_stream_framing(443, 0, 0, 4, NULL);
+    test_epoll_cf_worker_uses_raw_stream_framing(5222, 0, 0, 4, NULL);
+    test_epoll_cf_worker_uses_raw_stream_framing(5222, 1, 0, 4, NULL);
     test_epoll_wss_sends_ping();
     test_async_route_dns_waits_before_worker();
     test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing();

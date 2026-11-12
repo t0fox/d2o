@@ -430,8 +430,7 @@ static void telegram_route_only_value(const d2k_panel_config *cfg,
             *--end = '\0';
             eq++;
         }
-        if (strcmp(eq, "direct") == 0 || strcmp(eq, "worker") == 0 ||
-            strcmp(eq, "cf-proxy") == 0 || strcmp(eq, "tcp") == 0)
+        if (strcmp(eq, "worker") == 0 || strcmp(eq, "cf-proxy") == 0)
             snprintf(out, 16, "%s", eq);
         else if (strcmp(eq, "auto") == 0)
             snprintf(out, 16, "auto");
@@ -1050,14 +1049,13 @@ static int api_telegram_route(int fd, const d2k_panel_config *cfg,
         !json_top_value(request_body, "route", &value, &value_len) ||
         value_len < 3 || value[0] != '"' || value[value_len - 1] != '"' ||
         value_len - 2 >= sizeof route) {
-        static const char body[] = "{\"ok\":false,\"message\":\"Укажите маршрут: auto, direct, worker, cf-proxy или tcp\"}";
+        static const char body[] = "{\"ok\":false,\"message\":\"Укажите маршрут: auto, worker или cf-proxy\"}";
         return response(fd, 400, "Bad Request", json_type, body, sizeof body - 1);
     }
     memcpy(route, value + 1, value_len - 2);
     route[value_len - 2] = '\0';
-    if (strcmp(route, "auto") != 0 && strcmp(route, "direct") != 0 &&
-        strcmp(route, "worker") != 0 && strcmp(route, "cf-proxy") != 0 &&
-        strcmp(route, "tcp") != 0) {
+    if (strcmp(route, "auto") != 0 && strcmp(route, "worker") != 0 &&
+        strcmp(route, "cf-proxy") != 0) {
         static const char body[] = "{\"ok\":false,\"message\":\"Неизвестный маршрут\"}";
         return response(fd, 400, "Bad Request", json_type, body, sizeof body - 1);
     }

@@ -20,7 +20,8 @@ typedef enum {
     TG_EPOLL_FAILURE_WEBSOCKET = 4,
     TG_EPOLL_FAILURE_MTPROTO = 5,
     TG_EPOLL_FAILURE_SETUP = 6,
-    TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE = 7
+    TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE = 7,
+    TG_EPOLL_FAILURE_WORKER_PORT = 8
 } tg_epoll_failure_stage;
 
 #define TG_EPOLL_MAX_ACTIVE_ROUTE_SESSIONS 64u
@@ -172,7 +173,8 @@ typedef struct {
     uint32_t socket_mark;
     int require_socket_mark;
     int enforce_self_dial;
-    int enable_direct_wss;
+    int enable_direct_wss; /* Enables the shared WSS transport. */
+    int cloudflare_only;
     uint16_t direct_wss_port;
     SSL_CTX *tls_context;
     const tg_config *routing_config;

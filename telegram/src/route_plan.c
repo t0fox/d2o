@@ -36,10 +36,13 @@ static int append_direct(tg_route_plan *plan, uint32_t dc_id, int is_media) {
            append_step(plan, TG_ROUTE_DIRECT_WSS, 1u - first) == 0 ? 0 : -1;
 }
 
-static int append_cloudflare(tg_route_plan *plan, size_t worker_count,
-                             size_t cf_domain_count, int is_media) {
+static int append_workers(tg_route_plan *plan, size_t worker_count) {
     for (size_t i = 0; i < worker_count; ++i)
         if (append_step(plan, TG_ROUTE_CF_WORKER, i) != 0) return -1;
+    return 0;
+}
+
+static int append_proxies(tg_route_plan *plan, size_t cf_domain_count, int is_media) {
     for (size_t i = 0; i < cf_domain_count; ++i) {
         /* Index encodes the base domain and its media (-1) variant. */
         if (is_media &&
@@ -49,6 +52,17 @@ static int append_cloudflare(tg_route_plan *plan, size_t worker_count,
             return -1;
     }
     return 0;
+}
+
+int tg_route_plan_build_cloudflare(int is_media, size_t worker_count,
+                                   size_t cf_domain_count, tg_route_plan *out) {
+    if (!out || (is_media != 0 && is_media != 1) ||
+        worker_count > TG_CONFIG_MAX_CF_WORKER_DOMAINS ||
+        cf_domain_count > TG_CF_POOL_MAX)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    if (append_proxies(out, cf_domain_count, is_media) != 0) return -1;
+    return append_workers(out, worker_count);
 }
 
 int tg_route_plan_build(uint32_t dc_id, int is_media,
@@ -70,12 +84,14 @@ int tg_route_plan_build(uint32_t dc_id, int is_media,
     int cf_first = policy == TG_WS_ROUTING_CF_FIRST ||
                    (policy == TG_WS_ROUTING_ADAPTIVE && prefer_cf);
     if (cf_first) {
-        if (append_cloudflare(out, worker_count, cf_domain_count, is_media) != 0 ||
+        if (append_workers(out, worker_count) != 0 ||
+            append_proxies(out, cf_domain_count, is_media) != 0 ||
             append_direct(out, dc_id, is_media) != 0)
             return -1;
     } else {
         if (append_direct(out, dc_id, is_media) != 0 ||
-            append_cloudflare(out, worker_count, cf_domain_count, is_media) != 0)
+            append_workers(out, worker_count) != 0 ||
+            append_proxies(out, cf_domain_count, is_media) != 0)
             return -1;
     }
     return diagnostic_direct_tcp

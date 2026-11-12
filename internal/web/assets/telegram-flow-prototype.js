@@ -11,10 +11,8 @@ const COLORS = {
   mute: [193, 189, 175], ink: [246, 243, 235], rule: [101, 100, 87], warn: [224, 176, 80],
 };
 const ROUTES = [
-  ["direct_wss", "Прямой WSS", 62, COLORS.ok],
-  ["cloudflare_worker", "Cloudflare Worker", 148, COLORS.sig],
-  ["cloudflare_proxy", "Прокси Cloudflare", 272, COLORS.sig],
-  ["tcp_passthrough", "Прямой TCP · диагностика", 358, COLORS.warn],
+  ["cloudflare_proxy", "Прокси Cloudflare", 148, COLORS.sig],
+  ["cloudflare_worker", "Cloudflare Worker", 272, COLORS.sig],
 ];
 const LANE_INDEX = new Map(ROUTES.map((route, index) => [route[0], index]));
 const GATE_BY_STAGE = { 1: 0, 2: 1, 3: 2, 4: 3, 5: 4 };
@@ -225,8 +223,8 @@ function mountTelegramFlow(canvas) {
         confirmed: Number(view.dcActivity[index]?.confirmed) || 0,
       }));
     if (snapshot && Number(snapshot.last_failure_stage) >= 1) {
-      const index = Number(snapshot.last_failure_route) - 1;
-      if (lanes[index]) {
+      const index = view.latestFailure?.lane;
+      if (lanes[index] && !lanes[index].failStage) {
         lanes[index].failStage = Number(snapshot.last_failure_stage) || lanes[index].failStage;
         lanes[index].failT = now - Math.max(0, Number(snapshot.last_failure_age_ms) || 0);
       }

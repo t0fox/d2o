@@ -180,6 +180,7 @@ struct proxy_connection {
     byte_queue to_client;
 };
 
+#define TG_WORKER_5222_SUBPROTOCOL "d2o-tcp-5222-v1"
 #define TG_WORKER_POOL_MAX 12u
 #define TG_WORKER_POOL_SLOTS 12u
 #define TG_WORKER_POOL_MAX_AGE_MS 80000u
@@ -212,6 +213,8 @@ typedef struct {
     uint32_t dcs[TG_WORKER_POOL_SLOTS];
     int media[TG_WORKER_POOL_SLOTS];
     char paths[TG_WORKER_POOL_SLOTS][512];
+    uint64_t host_retry_at;
+    unsigned host_failures;
     uint64_t retry_at[TG_WORKER_POOL_SLOTS];
     unsigned failures[TG_WORKER_POOL_SLOTS];
     size_t dc_count;
@@ -353,6 +356,14 @@ static uint8_t route_session_transport_for(const proxy_connection *connection,
     return TG_ROUTE_SESSION_TRANSPORT_NONE;
 }
 
+static uint8_t route_session_branch(const proxy_connection *connection,
+                                    uint8_t transport) {
+    if (connection->server->config.cloudflare_only)
+        return transport == TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_PROXY ? 0u : 1u;
+    return transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS ||
+           transport == TG_ROUTE_SESSION_TRANSPORT_TCP_PASSTHROUGH ? 0u : 1u;
+}
+
 static void route_session_append(tg_active_route_session *session,
                                  uint8_t branch, uint8_t transport,
                                  uint8_t state, uint8_t failure_stage) {
@@ -377,8 +388,7 @@ static void route_session_event(proxy_connection *connection,
     tg_active_route_session *session = &owner->route_session;
     uint8_t transport = route_session_transport_for(connection, kind);
     if (transport == TG_ROUTE_SESSION_TRANSPORT_NONE) return;
-    uint8_t branch = transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS ||
-        transport == TG_ROUTE_SESSION_TRANSPORT_TCP_PASSTHROUGH ? 0u : 1u;
+    uint8_t branch = route_session_branch(connection, transport);
     session->stage = TG_ROUTE_SESSION_STAGE_ROUTING;
     if (!branch) {
         session->direct_state = state;
@@ -398,8 +408,7 @@ static void route_session_selected(proxy_connection *connection,
     tg_active_route_session *session = &owner->route_session;
     uint8_t transport = route_session_transport_for(connection, kind);
     if (transport == TG_ROUTE_SESSION_TRANSPORT_NONE) return;
-    uint8_t branch = transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS ||
-        transport == TG_ROUTE_SESSION_TRANSPORT_TCP_PASSTHROUGH ? 0u : 1u;
+    uint8_t branch = route_session_branch(connection, transport);
     uint8_t *losing_state = branch ? &session->direct_state
                                    : &session->fallback_state;
     uint8_t losing_transport = branch ? session->direct_transport
@@ -875,7 +884,10 @@ static void route_health_failed(proxy_connection *connection) {
         stage = TG_EPOLL_FAILURE_TLS;
     } else if (connection->wss_phase == WSS_UPGRADE_WRITE ||
                connection->wss_phase == WSS_UPGRADE_READ) {
-        stage = TG_EPOLL_FAILURE_WEBSOCKET;
+        stage = connection->ws_upgrade.failed &&
+            connection->route_kind == TG_ROUTE_CF_WORKER &&
+            connection->route_tcp_only && connection->original.port == 5222
+            ? TG_EPOLL_FAILURE_WORKER_PORT : TG_EPOLL_FAILURE_WEBSOCKET;
     } else if (connection->wss_phase == WSS_READY) {
         stage = TG_EPOLL_FAILURE_MTPROTO;
     } else {
@@ -899,10 +911,15 @@ static int route_health_preferred_step(const tg_epoll_proxy *server,
     if (target->family != AF_INET && target->family != AF_INET6) return 0;
     size_t address_len = target->family == AF_INET ? 4u : 16u;
     const route_health *best = NULL;
+    int proxy_first = server->config.cloudflare_only && !connection->route_tcp_only &&
+        (!server->config.routing_config ||
+         server->config.routing_config->route_only != TG_ROUTE_ONLY_WORKER) &&
+        route_cf_domain_count(server) > 0;
     for (size_t i = 0; i < TG_ROUTE_HEALTH_MAX; ++i) {
         const route_health *health = &server->route_health[i];
         if (!health->used ||
             health->kind == TG_ROUTE_DIRECT_TCP ||
+            (proxy_first && health->kind != TG_ROUTE_CF_PROXY) ||
             health->dc_id != connection->route_dc_id ||
             health->is_media != connection->route_is_media ||
             !health->last_success_ms || now < health->last_success_ms ||
@@ -1133,8 +1150,13 @@ static int worker_path_for_dc(uint32_t dc, int is_media,
     return n > 0 && (size_t)n < path_size ? 0 : -1;
 }
 
+static int worker_requires_5222(const proxy_connection *connection) {
+    return connection->route_kind == TG_ROUTE_CF_WORKER &&
+           connection->route_tcp_only && connection->original.port == 5222;
+}
+
 static int set_worker_path(proxy_connection *connection) {
-    if (worker_path_for_dc(connection->route_dc_id,
+    if (!connection->route_tcp_only && worker_path_for_dc(connection->route_dc_id,
                            connection->route_is_media,
                            connection->wss_path,
                            sizeof(connection->wss_path)) == 0)
@@ -1144,7 +1166,8 @@ static int set_worker_path(proxy_connection *connection) {
                    connection->original.address, original,
                    sizeof(original))) return -1;
     int n = snprintf(connection->wss_path, sizeof(connection->wss_path),
-                     "/apiws?dst=%s&dc=%u&media=%d", original,
+                     "%s?dst=%s&dc=%u&media=%d",
+                     worker_requires_5222(connection) ? "/d2o/apiws/5222" : "/apiws", original,
                      connection->route_dc_id,
                      connection->route_is_media ? 1 : 0);
     return n > 0 && (size_t)n < sizeof(connection->wss_path) ? 0 : -1;
@@ -1173,8 +1196,8 @@ static int worker_pool_entry_alive(const worker_pool_entry *entry) {
     return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE;
 }
 
-static int worker_pool_connect_host(const char *domain, uint32_t socket_mark,
-                                    int require_socket_mark) {
+static int worker_pool_connect_host(worker_pool *pool, SSL **out_ssl) {
+    const char *domain = pool->domain;
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -1185,12 +1208,13 @@ static int worker_pool_connect_host(const char *domain, uint32_t socket_mark,
         return -1;
     }
     int fd = -1;
+    unsigned tls_failures = 0;
     for (struct addrinfo *it = result; it; it = it->ai_next) {
         fd = socket(it->ai_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (fd < 0) continue;
-        if (require_socket_mark) {
+        if (pool->require_socket_mark) {
 #ifdef SO_MARK
-            int mark = (int)socket_mark;
+            int mark = (int)pool->socket_mark;
             if (!mark || setsockopt(fd, SOL_SOCKET, SO_MARK, &mark,
                                     sizeof(mark)) != 0) {
                 close(fd); fd = -1; continue;
@@ -1222,41 +1246,47 @@ static int worker_pool_connect_host(const char *domain, uint32_t socket_mark,
         struct timeval timeout = { .tv_sec = 8 };
         (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        break;
+        *out_ssl = tg_tls_connect_fd_sni(pool->tls_context, fd, domain, domain);
+        if (*out_ssl) break;
+        close(fd);
+        fd = -1;
+        if (++tls_failures == 2) break;
     }
+    if (fd < 0)
+        fprintf(stderr, "worker pool: %s %s failed\n",
+                tls_failures ? "TLS" : "TCP", domain);
     freeaddrinfo(result);
     return fd;
 }
 
-static int worker_pool_connect(worker_pool *pool, uint32_t dc, int is_media,
-                               worker_pool_entry *out) {
+typedef enum {
+    WORKER_POOL_CONNECTED,
+    WORKER_POOL_HOST_FAILED,
+    WORKER_POOL_PATH_FAILED
+} worker_pool_connect_result;
+
+static worker_pool_connect_result worker_pool_connect(
+    worker_pool *pool, uint32_t dc, int is_media, worker_pool_entry *out) {
     const char *path = NULL;
     for (size_t i = 0; i < pool->dc_count; ++i)
         if (pool->dcs[i] == dc && pool->media[i] == is_media)
             path = pool->paths[i];
-    if (!path) return -1;
-    int fd = worker_pool_connect_host(pool->domain, pool->socket_mark,
-                                      pool->require_socket_mark);
-    if (fd < 0) return -1;
-    SSL *ssl = tg_tls_connect_fd_sni(pool->tls_context, fd, pool->domain,
-                                      pool->domain);
-    if (!ssl) {
-        fprintf(stderr, "worker pool: TLS %s failed\n", pool->domain);
-        close(fd);
-        return -1;
-    }
+    if (!path) return WORKER_POOL_PATH_FAILED;
+    SSL *ssl = NULL;
+    int fd = worker_pool_connect_host(pool, &ssl);
+    if (fd < 0) return WORKER_POOL_HOST_FAILED;
     if (tg_ws_upgrade(ssl, pool->domain, path) != 0) {
         fprintf(stderr, "worker pool: WS %s%s failed\n", pool->domain, path);
         SSL_free(ssl);
         close(fd);
-        return -1;
+        return WORKER_POOL_PATH_FAILED;
     }
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         fprintf(stderr, "worker pool: nonblocking %s failed\n", pool->domain);
         SSL_free(ssl);
         close(fd);
-        return -1;
+        return WORKER_POOL_PATH_FAILED;
     }
     memset(out, 0, sizeof(*out));
     out->fd = fd;
@@ -1266,7 +1296,13 @@ static int worker_pool_connect(worker_pool *pool, uint32_t dc, int is_media,
     out->created_ms = monotonic_ms();
     snprintf(out->hostname, sizeof(out->hostname), "%s", pool->domain);
     snprintf(out->path, sizeof(out->path), "%s", path);
-    return 0;
+    return WORKER_POOL_CONNECTED;
+}
+
+static uint64_t worker_pool_retry_delay(unsigned *failures) {
+    if (*failures < 7u) ++*failures;
+    uint64_t delay = UINT64_C(1000) << (*failures - 1u);
+    return delay > 60000u ? 60000u : delay;
 }
 
 static void *worker_pool_thread(void *opaque) {
@@ -1291,7 +1327,7 @@ static void *worker_pool_thread(void *opaque) {
                 ++i;
             }
         }
-        for (size_t i = 0; pool->count < pool->capacity &&
+        for (size_t i = 0; now >= pool->host_retry_at && pool->count < pool->capacity &&
                          i < pool->dc_count && !have_missing; ++i) {
             int found = 0;
             for (size_t j = 0; j < pool->count; ++j)
@@ -1319,15 +1355,21 @@ static void *worker_pool_thread(void *opaque) {
             worker_pool_entry_close(&stale[i]);
         if (!have_missing) continue;
         worker_pool_entry entry;
-        if (worker_pool_connect(pool, missing, missing_media, &entry) != 0) {
+        worker_pool_connect_result status =
+            worker_pool_connect(pool, missing, missing_media, &entry);
+        if (status != WORKER_POOL_CONNECTED) {
             pthread_mutex_lock(&pool->lock);
             if (!pool->stopping) {
-                unsigned failures = pool->failures[missing_index] + 1u;
-                pool->failures[missing_index] = failures;
-                unsigned shift = failures > 7u ? 6u : failures - 1u;
-                uint64_t delay = (uint64_t)1000u << shift;
-                if (delay > 60000u) delay = 60000u;
-                pool->retry_at[missing_index] = monotonic_ms() + delay;
+                uint64_t now = monotonic_ms();
+                if (status == WORKER_POOL_HOST_FAILED) {
+                    pool->host_retry_at = now +
+                        worker_pool_retry_delay(&pool->host_failures);
+                } else {
+                    pool->host_failures = 0;
+                    pool->host_retry_at = 0;
+                    pool->retry_at[missing_index] = now +
+                        worker_pool_retry_delay(&pool->failures[missing_index]);
+                }
                 struct timespec retry_at;
                 clock_gettime(CLOCK_REALTIME, &retry_at);
                 retry_at.tv_sec += 1;
@@ -1338,6 +1380,8 @@ static void *worker_pool_thread(void *opaque) {
             continue;
         }
         pthread_mutex_lock(&pool->lock);
+        pool->host_failures = 0;
+        pool->host_retry_at = 0;
         pool->failures[missing_index] = 0;
         pool->retry_at[missing_index] = 0;
         if (pool->stopping || pool->count >= pool->capacity) {
@@ -1607,8 +1651,7 @@ static void clear_route_attempt(proxy_connection *connection, int failed) {
         if (!owner->route_session_tracked) goto route_attempt_cleared;
         uint8_t transport = route_session_transport_for(connection,
                                                         connection->route_kind);
-        uint8_t branch = transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS ||
-            transport == TG_ROUTE_SESSION_TRANSPORT_TCP_PASSTHROUGH ? 0u : 1u;
+        uint8_t branch = route_session_branch(connection, transport);
         uint8_t state = branch ? owner->route_session.fallback_state
                                : owner->route_session.direct_state;
         if (state == TG_ROUTE_SESSION_CONNECTING ||
@@ -1854,7 +1897,8 @@ static int start_next_route(proxy_connection *connection) {
             connection->route_started_ms = monotonic_ms();
             if (health->attempts != UINT64_MAX) ++health->attempts;
         }
-        if (step.kind == TG_ROUTE_CF_WORKER && server->worker_pool) {
+        if (step.kind == TG_ROUTE_CF_WORKER && step.index == 0 &&
+            !connection->route_tcp_only && server->worker_pool) {
             worker_pool_entry pooled;
             if (worker_pool_take(server->worker_pool, connection->route_dc_id,
                                  connection->route_is_media, &pooled)) {
@@ -1863,7 +1907,6 @@ static int start_next_route(proxy_connection *connection) {
                 ++server->active_wss_connections;
                 if (attach_pooled_worker(connection, &pooled) == 0)
                     return 0;
-                --server->active_wss_connections;
                 clear_route_attempt(connection, 1);
                 continue;
             }
@@ -1911,6 +1954,12 @@ static size_t hedge_connection_count(const tg_epoll_proxy *server) {
     return count;
 }
 
+static size_t hedge_worker_index(const proxy_connection *parent) {
+    for (size_t i = parent->route_index; i < parent->route_plan.count; ++i)
+        if (parent->route_plan.steps[i].kind == TG_ROUTE_CF_WORKER) return i;
+    return parent->route_plan.count;
+}
+
 static size_t hedge_next_index(const proxy_connection *parent) {
     size_t direct = 0, worker = 0, cf = 0, cf_index = 0;
     for (size_t i = 0; i < TG_HEDGE_CANDIDATES; ++i) {
@@ -1923,6 +1972,10 @@ static size_t hedge_next_index(const proxy_connection *parent) {
             cf_index = candidate->hedge_step_index / 2u;
         }
     }
+    if (parent->server->config.cloudflare_only && cf && !worker) {
+        size_t index = hedge_worker_index(parent);
+        if (index < parent->route_plan.count) return index;
+    }
     size_t next_direct = parent->route_plan.count;
     size_t next_cf = parent->route_plan.count;
     for (size_t i = parent->route_index; i < parent->route_plan.count; ++i) {
@@ -1930,8 +1983,9 @@ static size_t hedge_next_index(const proxy_connection *parent) {
         if (step.kind == TG_ROUTE_DIRECT_TCP) break;
         if (step.kind == TG_ROUTE_DIRECT_WSS) {
             if (direct < 2 && next_direct == parent->route_plan.count) next_direct = i;
-        } else if (!worker && next_cf == parent->route_plan.count) {
-            if ((step.kind == TG_ROUTE_CF_WORKER && !cf) ||
+        } else if ((!worker || parent->server->config.cloudflare_only) &&
+                   next_cf == parent->route_plan.count) {
+            if ((step.kind == TG_ROUTE_CF_WORKER && !cf && !worker) ||
                 (step.kind == TG_ROUTE_CF_PROXY && cf < 2 &&
                  (!cf || cf_index != step.index / 2u)))
                 next_cf = i;
@@ -1949,8 +2003,11 @@ static int hedge_launch_next(proxy_connection *parent) {
     tg_epoll_proxy *server = parent->server;
     if (server->active_wss_connections >= server->max_wss_connections)
         return 0;
+    size_t worker_after_pending_proxy = parent->route_plan.count;
     while (parent->route_index < parent->route_plan.count) {
-        size_t index = hedge_next_index(parent);
+        size_t index = worker_after_pending_proxy < parent->route_plan.count
+            ? worker_after_pending_proxy : hedge_next_index(parent);
+        worker_after_pending_proxy = parent->route_plan.count;
         if (index == parent->route_plan.count) return 0;
         tg_route_step step = parent->route_plan.steps[index];
         if (step.kind == TG_ROUTE_DIRECT_TCP) return 0;
@@ -1985,6 +2042,22 @@ static int hedge_launch_next(proxy_connection *parent) {
         if (setup_status == 1) {
             --parent->route_index;
             free(candidate);
+            if (server->config.cloudflare_only && !hedge_candidate_count(parent) &&
+                step.kind == TG_ROUTE_CF_PROXY) {
+                size_t worker = hedge_worker_index(parent);
+                if (worker < parent->route_plan.count) {
+                    /* Try a ready Worker while the primary resolves. */
+                    worker_after_pending_proxy = worker;
+                    continue;
+                }
+            }
+            if (server->config.cloudflare_only && step.kind == TG_ROUTE_CF_WORKER &&
+                index > parent->route_index) {
+                memmove(&parent->route_plan.steps[parent->route_index],
+                        &parent->route_plan.steps[parent->route_index + 1],
+                        (index - parent->route_index) * sizeof(step));
+                parent->route_plan.steps[index] = step;
+            }
             return 0;
         }
         if (route_cooldown) {
@@ -2152,6 +2225,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
     parent->route_health_index = candidate->route_health_index;
     parent->route_data_seen = candidate->route_data_seen;
     parent->route_response_seen = candidate->route_response_seen;
+    if (parent->route_tcp_only) parent->response_observer_disabled = 1;
     memcpy(parent->response_header, candidate->response_header,
            sizeof(parent->response_header));
     parent->response_header_len = candidate->response_header_len;
@@ -2295,27 +2369,39 @@ static int route_after_handshake(proxy_connection *connection) {
             connection->route_session.has_media = 1;
         }
     }
-    if (selection.dc_id != 0 && !selection.tcp_only) {
-        worker_count = route_worker_count(server);
-        cf_count = route_cf_domain_count(server);
-        if (server->config.routing_config)
-            policy = server->config.routing_config->ws_routing;
-    }
-    have_preferred = route_health_preferred_step(server, connection,
-                                                  &preferred);
-    int prefer_cf = policy == TG_WS_ROUTING_ADAPTIVE && have_preferred &&
-        preferred.kind == TG_ROUTE_CF_PROXY;
-    tg_route_only route_only = server->config.routing_config
-        ? server->config.routing_config->route_only : TG_ROUTE_ONLY_AUTO;
     const tg_config *routing = server->config.routing_config;
-    int allow_tcp = selection.tcp_only || route_only == TG_ROUTE_ONLY_TCP ||
-        (routing && (routing->tcp_fallback_timeout_secs ||
-                     routing->diagnostic_direct_tcp));
-    if (tg_route_plan_build(selection.tcp_only ? 0 : connection->route_dc_id,
-                            connection->route_is_media, policy, prefer_cf,
-                            worker_count, cf_count, allow_tcp,
-                            &connection->route_plan) != 0)
-        return -1;
+    tg_route_only route_only = routing ? routing->route_only : TG_ROUTE_ONLY_AUTO;
+    if (routing) policy = routing->ws_routing;
+    have_preferred = route_health_preferred_step(server, connection, &preferred);
+    if (server->config.cloudflare_only) {
+        if (selection.tcp_only) {
+            /* Production's transparent selector has already checked the DC
+             * map or Telegram CIDRs and the original destination port. */
+            if (validated && (connection->original.port == 443 ||
+                              connection->original.port == 5222))
+                worker_count = route_worker_count(server);
+        } else if (selection.dc_id) {
+            worker_count = route_worker_count(server);
+            cf_count = route_cf_domain_count(server);
+        }
+        if (tg_route_plan_build_cloudflare(connection->route_is_media,
+                worker_count, cf_count, &connection->route_plan) != 0)
+            return -1;
+    } else {
+        if (selection.dc_id && !selection.tcp_only) {
+            worker_count = route_worker_count(server);
+            cf_count = route_cf_domain_count(server);
+        }
+        int allow_tcp = selection.tcp_only || route_only == TG_ROUTE_ONLY_TCP ||
+            (routing && (routing->tcp_fallback_timeout_secs ||
+                         routing->diagnostic_direct_tcp));
+        int prefer_cf = policy == TG_WS_ROUTING_ADAPTIVE && have_preferred &&
+            preferred.kind == TG_ROUTE_CF_PROXY;
+        if (tg_route_plan_build(selection.tcp_only ? 0 : connection->route_dc_id,
+                connection->route_is_media, policy, prefer_cf,
+                worker_count, cf_count, allow_tcp, &connection->route_plan) != 0)
+            return -1;
+    }
     if (routing && routing->cf_balance) {
         size_t worker_offset = worker_count
             ? server->worker_balance_offset++ % worker_count : 0;
@@ -2793,11 +2879,14 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
 }
 
 static int establish_wss_stream(proxy_connection *connection) {
-    if (connection->wss_proto < TG_MTPROTO_ABRIDGED ||
-        connection->wss_proto > TG_MTPROTO_PADDED_INTERMEDIATE ||
-        tg_mtproto_direct_server_stream_cipher(connection->handshake,
-                                                &connection->server_decrypt) != 0)
+    if (connection->route_tcp_only) {
+        connection->response_observer_disabled = 1;
+    } else if (connection->wss_proto < TG_MTPROTO_ABRIDGED ||
+               connection->wss_proto > TG_MTPROTO_PADDED_INTERMEDIATE ||
+               tg_mtproto_direct_server_stream_cipher(connection->handshake,
+                   &connection->server_decrypt) != 0) {
         return -1;
+    }
     connection->response_header_needed =
         connection->wss_proto == TG_MTPROTO_ABRIDGED ? 0u : 4u;
     if (tg_ws_pump_init_accounted(&connection->ws_pump,
@@ -2859,6 +2948,7 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
             if (SSL_get_verify_result(connection->upstream_ssl) != X509_V_OK ||
                 tg_ws_upgrade_start_ex(&connection->ws_upgrade,
                     connection->tls_hostname, connection->wss_path,
+                    worker_requires_5222(connection) ? TG_WORKER_5222_SUBPROTOCOL :
                     connection->wss_subprotocol ? "binary" : NULL,
                     connection->route_kind == TG_ROUTE_CF_WORKER
                         ? NULL : "https://web.telegram.org",
@@ -2942,7 +3032,7 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
             disable_wss_replay_after_payload_write(connection);
             if (pump_rc != 0) {
                 if (connection->route_data_seen) {
-                    if (!connection->route_response_seen)
+                    if (!connection->route_response_seen && !connection->route_tcp_only)
                         route_health_failed(connection);
                     connection->upstream_eof = 1;
                     advance_half_closes(connection);
@@ -2967,7 +3057,7 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
                     advance_route(connection) == 0)
                     return 0;
                 if (!connection->route_data_seen) return -1;
-                if (!connection->route_response_seen)
+                if (!connection->route_response_seen && !connection->route_tcp_only)
                     route_health_failed(connection);
                 connection->upstream_eof = 1;
                 advance_half_closes(connection);
@@ -3111,7 +3201,7 @@ static void upstream_event(proxy_connection *connection, uint32_t events) {
                 return;
             }
             if (connection->route_data_seen) {
-                if (!connection->route_response_seen)
+                if (!connection->route_response_seen && !connection->route_tcp_only)
                     route_health_failed(connection);
                 connection->upstream_eof = 1;
                 advance_half_closes(connection);

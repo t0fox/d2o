@@ -38,7 +38,11 @@ for arch in $ARCHES; do
     sum=$(sha "$OUT/d2k-$arch.tar.gz")
     assets="$assets${assets:+,}\"$arch\":{\"sha256\":\"$sum\"}"
 done
+# The existing release asset glob uploads the Worker alongside the router archives.
+worker_asset=d2k-telegram-worker.tar.gz
+tar -czf "$OUT/$worker_asset" -C "$ROOT/telegram/cloudflare" worker.js README.md
+worker_sum=$(sha "$OUT/$worker_asset")
 # Одна строка: d2k-update.sh читает поля sed'ом и встраивает объект в своё состояние.
-printf '{"release_id":"%s","version":%s,"notes":%s,"assets":{%s}}\n' \
-    "$RELEASE_ID" "$(json "$VERSION")" "$(json "$NOTES")" "$assets" > "$OUT/latest.json"
+printf '{"release_id":"%s","version":%s,"notes":%s,"assets":{%s},"telegram_worker":{"asset":"%s","sha256":"%s"}}\n' \
+    "$RELEASE_ID" "$(json "$VERSION")" "$(json "$NOTES")" "$assets" "$worker_asset" "$worker_sum" > "$OUT/latest.json"
 echo "выпуск $RELEASE_ID: $(echo "$ARCHES" | wc -w | tr -d ' ') арок, $OUT/latest.json"

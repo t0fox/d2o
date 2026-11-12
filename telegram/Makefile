@@ -10,7 +10,12 @@ ZLIB_LIBS ?= -lz
 
 .PHONY: test san test-ws test-tls test-config test-enroll test-identity test-mtproto test-mtproto-probe test-mtproto-splitter test-mtproto-auth test-mtproto-encrypted test-mtproto-config test-listener test-dc-map test-dc-map-json test-dc-map-store test-cf-domains test-route-plan test-route-dns test-limits test-memory-budget test-epoll-proxy test-transparent clean arm64 d2ktg
 
-test: test-ws test-tls test-config test-enroll test-identity test-mtproto test-mtproto-probe test-mtproto-splitter test-mtproto-auth test-mtproto-encrypted test-mtproto-config test-listener test-dc-map test-dc-map-json test-dc-map-store test-cf-domains test-route-plan test-route-dns test-limits test-memory-budget test-epoll-proxy test-transparent
+test: test-cloudflare test-ws test-tls test-config test-enroll test-identity test-mtproto test-mtproto-probe test-mtproto-splitter test-mtproto-auth test-mtproto-encrypted test-mtproto-config test-listener test-dc-map test-dc-map-json test-dc-map-store test-cf-domains test-route-plan test-route-dns test-limits test-memory-budget test-epoll-proxy test-transparent
+
+.PHONY: test-cloudflare
+test-cloudflare:
+	node --check cloudflare/worker.js
+	node --experimental-vm-modules --test cloudflare/test_worker.mjs
 
 san:
 	$(MAKE) BUILD_DIR=build/san CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-omit-frame-pointer' test d2ktg

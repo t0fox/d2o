@@ -632,11 +632,11 @@ static int ssl_transfer_until(SSL *ssl, int fd, uint8_t *data, size_t len,
 }
 
 static int wss_upgrade_until(SSL *ssl, int fd, const char *hostname,
-                             const char *path, uint64_t deadline) {
+                             const char *path, int worker, uint64_t deadline) {
     tg_ws_upgrade_state state = {0};
-    if (tg_ws_upgrade_start_ex(&state, hostname, path, "binary",
-                               "https://web.telegram.org",
-                               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    if (tg_ws_upgrade_start_ex(&state, hostname, path, worker ? NULL : "binary",
+                               worker ? NULL : "https://web.telegram.org",
+                               worker ? NULL : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/131.0.0.0 Safari/537.36") != 0)
         return -1;
@@ -804,7 +804,7 @@ tg_mtproto_probe_status tg_mtproto_probe_res_pq_wss(
         goto done;
     }
     out->stage = TG_MTPROTO_PROBE_STAGE_WS;
-    if (wss_upgrade_until(ssl, fd, hostname, "/apiws", deadline) != 0) {
+    if (wss_upgrade_until(ssl, fd, hostname, "/apiws", 0, deadline) != 0) {
         error = errno == ETIMEDOUT ? TG_MTPROTO_PROBE_ERROR_TIMEOUT
                                    : TG_MTPROTO_PROBE_ERROR_WS_UPGRADE;
         status = errno == ETIMEDOUT ? TG_MTPROTO_PROBE_TIMEOUT
@@ -1276,7 +1276,7 @@ int tg_mtproto_discover_config(const char *numeric_address, uint16_t port,
 int tg_mtproto_discover_config_wss(SSL_CTX *tls_context,
                                    const char *numeric_address,
                                    const char *hostname, const char *path,
-                                   uint16_t port, uint32_t dc_id,
+                                   int worker, uint16_t port, uint32_t dc_id,
                                    uint32_t timeout_ms,
                                    uint32_t socket_mark, int64_t now,
                                    tg_dc_snapshot *out) {
@@ -1299,7 +1299,7 @@ int tg_mtproto_discover_config_wss(SSL_CTX *tls_context,
     ssl = tg_tls_prepare_client_fd(tls_context, io.fd, hostname, hostname);
     if (!ssl || ssl_handshake_until(ssl, io.fd, deadline) != 0 ||
         SSL_get_verify_result(ssl) != X509_V_OK ||
-        wss_upgrade_until(ssl, io.fd, hostname, path, deadline) != 0)
+        wss_upgrade_until(ssl, io.fd, hostname, path, worker, deadline) != 0)
         goto done;
     io.ssl = ssl;
     io.websocket = 1;

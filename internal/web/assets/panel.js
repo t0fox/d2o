@@ -119,9 +119,8 @@
     return Math.floor(h / 24) + " дн " + (h % 24) + " ч";
   }
   function telegramRouteName(route) {
-    return route === 1 ? "Прямой WSS" :
-      route === 2 ? "Cloudflare Worker" :
-      route === 3 ? "Прокси Cloudflare" : route === 4 ? "Прямой TCP (диагностика)" : "Маршрут не определён";
+    return route === 2 ? "Cloudflare Worker" :
+      route === 3 ? "Прокси Cloudflare" : "Маршрут не определён";
   }
   function telegramFailureStage(stage) {
     return stage === 1 ? "DNS" :
@@ -129,6 +128,7 @@
       stage === 3 ? "TLS" :
       stage === 4 ? "WebSocket" :
       stage === 5 ? "MTProto" :
+      stage === 8 ? "Worker не подтвердил TCP 5222" :
       stage === 6 || stage === 7 ? "настройка маршрута" : "неизвестный этап";
   }
   function telegramAge(ms) { return ms < 1000 ? "только что" : duration(ms); }
@@ -2097,10 +2097,8 @@
     routeSelect.setAttribute("data-tg-route-select", "");
     routeSelect.setAttribute("aria-label", "Маршрут Telegram");
     [
-      ["direct", "Прямой WSS"],
-      ["worker", "Cloudflare Worker"],
       ["cf-proxy", "Прокси Cloudflare"],
-      ["tcp", "Прямой TCP · диагностика"]
+      ["worker", "Cloudflare Worker"]
     ].forEach(function (item) {
       var option = el(doc, "option", "", item[1]);
       option.value = item[0];
@@ -2218,8 +2216,6 @@
       "Сколько активных сессий сейчас в отказе на маршруте, на каком этапе и как давно.");
     helpTerm(routeTerms, "На паузе (cooldown)",
       "Маршрут временно не пробуется после отказа.");
-    helpTerm(routeTerms, "Прямой TCP · диагностика",
-      "Диагностическая проверка; в автоматическом выборе маршрута не участвует.");
 
     var scheme = helpKeys("Схема");
     helpKey(scheme.list, "tg-flow-key-line", "ok", "Зелёная линия",
@@ -2475,8 +2471,8 @@
       var savedRoute = self.win.localStorage && self.win.localStorage.getItem("d2k-tg-route");
       if (savedRoute) lastRoute = savedRoute;
     } catch (e) { /* приватный режим */ }
-    if (["direct", "worker", "cf-proxy", "tcp"].indexOf(lastRoute) < 0) lastRoute = "worker";
-    if (["direct", "worker", "cf-proxy", "tcp"].indexOf(lockedRoute) < 0) lockedRoute = lastRoute;
+    if (["worker", "cf-proxy"].indexOf(lastRoute) < 0) lastRoute = "worker";
+    if (["worker", "cf-proxy"].indexOf(lockedRoute) < 0) lockedRoute = lastRoute;
     ui.routeLock.checked = str(snap.telegram_route_only) !== "auto" &&
       !!str(snap.telegram_route_only);
     ui.routeSelect.value = lockedRoute;

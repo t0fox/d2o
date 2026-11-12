@@ -158,7 +158,7 @@ static void *serve_wss_discovery_request(void *opaque) {
     assert(strstr(request,
         "GET /apiws?dst=149.154.175.50&dc=1&media=0 HTTP/1.1\r\n") != NULL);
     assert(strstr(request, "Host: worker.example\r\n") != NULL);
-    assert(strstr(request, "Sec-WebSocket-Protocol: binary\r\n") != NULL);
+    assert(strstr(request, "Sec-WebSocket-Protocol:") == NULL);
     const char *key_line = strstr(request, "Sec-WebSocket-Key: ");
     assert(key_line);
     key_line += strlen("Sec-WebSocket-Key: ");
@@ -181,8 +181,7 @@ static void *serve_wss_discovery_request(void *opaque) {
     int response_len = snprintf(response, sizeof(response),
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: %s\r\n"
-        "Sec-WebSocket-Protocol: binary\r\n\r\n", accept_key);
+        "Sec-WebSocket-Accept: %s\r\n\r\n", accept_key);
     assert(response_len > 0 && (size_t)response_len < sizeof(response));
     ssl_write_all(ssl, (const uint8_t *)response, (size_t)response_len);
 
@@ -358,12 +357,12 @@ static void test_config_discovery_rejects_invalid_arguments(void) {
                                       &snapshot) != 0);
     snapshot.this_dc = 77;
     assert(tg_mtproto_discover_config_wss(NULL, "127.0.0.1",
-                                          "worker.example", "/apiws", 443, 1,
+                                          "worker.example", "/apiws", 1, 443, 1,
                                           1000, 0, 1, &snapshot) != 0);
     assert(snapshot.this_dc == 0 && snapshot.endpoint_count == 0);
     snapshot.this_dc = 77;
     assert(tg_mtproto_discover_config_wss(NULL, NULL, "worker.example",
-                                          "/apiws", 443, 1, 1000, 0, 1,
+                                          "/apiws", 1, 443, 1, 1000, 0, 1,
                                           &snapshot) != 0);
     assert(snapshot.this_dc == 0 && snapshot.endpoint_count == 0);
 }
@@ -388,7 +387,7 @@ static void test_wss_discovery_authenticates_host_and_forwards_binary_stream(voi
     tg_dc_snapshot snapshot = {.this_dc = 77};
     assert(tg_mtproto_discover_config_wss(
         client_context, "127.0.0.1", "worker.example",
-        "/apiws?dst=149.154.175.50&dc=1&media=0", port, 1, 5000, 0,
+        "/apiws?dst=149.154.175.50&dc=1&media=0", 1, port, 1, 5000, 0,
         (int64_t)time(NULL), &snapshot) != 0);
     assert(snapshot.this_dc == 0 && snapshot.endpoint_count == 0);
     assert(pthread_join(thread, NULL) == 0);

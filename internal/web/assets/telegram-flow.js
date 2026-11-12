@@ -7,7 +7,7 @@ const PROTOTYPE_GEOMETRY = Object.freeze({
   client: Object.freeze([70, 210]),
   hub: Object.freeze([300, 210]),
   collector: Object.freeze([720, 210]),
-  laneY: Object.freeze([62, 148, 272, 358]),
+  laneY: Object.freeze([148, 272]),
   gateX: Object.freeze([465, 500, 535, 570, 605]),
   dcPositions: Object.freeze([[802, 70], [816, 140], [830, 210], [816, 280], [802, 350]]
     .map(position => Object.freeze(position))),
@@ -26,18 +26,11 @@ const MOTION = Object.freeze({
   rippleDurationMs: 1200,
 });
 const ROUTES = [
-  { transport: "direct_wss", label: "Прямой WSS" },
-  { transport: "cloudflare_worker", label: "Cloudflare Worker" },
   { transport: "cloudflare_proxy", label: "Прокси Cloudflare" },
-  { transport: "tcp_passthrough", label: "Прямой TCP · диагностика" },
+  { transport: "cloudflare_worker", label: "Cloudflare Worker" },
 ];
 
-const TRANSPORT_TO_LANE = new Map([
-  ["direct_wss", 0],
-  ["cloudflare_worker", 1],
-  ["cloudflare_proxy", 2],
-  ["tcp_passthrough", 3],
-]);
+const TRANSPORT_TO_LANE = new Map(ROUTES.map((route, index) => [route.transport, index]));
 
 const STATE_LABELS = {
   idle: "резерв",
@@ -154,7 +147,6 @@ function eventState(value) {
 }
 
 function routeDescription(transport, lane) {
-  if (transport === "tcp_passthrough") return "Прямой TCP passthrough";
   return ROUTES[lane]?.label || "WSS-транспорт не определён";
 }
 
@@ -168,10 +160,8 @@ function latestRouteFailure(snapshot) {
   const failureAge = metricNumber(snapshot, "last_failure_age_ms");
   if (!stage || failureAge === null) return null;
   const routes = {
-    1: [0, "Прямой WSS"],
     2: [1, "Cloudflare Worker"],
-    3: [2, "Прокси Cloudflare"],
-    4: [3, "Прямой TCP (диагностика)"],
+    3: [0, "Прокси Cloudflare"],
   };
   const stages = {
     1: "DNS",
@@ -181,6 +171,7 @@ function latestRouteFailure(snapshot) {
     5: "MTProto",
     6: "Настройка маршрута",
     7: "Настройка маршрута",
+    8: "Worker не подтвердил TCP 5222",
   };
   const routeNumber = metricNumber(snapshot, "last_failure_route");
   const route = routeNumber === 0 || stage === 7 ? [-1, "Маршрут не выбран"]

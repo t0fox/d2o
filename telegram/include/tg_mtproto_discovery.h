@@ -25,7 +25,7 @@ int tg_mtproto_discover_config(const char *numeric_address, uint16_t port,
 int tg_mtproto_discover_config_wss(SSL_CTX *tls_context,
                                    const char *numeric_address,
                                    const char *hostname, const char *path,
-                                   uint16_t port, uint32_t dc_id,
+                                   int worker, uint16_t port, uint32_t dc_id,
                                    uint32_t timeout_ms,
                                    uint32_t socket_mark, int64_t now,
                                    tg_dc_snapshot *out);

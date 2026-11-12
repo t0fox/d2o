@@ -1,5 +1,9 @@
 # Матрица порта Telegram proxy: Rust → C11
 
+Актуальная маршрутизация описана в [README](../README.md#telegram).
+Матрица и полевые замеры ниже относятся к прежним версиям C11.
+Для текущего Worker см. [поддержку 5222](../telegram/cloudflare/README.md).
+
 Аудит кода Telegram-донора выполнен на `z2kOW` `4ef79fb99c30c233488623c04ec13c8097a614e0`.
 Текущий `z2kOW/main` — `9fc14bb67c3147b51d6d022575c9bba8f8f9ed2d`, на 10 коммитов
 впереди аудита; сравнение подтверждает, что `platform/openwrt/tg-proxy` не менялся

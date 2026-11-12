@@ -190,13 +190,13 @@ static void test_exact_tcpo_secret_is_used_for_original_destination_only(void) {
         },
         .has_snapshot = 1,
     };
-    const uint16_t ports[] = {443};
+    const uint16_t ports[] = {443, 5222};
     /* A verified exact address can arrive outside the bootstrap CIDRs. */
     const char *cidrs[] = {"91.108.56.0/22"};
     tg_transparent_policy policy = {
         .map_store = &store,
         .allowed_ports = ports,
-        .allowed_port_count = 1,
+        .allowed_port_count = 2,
         .allowed_cidrs = cidrs,
         .allowed_cidr_count = 1,
     };
@@ -208,6 +208,14 @@ static void test_exact_tcpo_secret_is_used_for_original_destination_only(void) {
     assert(tg_transparent_select_route(&policy, &original, handshake,
                                        &selected) == 0);
     assert(selected.dc_id == 4 && selected.tcp_only);
+    endpoints[5].port = 5222;
+    endpoints[5].this_port_only = 1;
+    assert(tg_transparent_select_route(&policy, &original, handshake,
+                                       &selected) != 0);
+    destination(&original, "149.154.167.91", 5222);
+    assert(tg_transparent_select_route(&policy, &original, handshake,
+                                       &selected) == 0);
+    assert(selected.dc_id == 4 && selected.tcp_only && selected.upstream.port == 5222);
     destination(&original, "149.154.167.92", 443);
     assert(tg_transparent_select_target(&policy, &original, handshake,
                                         &upstream) != 0);

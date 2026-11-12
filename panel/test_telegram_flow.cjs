@@ -32,7 +32,7 @@ assert.deepEqual(flow.prototypeGeometry, {
   client: [70, 210],
   hub: [300, 210],
   collector: [720, 210],
-  laneY: [62, 148, 272, 358],
+  laneY: [148, 272],
   gateX: [465, 500, 535, 570, 605],
   dcPositions: [[802, 70], [816, 140], [830, 210], [816, 280], [802, 350]],
 }, "сцена использует координаты исходного HTML-прототипа");
@@ -54,7 +54,7 @@ assert.deepEqual(flow.prototypeGeometry, {
   assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [
     { ...next, bytes_from_clients: 3, bytes_from_upstreams: 2 },
   ]), [], "сброс счётчиков не выдаётся за новые пакеты");
-  const unconfirmed = session({ id: 92, dc: 2, selected_transport: "direct_wss",
+  const unconfirmed = session({ id: 92, dc: 2, selected_transport: "cloudflare_proxy",
     bytes_from_clients: 0, bytes_from_upstreams: 0 });
   flow.collectConfirmedTrafficDeltas(previous, [unconfirmed]);
   assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [{ ...unconfirmed,
@@ -137,7 +137,7 @@ assert.deepEqual(flow.prototypeGeometry, {
   }));
   assert.deepEqual(view.cooldowns, [{ dc: 4, isMedia: true, transport: "cloudflare_proxy",
     remainingMs: 28750, failureStage: 3 }]);
-  assert.equal(view.lanes[2].cooldownCount, 1);
+  assert.equal(view.lanes[0].cooldownCount, 1);
   assert.ok(flow.visibleRouteLanes(view).some(lane => lane.transport === "cloudflare_proxy"));
 }
 
@@ -148,7 +148,7 @@ assert.deepEqual(flow.prototypeGeometry, {
     last_failure_stage: 3,
     last_failure_age_ms: 100,
     last_success_dc: 2,
-    last_success_route: 1,
+    last_success_route: 3,
     last_success_age_ms: 1000,
   });
   const view = flow.summarizeTelegramFlow(sample);
@@ -156,7 +156,7 @@ assert.deepEqual(flow.prototypeGeometry, {
   assert.equal(view.state, "unavailable");
   assert.equal(view.transportLabel, "Недоступно");
   assert.match(view.caption, /TLS.*DC4.*Прокси Cloudflare/);
-  assert.equal(view.lanes[2].counts.failed, 1);
+  assert.equal(view.lanes[0].counts.failed, 1);
   assert.deepEqual(flow.visibleRouteLanes(view).map(lane => lane.transport), ["cloudflare_proxy"]);
 }
 
@@ -167,7 +167,7 @@ assert.deepEqual(flow.prototypeGeometry, {
     last_failure_stage: 3,
     last_failure_age_ms: 1000,
     last_success_dc: 2,
-    last_success_route: 1,
+    last_success_route: 3,
     last_success_age_ms: 100,
   });
   const view = flow.summarizeTelegramFlow(sample);
@@ -182,20 +182,20 @@ assert.deepEqual(flow.prototypeGeometry, {
     route_sessions_truncated: true,
     active_sessions: [
       session({ id: 4, dc: 2, is_media: false, stage: "upstream_ready",
-        direct_state: "selected", direct_transport: "direct_wss",
-        selected_transport: "direct_wss" }),
+        direct_state: "selected", direct_transport: "cloudflare_proxy",
+        selected_transport: "cloudflare_proxy" }),
       session({ id: 5, dc: 2, is_media: true, stage: "first_wss_binary_response",
-        direct_state: "selected", direct_transport: "direct_wss",
-        selected_transport: "direct_wss", telegram_response_seen: true,
-        events: [{ sequence: 4, branch: "direct", transport: "direct_wss",
+        direct_state: "selected", direct_transport: "cloudflare_proxy",
+        selected_transport: "cloudflare_proxy", telegram_response_seen: true,
+        events: [{ sequence: 4, branch: "direct", transport: "cloudflare_proxy",
           state: "first_binary_response" }] }),
       session({ id: 6, dc: 4, is_media: true, stage: "routing",
         fallback_state: "connecting", fallback_transport: "cloudflare_worker",
         events: [{ sequence: 1, branch: "fallback", transport: "cloudflare_worker",
           state: "connecting" }] }),
       session({ id: 7, dc: null, is_media: null, stage: "upstream_ready",
-        direct_state: "selected", direct_transport: "tcp_passthrough",
-        selected_transport: "tcp_passthrough" }),
+        fallback_state: "selected", fallback_transport: "cloudflare_worker",
+        selected_transport: "cloudflare_worker" }),
     ],
   }));
   assert.equal(view.state, "mixed");
@@ -207,14 +207,12 @@ assert.deepEqual(flow.prototypeGeometry, {
   assert.equal(view.lanes[0].counts.selected, 2);
   assert.equal(view.lanes[0].confirmed, 1,
     "маршрут считает только сессии с подтверждённым ответом Telegram");
-  assert.equal(view.lanes[3].label, "Прямой TCP passthrough");
-  assert.equal(view.lanes[3].counts.selected, 1);
+  assert.equal(view.lanes[1].counts.selected, 1);
   assert.equal(view.lanes[1].counts.connecting, 1);
   assert.deepEqual(view.lanes.map(lane => lane.transport),
-    ["direct_wss", "cloudflare_worker", "cloudflare_proxy", "tcp_passthrough"],
-    "на схеме нет удалённого автоматического TCP fallback");
+    ["cloudflare_proxy", "cloudflare_worker"]);
   assert.deepEqual(flow.visibleRouteLanes(view).map(lane => lane.transport),
-    ["direct_wss", "cloudflare_worker", "tcp_passthrough"]);
+    ["cloudflare_proxy", "cloudflare_worker"]);
 }
 
 {
@@ -222,11 +220,11 @@ assert.deepEqual(flow.prototypeGeometry, {
     active_connections: 2,
     active_sessions: [
       session({ id: 31, dc: 2, is_media: false, stage: "upstream_ready",
-        direct_state: "selected", direct_transport: "direct_wss",
-        selected_transport: "direct_wss" }),
+        direct_state: "selected", direct_transport: "cloudflare_proxy",
+        selected_transport: "cloudflare_proxy" }),
       session({ id: 32, dc: null, is_media: null, stage: "upstream_ready",
-        direct_state: "selected", direct_transport: "tcp_passthrough",
-        selected_transport: "tcp_passthrough" }),
+        fallback_state: "selected", fallback_transport: "cloudflare_worker",
+        selected_transport: "cloudflare_worker" }),
     ],
   }));
   assert.equal(view.dcLabel, "DC2");

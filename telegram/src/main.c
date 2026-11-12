@@ -109,15 +109,10 @@ typedef struct {
 
 static const dc_bootstrap dc_bootstraps[] = {
     {1, "149.154.175.50"},
-    {1, "2001:b28:f23d:f001::a"},
     {2, "149.154.167.51"},
-    {2, "2001:67c:4e8:f002::a"},
     {3, "149.154.175.100"},
-    {3, "2001:b28:f23d:f003::a"},
     {4, "149.154.167.91"},
-    {4, "2001:67c:4e8:f004::a"},
     {5, "149.154.171.5"},
-    {5, "2001:b28:f23f:f005::a"},
     {203, "91.105.192.100"}
 };
 
@@ -149,7 +144,7 @@ static int discovery_cancelled(const atomic_int *cancelled,
 }
 
 static int discover_wss_host(SSL_CTX *tls_context, tg_route_dns *route_dns,
-                             const char *hostname, const char *path,
+                             const char *hostname, const char *path, int worker,
                              uint32_t dc_id, int64_t now,
                              const atomic_int *cancelled, uint64_t deadline,
                              tg_dc_snapshot *snapshot) {
@@ -188,9 +183,14 @@ static int discover_wss_host(SSL_CTX *tls_context, tg_route_dns *route_dns,
                        sizeof(numeric_address)))
             continue;
         if (discovery_cancelled(cancelled, deadline)) return -1;
+        now_ms = monotonic_ms();
+        if (!now_ms || now_ms >= deadline) return -1;
+        uint64_t remaining = deadline - now_ms;
+        uint32_t timeout = remaining < TG_DC_DISCOVERY_TIMEOUT_MS
+            ? (uint32_t)remaining : TG_DC_DISCOVERY_TIMEOUT_MS;
         if (tg_mtproto_discover_config_wss(
-                tls_context, numeric_address, hostname, path, 443, dc_id,
-                TG_DC_DISCOVERY_TIMEOUT_MS, TG_OUTBOUND_SOCKET_MARK, now,
+                tls_context, numeric_address, hostname, path, worker, 443, dc_id,
+                timeout, TG_OUTBOUND_SOCKET_MARK, now,
                 snapshot) == 0)
             return 0;
     }
@@ -203,59 +203,42 @@ static int refresh_local_dc_map(const tg_config *config,
                                 SSL_CTX *tls_context, int64_t now,
                                 const atomic_int *cancelled,
                                 tg_dc_snapshot *snapshot) {
-    if (!config || !cf_domains || !tls_context || !snapshot)
+    if (!config || !cf_domains || !route_dns || !tls_context || !snapshot)
         return -1;
     memset(snapshot, 0, sizeof(*snapshot));
     uint64_t started = monotonic_ms();
     if (!started) return -1;
     uint64_t deadline = started + TG_DC_DISCOVERY_TOTAL_MS;
-    for (size_t i = 0; i < 3; ++i) {
-        if (discovery_cancelled(cancelled, deadline)) return -1;
-        if (tg_mtproto_discover_config(dc_bootstraps[i].address, 443,
-                dc_bootstraps[i].dc_id, TG_DC_DISCOVERY_TIMEOUT_MS,
-                TG_OUTBOUND_SOCKET_MARK, now, snapshot) == 0)
-            return 0;
-    }
-
-    for (size_t i = 0; i < sizeof(dc_bootstraps) / sizeof(dc_bootstraps[0]);
-         ++i) {
+    size_t domain_count = config->route_only == TG_ROUTE_ONLY_WORKER
+        ? 0 : tg_cf_domain_pool_count(cf_domains);
+    size_t worker_count = config->route_only == TG_ROUTE_ONLY_CF_PROXY
+        ? 0 : config->cf_worker_domain_count;
+    if (worker_count > TG_DC_DISCOVERY_WORKER_LIMIT)
+        worker_count = TG_DC_DISCOVERY_WORKER_LIMIT;
+    size_t first_proxy = domain_count ? 1u : 0u;
+    for (size_t i = 0; i < sizeof(dc_bootstraps) / sizeof(dc_bootstraps[0]); ++i) {
         uint32_t dc_id = dc_bootstraps[i].dc_id;
-        int first_for_dc = 1;
-        for (size_t earlier = 0; earlier < i; ++earlier) {
-            if (dc_bootstraps[earlier].dc_id == dc_id) {
-                first_for_dc = 0;
-                break;
-            }
-        }
-        if (!first_for_dc) continue;
-        if (discovery_cancelled(cancelled, deadline)) return -1;
-        const char *bootstrap_address = dc_bootstraps[i].address;
-        if (!route_dns) continue;
-        size_t worker_count = config->cf_worker_domain_count;
-        if (worker_count > TG_DC_DISCOVERY_WORKER_LIMIT)
-            worker_count = TG_DC_DISCOVERY_WORKER_LIMIT;
-        for (size_t worker = 0; worker < worker_count; ++worker) {
-            char path[1024];
-            int n = snprintf(path, sizeof(path),
-                "/apiws?dst=%s&dc=%u&media=0", bootstrap_address, dc_id);
-            if (n <= 0 || (size_t)n >= sizeof(path)) continue;
-            if (discover_wss_host(tls_context, route_dns,
-                    config->cf_worker_domains[worker], path, dc_id, now,
-                    cancelled, deadline, snapshot) == 0)
-                return 0;
-        }
-
-        size_t domain_count = tg_cf_domain_pool_count(cf_domains);
-        for (size_t domain_index = 0; domain_index < domain_count;
-             ++domain_index) {
-            char domain[TG_CF_DOMAIN_LEN] = {0};
+        /* Try the primary proxy, then Workers before the remaining proxies. */
+        for (size_t route = 0; route < domain_count + worker_count; ++route) {
+            if (discovery_cancelled(cancelled, deadline)) return -1;
+            int worker = route >= first_proxy && route < first_proxy + worker_count;
             char hostname[TG_CF_DOMAIN_LEN + 16u];
-            if (tg_cf_domain_pool_copy_at(cf_domains, domain_index, domain) != 0)
-                continue;
-            int n = snprintf(hostname, sizeof(hostname), "kws%u.%s", dc_id,
-                             domain);
-            if (n <= 0 || (size_t)n >= sizeof(hostname)) continue;
-            if (discover_wss_host(tls_context, route_dns, hostname, "/apiws",
+            char path[128] = "/apiws";
+            if (worker) {
+                snprintf(hostname, sizeof(hostname), "%s",
+                         config->cf_worker_domains[route - first_proxy]);
+                int n = snprintf(path, sizeof(path), "/apiws?dst=%s&dc=%u&media=0",
+                                 dc_bootstraps[i].address, dc_id);
+                if (n <= 0 || (size_t)n >= sizeof(path)) continue;
+            } else {
+                size_t index = route == 0 ? 0 : route - worker_count;
+                char domain[TG_CF_DOMAIN_LEN];
+                if (tg_cf_domain_pool_copy_at(cf_domains, index, domain) != 0 ||
+                    tg_route_cf_proxy_hostname(dc_id, 0, domain, hostname,
+                                               sizeof(hostname)) != 0)
+                    continue;
+            }
+            if (discover_wss_host(tls_context, route_dns, hostname, path, worker,
                     dc_id, now, cancelled, deadline, snapshot) == 0)
                 return 0;
         }
@@ -383,13 +366,13 @@ static int run_local_daemon(const char *config_path) {
     next_dc_refresh_at = initial_refresh_due ? now : now + TG_DC_REFRESH_SECS;
     tls_context = tg_tls_client_context(cfg.ca_bundle);
     if (!tls_context) {
-        log_msg("не удалось загрузить доверенные сертификаты для direct WSS");
+        log_msg("не удалось загрузить доверенные сертификаты для маршрутов Cloudflare");
         goto done;
     }
     discovery_dns = tg_route_dns_create(tls_context,
         TG_OUTBOUND_SOCKET_MARK, NULL, NULL, NULL);
     if (!discovery_dns)
-        log_msg("не удалось создать DoH-резолвер обновления карты; останется проверка прямых DC");
+        log_msg("не удалось создать DoH-резолвер обновления карты DC");
     listener = create_local_listener(cfg.listen_port);
     if (listener < 0) {
         log_msg("не удалось открыть IPv4/IPv6 listener локального прокси");
@@ -413,7 +396,7 @@ static int run_local_daemon(const char *config_path) {
         .require_socket_mark = 1,
         .enforce_self_dial = 1,
         .enable_direct_wss = 1,
-        .direct_wss_port = 443,
+        .cloudflare_only = 1,
         .tls_context = tls_context,
         .routing_config = &cfg,
         .cf_domain_pool = &cf_domain_pool,
@@ -500,12 +483,12 @@ static int run_local_daemon(const char *config_path) {
             next_dc_refresh_at = refresh_now + TG_DC_REFRESH_RETRY_SECS;
             log_msg("обновление карты Telegram не подтвердилось; сохранена last-known-good карта");
         }
-        if (!refresh_job.started && refresh_now >= next_dc_refresh_at &&
+        if (discovery_dns && !refresh_job.started && refresh_now >= next_dc_refresh_at &&
             tg_dc_map_store_refresh_due(&map_store, refresh_now,
                                        TG_DC_REFRESH_SECS)) {
             if (start_dc_refresh(&refresh_job, &cfg, &cf_domain_pool,
                     discovery_dns, tls_context, refresh_now) == 0) {
-                log_msg("запущено фоновое обновление DC через direct, Worker и Cloudflare WSS");
+                log_msg("запущено фоновое обновление DC через Cloudflare Proxy и Worker");
             } else {
                 log_msg("не удалось запустить фоновое обновление карты Telegram");
                 next_dc_refresh_at = refresh_now + TG_DC_REFRESH_RETRY_SECS;
@@ -591,186 +574,50 @@ static int offline_self_check(void) {
     return OPENSSL_init_ssl(0,NULL)==1?0:-1;
 }
 
-static int parse_unsigned_arg(const char *text, unsigned long max,
-                              unsigned long *value) {
-    if (!text || !*text || !value) return -1;
-    for (const char *p = text; *p; ++p)
-        if (*p < '0' || *p > '9') return -1;
-    errno = 0;
-    char *end = NULL;
-    unsigned long parsed = strtoul(text, &end, 10);
-    if (errno || !end || *end || parsed == 0 || parsed > max) return -1;
-    *value = parsed;
-    return 0;
-}
-
-static int check_telegram_dc(const char *address, const char *dc_text,
-                            const char *port_text) {
-    struct in_addr v4;
-    struct in6_addr v6;
-    unsigned long dc, port = 443;
-    if ((!inet_pton(AF_INET, address, &v4) &&
-         !inet_pton(AF_INET6, address, &v6)) ||
-        parse_unsigned_arg(dc_text, 999, &dc) != 0 ||
-        (port_text && parse_unsigned_arg(port_text, 65535, &port) != 0)) {
-        puts("{\"ok\":false,\"stage\":\"input\",\"error\":\"invalid_arguments\"}");
+static int check_telegram_dc_map(const char *config_path) {
+    tg_config config;
+    if (tg_config_read(config_path, &config) != 0) {
+        puts("{\"ok\":false,\"error\":\"invalid_config\"}");
         return 2;
     }
-    tg_mtproto_probe_result result = {0};
-    tg_mtproto_probe_status status = tg_mtproto_probe_res_pq(
-        address, (uint16_t)port, (uint32_t)dc, 0,
-        TG_OUTBOUND_SOCKET_MARK, 8000, &result);
-    const char *stage = "input", *error = "invalid";
-    switch (result.stage) {
-    case TG_MTPROTO_PROBE_STAGE_TCP: stage = "tcp"; break;
-    case TG_MTPROTO_PROBE_STAGE_MTPROTO: stage = "mtproto"; break;
-    case TG_MTPROTO_PROBE_STAGE_RES_PQ: stage = "resPQ"; break;
-    default: break;
-    }
-    switch (status) {
-    case TG_MTPROTO_PROBE_OK: error = ""; break;
-    case TG_MTPROTO_PROBE_TIMEOUT: error = "timeout"; break;
-    case TG_MTPROTO_PROBE_CONNECT: error = "connect_failed"; break;
-    case TG_MTPROTO_PROBE_IO: error = "io_error"; break;
-    default: error = "invalid_resPQ"; break;
-    }
-    printf("{\"ok\":%s,\"stage\":\"%s\",\"dc\":%lu,\"address\":\"%s\",\"port\":%lu,\"latency_ms\":%llu,\"error\":\"%s\"}\n",
-           status == TG_MTPROTO_PROBE_OK ? "true" : "false", stage, dc,
-           address, port, (unsigned long long)result.latency_ms, error);
-    return status == TG_MTPROTO_PROBE_OK ? 0 : 1;
-}
-
-static const char *telegram_probe_stage_name(tg_mtproto_probe_stage stage) {
-    switch (stage) {
-    case TG_MTPROTO_PROBE_STAGE_DNS: return "dns";
-    case TG_MTPROTO_PROBE_STAGE_TCP: return "tcp";
-    case TG_MTPROTO_PROBE_STAGE_TLS: return "tls";
-    case TG_MTPROTO_PROBE_STAGE_WS: return "websocket";
-    case TG_MTPROTO_PROBE_STAGE_MTPROTO: return "mtproto";
-    case TG_MTPROTO_PROBE_STAGE_RES_PQ: return "resPQ";
-    default: return "input";
-    }
-}
-
-static const char *telegram_probe_error_name(tg_mtproto_probe_error error) {
-    switch (error) {
-    case TG_MTPROTO_PROBE_ERROR_NONE: return "";
-    case TG_MTPROTO_PROBE_ERROR_INVALID_INPUT: return "invalid_arguments";
-    case TG_MTPROTO_PROBE_ERROR_DNS: return "dns_failed";
-    case TG_MTPROTO_PROBE_ERROR_CONNECT: return "connect_failed";
-    case TG_MTPROTO_PROBE_ERROR_TLS_HANDSHAKE: return "tls_handshake_failed";
-    case TG_MTPROTO_PROBE_ERROR_TLS_VERIFY: return "tls_verify_failed";
-    case TG_MTPROTO_PROBE_ERROR_WS_UPGRADE: return "websocket_upgrade_failed";
-    case TG_MTPROTO_PROBE_ERROR_MTPROTO_RESPONSE:
-        return "invalid_mtproto_response";
-    case TG_MTPROTO_PROBE_ERROR_TIMEOUT: return "timeout";
-    case TG_MTPROTO_PROBE_ERROR_IO: return "io_error";
-    default: return "unknown_error";
-    }
-}
-
-static int check_telegram_wss_matrix(const char *ca_bundle) {
-    if (!ca_bundle || !*ca_bundle) ca_bundle = "/opt/d2k/files/tg-roots.pem";
-    SSL_CTX *tls_context = tg_tls_client_context(ca_bundle);
-    if (!tls_context) {
-        puts("{\"ok\":false,\"stage\":\"input\",\"error\":\"ca_bundle_unavailable\"}");
-        return 2;
-    }
-    int failed = 0;
-    for (uint32_t dc = 1; dc <= 5; ++dc) {
-        char hostname[64];
-        int n = snprintf(hostname, sizeof(hostname),
-                         "kws%u.web.telegram.org", dc);
-        if (n <= 0 || (size_t)n >= sizeof(hostname)) {
-            failed = 1;
-            continue;
-        }
-        tg_mtproto_probe_result result = {0};
-        tg_mtproto_probe_status status = tg_mtproto_probe_res_pq_wss(
-            tls_context, hostname, dc, TG_OUTBOUND_SOCKET_MARK,
-            8000, &result);
-        printf("{\"ok\":%s,\"route\":\"direct_wss\",\"stage\":\"%s\",\"dc\":%u,\"host\":\"%s\",\"latency_ms\":%llu,\"error\":\"%s\"}\n",
-               status == TG_MTPROTO_PROBE_OK ? "true" : "false",
-               telegram_probe_stage_name(result.stage), dc, hostname,
-               (unsigned long long)result.latency_ms,
-               telegram_probe_error_name(result.error));
-        if (status != TG_MTPROTO_PROBE_OK) failed = 1;
-    }
-    SSL_CTX_free(tls_context);
-    return failed;
-}
-static int discover_telegram_dc(const char *address, const char *dc_text,
-                               const char *port_text) {
-    struct in_addr v4;
-    struct in6_addr v6;
-    unsigned long dc, port = 443;
-    if ((!inet_pton(AF_INET, address, &v4) &&
-         !inet_pton(AF_INET6, address, &v6)) ||
-        parse_unsigned_arg(dc_text, 999, &dc) != 0 ||
-        (port_text && parse_unsigned_arg(port_text, 65535, &port) != 0)) {
-        puts("{\"ok\":false,\"stage\":\"input\",\"error\":\"invalid_arguments\"}");
-        return 2;
-    }
+    (void)signal(SIGPIPE, SIG_IGN);
+    tg_cf_domain_pool domains = {0};
     tg_dc_snapshot snapshot = {0};
-    int rc = tg_mtproto_discover_config(address, (uint16_t)port,
-                                        (uint32_t)dc, 8000,
-                                        TG_OUTBOUND_SOCKET_MARK,
-                                        (int64_t)time(NULL), &snapshot);
-    if (rc == 0) {
-        printf("{\"ok\":true,\"stage\":\"help.getConfig\",\"dc\":%lu,\"address\":\"%s\",\"port\":%lu,\"this_dc\":%u,\"endpoint_count\":%zu,\"config_date\":%lld,\"config_expires\":%lld}\n",
-               dc, address, port, snapshot.this_dc, snapshot.endpoint_count,
-               (long long)snapshot.config_date,
-               (long long)snapshot.config_expires);
-        tg_dc_snapshot_destroy(&snapshot);
-        return 0;
-    }
-    printf("{\"ok\":false,\"stage\":\"help.getConfig\",\"dc\":%lu,\"address\":\"%s\",\"port\":%lu,\"error\":\"discovery_failed\"}\n",
-           dc, address, port);
+    atomic_int cancelled = ATOMIC_VAR_INIT(0);
+    SSL_CTX *tls = tg_tls_client_context(config.ca_bundle);
+    tg_route_dns *dns = tls ? tg_route_dns_create(tls, TG_OUTBOUND_SOCKET_MARK,
+                                                   NULL, NULL, NULL) : NULL;
+    int rc = -1;
+    if (dns && tg_cf_domain_pool_init(&domains, config.cf_domain_cache_path,
+            &config.cf_proxy_domains[0][0], config.cf_proxy_domain_count,
+            config.default_domains) == 0)
+        rc = refresh_local_dc_map(&config, &domains, dns, tls,
+                                  (int64_t)time(NULL), &cancelled, &snapshot);
+    if (rc == 0)
+        printf("{\"ok\":true,\"stage\":\"help.getConfig\",\"this_dc\":%u,\"endpoint_count\":%zu}\n",
+               snapshot.this_dc, snapshot.endpoint_count);
+    else
+        puts("{\"ok\":false,\"stage\":\"help.getConfig\",\"error\":\"discovery_failed\"}");
     tg_dc_snapshot_destroy(&snapshot);
-    return 1;
-}
-
-static const struct {
-    const char *address;
-    const char *dc;
-} telegram_dc_matrix[] = {
-    {"149.154.175.50", "1"},
-    {"149.154.167.51", "2"},
-    {"149.154.175.100", "3"},
-    {"149.154.167.91", "4"},
-    {"149.154.171.5", "5"}
-};
-
-static int check_telegram_dc_matrix(void) {
-    int failed = 0;
-    for (size_t i = 0; i < sizeof(telegram_dc_matrix) / sizeof(telegram_dc_matrix[0]); ++i)
-        if (check_telegram_dc(telegram_dc_matrix[i].address,
-                              telegram_dc_matrix[i].dc, NULL) != 0)
-            failed = 1;
-    return failed;
-}
-
-static int discover_telegram_dc_matrix(void) {
-    int failed = 0;
-    for (size_t i = 0; i < sizeof(telegram_dc_matrix) / sizeof(telegram_dc_matrix[0]); ++i)
-        if (discover_telegram_dc(telegram_dc_matrix[i].address,
-                                 telegram_dc_matrix[i].dc, NULL) != 0)
-            failed = 1;
-    return failed;
+    tg_route_dns_destroy(dns);
+    tg_cf_domain_pool_destroy(&domains);
+    SSL_CTX_free(tls);
+    tg_config_clean(&config);
+    return rc == 0 ? 0 : 1;
 }
 
 int main(int argc,char **argv) {
     int offline = d2k_runtime_offline(argc, argv, "d2ktg", offline_self_check);
     if (offline >= 0) return offline;
     const char *config="/opt/d2k/config",*log_path=NULL;
-    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=instagram-ip-probe,meta-hosts-v3,telegram-local-tcp-epoll,mtproto-respq,mtproto-auth,mtproto-v2,mtproto-help-config,mtproto-gzip-config,mtproto-wss-probe release=" D2K_RELEASE_ID);return 0;}
+    if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=instagram-ip-probe,meta-hosts-v3,telegram-local-tcp-epoll,mtproto-respq,mtproto-auth,mtproto-v2,mtproto-help-config,mtproto-gzip-config,telegram-cf-dc-discovery release=" D2K_RELEASE_ID);return 0;}
     if(argc==5&&strcmp(argv[1],"--check-instagram-ip")==0)return check_instagram_ip(argv[2],argv[3],argv[4]);
-    if((argc==4||argc==5)&&strcmp(argv[1],"--check-telegram-dc")==0)return check_telegram_dc(argv[2],argv[3],argc==5?argv[4]:NULL);
-    if((argc==4||argc==5)&&strcmp(argv[1],"--discover-telegram-dc")==0)return discover_telegram_dc(argv[2],argv[3],argc==5?argv[4]:NULL);
-    if(argc==2&&strcmp(argv[1],"--check-telegram-dc-matrix")==0)return check_telegram_dc_matrix();
-    if(argc==2&&strcmp(argv[1],"--discover-telegram-dc-matrix")==0)return discover_telegram_dc_matrix();
-    if((argc==2||argc==3)&&strcmp(argv[1],"--check-telegram-wss-matrix")==0)return check_telegram_wss_matrix(argc==3?argv[2]:NULL);
-    if(argc==2&&strcmp(argv[1],"--help")==0){puts("d2ktg [--config FILE] | --check-telegram-dc-matrix | --discover-telegram-dc-matrix | --check-telegram-wss-matrix [CA_BUNDLE] | --check-telegram-dc IP DC [PORT] | --discover-telegram-dc IP DC [PORT]");return 0;}
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "--check-telegram-dc-map") == 0)
+        return check_telegram_dc_map(argc == 3 ? argv[2] : config);
+    if (argc == 2 && strcmp(argv[1], "--help") == 0) {
+        puts("d2ktg [--config FILE] | --check-telegram-dc-map [CONFIG]");
+        return 0;
+    }
     if(argc==3&&strcmp(argv[1],"--check-config")==0)return check_config(argv[2]);
     for(int i=1;i<argc;i++) {
         if(strcmp(argv[i],"--health-file")==0&&i+1<argc)health_path=argv[++i];
