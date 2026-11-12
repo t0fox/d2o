@@ -688,7 +688,7 @@ san-volume-context:
 
 # Исходники вне SRC, которые нужны тестам общего цикла (HTTPS-зонд и логика
 # вставки провайдера); без них цикл не линковал test_httpsprobe и соседей.
-SAN_EXTRA_SRC = httpsprobe.c httpup_logic.c
+SAN_EXTRA_SRC = httpsprobe.c httpup_logic.c ../runtime/d2k_dns_config.c
 # test_quicconn_fc гонит 1 МБ по UDP-петле без повторов: под ASan клиент
 # читает медленнее, на Linux приёмный буфер петли (208 КБ) переполняется,
 # датаграммы теряются, и ответ «не доходит». Это свойство стенда, а не кода;
