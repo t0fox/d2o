@@ -36,8 +36,11 @@ int tg_ws_pump_init_accounted(tg_ws_pump *p, SSL *ssl,
         tg_memory_budget_reserve(memory_budget, TG_WS_PUMP_RX_INITIAL) != 0)
         return -1;
     p->rx=malloc(TG_WS_PUMP_RX_INITIAL);
-    if(!p->rx){tg_memory_budget_release(memory_budget,
-                                         TG_WS_PUMP_RX_INITIAL);return -1;}
+    if (!p->rx) {
+        if (memory_budget) ++memory_budget->allocation_failures;
+        tg_memory_budget_release(memory_budget, TG_WS_PUMP_RX_INITIAL);
+        return -1;
+    }
     p->rx_cap=TG_WS_PUMP_RX_INITIAL;
     int flags=fcntl(p->fd,F_GETFL,0);
     if(flags<0||fcntl(p->fd,F_SETFL,flags|O_NONBLOCK)<0){free(p->rx);
@@ -47,7 +50,10 @@ int tg_ws_pump_init_accounted(tg_ws_pump *p, SSL *ssl,
 }
 
 static int reserve_rx(tg_ws_pump *p,size_t needed) {
-    if(needed>TG_WS_PUMP_RX_LIMIT)return -1;
+    if (needed > TG_WS_PUMP_RX_LIMIT) {
+        if (p->memory_budget) ++p->memory_budget->size_rejections;
+        return -1;
+    }
     if(needed<=p->rx_cap)return 0;
     size_t cap=p->rx_cap?p->rx_cap:TG_WS_PUMP_RX_INITIAL;
     while(cap<needed){
@@ -58,7 +64,11 @@ static int reserve_rx(tg_ws_pump *p,size_t needed) {
     if(p->memory_budget&&tg_memory_budget_reserve(p->memory_budget,cap)!=0)
         return -1;
     uint8_t *grown=realloc(p->rx,cap);
-    if(!grown){tg_memory_budget_release(p->memory_budget,cap);return -1;}
+    if (!grown) {
+        if (p->memory_budget) ++p->memory_budget->allocation_failures;
+        tg_memory_budget_release(p->memory_budget, cap);
+        return -1;
+    }
     tg_memory_budget_release(p->memory_budget,p->rx_cap);
     p->rx=grown;p->rx_cap=cap;
     return 0;
@@ -105,15 +115,22 @@ static int queue_opcode(tg_ws_pump *p,uint8_t opcode,const uint8_t *data,
                         size_t len,int mtproto_payload) {
     if(!p||p->failed||p->closed||(!data&&len)||len>TG_WS_MAX_MESSAGE)return -1;
     size_t alloc=len+14,written=0;
-    if(p->tx_memory_bytes>TG_WS_PUMP_TX_LIMIT||
-       alloc+sizeof(tg_ws_tx_frame)>TG_WS_PUMP_TX_LIMIT-p->tx_memory_bytes)return -1;
+    if (p->tx_memory_bytes > TG_WS_PUMP_TX_LIMIT ||
+        alloc + sizeof(tg_ws_tx_frame) > TG_WS_PUMP_TX_LIMIT - p->tx_memory_bytes) {
+        if (p->memory_budget) ++p->memory_budget->size_rejections;
+        return -1;
+    }
     size_t charge=alloc+sizeof(tg_ws_tx_frame);
     if(p->memory_budget&&tg_memory_budget_reserve(p->memory_budget,charge)!=0)
         return -1;
-    tg_ws_tx_frame *f=calloc(1,sizeof(*f));if(!f){
-        tg_memory_budget_release(p->memory_budget,charge);return -1;}
-    f->bytes=OPENSSL_malloc(alloc);if(!f->bytes){free(f);
-        tg_memory_budget_release(p->memory_budget,charge);return -1;}
+    tg_ws_tx_frame *f = calloc(1, sizeof *f);
+    if (f) f->bytes = OPENSSL_malloc(alloc);
+    if (!f || !f->bytes) {
+        free(f);
+        if (p->memory_budget) ++p->memory_budget->allocation_failures;
+        tg_memory_budget_release(p->memory_budget, charge);
+        return -1;
+    }
     if(tg_ws_encode_client_frame(f->bytes,alloc,opcode,data,len,&written)!=0){
         OPENSSL_clear_free(f->bytes,alloc);free(f);
         tg_memory_budget_release(p->memory_budget,charge);return -1;}
@@ -142,7 +159,10 @@ short tg_ws_pump_events(const tg_ws_pump *p){
 
 static int append_fragment(tg_ws_reassembly *state, const uint8_t *data,
                            size_t len, size_t limit) {
-    if (state->len > limit || len > limit - state->len) return -1;
+    if (state->len > limit || len > limit - state->len) {
+        if (state->memory_budget) ++state->memory_budget->size_rejections;
+        return -1;
+    }
     size_t needed = state->len + len;
     if (needed > state->cap) {
         size_t cap = state->cap ? state->cap : 256u;
@@ -155,6 +175,7 @@ static int append_fragment(tg_ws_reassembly *state, const uint8_t *data,
            tg_memory_budget_reserve(state->memory_budget,cap)!=0)return -1;
         uint8_t *buffer = OPENSSL_malloc(cap);
         if (!buffer) {
+            if (state->memory_budget) ++state->memory_budget->allocation_failures;
             tg_memory_budget_release(state->memory_budget,cap);
             return -1;
         }

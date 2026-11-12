@@ -1607,7 +1607,6 @@ static void test_epoll_wss_forwards_unrecognized_binary_response(void) {
     tg_mtproto_ctr_destroy(&encrypt);
     assert(send(client, encrypted_packet, sizeof(encrypted_packet), 0) ==
            (ssize_t)sizeof(encrypted_packet));
-    assert(shutdown(client, SHUT_WR) == 0);
 
     uint8_t response[sizeof(invalid_response)];
     size_t received = 0;
@@ -1622,9 +1621,16 @@ static void test_epoll_wss_forwards_unrecognized_binary_response(void) {
     assert(recv(client, &extra, sizeof(extra), 0) == 0);
     assert(pthread_join(wss_thread, NULL) == 0);
     assert(atomic_load(&wss.complete) == 1 && fixture.routes == 1);
-    close(client);
+    /* Leave the client write side open after upstream EOF. It must release
+     * the slot on the close deadline instead of keeping it until idle. */
     atomic_store(&runner.stop, 1);
     assert(pthread_join(proxy_thread, NULL) == 0);
+    assert(tg_epoll_proxy_active_connections(proxy) == 1);
+    atomic_store(&test_monotonic_offset_ms, 3100u);
+    assert(tg_epoll_proxy_step(proxy, 0) >= 0);
+    atomic_store(&test_monotonic_offset_ms, 0);
+    assert(tg_epoll_proxy_active_connections(proxy) == 0);
+    close(client);
     tg_epoll_proxy_stats route_stats;
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
     assert(route_stats.wss_attempts == 1 && route_stats.wss_responses == 0 &&
@@ -3540,11 +3546,30 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
             atomic_store(&runner.stop, 1);
             assert(pthread_join(proxy_thread, NULL) == 0);
             assert(tg_epoll_proxy_active_connections(proxy) == 2);
+            /* Under pressure there is no room for another session, but the
+             * already allocated buffers must remain usable. */
+            size_t ceiling = tg_limits_runtime_memory_budget(total, total);
+            size_t admission = tg_limits_policy_admission(tg_limits_soft_nofile(),
+                total, 0, configured, tg_epoll_proxy_active_connections(proxy));
+            tg_epoll_proxy_update_limits(proxy, admission, 0, ceiling);
+            tg_epoll_proxy_stats pressure;
+            assert(tg_epoll_proxy_get_stats(proxy, &pressure) == 0);
+            assert(pressure.buffer_bytes_current > 0);
+            assert(pressure.buffer_bytes_limit == pressure.buffer_bytes_current);
+            assert(pressure.max_connections == 2 && pressure.active_connections == 2);
+            int rejected = connect_to_listener(proxy_port);
+            assert(tg_epoll_proxy_step(proxy, 0) >= 0);
+            uint8_t byte;
+            assert(recv(rejected, &byte, sizeof(byte), MSG_DONTWAIT) == 0);
+            close(rejected);
+            assert(tg_epoll_proxy_get_stats(proxy, &pressure) == 0);
+            assert(pressure.accept_limit_rejections == 1);
             fixture.fail_dc4_proxy = 1;
             tg_epoll_proxy_update_limits(proxy,
                 tg_limits_policy_connections(tg_limits_soft_nofile(),
                                              total, recovered, configured),
-                tg_limits_runtime_memory_budget(total, recovered));
+                tg_limits_runtime_memory_budget(total, recovered),
+                tg_limits_runtime_memory_budget(total, total));
             atomic_store(&runner.stop, 0);
             assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
             media_started_us = test_monotonic_us();
@@ -3592,6 +3617,8 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
     assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
     assert(stats.wss_responses == 4 && stats.cf_wss_responses == 4);
     assert(stats.buffer_bytes_peak < mib);
+    assert(stats.buffer_budget_rejections == 0 && stats.allocation_failures == 0);
+    assert(stats.wss_read_pauses == stats.wss_read_resumes && stats.wss_reads_paused == 0);
     printf("mixed traffic: 4/4, media 2/2, WSS buffer peak %zu bytes, "
            "media %zu bytes in %" PRIu64 " us, text max RTT %" PRIu64 " us\n",
            stats.buffer_bytes_peak, 2u * TEST_MEDIA_CHUNK * media_chunks,

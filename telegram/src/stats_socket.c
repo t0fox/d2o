@@ -263,6 +263,16 @@ int tg_stats_socket_serve(tg_stats_socket *server,
                     ",\"buffer_bytes_current\":%zu"
                     ",\"buffer_bytes_peak\":%zu"
                     ",\"buffer_bytes_limit\":%zu"
+                    ",\"accept_limit_rejections\":%" PRIu64
+                    ",\"accept_fd_exhaustion\":%" PRIu64
+                    ",\"allocation_failures\":%" PRIu64
+                    ",\"buffer_budget_rejections\":%" PRIu64
+                    ",\"buffer_size_rejections\":%" PRIu64
+                    ",\"wss_read_pauses\":%" PRIu64
+                    ",\"wss_read_resumes\":%" PRIu64
+                    ",\"wss_paused_timeouts\":%" PRIu64
+                    ",\"wss_reads_paused\":%zu"
+                    ",\"wss_oldest_pause_ms\":%" PRIu64
                     ",\"connections_started\":%" PRIu64
                     ",\"bytes_from_clients\":%" PRIu64
                     ",\"bytes_from_upstreams\":%" PRIu64
@@ -286,6 +296,16 @@ int tg_stats_socket_serve(tg_stats_socket *server,
                     stats.max_connections, stats.active_wss_connections,
                     stats.max_wss_connections, stats.buffer_bytes_current,
                     stats.buffer_bytes_peak, stats.buffer_bytes_limit,
+                    stats.accept_limit_rejections,
+                    stats.accept_fd_exhaustion,
+                    stats.allocation_failures,
+                    stats.buffer_budget_rejections,
+                    stats.buffer_size_rejections,
+                    stats.wss_read_pauses,
+                    stats.wss_read_resumes,
+                    stats.wss_paused_timeouts,
+                    stats.wss_reads_paused,
+                    stats.wss_oldest_pause_ms,
                     stats.connections_started,
                     stats.bytes_from_clients, stats.bytes_from_upstreams,
                     stats.wss_attempts, stats.wss_failures, stats.wss_responses,

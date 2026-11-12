@@ -24,6 +24,7 @@ static int grow_packet(tg_mtproto_splitter *splitter, size_t extra) {
         return TG_MTPROTO_SPLIT_NO_MEMORY;
     uint8_t *packet = realloc(splitter->packet, cap);
     if (!packet) {
+        if (splitter->memory_budget) ++splitter->memory_budget->allocation_failures;
         tg_memory_budget_release(splitter->memory_budget, cap);
         return TG_MTPROTO_SPLIT_NO_MEMORY;
     }

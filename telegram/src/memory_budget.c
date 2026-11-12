@@ -5,6 +5,7 @@
 int tg_memory_budget_reserve(tg_memory_budget *budget, size_t bytes) {
     if (!budget || budget->used > budget->limit ||
         bytes > budget->limit - budget->used) {
+        if (budget) ++budget->rejections;
         errno = ENOMEM;
         return -1;
     }

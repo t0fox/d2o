@@ -10,6 +10,7 @@ static void test_dynamic_buffer_budget_is_hard_and_releasable(void) {
     assert(budget.used == 48u * 1024u);
     assert(budget.peak == budget.used);
     assert(tg_memory_budget_reserve(&budget, 16u * 1024u + 1u) != 0);
+    assert(budget.rejections == 1);
     assert(budget.used == 48u * 1024u);
     assert(tg_memory_budget_reserve(&budget, 16u * 1024u) == 0);
     assert(budget.used == budget.limit && budget.peak == budget.limit);

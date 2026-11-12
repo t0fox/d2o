@@ -451,9 +451,11 @@ static int run_local_daemon(const char *config_path) {
             if (read_memory_resources(&total, &available)) {
                 size_t old_limit = tg_epoll_proxy_max_connections(proxy);
                 tg_epoll_proxy_update_limits(proxy,
-                    tg_limits_policy_connections(tg_limits_soft_nofile(),
-                                                 total, available, configured_limit),
-                    tg_limits_runtime_memory_budget(total, available));
+                    tg_limits_policy_admission(tg_limits_soft_nofile(), total,
+                                                available, configured_limit,
+                                                tg_epoll_proxy_active_connections(proxy)),
+                    tg_limits_runtime_memory_budget(total, available),
+                    tg_limits_runtime_memory_budget(total, total));
                 size_t new_limit = tg_epoll_proxy_max_connections(proxy);
                 if (old_limit != new_limit) {
                     snprintf(resource_note, sizeof(resource_note),

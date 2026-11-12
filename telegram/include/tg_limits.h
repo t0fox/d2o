@@ -12,6 +12,9 @@ size_t tg_limits_auto_max_connections(size_t fd_limit, size_t memory_budget,
                                      size_t configured_max);
 size_t tg_limits_policy_connections(size_t fd_limit, size_t total_bytes,
                                     size_t available_bytes, size_t cap);
+size_t tg_limits_policy_admission(size_t fd_limit, size_t total_bytes,
+                                  size_t available_bytes, size_t cap,
+                                  size_t active);
 size_t tg_limits_runtime_memory_budget(size_t total_bytes,
                                       size_t available_bytes);
 

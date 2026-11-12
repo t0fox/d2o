@@ -79,6 +79,11 @@ int main(void) {
     assert(tg_limits_policy_connections(1024, 128*mib, 3*mib, 32) == 0);
     assert(tg_limits_policy_connections(48, 128*mib, 16*mib, 32) == 1);
     assert(tg_limits_policy_connections(32, 128*mib, 64*mib, 32) == 0);
+    assert(tg_limits_policy_admission(128, 128*mib, 6*mib, 32, 4) == 5);
+    assert(tg_limits_policy_admission(128, 128*mib, 1*mib, 32, 4) == 4);
+    assert(tg_limits_policy_admission(128, 128*mib, 0, 32, 4) == 4);
+    assert(tg_limits_policy_admission(128, 128*mib, 64*mib, 32, 13) == 14);
+    assert(tg_limits_policy_admission(128, 128*mib, 16*mib, 4, 4) == 4);
     puts("Тесты лимитов Telegram runtime: ок");
     return 0;
 }

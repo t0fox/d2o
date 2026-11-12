@@ -73,9 +73,10 @@ size_t tg_limits_auto_max_connections(size_t fd_limit, size_t memory_budget,
     return cap;
 }
 
-size_t tg_limits_policy_connections(size_t fd_limit, size_t total_bytes,
-                                    size_t available_bytes, size_t cap) {
-    if (!total_bytes || !available_bytes || available_bytes > total_bytes) return 0;
+size_t tg_limits_policy_admission(size_t fd_limit, size_t total_bytes,
+                                  size_t available_bytes, size_t cap,
+                                  size_t active) {
+    if (!total_bytes || available_bytes > total_bytes) return 0;
     size_t usable_fds = fd_limit - (fd_limit / 5u + (fd_limit % 5u != 0));
     size_t fd_slots = usable_fds > 32u ? (usable_fds - 32u) / 5u : 0;
     size_t reserved = total_bytes / 5u;
@@ -87,7 +88,15 @@ size_t tg_limits_policy_connections(size_t fd_limit, size_t total_bytes,
     if (reserved > max_reserve) reserved = max_reserve;
     size_t memory_slots = (available_bytes - reserved) / (1024u * 1024u);
     if (cap > fd_slots) cap = fd_slots;
-    return cap < memory_slots ? cap : memory_slots;
+    /* MemAvailable budgets additional clients. Counting live clients
+     * against that allowance would starve new media behind idle text. */
+    if (active >= cap || memory_slots >= cap - active) return cap;
+    return active + memory_slots;
+}
+
+size_t tg_limits_policy_connections(size_t fd_limit, size_t total_bytes,
+                                    size_t available_bytes, size_t cap) {
+    return tg_limits_policy_admission(fd_limit, total_bytes, available_bytes, cap, 0);
 }
 
 size_t tg_limits_runtime_memory_budget(size_t total_bytes,
