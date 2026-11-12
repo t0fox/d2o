@@ -906,7 +906,7 @@ static void route_health_failed(proxy_connection *connection) {
                connection->wss_phase == WSS_UPGRADE_READ) {
         stage = connection->ws_upgrade.failed &&
             connection->route_kind == TG_ROUTE_CF_WORKER &&
-            connection->route_tcp_only && connection->original.port == 5222
+            connection->original.port == 5222
             ? TG_EPOLL_FAILURE_WORKER_PORT : TG_EPOLL_FAILURE_WEBSOCKET;
     } else if (connection->wss_phase == WSS_READY) {
         stage = TG_EPOLL_FAILURE_MTPROTO;
@@ -1147,50 +1147,34 @@ static int set_direct_hostname(proxy_connection *connection, unsigned variant) {
 static const struct {
     uint32_t dc;
     const char *address;
-} worker_fallback[] = {
+} worker_warm_targets[] = {
     {1, "149.154.175.50"}, {2, "149.154.167.51"},
     {3, "149.154.175.100"}, {4, "149.154.167.91"},
     {5, "149.154.171.5"}, {203, "91.105.192.100"},
 };
 
-static const char *worker_primary_address(uint32_t dc) {
-    for (size_t i = 0; i < sizeof(worker_fallback) / sizeof(worker_fallback[0]); ++i)
-        if (worker_fallback[i].dc == dc) return worker_fallback[i].address;
-    return NULL;
-}
-
-static int worker_path_for_dc(uint32_t dc, int is_media,
-                              char *path, size_t path_size) {
-    /* The Worker tunnels raw TCP to the DC's regular endpoint; media=1 only
-       tells a supporting Worker script which Telegram route to use. */
-    const char *address = worker_primary_address(dc);
-    if (!address || !path || !path_size) return -1;
-    int n = snprintf(path, path_size, "/apiws?dst=%s&dc=%u&media=%d",
+static int format_worker_path(const char *address, uint16_t port,
+                              uint32_t dc, int is_media, char *path, size_t path_size) {
+    if (port != 443 && port != 5222) return -1;
+    int n = snprintf(path, path_size, "%s?dst=%s&dc=%u&media=%d",
+                     port == 5222 ? "/d2o/apiws/5222" : "/apiws",
                      address, dc, is_media ? 1 : 0);
     return n > 0 && (size_t)n < path_size ? 0 : -1;
 }
 
 static int worker_requires_5222(const proxy_connection *connection) {
     return connection->route_kind == TG_ROUTE_CF_WORKER &&
-           connection->route_tcp_only && connection->original.port == 5222;
+           connection->original.port == 5222;
 }
 
 static int set_worker_path(proxy_connection *connection) {
-    if (!connection->route_tcp_only && worker_path_for_dc(connection->route_dc_id,
-                           connection->route_is_media,
-                           connection->wss_path,
-                           sizeof(connection->wss_path)) == 0)
-        return 0;
-    char original[INET6_ADDRSTRLEN];
-    if (!inet_ntop(connection->original.family,
-                   connection->original.address, original,
-                   sizeof(original))) return -1;
-    int n = snprintf(connection->wss_path, sizeof(connection->wss_path),
-                     "%s?dst=%s&dc=%u&media=%d",
-                     worker_requires_5222(connection) ? "/d2o/apiws/5222" : "/apiws", original,
-                     connection->route_dc_id,
-                     connection->route_is_media ? 1 : 0);
-    return n > 0 && (size_t)n < sizeof(connection->wss_path) ? 0 : -1;
+    char address[INET6_ADDRSTRLEN];
+    const tg_listener_destination *original = &connection->original;
+    if (!inet_ntop(original->family, original->address, address, sizeof(address)))
+        return -1;
+    return format_worker_path(address, original->port, connection->route_dc_id,
+                              connection->route_is_media, connection->wss_path,
+                              sizeof(connection->wss_path));
 }
 
 static void worker_pool_entry_close(worker_pool_entry *entry) {
@@ -1438,14 +1422,14 @@ static worker_pool *worker_pool_start(const tg_epoll_proxy_config *config,
     snprintf(pool->domain, sizeof(pool->domain), "%s",
              config->routing_config->cf_worker_domains[0]);
     if (!pool->domain[0]) { free(pool); return NULL; }
-    static const uint32_t candidates[] = {1, 2, 3, 4, 5, 203};
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+    for (size_t i = 0; i < sizeof(worker_warm_targets) / sizeof(worker_warm_targets[0]); ++i) {
         for (int is_media = 0; is_media <= 1; ++is_media) {
             char path[512];
-            if (worker_path_for_dc(candidates[i], is_media,
+            if (format_worker_path(worker_warm_targets[i].address, 443,
+                                   worker_warm_targets[i].dc, is_media,
                                    path, sizeof(path)) != 0)
                 continue;
-            pool->dcs[pool->dc_count] = candidates[i];
+            pool->dcs[pool->dc_count] = worker_warm_targets[i].dc;
             pool->media[pool->dc_count] = is_media;
             memcpy(pool->paths[pool->dc_count], path, strlen(path) + 1u);
             ++pool->dc_count;
@@ -1473,8 +1457,8 @@ static worker_pool *worker_pool_start(const tg_epoll_proxy_config *config,
     return pool;
 }
 
-static int worker_pool_take(worker_pool *pool, uint32_t dc, int is_media,
-                            worker_pool_entry *out) {
+static int worker_pool_take(worker_pool *pool, const char *hostname,
+                            const char *path, worker_pool_entry *out) {
     if (!pool || !out) return 0;
     worker_pool_entry stale[TG_WORKER_POOL_MAX];
     size_t stale_count = 0;
@@ -1482,8 +1466,10 @@ static int worker_pool_take(worker_pool *pool, uint32_t dc, int is_media,
     pthread_mutex_lock(&pool->lock);
     uint64_t now = monotonic_ms();
     for (size_t i = 0; i < pool->count;) {
-        if (pool->entries[i].dc_id != dc ||
-            pool->entries[i].is_media != is_media) { ++i; continue; }
+        /* The upgrade already opened a specific Telegram destination. The
+         * full path includes its address, port, DC and media class. */
+        if (strcmp(pool->entries[i].hostname, hostname) != 0 ||
+            strcmp(pool->entries[i].path, path) != 0) { ++i; continue; }
         if (now - pool->entries[i].created_ms >= TG_WORKER_POOL_MAX_AGE_MS ||
             !worker_pool_entry_alive(&pool->entries[i])) {
             stale[stale_count++] = pool->entries[i];
@@ -1501,6 +1487,27 @@ static int worker_pool_take(worker_pool *pool, uint32_t dc, int is_media,
         worker_pool_entry_close(&stale[i]);
     return found;
 }
+
+#ifdef TG_EPOLL_TESTING
+int tg_epoll_proxy_test_worker_pool_take(int fd, SSL *ssl,
+                                      const char *hostname, const char *path) {
+    worker_pool pool = {.count = 1};
+    if (pthread_mutex_init(&pool.lock, NULL) != 0) return -1;
+    if (pthread_cond_init(&pool.wake, NULL) != 0) {
+        pthread_mutex_destroy(&pool.lock);
+        return -1;
+    }
+    pool.entries[0] = (worker_pool_entry){
+        .fd = fd, .ssl = ssl, .created_ms = monotonic_ms(),
+        .hostname = "worker.test", .path = "/apiws?dst=149.154.167.51&dc=2&media=1",
+    };
+    worker_pool_entry entry;
+    int found = worker_pool_take(&pool, hostname, path, &entry);
+    pthread_cond_destroy(&pool.wake);
+    pthread_mutex_destroy(&pool.lock);
+    return found;
+}
+#endif
 
 static void worker_pool_stop(worker_pool *pool) {
     if (!pool) return;
@@ -1921,8 +1928,8 @@ static int start_next_route(proxy_connection *connection) {
         if (step.kind == TG_ROUTE_CF_WORKER && step.index == 0 &&
             !connection->route_tcp_only && server->worker_pool) {
             worker_pool_entry pooled;
-            if (worker_pool_take(server->worker_pool, connection->route_dc_id,
-                                 connection->route_is_media, &pooled)) {
+            if (worker_pool_take(server->worker_pool, connection->tls_hostname,
+                                 connection->wss_path, &pooled)) {
                 ++server->worker_pool_hits;
                 connection->direct_wss = 1;
                 ++server->active_wss_connections;

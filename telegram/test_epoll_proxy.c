@@ -2153,10 +2153,42 @@ static int select_raw_worker_endpoint(
     return 0;
 }
 
+int tg_epoll_proxy_test_worker_pool_take(int fd, SSL *ssl,
+                                      const char *hostname, const char *path);
+
+static void test_worker_pool_requires_exact_target(void) {
+    uint16_t port;
+    int listener = create_listener(&port);
+    int fd = connect_to_listener(port);
+    int peer = accept(listener, NULL, NULL);
+    assert(peer >= 0);
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    assert(ctx);
+    SSL *ssl = SSL_new(ctx);
+    assert(ssl && SSL_set_fd(ssl, fd) == 1);
+    assert(tg_epoll_proxy_test_worker_pool_take(fd, ssl, "worker.test",
+        "/apiws?dst=149.154.167.151&dc=2&media=1") == 0);
+    assert(tg_epoll_proxy_test_worker_pool_take(fd, ssl, "worker.test",
+        "/apiws?dst=149.154.167.51&dc=2&media=0") == 0);
+    assert(tg_epoll_proxy_test_worker_pool_take(fd, ssl, "worker.test",
+        "/apiws?dst=149.154.167.51&dc=4&media=1") == 0);
+    assert(tg_epoll_proxy_test_worker_pool_take(fd, ssl, "worker.test",
+        "/d2o/apiws/5222?dst=149.154.167.51&dc=2&media=1") == 0);
+    assert(tg_epoll_proxy_test_worker_pool_take(fd, ssl, "other.test",
+        "/apiws?dst=149.154.167.51&dc=2&media=1") == 0);
+    assert(tg_epoll_proxy_test_worker_pool_take(fd, ssl, "worker.test",
+        "/apiws?dst=149.154.167.51&dc=2&media=1") == 1);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    close(peer);
+    close(fd);
+    close(listener);
+}
+
 static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
                                                         int legacy_worker,
                                                         int slow_proxy, uint32_t dc,
-                                                        const char *dc_address) {
+                                                        const char *dc_address, int media) {
     char directory[] = "/tmp/d2k-tg-worker-XXXXXX";
     char cert_path[256], key_path[256];
     assert(mkdtemp(directory) != NULL);
@@ -2175,11 +2207,11 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
 
     uint16_t ws_port, proxy_port;
     uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN];
-    make_wss_test_handshake(TG_MTPROTO_INTERMEDIATE, dc, 1, handshake);
+    make_wss_test_handshake(TG_MTPROTO_INTERMEDIATE, dc, media, handshake);
     char path[128];
-    int path_len = snprintf(path, sizeof(path), "%s?dst=%s&dc=%u&media=1",
+    int path_len = snprintf(path, sizeof(path), "%s?dst=%s&dc=%u&media=%d",
         raw_port == 5222 ? "/d2o/apiws/5222" : "/apiws",
-        raw_port ? "149.154.167.51" : dc_address, dc);
+        dc_address, dc, media);
     assert(path_len > 0 && (size_t)path_len < sizeof(path));
     wss_server_fixture worker = {
         .listener = create_listener(&ws_port),
@@ -2211,7 +2243,9 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
 
     int listener = create_listener(&proxy_port);
     proxy_fixture fixture = {0};
-    set_ipv4(&fixture.original, "149.154.167.51", raw_port ? raw_port : 443);
+    fixture.original.family = strchr(dc_address, ':') ? AF_INET6 : AF_INET;
+    fixture.original.port = raw_port ? raw_port : 443;
+    assert(inet_pton(fixture.original.family, dc_address, fixture.original.address) == 1);
     set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
     SSL_CTX *tls_context = tg_tls_client_context(cert_path);
     assert(tls_context);
@@ -2329,7 +2363,7 @@ static void test_async_route_dns_waits_before_worker(void) {
         .cert_path = cert_path,
         .key_path = key_path,
         .expected_sni = "worker.test",
-        .expected_path = "/apiws?dst=149.154.167.91&dc=4&media=1",
+        .expected_path = "/apiws?dst=149.154.167.51&dc=4&media=1",
         .expect_binary_subprotocol = 0,
         .expect_no_browser_headers = 1
     };
@@ -3481,7 +3515,7 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
         upstream->key_path = key_path;
         upstream->expected_sni = sni[i];
         upstream->expected_path = i == 3
-            ? "/apiws?dst=149.154.167.91&dc=4&media=1" : "/apiws";
+            ? "/apiws?dst=149.154.167.51&dc=4&media=1" : "/apiws";
         upstream->expect_binary_subprotocol = i != 3;
         upstream->expect_no_browser_headers = i == 3;
         upstream->media_chunks = i >= 2 ? media_chunks : 0;
@@ -3665,13 +3699,19 @@ int main(int argc, char **argv) {
         {1, "149.154.175.50"}, {2, "149.154.167.51"}, {3, "149.154.175.100"},
         {4, "149.154.167.91"}, {5, "149.154.171.5"}, {203, "91.105.192.100"}
     };
+    test_worker_pool_requires_exact_target();
     for (size_t i = 0; i < sizeof(worker_dcs) / sizeof(worker_dcs[0]); ++i)
         test_epoll_cf_worker_uses_raw_stream_framing(
-            0, 0, 0, worker_dcs[i].dc, worker_dcs[i].address);
-    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 1, 4, "149.154.167.91");
-    test_epoll_cf_worker_uses_raw_stream_framing(443, 0, 0, 4, NULL);
-    test_epoll_cf_worker_uses_raw_stream_framing(5222, 0, 0, 4, NULL);
-    test_epoll_cf_worker_uses_raw_stream_framing(5222, 1, 0, 4, NULL);
+            0, 0, 0, worker_dcs[i].dc, worker_dcs[i].address, 0);
+    /* Ordinary, dedicated media, and IPv6 destinations must survive the
+     * Worker upgrade unchanged, including when Proxy is attempted first. */
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 2, "149.154.167.50", 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 2, "149.154.167.151", 1);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 1, 4, "149.154.167.43", 1);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 4, "2001:67c:4e8:f004::a", 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(443, 0, 0, 4, "149.154.167.51", 1);
+    test_epoll_cf_worker_uses_raw_stream_framing(5222, 0, 0, 4, "149.154.167.51", 1);
+    test_epoll_cf_worker_uses_raw_stream_framing(5222, 1, 0, 4, "149.154.167.51", 1);
     test_epoll_wss_sends_ping();
     test_async_route_dns_waits_before_worker();
     test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing();

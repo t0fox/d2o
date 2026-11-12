@@ -69,15 +69,15 @@ function tcp(opened = Promise.resolve()) {
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-test("Flowseal /apiws opens 443 without extra fields or a TCP-open delay and forwards bytes in order", async () => {
+test("Flowseal /apiws opens the requested media DC on 443 and forwards bytes in order", async () => {
   let opened;
   const socket = tcp(new Promise(resolve => { opened = resolve; }));
   const worker = await loadWorker(address => {
-    assert.equal(address.hostname, "149.154.167.91");
+    assert.equal(address.hostname, "149.154.167.43");
     assert.equal(address.port, 443);
     return socket;
   });
-  const response = await worker.fetch(upgrade("/apiws", "dst=::ffff:149.154.167.91&dc=4&media=1&port=5222"));
+  const response = await worker.fetch(upgrade("/apiws", "dst=::ffff:149.154.167.43&dc=4&media=1&port=5222"));
   assert.equal(response.status, 101);
   assert.equal(response.headers.get("Sec-WebSocket-Protocol"), null);
   opened();

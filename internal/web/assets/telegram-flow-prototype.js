@@ -175,8 +175,10 @@ function mountTelegramFlow(canvas) {
         return;
       }
       const oldest = events.length ? Number(events[0].sequence) || newest : newest;
-      if (previous < oldest - 1) { cursors.set(id, newest); return; }
-      events.filter(event => Number(event.sequence) > previous).slice()
+      const gap = previous < oldest - 1;
+      events.filter(event => Number(event.sequence) > previous &&
+        (!gap || (Number(event.age_ms) >= 0 &&
+          Number(event.age_ms) <= (EVENT_WINDOW[event.state] || 0)))).slice()
         .sort((a, b) => a.sequence - b.sequence).forEach(event => processEvent(item, event));
       cursors.set(id, newest);
     });
@@ -194,7 +196,7 @@ function mountTelegramFlow(canvas) {
       const count = Math.min(8, Math.max(1, Math.ceil(delta.bytes / 1024)));
       for (let index = 0; index < count; index += 1) {
         const representedBytes = delta.bytes / count;
-        parts.push({ kind: "pkt", lane, path, t0: now + deltaIndex * 55 + index * 45,
+        parts.push({ kind: "pkt", lane, path, t0: now + Math.min(500, deltaIndex * 55) + index * 45,
           dur: 2400 + Math.random() * 1000, back: delta.direction === "response",
           dc: delta.dc, size: 4 + Math.min(8, Math.log2(1 + representedBytes / 256)) });
       }
@@ -257,6 +259,7 @@ function mountTelegramFlow(canvas) {
   function update(snapshot, isStale) {
     if (destroyed) return null;
     const stale = isStale === true;
+    now = performance.now();
     view = api.summarizeTelegramFlow(snapshot || null, stale ? "stale" : undefined);
     if (!snapshot) {
       sessions.clear(); cursors.clear(); previousTraffic.clear(); parts.length = 0;
@@ -424,6 +427,7 @@ function mountTelegramFlow(canvas) {
       context.shadowBlur = 0;
     }
     for (const particle of parts) {
+      if (now < particle.t0) continue;
       const fraction = Math.max(0, Math.min(1, (now - particle.t0) / particle.dur)), eased = ease(fraction);
       const progress = particle.back ? 1 - eased : eased, point = pointAt(particle.path, progress);
       if (particle.kind === "pkt") {
@@ -594,7 +598,7 @@ function mountTelegramFlow(canvas) {
     frameId = 0;
     if (destroyed || view.state === "stale" || !inView || document.hidden) return;
     const delta = Math.min(0.05, Math.max(0, (timestamp - lastFrame) / 1000));
-    lastFrame = timestamp; now += delta * 1000; animate(delta); draw(); startLoop();
+    lastFrame = timestamp; now = Math.max(now, timestamp); animate(delta); draw(); startLoop();
   }
   function startLoop() {
     // This canvas is live proxy telemetry; keep it animated independently of

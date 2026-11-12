@@ -338,3 +338,55 @@ assert.deepEqual(flow.motionProfile, {
   rippleDurationMs: 1200,
 }, "реальный поток движется спокойно и ограничивает визуальный шум");
 console.log("telegram flow: active sessions and route states match C11 snapshots");
+
+{
+  // Keep the final 110 particles from a large poll, as in the live canvas.
+  // They must be visible before the next poll replaces them.
+  let timestamp = 1000, nextFrame, paintedPackets = 0, paintedResponses = 0;
+  const ctx = new Proxy({
+    fillRect(x, y, width, height) {
+      if (height === 2.4 && !this.fillStyle.endsWith(",0)")) ++paintedPackets;
+    },
+    arc(x, y, radius) {
+      if (this.globalCompositeOperation === "lighter" && radius === 4.4) ++paintedResponses;
+    },
+  }, { get(target, key) { return target[key] ?? (() => {}); } });
+  const canvas = {
+    style: {}, dataset: {}, getContext: () => ctx, closest: () => null,
+    getBoundingClientRect: () => ({ width: 900 }), setAttribute() {},
+  };
+  const { runInNewContext } = require("node:vm");
+  const { readFileSync } = require("node:fs");
+  const scope = {
+    D2kTelegramFlow: flow, performance: { now: () => timestamp },
+    document: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    requestAnimationFrame(callback) { nextFrame = callback; return 1; },
+    cancelAnimationFrame() { nextFrame = null; },
+    addEventListener() {}, removeEventListener() {},
+  };
+  runInNewContext(readFileSync(require.resolve("../internal/web/assets/telegram-flow-prototype.js"), "utf8"), scope);
+  const scene = scope.D2kTelegramPrototype.mountTelegramFlow(canvas);
+  const sessions = Array.from({ length: 64 }, (_, id) => session({
+    id: id + 1, dc: 4, is_media: true, selected_transport: "cloudflare_worker",
+    telegram_response_seen: true, bytes_from_clients: 0, bytes_from_upstreams: 0,
+    events: [{ sequence: 1, age_ms: 10, transport: "cloudflare_worker", state: "connected" }],
+  }));
+  scene.update(snapshot({ active_connections: sessions.length, active_sessions: sessions }));
+  const traffic = sessions.map(item => ({
+    ...item, bytes_from_clients: 8192, bytes_from_upstreams: 8192,
+  }));
+  timestamp += 1000;
+  scene.update(snapshot({ active_connections: traffic.length, active_sessions: traffic }));
+  timestamp += 1000;
+  nextFrame(timestamp);
+  assert.ok(paintedPackets > 0, "пакеты большого снимка видны до следующего опроса");
+
+  // The C11 ring may have evicted everything after the previous cursor.
+  traffic[0].events = [{ sequence: 12, age_ms: 20, transport: "cloudflare_worker",
+    state: "first_binary_response" }];
+  scene.update(snapshot({ active_connections: traffic.length, active_sessions: traffic }));
+  timestamp += 100;
+  nextFrame(timestamp);
+  assert.ok(paintedResponses > 0, "свежий ответ виден после переполнения кольца событий");
+  scene.destroy();
+}
