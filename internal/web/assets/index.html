@@ -50,10 +50,12 @@
 
     <main id="app">
       <section class="sheet sheet-now" id="now" aria-labelledby="now-title">
-        <h1 class="statement" id="now-title">Получаем состояние…</h1>
-        <p class="lede" id="now-lede"></p>
-        <div class="slots" id="slots"></div>
-        <ol class="searches" id="searches" aria-label="Текущие поиски"></ol>
+        <div class="now-summary" role="region" aria-label="Состояние подбора" tabindex="0">
+          <h1 class="statement" id="now-title">Получаем состояние…</h1>
+          <p class="lede" id="now-lede"></p>
+          <div class="slots" id="slots"></div>
+        </div>
+        <ol class="searches" id="searches" aria-label="Текущие поиски" tabindex="0"></ol>
       </section>
 
       <section class="sheet dns-services-sheet" id="dns-services" aria-labelledby="dns-services-title" hidden>

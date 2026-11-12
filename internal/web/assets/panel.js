@@ -1394,7 +1394,7 @@
     if (listNode.__d2kKey === "none" || (listNode.__d2kKey && listNode.__d2kKey.indexOf("absent:") === 0)) {
       listNode.replaceChildren();
     }
-    var firstLive = listNode.__d2kKey !== "live";
+    var firstRender = !listNode.__d2kKey;
     listNode.__d2kKey = "live";
     var animate = Motion.on() && Motion.Flip;
     var stable = [];
@@ -1461,7 +1461,7 @@
         onComplete: function () { movers.forEach(function (r) { r.classList.remove("is-moving"); r.style.zIndex = ""; }); }
       }));
     }
-    if (entered.length && !firstLive) {
+    if (entered.length && !firstRender) {
       Motion.g.fromTo(entered, { y: 28, autoAlpha: 0 }, { y: 0, autoAlpha: 1, duration: 0.6, stagger: 0.08, ease: "power4.out", clearProps: "transform,opacity,visibility" });
     }
   };

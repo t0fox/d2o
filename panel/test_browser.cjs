@@ -196,6 +196,8 @@ async function main(){
    if(new URL(url,location.href).pathname!=='/api/status')return response;
    const body=await response.clone().json();
    body.snapshot=body.snapshot||{};body.snapshot.dns_services=dnsServices;
+   if(window.__searchLayoutFixture && body.knowledge)
+    Object.assign(body.knowledge,window.__searchLayoutFixture);
    return new Response(JSON.stringify(body),{status:response.status,headers:{'Content-Type':'application/json'}});
   });
   const arc=CanvasRenderingContext2D.prototype.arc;
@@ -381,6 +383,49 @@ async function main(){
    await evaluate('scrollTo(0,0)');await wait(120);
   }
   }
+  async function checkSearchLayout(){
+   const rects = `[...document.querySelectorAll(".mast, .index, [data-nav='families'], #engine-actions, #searches, .filter-bar, #families, #boxes, #telegram, #diagnostics")]
+    .map(el=>{const r=el.getBoundingClientRect();return [r.x,r.y,r.width,r.height]})`;
+   const setSearches=async(count)=>{
+    const searches=Array.from({length:count},(_,i)=>({
+     ...fixture.knowledge.searches[i<2?0:2], target:"discovered-"+i+".long-domain.example.test",
+    }));
+    const measurements={limit:16,active:Math.min(2,count),queued:Math.max(0,count-2),free_pct:30,cores:4};
+    await evaluate(`window.__searchLayoutFixture=${JSON.stringify({searches,measurements})};
+      document.dispatchEvent(new Event("visibilitychange"))`);
+    await until(`document.querySelector("#nav-now").textContent===${JSON.stringify(count?String(count):"")}`,
+     "search snapshot must appear in navigation");
+   };
+   for(const width of [1440,390,320]){
+    await call("Emulation.setDeviceMetricsOverride",{width,height:900,deviceScaleFactor:1,mobile:width<600});
+    await evaluate("scrollTo(0,0)");
+    await setSearches(0);
+    await wait(850);
+    const before=await evaluate(rects);
+    for(const count of [1,12,100,3,0]){
+     await setSearches(count);
+     assert.deepEqual(await evaluate(rects),before,width+"px: layout while rendering "+count+" searches");
+     await wait(850);
+     assert.deepEqual(await evaluate(rects),before,width+"px: layout after motion for "+count+" searches");
+     assert.equal(await evaluate("document.documentElement.scrollWidth<=innerWidth"),true,width+"px: no horizontal page overflow");
+     if(count===100){
+      const scrolled=await evaluate(`(()=>{
+       const list=document.querySelector("#searches"), pageY=scrollY;
+       list.scrollTop=list.scrollHeight;
+       const result=list.scrollTop>0&&scrollY===pageY;
+       list.scrollTop=0;
+       return result;
+      })()`);
+      assert.equal(scrolled,true,width+"px: long queue scrolls inside the results");
+     }
+    }
+   }
+   await call("Emulation.setDeviceMetricsOverride",{width:1440,height:900,deviceScaleFactor:1,mobile:false});
+   await evaluate('delete window.__searchLayoutFixture;document.dispatchEvent(new Event("visibilitychange"))');
+   await until('document.querySelector("#nav-now").textContent==="3"',"restore the original search fixture");
+   await wait(850);
+  }
+  await checkSearchLayout();
   if(process.env.D2K_LAYOUT_ONLY){await checkLayout();return;}
   assert.match(await evaluate('document.querySelector("#now-title").textContent'),/Идёт 3 поиска/);
   assert.equal(await evaluate('document.querySelectorAll(".queue-list li").length'),1,'queued searches are listed compactly');
