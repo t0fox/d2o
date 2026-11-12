@@ -133,8 +133,10 @@ int tg_ws_pump_queue_close(tg_ws_pump *p){return queue_opcode(p,TG_WS_CLOSE,NULL
 int tg_ws_pump_fd(const tg_ws_pump *p){return p?p->fd:-1;}
 short tg_ws_pump_events(const tg_ws_pump *p){
     if(!p||p->failed||p->closed)return 0;
-    short events=POLLIN;
-    if(p->tx_head||p->read_wants_write)events|=POLLOUT;
+    if (p->read_paused)
+        return p->write_wants_read ? POLLIN : p->tx_head ? POLLOUT : 0;
+    short events = POLLIN;
+    if (p->tx_head || p->read_wants_write) events |= POLLOUT;
     return events;
 }
 
@@ -309,11 +311,15 @@ static int dispatch_frames(tg_ws_pump *p,tg_ws_message_cb callback,void *ctx) {
                 p->closed=1;return 0;
             }
             else if(op==TG_WS_TEXT)return -1;
-            else if(op==TG_WS_BINARY&&callback&&
-                    callback(ctx,data,len)!=0)return -1;
+            else if (op == TG_WS_BINARY && callback) {
+                int result = callback(ctx, data, len);
+                if (result < 0) return -1;
+                if (result > 0) p->read_paused = 1;
+            }
             trim_idle_buffers(p);
         }
         memmove(p->rx,p->rx+used,p->rx_len-used);p->rx_len-=used;
+        if (p->read_paused) return 0;
     }
     return 0;
 }
@@ -338,8 +344,18 @@ int tg_ws_pump_process(tg_ws_pump *p,short revents,tg_ws_message_cb callback,voi
     if(!p||p->failed)return -1;
     if(revents&(POLLERR|POLLNVAL)){p->failed=1;return -1;}
     if((revents&POLLOUT)||p->tx_head||p->write_wants_read)if(flush_tx(p)!=0)return -1;
+    if (p->read_paused) return 0;
     if((revents&POLLIN)||p->read_wants_write||SSL_pending(p->ssl)>0){
         p->read_wants_write=0;
+        /* A pause can leave complete frames in our own receive buffer. */
+        if (dispatch_frames(p, callback, ctx) != 0) {
+            p->failed = 1;
+            return -1;
+        }
+        if (p->read_paused || p->closed) {
+            trim_idle_buffers(p);
+            return 0;
+        }
         for(;;){
             if(p->rx_len==p->rx_cap&&reserve_rx(p,p->rx_len+1u)!=0){p->failed=1;return -1;}
             size_t n=0;int rc=SSL_read_ex(p->ssl,p->rx+p->rx_len,p->rx_cap-p->rx_len,&n);
@@ -351,7 +367,7 @@ int tg_ws_pump_process(tg_ws_pump *p,short revents,tg_ws_message_cb callback,voi
             }
             if(!n){p->failed=1;return -1;}p->rx_len+=n;
             if(dispatch_frames(p,callback,ctx)!=0){p->failed=1;return -1;}
-            if(p->closed){trim_idle_buffers(p);return 0;}
+            if(p->read_paused||p->closed){trim_idle_buffers(p);return 0;}
         }
     }
     if(revents&POLLHUP)p->closed=1;

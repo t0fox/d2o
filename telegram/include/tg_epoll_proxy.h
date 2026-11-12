@@ -168,6 +168,7 @@ typedef struct {
     size_t queue_bytes;
     size_t memory_budget_bytes;
     size_t configured_max_connections;
+    size_t initial_connection_limit; /* Zero uses the configured maximum. */
     uint32_t handshake_timeout_ms;
     uint32_t idle_timeout_ms;
     uint32_t socket_mark;
@@ -193,6 +194,9 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config);
 /* The caller owns both the current and replacement descriptors. */
 #define TG_EPOLL_REBIND_LISTENER (-2)
 int tg_epoll_proxy_set_listener(tg_epoll_proxy *server, int listener_fd);
+/* Call on the event-loop thread. Existing connections are not evicted. */
+void tg_epoll_proxy_update_limits(tg_epoll_proxy *server, size_t connection_limit,
+                                  size_t memory_budget_bytes);
 int tg_epoll_proxy_step(tg_epoll_proxy *server, int timeout_ms);
 void tg_epoll_proxy_destroy(tg_epoll_proxy *server);
 size_t tg_epoll_proxy_active_connections(const tg_epoll_proxy *server);

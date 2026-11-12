@@ -37,6 +37,8 @@
 #include <unistd.h>
 
 #define TG_BUILD "d2k-tg-0.3"
+#define TG_LOW_MEMORY_ROUTER_BYTES (128u * 1024u * 1024u)
+#define TG_RESOURCE_REFRESH_MS 5000u
 #define TG_DC_REFRESH_SECS (6u * 60u * 60u)
 #define TG_DC_REFRESH_RETRY_SECS (60u * 60u)
 #define TG_DC_DISCOVERY_TIMEOUT_MS 12000u
@@ -296,6 +298,13 @@ static void stop_dc_refresh(dc_refresh_job *job) {
     job->started = 0;
 }
 
+static int read_memory_resources(size_t *total, size_t *available) {
+    FILE *file = fopen("/proc/meminfo", "r");
+    tg_limits_read_meminfo(file, total, available);
+    if (file) fclose(file);
+    return *total && *available <= *total;
+}
+
 static int run_local_daemon(const char *config_path) {
     static const uint16_t allowed_ports[] = {443, 5222};
     static const char *const allowed_cidrs[] = {
@@ -328,14 +337,12 @@ static int run_local_daemon(const char *config_path) {
         return 0;
     }
     size_t total_memory, available_memory;
-    FILE *meminfo = fopen("/proc/meminfo", "r");
-    tg_limits_read_meminfo(meminfo, &total_memory, &available_memory);
-    if (meminfo) fclose(meminfo);
+    (void)read_memory_resources(&total_memory, &available_memory);
     size_t fd_limit = tg_limits_soft_nofile();
     char resource_note[192];
-    size_t max_connections = tg_limits_policy_connections(fd_limit,
-        total_memory, available_memory, cfg.manual_connection_limit
-            ? cfg.connection_limit : 32u);
+    size_t configured_limit = cfg.manual_connection_limit ? cfg.connection_limit : 32u;
+    size_t max_connections = tg_limits_policy_connections(
+        fd_limit, total_memory, available_memory, configured_limit);
     if (!max_connections) {
         snprintf(resource_note, sizeof(resource_note),
                  "нет бюджета запуска: RAM %zu/%zu КиБ доступно, FD %zu",
@@ -389,7 +396,8 @@ static int run_local_daemon(const char *config_path) {
         .listener_fd = listener,
         .queue_bytes = 64u * 1024u,
         .memory_budget_bytes = tg_limits_runtime_memory_budget(total_memory, available_memory),
-        .configured_max_connections = max_connections,
+        .configured_max_connections = configured_limit,
+        .initial_connection_limit = max_connections,
         .handshake_timeout_ms = cfg.handshake_timeout_secs * 1000u,
         .idle_timeout_ms = 300000,
         .socket_mark = TG_OUTBOUND_SOCKET_MARK,
@@ -434,7 +442,27 @@ static int run_local_daemon(const char *config_path) {
     rc = 0;
     uint64_t rebind_at_ms = 0;
     unsigned rebind_attempt = 0;
+    uint64_t next_resource_refresh = monotonic_ms() + TG_RESOURCE_REFRESH_MS;
     while (!stop_requested) {
+        if (total_memory <= TG_LOW_MEMORY_ROUTER_BYTES &&
+            monotonic_ms() >= next_resource_refresh) {
+            next_resource_refresh = monotonic_ms() + TG_RESOURCE_REFRESH_MS;
+            size_t total, available;
+            if (read_memory_resources(&total, &available)) {
+                size_t old_limit = tg_epoll_proxy_max_connections(proxy);
+                tg_epoll_proxy_update_limits(proxy,
+                    tg_limits_policy_connections(tg_limits_soft_nofile(),
+                                                 total, available, configured_limit),
+                    tg_limits_runtime_memory_budget(total, available));
+                size_t new_limit = tg_epoll_proxy_max_connections(proxy);
+                if (old_limit != new_limit) {
+                    snprintf(resource_note, sizeof(resource_note),
+                             "лимит соединений Telegram %zu → %zu, RAM %zu/%zu КиБ доступно",
+                             old_limit, new_limit, available / 1024u, total / 1024u);
+                    log_msg(resource_note);
+                }
+            }
+        }
         if (listener < 0 && monotonic_ms() >= rebind_at_ms) {
             listener = create_local_listener(cfg.listen_port);
             if (listener >= 0 && tg_epoll_proxy_set_listener(proxy, listener) == 0) {

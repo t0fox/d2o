@@ -80,7 +80,10 @@ typedef struct {
     tg_memory_budget *memory_budget;
     int failed,closed,read_wants_write,write_wants_read;
     int mtproto_payload_write_attempted;
+    int read_paused;
 } tg_ws_pump;
+/* Negative rejects the message. Positive consumes it and pauses reads until
+ * the caller clears read_paused and calls the pump again with POLLIN. */
 typedef int (*tg_ws_message_cb)(void *ctx,const uint8_t *payload,size_t payload_len);
 int tg_ws_pump_init(tg_ws_pump *pump,SSL *ssl);
 int tg_ws_pump_init_accounted(tg_ws_pump *pump, SSL *ssl,

@@ -3,6 +3,7 @@
 
 void tg_epoll_proxy_test_set_ping_interval_ms(uint64_t interval_ms);
 #include "tg_mtproto.h"
+#include "tg_limits.h"
 #include "tg_stats_socket.h"
 #include "tg_tls.h"
 #include "tg_ws.h"
@@ -137,6 +138,8 @@ typedef struct {
     int wait_for_second;
     int accepted_count;
     unsigned response_delay_ms;
+    size_t media_chunks;
+    int repeat_response;
     uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN];
     size_t handshake_len;
     uint8_t expected_packet[12];
@@ -396,7 +399,7 @@ static X509 *make_wss_test_cert(EVP_PKEY *key) {
         "DNS:worker.test,DNS:kws4.cfproxy.test,DNS:kws4-1.cfproxy.test,"
         "DNS:kws4.cfproxy-a.test,DNS:kws4-1.cfproxy-a.test,"
         "DNS:kws4.cfproxy-b.test,DNS:kws4-1.cfproxy-b.test,"
-        "DNS:kws203-1.cfproxy.test,IP:127.0.0.1");
+        "DNS:kws2.cfproxy.test,DNS:kws2-1.cfproxy.test,DNS:kws203-1.cfproxy.test,IP:127.0.0.1");
     assert(extension && X509_add_ext(cert, extension, -1) == 1);
     X509_EXTENSION_free(extension);
     assert(X509_sign(cert, key, EVP_sha256()) > 0);
@@ -457,6 +460,27 @@ static int write_server_frame(SSL *ssl, uint8_t opcode,
     }
     if (payload_len) memcpy(frame + header, payload, payload_len);
     return ssl_write_exact(ssl, frame, header + payload_len);
+}
+
+#define TEST_MEDIA_CHUNK 16384u
+
+static void write_media_chunks(SSL *ssl, const wss_server_fixture *fixture) {
+    if (!fixture->media_chunks) return;
+    tg_mtproto_ctr cipher = {0};
+    assert(tg_mtproto_direct_server_stream_cipher(fixture->handshake, &cipher) == 0);
+    uint8_t response[sizeof(fixture->response_packet)];
+    memcpy(response, fixture->response_packet, fixture->response_packet_len);
+    assert(tg_mtproto_ctr_xor(&cipher, response, fixture->response_packet_len) == 0);
+    uint8_t frame[4u + TEST_MEDIA_CHUNK] = {0x82, 126, 0x40, 0};
+    for (size_t i = 0; i < fixture->media_chunks; ++i) {
+        /* Intermediate framing, followed by deterministic payload bytes. */
+        memset(frame + 4u, (uint8_t)(i + 1u), TEST_MEDIA_CHUNK);
+        const uint8_t packet_length[] = {0xfc, 0x3f, 0, 0};
+        memcpy(frame + 4u, packet_length, sizeof(packet_length));
+        assert(tg_mtproto_ctr_xor(&cipher, frame + 4u, TEST_MEDIA_CHUNK) == 0);
+        assert(ssl_write_exact(ssl, frame, sizeof(frame)) == 0);
+    }
+    tg_mtproto_ctr_destroy(&cipher);
 }
 
 static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
@@ -668,6 +692,14 @@ static void serve_direct_wss_connection(wss_server_fixture *fixture, int fd) {
         assert(write_server_frame(ssl, TG_WS_BINARY,
                                   fixture->response_packet,
                                   fixture->response_packet_len) == 0);
+        write_media_chunks(ssl, fixture);
+        if (fixture->repeat_response) {
+            assert(read_masked_client_frame(ssl, &opcode, payload, sizeof(payload),
+                                            &payload_len) == 0);
+            assert(opcode == TG_WS_BINARY && payload_len == 12);
+            assert(write_server_frame(ssl, TG_WS_BINARY, fixture->response_packet,
+                                      fixture->response_packet_len) == 0);
+        }
         assert(read_masked_client_frame(ssl, &opcode, payload, sizeof(payload),
                                         &payload_len) == 0);
         assert(opcode == TG_WS_CLOSE && payload_len == 0);
@@ -3357,8 +3389,228 @@ static void test_small_fd_limit_keeps_a_client_slot(void) {
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
-int main(void) {
+typedef struct {
+    wss_server_fixture upstream[4];
+    tg_listener_destination targets[4];
+    int fail_dc4_proxy;
+} memory_recovery_fixture;
+
+static int resolve_memory_test_route(void *opaque, const char *hostname,
+                                     tg_listener_destination *out) {
+    memory_recovery_fixture *fixture = opaque;
+    /* DC4 media must fail both Proxy variants before reaching Worker. */
+    if (fixture->fail_dc4_proxy && strcmp(hostname, "kws4.cfproxy.test") == 0)
+        return -1;
+    for (size_t i = 0; i < 4; ++i) {
+        if (strcmp(hostname, fixture->upstream[i].expected_sni) == 0) {
+            *out = fixture->targets[i];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void receive_exact_client(int fd, uint8_t *data, size_t len) {
+    while (len) {
+        ssize_t received = recv(fd, data, len, 0);
+        assert(received > 0);
+        data += (size_t)received;
+        len -= (size_t)received;
+    }
+}
+
+typedef struct {
+    int fd;
+    wss_server_fixture *upstream;
+} media_test_client;
+
+static void *read_media_test_client(void *opaque) {
+    const media_test_client *client = opaque;
+    wss_server_fixture *upstream = client->upstream;
+    uint8_t data[TEST_MEDIA_CHUNK];
+    receive_exact_client(client->fd, data, upstream->response_packet_len);
+    assert(memcmp(data, upstream->response_packet, upstream->response_packet_len) == 0);
+    if (!upstream->media_chunks) return NULL;
+    tg_mtproto_ctr cipher = {0};
+    assert(tg_mtproto_direct_server_stream_cipher(upstream->handshake, &cipher) == 0);
+    assert(tg_mtproto_ctr_xor(&cipher, data, upstream->response_packet_len) == 0);
+    for (size_t i = 0; i < upstream->media_chunks; ++i) {
+        receive_exact_client(client->fd, data, sizeof(data));
+        assert(tg_mtproto_ctr_xor(&cipher, data, sizeof(data)) == 0);
+        assert(memcmp(data, (uint8_t[]){0xfc, 0x3f, 0, 0}, 4) == 0);
+        for (size_t j = 4; j < sizeof(data); ++j) assert(data[j] == (uint8_t)(i + 1u));
+    }
+    tg_mtproto_ctr_destroy(&cipher);
+    return NULL;
+}
+
+static void test_media_after_low_memory_start(size_t media_chunks) {
+    char directory[] = "/tmp/d2k-tg-memory-XXXXXX", cert_path[256], key_path[256];
+    assert(mkdtemp(directory));
+    assert(snprintf(cert_path, sizeof(cert_path), "%s/cert.pem", directory) > 0);
+    assert(snprintf(key_path, sizeof(key_path), "%s/key.pem", directory) > 0);
+    EVP_PKEY *key = make_wss_test_key();
+    X509 *cert = make_wss_test_cert(key);
+    FILE *file = fopen(cert_path, "w");
+    assert(file && PEM_write_X509(file, cert) == 1);
+    fclose(file);
+    file = fopen(key_path, "w");
+    assert(file && PEM_write_PrivateKey(file, key, NULL, NULL, 0, NULL, NULL) == 1);
+    fclose(file);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+
+    memory_recovery_fixture fixture = {0};
+    static const char *const sni[] = {
+        "kws4.cfproxy.test", "kws2.cfproxy.test", "kws2-1.cfproxy.test", "worker.test"
+    };
+    static const uint32_t dc[] = {4, 2, 2, 4};
+    pthread_t upstream_threads[4], readers[2];
+    media_test_client clients[4];
+    for (size_t i = 0; i < 4; ++i) {
+        uint16_t port;
+        wss_server_fixture *upstream = &fixture.upstream[i];
+        upstream->listener = create_listener(&port);
+        upstream->cert_path = cert_path;
+        upstream->key_path = key_path;
+        upstream->expected_sni = sni[i];
+        upstream->expected_path = i == 3
+            ? "/apiws?dst=149.154.167.91&dc=4&media=1" : "/apiws";
+        upstream->expect_binary_subprotocol = i != 3;
+        upstream->expect_no_browser_headers = i == 3;
+        upstream->media_chunks = i >= 2 ? media_chunks : 0;
+        upstream->repeat_response = i < 2;
+        upstream->handshake_len = sizeof(upstream->handshake);
+        atomic_init(&upstream->complete, 0);
+        make_wss_test_handshake(TG_MTPROTO_INTERMEDIATE, dc[i], i >= 2,
+                                upstream->handshake);
+        prepare_wss_response(upstream, upstream->handshake, TG_MTPROTO_INTERMEDIATE);
+        memcpy(upstream->expected_packet, (uint8_t[]){8,0,0,0,1,2,3,4,5,6,7,8}, 12);
+        tg_mtproto_ctr decrypt = {0}, encrypt = {0};
+        assert(tg_mtproto_direct_stream_ciphers(upstream->handshake, &decrypt, &encrypt) == 0);
+        assert(tg_mtproto_ctr_xor(&encrypt, upstream->expected_packet, 12) == 0);
+        tg_mtproto_ctr_destroy(&decrypt);
+        tg_mtproto_ctr_destroy(&encrypt);
+        set_ipv4(&fixture.targets[i], "127.0.0.1", port);
+        assert(pthread_create(&upstream_threads[i], NULL, serve_direct_wss, upstream) == 0);
+    }
+
+    uint16_t proxy_port;
+    int listener = create_listener(&proxy_port);
+    proxy_fixture target = {0};
+    set_ipv4(&target.original, "149.154.167.51", 443);
+    target.upstream = fixture.targets[0];
+    tg_config routing = {.ws_routing = TG_WS_ROUTING_CF_FIRST};
+    routing.cf_proxy_domain_count = 1;
+    routing.cf_worker_domain_count = 1;
+    memcpy(routing.cf_proxy_domains[0], "cfproxy.test", sizeof("cfproxy.test"));
+    memcpy(routing.cf_worker_domains[0], "worker.test", sizeof("worker.test"));
+    SSL_CTX *tls = tg_tls_client_context(cert_path);
+    assert(tls);
+    const size_t mib = 1024u * 1024u, total = 128u * mib, configured = 32;
+    const size_t cold = 8u * mib, recovered = 48u * mib;
+    tg_epoll_proxy_config config = {
+        .listener_fd = listener,
+        .queue_bytes = 64u * 1024u,
+        .configured_max_connections = configured,
+        .initial_connection_limit = tg_limits_policy_connections(
+            tg_limits_soft_nofile(), total, cold, configured),
+        .memory_budget_bytes = tg_limits_runtime_memory_budget(total, cold),
+        .handshake_timeout_ms = 3000,
+        .idle_timeout_ms = 30000,
+        .enable_direct_wss = 1,
+        .cloudflare_only = 1,
+        .tls_context = tls,
+        .routing_config = &routing,
+        .resolve_domain = resolve_memory_test_route,
+        .route_context = &fixture,
+        .original_destination = original_destination,
+        .select_target = select_target,
+        .context = &target
+    };
+    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+    assert(proxy && tg_epoll_proxy_max_connections(proxy) == 2);
+    proxy_runner runner = {.server = proxy};
+    atomic_init(&runner.stop, 0);
+    pthread_t proxy_thread;
+    uint64_t media_started_us = 0;
+    assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
+    for (size_t i = 0; i < 4; ++i) {
+        if (i == 2) {
+            atomic_store(&runner.stop, 1);
+            assert(pthread_join(proxy_thread, NULL) == 0);
+            assert(tg_epoll_proxy_active_connections(proxy) == 2);
+            fixture.fail_dc4_proxy = 1;
+            tg_epoll_proxy_update_limits(proxy,
+                tg_limits_policy_connections(tg_limits_soft_nofile(),
+                                             total, recovered, configured),
+                tg_limits_runtime_memory_budget(total, recovered));
+            atomic_store(&runner.stop, 0);
+            assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
+            media_started_us = test_monotonic_us();
+        }
+        clients[i].fd = connect_to_listener(proxy_port);
+        clients[i].upstream = &fixture.upstream[i];
+        struct timeval timeout = {.tv_sec = 10};
+        assert(setsockopt(clients[i].fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+        assert(send(clients[i].fd, fixture.upstream[i].handshake, 64, MSG_NOSIGNAL) == 64);
+        assert(send(clients[i].fd, fixture.upstream[i].expected_packet, 12, MSG_NOSIGNAL) == 12);
+        if (i < 2) read_media_test_client(&clients[i]);
+        else assert(pthread_create(&readers[i - 2], NULL, read_media_test_client, &clients[i]) == 0);
+    }
+    uint64_t text_latency_us = 0;
+    /* Send a second valid transport packet on each established text stream
+     * while the media readers and writers are running. */
+    for (size_t i = 0; i < 2; ++i) {
+        wss_server_fixture *upstream = clients[i].upstream;
+        uint8_t packet[] = {8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8};
+        uint8_t discarded[sizeof(packet)] = {0};
+        tg_mtproto_ctr decrypt = {0}, encrypt = {0};
+        assert(tg_mtproto_direct_stream_ciphers(upstream->handshake, &decrypt, &encrypt) == 0);
+        assert(tg_mtproto_ctr_xor(&encrypt, discarded, sizeof(discarded)) == 0);
+        assert(tg_mtproto_ctr_xor(&encrypt, packet, sizeof(packet)) == 0);
+        tg_mtproto_ctr_destroy(&decrypt);
+        tg_mtproto_ctr_destroy(&encrypt);
+        uint64_t sent_us = test_monotonic_us();
+        assert(send(clients[i].fd, packet, sizeof(packet), MSG_NOSIGNAL) == (ssize_t)sizeof(packet));
+        read_media_test_client(&clients[i]);
+        uint64_t elapsed_us = test_monotonic_us() - sent_us;
+        if (elapsed_us > text_latency_us) text_latency_us = elapsed_us;
+    }
+    for (size_t i = 0; i < 2; ++i) assert(pthread_join(readers[i], NULL) == 0);
+    uint64_t media_elapsed_us = test_monotonic_us() - media_started_us;
+    for (size_t i = 0; i < 4; ++i) {
+        assert(shutdown(clients[i].fd, SHUT_WR) == 0);
+        assert(pthread_join(upstream_threads[i], NULL) == 0);
+        assert(atomic_load(&fixture.upstream[i].complete) == 1);
+        close(clients[i].fd);
+        close(fixture.upstream[i].listener);
+    }
+    atomic_store(&runner.stop, 1);
+    assert(pthread_join(proxy_thread, NULL) == 0);
+    tg_epoll_proxy_stats stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.wss_responses == 4 && stats.cf_wss_responses == 4);
+    assert(stats.buffer_bytes_peak < mib);
+    printf("mixed traffic: 4/4, media 2/2, WSS buffer peak %zu bytes, "
+           "media %zu bytes in %" PRIu64 " us, text max RTT %" PRIu64 " us\n",
+           stats.buffer_bytes_peak, 2u * TEST_MEDIA_CHUNK * media_chunks,
+           media_elapsed_us, text_latency_us);
+    tg_epoll_proxy_destroy(proxy);
+    SSL_CTX_free(tls);
+    close(listener);
+    unlink(key_path);
+    unlink(cert_path);
+    assert(rmdir(directory) == 0);
+}
+
+int main(int argc, char **argv) {
     (void)signal(SIGPIPE, SIG_IGN);
+    if (argc == 2) {
+        test_media_after_low_memory_start((size_t)strtoul(argv[1], NULL, 10));
+        return 0;
+    }
+    test_media_after_low_memory_start(512);
     test_small_fd_limit_keeps_a_client_slot();
     test_listener_recovery_preserves_runtime();
     test_adaptive_races_alternates_in_both_wss_branches();
