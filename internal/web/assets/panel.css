@@ -1278,6 +1278,7 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
 .diag-series label { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; color: var(--ink-2); font-size: .75rem; cursor: pointer; }
 .diag-series label[hidden] { display: none; }
 .diag-series input { width: 14px; height: 14px; margin: 0; accent-color: var(--signal); }
+.diag-memory-chart[hidden] { display: none; }
 .diag-memory-chart { display: block; width: 100%; height: auto; min-height: 180px; overflow: visible; }
 .diag-memory-chart text { fill: var(--ink-3); font: 12px var(--mono); }
 .diag-memory-chart .diag-gridline { stroke: var(--rule); stroke-width: 1; }
@@ -1327,6 +1328,40 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
 .diag-notice details { margin-top: 4px; font-size: .75rem; }
 .diag-notice details summary { display: inline-block; min-height: 28px; padding-top: 5px; color: var(--ink-3); cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
 .diag-notice details p { max-width: 90ch; color: var(--ink-3); }
+/* Telegram cards contain longer values and independently sized charts. */
+#telegram-diagnostic-data { align-items: start; }
+#telegram-diagnostic-data .tg-diag-metrics { margin: 0; }
+#telegram-diagnostic-data .tg-diag-metrics > div {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+  gap: 8px 14px; padding: 8px 0; border-bottom: 1px solid var(--rule);
+}
+#telegram-diagnostic-data .tg-diag-metrics > div[hidden] { display: none; }
+#telegram-diagnostic-data .tg-diag-metrics dt { font-size: .8125rem; color: var(--ink-2); }
+#telegram-diagnostic-data .tg-diag-metrics dd {
+  margin: 0; font: .8125rem var(--mono); text-align: right; overflow-wrap: anywhere;
+}
+#telegram-diagnostic-data .tg-diag-detail { grid-column: span 4; }
+#tg-diag-smaps-status:empty { display: none; }
+#telegram-diagnostic-data .diag-memory-chart { min-height: 0; overflow: hidden; }
+#telegram-diagnostic-data .tg-diag-secondary-chart { grid-column: span 6; }
+#telegram-diagnostic-data .diag-memory-panel,
+#telegram-diagnostic-data .diag-process-panel { align-self: stretch; }
+#telegram-diagnostic-data .diag-card.diag-limiter-panel,
+#telegram-diagnostic-data .diag-card.diag-search-panel { grid-column: 1 / -1; }
+.tg-diag-records { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 8px; align-items: start; }
+.tg-diag-record { min-width: 0; padding: 8px 12px; border: 1px solid var(--rule); border-radius: 8px; }
+.tg-diag-record summary { cursor: pointer; padding: 4px 0; font-size: .8125rem; overflow-wrap: anywhere; }
+#telegram-diagnostic-data .tg-diag-chart-help {
+  margin-top: 12px; color: var(--ink-2); font-size: .8125rem;
+}
+#telegram-diagnostic-data .tg-diag-chart-help summary { cursor: pointer; }
+@media (max-width: 940px) {
+  #telegram-diagnostic-data .diag-memory-panel,
+  #telegram-diagnostic-data .diag-process-panel,
+  #telegram-diagnostic-data .tg-diag-secondary-chart,
+  #telegram-diagnostic-data .tg-diag-detail { grid-column: 1 / -1; }
+}
+
 .diag-history-footer { margin-top: 24px; display: flex; flex-wrap: wrap; align-items: start; justify-content: space-between; gap: 20px; }
 .diag-history-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .diag-history-actions a { text-decoration: none; }

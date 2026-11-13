@@ -288,12 +288,44 @@
                 <p id="telegram-diagnostic-history-coverage" class="diag-history-note" role="status">Длительность истории определяется по снимкам.</p>
                 <svg id="telegram-diagnostic-memory-chart" class="diag-memory-chart" viewBox="0 0 960 260" role="img" aria-label="Память Telegram прокси"></svg>
                 <p id="telegram-diagnostic-memory-empty" class="diag-empty" hidden>Для выбранного периода нет доступных снимков памяти.</p>
+                <details class="tg-diag-chart-help"><summary>Как читать показатели памяти</summary>
                 <p class="diag-history-note">RSS — резидентная память. VmData — виртуальная область данных. Учтённые аллокации и буферы входят в память прокси и не складываются с RSS.</p>
                 <p class="diag-history-note">TLS-показатель — число объектов. Внутренние аллокации OpenSSL не считаются по байтам и остаются в разнице RSS минус учтённые объекты.</p>
-                <p class="diag-history-note">Суммарная скорость прокси между минутными снимками; после перезапуска процесса интервал не рассчитывается.</p>
+                </details>
+              </section>
+              <section class="diag-card diag-process-panel"><h4>Память процесса</h4>
+<dl id="tg-diag-memory" class="tg-diag-metrics">
+                  <div><dt>RSS</dt><dd data-tg-field="rss_kib" data-format="k">—</dd></div>
+                  <div><dt>Пик RSS</dt><dd data-tg-field="rss_hwm_kib" data-format="k">—</dd></div>
+                  <div><dt>Анонимная память</dt><dd data-tg-field="rss_anon_kib" data-format="k">—</dd></div>
+                  <div><dt>Виртуальная область данных</dt><dd data-tg-field="vm_data_kib" data-format="k">—</dd></div>
+                  <div><dt>Swap</dt><dd data-tg-field="vm_swap_kib" data-format="k">—</dd></div>
+                  <div><dt>Доступно на роутере</dt><dd data-tg-field="mem_available_kib" data-format="k">—</dd></div>
+                  <div><dt>Всего на роутере</dt><dd data-tg-field="mem_total_kib" data-format="k">—</dd></div>
+                  <div><dt>Учтённые выделения</dt><dd data-tg-field="memory_accounted_allocations_bytes" data-format="b">—</dd></div>
+                  <div><dt>Разница RSS и учтённых выделений</dt><dd data-tg-field="rss_minus_known_allocations_bytes" data-format="delta">—</dd></div>
+                </dl>
+<p id="tg-diag-smaps-status" class="diag-history-note"></p><dl id="tg-diag-smaps-list" class="tg-diag-metrics">
+                  <div><dt>PSS</dt><dd data-tg-field="smaps_pss_kib" data-format="k">—</dd></div>
+                  <div><dt>Anonymous</dt><dd data-tg-field="smaps_anonymous_kib" data-format="k">—</dd></div>
+                  <div><dt>Private Dirty</dt><dd data-tg-field="smaps_private_dirty_kib" data-format="k">—</dd></div>
+                  <div><dt>Swap</dt><dd data-tg-field="smaps_swap_kib" data-format="k">—</dd></div>
+                </dl>
+<details class="tg-diag-chart-help"><summary>Из чего складываются выделения</summary><dl id="tg-diag-allocations" class="tg-diag-metrics">
+                  <div><dt>Буферы</dt><dd data-tg-field="buffer_bytes_current" data-format="b">—</dd></div>
+                  <div><dt>Структура прокси</dt><dd data-tg-field="proxy_struct_bytes" data-format="b">—</dd></div>
+                  <div><dt>Соединения</dt><dd data-tg-field="connection_struct_bytes" data-format="b">—</dd></div>
+                  <div><dt>Закрываемые соединения</dt><dd data-tg-field="retired_connection_struct_bytes" data-format="b">—</dd></div>
+                  <div><dt>Пул Worker</dt><dd data-tg-field="worker_pool_struct_bytes" data-format="b">—</dd></div>
+                </dl></details>
+              </section>
+              <section class="diag-card tg-diag-secondary-chart"><h4>Скорость передачи</h4>
+                <dl id="tg-diag-rate-details" class="tg-diag-metrics"></dl>
                 <svg id="telegram-diagnostic-traffic-chart" class="diag-memory-chart" viewBox="0 0 960 260" role="img" aria-label="Скорость передачи Telegram прокси"></svg>
-                <p class="diag-history-note">Линии по порядку: клиент → прокси и upstream → клиент. Разрыв на графике отмечает перезапуск прокси.</p>
+                <p class="diag-history-note">Клиент → прокси и upstream → прокси. Разрыв линии отмечает перезапуск прокси.</p>
                 <p id="telegram-diagnostic-traffic-empty" class="diag-empty" hidden>Скорость недоступна: нужны два снимка одного запуска с доступными счётчиками.</p>
+              </section>
+              <section class="diag-card tg-diag-secondary-chart">
                 <h4>Жизненный цикл ресурсов</h4>
                 <div class="diag-series" aria-label="Показатели жизненного цикла Telegram прокси">
                   <label><input type="checkbox" data-tg-resource-series="active_connections" checked><span>Соединения</span></label>
@@ -306,65 +338,84 @@
                 <p id="telegram-diagnostic-resource-empty" class="diag-empty" hidden>Для выбранного периода нет доступных счётчиков ресурсов.</p>
                 <p class="diag-history-note">Разрыв линий отмечает перезапуск или недоступный счётчик; снижение чисел после нагрузки помогает проверить освобождение ресурсов.</p>
               </section>
-              <section class="diag-card diag-process-panel"><h4>Сводка памяти</h4>
-                <dl class="diag-history-counts">
-                  <div><dt>RSS / пик RSS</dt><dd id="tg-diag-rss">—</dd></div>
-                  <div><dt>RssAnon / VmData / swap</dt><dd id="tg-diag-anon-data">—</dd></div>
-                  <div><dt>PSS / MemAvailable / MemTotal</dt><dd id="tg-diag-pss-available">—</dd></div>
-                  <div><dt>smaps: Anonymous / Private_Dirty / Swap</dt><dd id="tg-diag-smaps-details">—</dd></div>
-                  <div><dt>smaps_rollup</dt><dd id="tg-diag-smaps-status">—</dd></div>
-                  <div><dt>Учтённые выделения</dt><dd id="tg-diag-accounted">—</dd></div>
-                  <div><dt>Разбивка: буферы / прокси / соединения / retired / worker pool</dt><dd id="tg-diag-allocation-breakdown">—</dd></div>
-                  <div><dt>RSS минус известные выделения</dt><dd id="tg-diag-residual">—</dd></div>
-                </dl>
+              <section class="diag-card tg-diag-detail"><h4>Буферы и лимиты</h4>
+<dl id="tg-diag-buffer-details" class="tg-diag-metrics">
+                  <div><dt>Буферы сейчас</dt><dd data-tg-field="buffer_bytes_current" data-format="b">—</dd></div>
+                  <div><dt>Пик буферов</dt><dd data-tg-field="buffer_bytes_peak" data-format="b">—</dd></div>
+                  <div><dt>Лимит буферов</dt><dd data-tg-field="buffer_bytes_limit" data-format="b">—</dd></div>
+                  <div><dt>Очередь к клиенту</dt><dd data-tg-field="client_queue_bytes" data-format="b" data-limit="client_queue_capacity_bytes">—</dd></div>
+                  <div><dt>Очередь к серверу</dt><dd data-tg-field="upstream_queue_bytes" data-format="b" data-limit="upstream_queue_capacity_bytes">—</dd></div>
+                  <div><dt>WebSocket RX</dt><dd data-tg-field="ws_rx_capacity_bytes" data-format="b">—</dd></div>
+                  <div><dt>WebSocket TX</dt><dd data-tg-field="ws_tx_memory_bytes" data-format="b">—</dd></div>
+                  <div><dt>MTProto</dt><dd data-tg-field="mtproto_packet_capacity_bytes" data-format="b">—</dd></div>
+                  <div><dt>Соединения</dt><dd data-tg-field="active_connections" data-format="n" data-limit="max_connections">—</dd></div>
+                  <div><dt>WSS</dt><dd data-tg-field="active_wss_connections" data-format="n" data-limit="max_wss_connections">—</dd></div>
+                  <div><dt>Файловые дескрипторы</dt><dd data-tg-field="fd_count" data-format="n" data-limit="soft_nofile_limit">—</dd></div>
+                  <div><dt>Доступно для роста</dt><dd data-tg-field="memory_headroom_bytes" data-format="b">—</dd></div>
+                  <div><dt>Потолок памяти</dt><dd data-tg-field="memory_ceiling_bytes" data-format="b">—</dd></div>
+                </dl><details class="tg-diag-chart-help"><summary>Изменения лимитов</summary><ol id="tg-diag-limit-history" class="diag-transition-list"></ol></details>
               </section>
-              <section class="diag-card diag-workers-panel"><h4>Буферы и лимиты</h4>
-                <dl class="diag-history-counts">
-                  <div><dt>Буферы: сейчас / пик / предел</dt><dd id="tg-diag-buffers">—</dd></div>
-                  <div><dt>Заполнение очередей / WS / MTProto</dt><dd id="tg-diag-queues">—</dd></div>
-                  <div><dt>Соединения / максимум</dt><dd id="tg-diag-connections">—</dd></div>
-                  <div><dt>Свободная память / резерв</dt><dd id="tg-diag-headroom">—</dd></div>
-                  <div><dt>FD / предел</dt><dd id="tg-diag-fds">—</dd></div>
-                </dl>
-                <p class="diag-history-note">История изменений лимитов по минутным снимкам</p>
-                <ol id="tg-diag-limit-history" class="diag-transition-list"></ol>
+              <section class="diag-card tg-diag-detail"><h4>Соединения и ошибки</h4>
+<dl id="tg-diag-connection-details" class="tg-diag-metrics">
+                  <div><dt>От клиента</dt><dd data-tg-field="bytes_from_clients" data-format="b">—</dd></div>
+                  <div><dt>От сервера</dt><dd data-tg-field="bytes_from_upstreams" data-format="b">—</dd></div>
+                  <div><dt>Ответ p50</dt><dd data-tg-field="client_response_latency_p50_us" data-format="us">—</dd></div>
+                  <div><dt>Ответ p95</dt><dd data-tg-field="client_response_latency_p95_us" data-format="us">—</dd></div>
+                  <div><dt>Попытки WSS</dt><dd data-tg-field="wss_attempts" data-format="n">—</dd></div>
+                  <div><dt>Ответы WSS</dt><dd data-tg-field="wss_responses" data-format="n">—</dd></div>
+                  <div><dt>Ошибки WSS</dt><dd data-tg-field="wss_failures" data-format="n">—</dd></div>
+                  <div><dt>Ответы Cloudflare</dt><dd data-tg-field="cf_wss_responses" data-format="n">—</dd></div>
+                  <div><dt>Ошибки HTTP 403</dt><dd data-tg-field="http_403" data-format="n">—</dd></div>
+                  <div><dt>Ошибки HTTP 501</dt><dd data-tg-field="http_501" data-format="n">—</dd></div>
+                  <div><dt>Ошибки HTTP 502</dt><dd data-tg-field="http_502" data-format="n">—</dd></div>
+                  <div><dt>Ошибки выделения</dt><dd data-tg-field="allocation_failures" data-format="n">—</dd></div>
+                </dl><details class="tg-diag-chart-help"><summary>Пул Worker, паузы и отказы</summary><dl id="tg-diag-connection-extra" class="tg-diag-metrics">
+                  <div><dt>TLS-объекты</dt><dd data-tg-field="tls_objects" data-format="n">—</dd></div>
+                  <div><dt>TLS в пуле Worker</dt><dd data-tg-field="worker_pool_tls_objects" data-format="n">—</dd></div>
+                  <div><dt>Слоты пула Worker</dt><dd data-tg-field="worker_pool_entries" data-format="n" data-limit="worker_pool_capacity">—</dd></div>
+                  <div><dt>Попадания в пул</dt><dd data-tg-field="worker_pool_hits" data-format="n">—</dd></div>
+                  <div><dt>Промахи пула</dt><dd data-tg-field="worker_pool_misses" data-format="n">—</dd></div>
+                  <div><dt>Ответы из пула</dt><dd data-tg-field="worker_pool_responses" data-format="n">—</dd></div>
+                  <div><dt>Чтение приостановлено сейчас</dt><dd data-tg-field="wss_reads_paused" data-format="n">—</dd></div>
+                  <div><dt>Приостановки чтения</dt><dd data-tg-field="wss_read_pauses" data-format="n">—</dd></div>
+                  <div><dt>Возобновления чтения</dt><dd data-tg-field="wss_read_resumes" data-format="n">—</dd></div>
+                  <div><dt>Истекло время ожидания</dt><dd data-tg-field="wss_paused_timeouts" data-format="n">—</dd></div>
+                  <div><dt>Дольше всего без чтения</dt><dd data-tg-field="wss_oldest_pause_ms" data-format="age">—</dd></div>
+                  <div><dt>Отказы по лимиту буферов</dt><dd data-tg-field="buffer_budget_rejections" data-format="n">—</dd></div>
+                  <div><dt>Отказы по размеру буфера</dt><dd data-tg-field="buffer_size_rejections" data-format="n">—</dd></div>
+                  <div><dt>Отказы по лимиту соединений</dt><dd data-tg-field="accept_limit_rejections" data-format="n">—</dd></div>
+                  <div><dt>Отказы из-за нехватки FD</dt><dd data-tg-field="accept_fd_exhaustion" data-format="n">—</dd></div>
+                </dl><dl class="tg-diag-metrics" id="tg-diag-period-errors"></dl><dl class="tg-diag-metrics" id="tg-diag-stage-failures"></dl></details>
               </section>
-              <section class="diag-card diag-catalog-panel"><h4>Процессы и ошибки</h4>
-                <dl class="diag-history-counts">
-                  <div><dt>TLS-объекты / worker pool</dt><dd id="tg-diag-workers">—</dd></div>
-                  <div><dt>Отказы выделения памяти</dt><dd id="tg-diag-alloc-failures">—</dd></div>
-                  <div><dt>HTTP 403 / 501 / 502</dt><dd id="tg-diag-http-errors">—</dd></div>
-                  <div><dt>Клиент → прокси / прокси → клиент</dt><dd id="tg-diag-traffic">—</dd></div>
-                  <div><dt>Скорость за последний интервал</dt><dd id="tg-diag-throughput">—</dd></div>
-                  <div><dt>Период: новые HTTP 403 / 501 / 502 / WSS ошибки</dt><dd id="tg-diag-error-delta">—</dd></div>
-                  <div><dt>WS попытки / ошибки / ответы</dt><dd id="tg-diag-wss">—</dd></div>
-                  <div><dt>CF ответы / worker hits / misses / ответы</dt><dd id="tg-diag-fallback">—</dd></div>
-                  <div><dt>Ответ приложения p50 / p95</dt><dd id="tg-diag-latency">—</dd></div>
-                  <div><dt>Read pause / resume / timeout / paused</dt><dd id="tg-diag-pauses">—</dd></div>
-                  <div><dt>Ограничения buffer / accept / FD</dt><dd id="tg-diag-rejections">—</dd></div>
-                  <div><dt>Ошибки по этапам</dt><dd id="tg-diag-stage-failures">—</dd></div>
-                </dl>
-              </section>
-              <section class="diag-card diag-http-panel"><h4>Карта Telegram DC</h4>
-                <dl class="diag-history-counts">
-                  <div><dt>Состояние / адресов / last-known-good</dt><dd id="tg-diag-map-status">—</dd></div>
-                  <div><dt>Последнее обновление</dt><dd id="tg-diag-map-refresh">—</dd></div>
-                  <div><dt>Попытки / успехи / ошибки</dt><dd id="tg-diag-map-counts">—</dd></div>
+              <section class="diag-card tg-diag-detail"><h4>Карта Telegram DC</h4>
+<dl id="tg-diag-dc-details" class="tg-diag-metrics">
+                  <div><dt>Состояние</dt><dd data-tg-field="dc_map_status" data-format="status">—</dd></div>
+                  <div><dt>Адресов</dt><dd data-tg-field="dc_map_endpoint_count" data-format="n">—</dd></div>
+                  <div><dt>Последняя рабочая копия</dt><dd data-tg-field="dc_map_last_known_good" data-format="yes">—</dd></div>
+                  <div><dt>Результат обновления</dt><dd data-tg-field="dc_map_last_refresh_result" data-format="status">—</dd></div>
+                  <div><dt>Последний успех</dt><dd data-tg-field="dc_map_last_success_at" data-format="time">—</dd></div>
+                  <div><dt>Последняя ошибка</dt><dd data-tg-field="dc_map_last_failure_at" data-format="time">—</dd></div>
+                  <div><dt>Следующая попытка</dt><dd data-tg-field="dc_map_next_refresh_at" data-format="time">—</dd></div>
+                  <div><dt>Попытки</dt><dd data-tg-field="dc_map_refresh_attempts" data-format="n">—</dd></div>
+                  <div><dt>Успехи</dt><dd data-tg-field="dc_map_refresh_successes" data-format="n">—</dd></div>
+                  <div><dt>Ошибки</dt><dd data-tg-field="dc_map_refresh_failures" data-format="n">—</dd></div>
+                  <div><dt>Ошибка обновления (errno)</dt><dd data-tg-field="dc_map_last_refresh_errno" data-format="n">—</dd></div>
+                  <div><dt>Ошибка записи (errno)</dt><dd data-tg-field="dc_map_last_manifest_errno" data-format="n">—</dd></div>
                 </dl>
               </section>
               <section class="diag-card diag-limiter-panel"><h4>Состояние маршрутов</h4>
-                <div class="diag-table-scroll"><table class="diag-memory"><thead><tr><th>DC / тип</th><th>Транспорт / порт</th><th>Попытки / ответы</th><th>Ошибки / пауза</th></tr></thead><tbody id="tg-diag-routes"></tbody></table></div>
+                <div id="tg-diag-routes" class="tg-diag-records"></div>
                 <p id="tg-diag-routes-empty" class="diag-history-note">Пока нет данных маршрута.</p>
               </section>
               <section class="diag-card diag-search-panel"><h4>Активные сессии и последние ошибки</h4>
-                <div class="diag-table-scroll"><table class="diag-memory"><thead><tr><th>Сессия / DC / тип</th><th>Маршрут / возраст</th><th>Байты и средняя скорость</th><th>Первый ответ / без прогресса</th><th>Очереди клиент / upstream</th><th>Состояние direct / fallback</th></tr></thead><tbody id="tg-diag-sessions"></tbody></table></div>
+                <div id="tg-diag-sessions" class="tg-diag-records"></div>
                 <p id="tg-diag-sessions-empty" class="diag-history-note">Активных сессий нет.</p>
                 <ul id="tg-diag-problems" class="diag-transition-list"></ul>
               </section>
             </div>
             <div class="diag-history-footer">
               <div class="diag-history-actions"><button type="button" class="btn" id="telegram-diagnostic-toggle">Включить сбор</button></div>
-              <details class="diag-history-help"><summary>Что сохраняется</summary><p>Прокси-срез читается через его локальный stats socket раз в минуту. В течение суток сохраняются память процесса, известные выделения, буферные лимиты, соединения и ошибки; в отчёт также попадает последний полный срез с маршрутами и активными сессиями. Сбор выключен по умолчанию и не меняет настройки прокси. Данные остаются локально. Перед отправкой отчёта проверьте его содержимое.</p></details>
+              <details class="diag-history-help"><summary>Что сохраняется</summary><p>Диагностика сохраняет снимок прокси раз в минуту. В течение суток сохраняются память процесса, известные выделения, буферные лимиты, соединения и ошибки; в отчёт также попадает последний полный срез с маршрутами и активными сессиями. Сбор выключен по умолчанию и не меняет настройки прокси. Данные остаются локально. Перед отправкой отчёта проверьте его содержимое.</p></details>
             </div>
           </section>
         </div>

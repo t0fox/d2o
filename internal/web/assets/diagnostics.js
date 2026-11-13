@@ -245,12 +245,12 @@
     chart.dataset.points = String(rows.length);
     chart.setAttribute("aria-label", "Память d2kc, период " + hours + " часа, точек: " + rows.length);
     if (!rows.length || !active.length || !all.length) {
-      chart.hidden = true;
+      chart.setAttribute("hidden", "");
       empty.hidden = false;
       empty.textContent = !active.length && rows.length ? "Выберите доступный показатель памяти." : "Для выбранного периода нет доступных снимков памяти.";
       return { rows: rows, delta: null, axisUnit: null };
     }
-    chart.hidden = false; empty.hidden = true;
+    chart.removeAttribute("hidden"); empty.hidden = true;
     var left = 68, right = 948, top = 16, bottom = 218;
     var min = Math.min.apply(Math, all), max = Math.max.apply(Math, all);
     var scale = max >= 1048576 ? 1048576 : max >= 1024 ? 1024 : 1;
@@ -684,8 +684,8 @@
     chart.replaceChildren();chart.dataset.points=String(rows.length);
     chart.setAttribute("aria-label",title+" Telegram прокси за "+hours+" часа, точек: "+rows.length);
     var values=[];active.forEach(function(item){rows.forEach(function(row){if(number(row[item.key])!==null)values.push(row[item.key]);});});
-    if(!rows.length||!values.length){chart.hidden=true;empty.hidden=false;return;}
-    chart.hidden=false;empty.hidden=true;
+    if(!rows.length||!values.length){chart.setAttribute("hidden","");empty.hidden=false;return;}
+    chart.removeAttribute("hidden");empty.hidden=true;
     var left=68,right=948,top=16,bottom=218,min=Math.min.apply(Math,values),max=Math.max.apply(Math,values);
     var scale=max>=1048576?1048576:max>=1024?1024:1,unit=(scale===1048576?"МиБ":scale===1024?"КиБ":"Б")+suffix;
     if(min===max){var pad=Math.max(min*.08,128);min=Math.max(0,min-pad);max+=pad;}else{var margin=(max-min)*.08;min=Math.max(0,min-margin);max+=margin;}
@@ -746,13 +746,63 @@
       "Ресурсы","","data-tg-resource-series",true);
   }
   function telegramLatestValue(latest,key) { return number(latest&&latest[key]); }
-  function telegramUnavailable(value) { return value===null||value===undefined?"unavailable":null; }
+  function telegramUnavailable(value) { return value===null||value===undefined||value==="unavailable"?"—":null; }
   function telegramBytes(value) { return telegramUnavailable(number(value))||formatBytes(value); }
   function telegramKib(value) { return telegramUnavailable(number(value))||formatKib(value); }
   function telegramCountText(value) { return telegramUnavailable(number(value))||pretty(value); }
   function telegramAgeText(value) { return telegramUnavailable(number(value))||formatAge(value); }
   function telegramPretty(value) { return telegramUnavailable(value)||pretty(value); }
   function telegramTime(value) { return telegramUnavailable(number(value))||timeLabel(value); }
+  function telegramMetricRows(doc, list, entries) {
+    list.replaceChildren();
+    entries.forEach(function(entry) {
+      if (entry[1] === null) return;
+      var row = doc.createElement("div"), label = doc.createElement("dt"), value = doc.createElement("dd");
+      label.textContent = entry[0];
+      value.textContent = entry[1];
+      row.append(label, value);
+      list.appendChild(row);
+    });
+  }
+  function telegramStatusLabel(value) {
+    var labels = {fresh:"Актуальна",expired:"Срок истёк",clock_skew:"Расхождение часов",
+      loaded:"Загружена",loaded_last_good:"Загружена рабочая копия",never:"Ещё не запускалось",
+      success:"Успешно",running:"В процессе",no_snapshot:"Снимка пока нет",
+      http_error:"Ошибка HTTP",discovery_failed:"Не удалось получить карту",
+      install_failed:"Не удалось сохранить карту",thread_start_failed:"Не удалось начать обновление"};
+    return labels[value] || telegramPretty(value);
+  }
+  function renderTelegramMetrics(doc, data, latest, history) {
+    var formats = {k:telegramKib,b:telegramBytes,n:telegramCountText,age:telegramAgeText,time:telegramTime,
+      status:telegramStatusLabel,yes:function(v){return v?"Да":"Нет";},
+      us:function(v){return (v/1000).toFixed(1)+" мс";},delta:formatDeltaBytes};
+    Array.from(data.querySelectorAll("[data-tg-field]")).forEach(function(element){
+      var key=element.dataset.tgField, value=latest[key], limit=latest[element.dataset.limit];
+      var available=value!==null&&value!==undefined&&value!=="unavailable";
+      var fmt=formats[element.dataset.format];
+      if(element.dataset.format==="us" && latest.client_response_latency_samples===0)available=false;
+      element.parentNode.hidden=!available;
+      element.textContent=available?fmt(value)+(limit===null||limit===undefined?"":" / "+fmt(limit)):"";
+    });
+    var smaps=latest.smaps_rollup_status;
+    setText(doc,"tg-diag-smaps-status",smaps==="ok"?"":smaps==="unsupported"?
+      "PSS и разбивка страниц недоступны: ядро не предоставляет smaps_rollup.":
+      smaps==="parse_error"?"Не удалось разобрать smaps_rollup.":
+      "Снимок smaps_rollup недоступен."+(number(latest.smaps_rollup_errno)===null?"":" Код "+latest.smaps_rollup_errno+"."));
+    var rate=history[history.length-1];
+    telegramMetricRows(doc,doc.getElementById("tg-diag-rate-details"),[
+      ["От клиента за минутный интервал", rate&&rate.client_rate!==null?telegramBytes(rate.client_rate)+"/с":null],
+      ["От сервера за минутный интервал", rate&&rate.upstream_rate!==null?telegramBytes(rate.upstream_rate)+"/с":null]
+    ]);
+    var errorKeys=["http_403","http_501","http_502","wss_failures"];
+    telegramMetricRows(doc,doc.getElementById("tg-diag-period-errors"),errorKeys.map(function(key,i){
+      var value=telegramCounterDelta(history,key);
+      return [["Новые HTTP 403","Новые HTTP 501","Новые HTTP 502","Новые ошибки WSS"][i],value===null?null:telegramCountText(value)];
+    }));
+    var stages=latest.failure_by_stage||{};
+    telegramMetricRows(doc,doc.getElementById("tg-diag-stage-failures"),Object.keys(stages)
+      .filter(function(key){return stages[key]>0;}).map(function(key){return [key,telegramCountText(stages[key])];}));
+  }
   function renderTelegram(doc,tg,enabled,range) {
     var state=doc.getElementById("telegram-diagnostic-state"),data=doc.getElementById("telegram-diagnostic-data");
     if(!state||!data)return;
@@ -771,80 +821,50 @@
     setText(doc,"telegram-diagnostic-status",(failed?
       "Текущий срез недоступен"+error+". Ниже последний успешный снимок. ":
       "Снимков памяти: "+countWithCapacity(history.length,(tg.memory_history||{}).capacity)+" · ")+
-      "последнее чтение: "+(number(tg.last_sample_at)===null?"unavailable":new Date(tg.last_sample_at*1000).toLocaleTimeString())+
+      "последнее чтение: "+(number(tg.last_sample_at)===null?"—":new Date(tg.last_sample_at*1000).toLocaleTimeString())+
       (tg.collection_failures?" · ошибок чтения: "+tg.collection_failures:""));
     drawTelegramMemory(doc,tg,range);drawTelegramTraffic(doc,tg,range);drawTelegramResources(doc,tg,range);
-    setText(doc,"tg-diag-rss",latest?telegramKib(latest.rss_kib)+" / "+telegramKib(latest.rss_hwm_kib):"unavailable");
-    setText(doc,"tg-diag-anon-data",latest?[latest.rss_anon_kib,latest.vm_data_kib,latest.vm_swap_kib].map(telegramKib).join(" / "):"unavailable");
-    setText(doc,"tg-diag-pss-available",latest?[latest.smaps_pss_kib,latest.mem_available_kib,latest.mem_total_kib].map(telegramKib).join(" / "):"unavailable");
-    setText(doc,"tg-diag-smaps-details",latest?[latest.smaps_anonymous_kib,latest.smaps_private_dirty_kib,latest.smaps_swap_kib].map(telegramKib).join(" / "):"unavailable");
-    var smapsStatus=latest&&latest.smaps_rollup_status;
-    setText(doc,"tg-diag-smaps-status",!latest?"unavailable":smapsStatus==="ok"?"доступен":smapsStatus==="unsupported"?"нет в procfs":
-      smapsStatus==="parse_error"?"ошибка разбора":smapsStatus==="unavailable"?"ошибка чтения"+(
-        telegramLatestValue(latest,"smaps_rollup_errno")===null?"":" · errno "+telegramPretty(latest.smaps_rollup_errno)):telegramPretty(smapsStatus));
-    setText(doc,"tg-diag-accounted",latest?telegramBytes(latest.memory_accounted_allocations_bytes):"unavailable");
-    setText(doc,"tg-diag-residual",latest?(telegramUnavailable(number(latest.rss_minus_known_allocations_bytes))||formatDeltaBytes(latest.rss_minus_known_allocations_bytes)):"unavailable");
-    setText(doc,"tg-diag-allocation-breakdown",latest?[
-      "буферы "+telegramBytes(latest.buffer_bytes_current),
-      "прокси "+telegramBytes(latest.proxy_struct_bytes),
-      "соединения "+telegramBytes(latest.connection_struct_bytes),
-      "retired "+telegramBytes(latest.retired_connection_struct_bytes),
-      "worker pool "+telegramBytes(latest.worker_pool_struct_bytes)
-    ].join(" · "):"unavailable");
-    setText(doc,"tg-diag-buffers",latest?[latest.buffer_bytes_current,latest.buffer_bytes_peak,latest.buffer_bytes_limit].map(telegramBytes).join(" / "):"unavailable");
-    setText(doc,"tg-diag-queues",latest?"клиент "+telegramBytes(latest.client_queue_bytes)+" / "+telegramBytes(latest.client_queue_capacity_bytes)+
-      " · upstream "+telegramBytes(latest.upstream_queue_bytes)+" / "+telegramBytes(latest.upstream_queue_capacity_bytes)+
-      " · WS rx "+telegramBytes(latest.ws_rx_capacity_bytes)+" · WS tx "+telegramBytes(latest.ws_tx_memory_bytes)+
-      " · MTProto "+telegramBytes(latest.mtproto_packet_capacity_bytes):"unavailable");
-    setText(doc,"tg-diag-connections",latest?["active_connections","max_connections"].map(function(key){return telegramCountText(latest[key]);}).join(" / ")+" · WSS "+
-      ["active_wss_connections","max_wss_connections"].map(function(key){return telegramCountText(latest[key]);}).join(" / "):"unavailable");
-    setText(doc,"tg-diag-headroom",latest?telegramBytes(latest.memory_headroom_bytes)+" / "+telegramBytes(latest.memory_ceiling_bytes):"unavailable");
-    setText(doc,"tg-diag-fds",latest?[latest.fd_count,latest.soft_nofile_limit].map(telegramCountText).join(" / "):"unavailable");
-    setText(doc,"tg-diag-workers",latest?[latest.tls_objects,latest.worker_pool_tls_objects,latest.worker_pool_entries,latest.worker_pool_capacity].map(telegramCountText).join(" / "):"unavailable");
-    setText(doc,"tg-diag-alloc-failures",latest?telegramCountText(latest.allocation_failures):"unavailable");
-    setText(doc,"tg-diag-http-errors",latest?[latest.http_403,latest.http_501,latest.http_502].map(telegramCountText).join(" / "):"unavailable");
-    setText(doc,"tg-diag-traffic",latest?telegramBytes(latest.bytes_from_clients)+" / "+telegramBytes(latest.bytes_from_upstreams):"unavailable");
-    var lastRate=history.length?history[history.length-1]:null;
-    setText(doc,"tg-diag-throughput",lastRate&&lastRate.client_rate!==null&&lastRate.upstream_rate!==null?
-      telegramBytes(lastRate.client_rate)+"/с / "+telegramBytes(lastRate.upstream_rate)+"/с":"unavailable");
-    var httpDelta=["http_403","http_501","http_502"].map(function(key){return telegramCounterDelta(history,key);});
-    var wssDelta=telegramCounterDelta(history,"wss_failures");
-    setText(doc,"tg-diag-error-delta",httpDelta.every(function(value){return value!==null;})&&wssDelta!==null?
-      httpDelta.join(" / ")+" / "+wssDelta:"unavailable");
-    setText(doc,"tg-diag-wss",latest?["wss_attempts","wss_failures","wss_responses"].map(function(key){return telegramCountText(latest[key]);}).join(" / "):"unavailable");
-    setText(doc,"tg-diag-fallback",latest?["cf_wss_responses","worker_pool_hits","worker_pool_misses","worker_pool_responses"].map(function(key){return telegramCountText(latest[key]);}).join(" / "):"unavailable");
-    setText(doc,"tg-diag-latency",latest?[latest.client_response_latency_p50_us,latest.client_response_latency_p95_us].map(function(value){
-      return telegramUnavailable(number(value))||(value/1000).toFixed(1)+" мс";}).join(" / "):"unavailable");
-    setText(doc,"tg-diag-pauses",latest?["wss_read_pauses","wss_read_resumes","wss_paused_timeouts"].map(function(key){return telegramCountText(latest[key]);}).join(" / ")+" / "+
-      telegramCountText(latest.wss_reads_paused)+" · самый долгий "+telegramAgeText(latest.wss_oldest_pause_ms):"unavailable");
-    setText(doc,"tg-diag-rejections",latest?["buffer_budget_rejections","buffer_size_rejections",
-      "accept_limit_rejections","accept_fd_exhaustion"].map(function(key){return telegramCountText(latest[key]);}).join(" / "):"unavailable");
-    setText(doc,"tg-diag-stage-failures",latest&&latest.failure_by_stage?Object.keys(latest.failure_by_stage).map(function(key){
-      return key+" "+telegramPretty(latest.failure_by_stage[key]);}).join(" · "):"unavailable");
-    setText(doc,"tg-diag-map-status",latest?telegramPretty(latest.dc_map_status)+" / "+telegramPretty(latest.dc_map_endpoint_count)+
-      " · last-known-good "+(latest.dc_map_last_known_good===true?"да":latest.dc_map_last_known_good===false?"нет":"unavailable"):"unavailable");
-    setText(doc,"tg-diag-map-refresh",latest?telegramPretty(latest.dc_map_last_refresh_result)+" · успех "+telegramTime(latest.dc_map_last_success_at)+
-      " · ошибка "+telegramTime(latest.dc_map_last_failure_at)+" · errno "+telegramPretty(firstDefined([latest.dc_map_last_refresh_errno,latest.dc_map_last_manifest_errno])):"unavailable");
-    setText(doc,"tg-diag-map-counts",latest?[latest.dc_map_refresh_attempts,latest.dc_map_refresh_successes,latest.dc_map_refresh_failures].map(telegramCountText).join(" / "):"unavailable");
-    var routes=doc.getElementById("tg-diag-routes"),routeEmpty=doc.getElementById("tg-diag-routes-empty");routes.replaceChildren();
-    list(latest&&latest.route_health).forEach(function(route){var tr=doc.createElement("tr"),kind=route.is_media?"media":"main";
-      ["DC "+telegramPretty(route.dc)+" / "+kind,telegramPretty(route.transport)+" / "+telegramPretty(route.client_port)+"→"+telegramPretty(route.upstream_port),
-       telegramCountText(route.attempts)+" / "+telegramCountText(route.responses),telegramCountText(route.failures)+" / "+telegramAgeText(route.cooldown_remaining_ms)].forEach(function(value){var td=doc.createElement("td");td.textContent=value;tr.appendChild(td);});routes.appendChild(tr);
-    });routeEmpty.hidden=list(latest&&latest.route_health).length>0;
-    var sessions=doc.getElementById("tg-diag-sessions"),sessionEmpty=doc.getElementById("tg-diag-sessions-empty");sessions.replaceChildren();
-    list(latest&&latest.active_sessions).forEach(function(session){var tr=doc.createElement("tr");
-      var kind=session.is_media===true?"media":session.is_media===false?"основная":"тип неизвестен";
-      var rates=["bytes_from_clients","bytes_from_upstreams"].map(function(key){var rate=telegramSessionRate(session,key);return rate===null?"unavailable":telegramBytes(rate)+"/с";});
-      ["#"+telegramPretty(session.id)+" / DC "+telegramPretty(session.dc)+" / "+kind,
-       telegramPretty(session.selected_transport||session.direct_transport)+" / "+telegramAgeText(session.age_ms),
-       telegramBytes(session.bytes_from_clients)+" / "+telegramBytes(session.bytes_from_upstreams)+" · "+rates.join(" / "),
-       telegramAgeText(session.first_response_latency_ms)+" / "+telegramAgeText(session.no_progress_ms),
-       "клиент "+telegramBytes(session.client_queue_bytes)+" / "+telegramBytes(session.client_queue_capacity_bytes)+
-        " · upstream "+telegramBytes(session.upstream_queue_bytes)+" / "+telegramBytes(session.upstream_queue_capacity_bytes),
-       "direct "+telegramPretty(session.direct_state)+" ("+telegramPretty(session.direct_transport)+") · fallback "+telegramPretty(session.fallback_state)+
-        " ("+telegramPretty(session.fallback_transport)+") · "+(session.read_paused?"чтение приостановлено":telegramPretty(session.stage))]
-       .forEach(function(value){var td=doc.createElement("td");td.textContent=value;tr.appendChild(td);});sessions.appendChild(tr);
-    });sessionEmpty.hidden=list(latest&&latest.active_sessions).length>0;
+    renderTelegramMetrics(doc,data,latest,history);
+    function renderRecords(id, emptyId, records, fields) {
+      var container=doc.getElementById(id);
+      var open = new Set(Array.from(container.querySelectorAll("details[open]")).map(function(node){return node.dataset.record;}));
+      container.replaceChildren();
+      records.forEach(function(record) {
+        var details=doc.createElement("details"), summary=doc.createElement("summary"), body=doc.createElement("dl");
+        var entries=fields(record);
+        summary.textContent=entries.shift()[1];
+        details.dataset.record=record.id===undefined?summary.textContent:record.id;
+        details.open=open.has(details.dataset.record);
+        details.className="tg-diag-record";
+        body.className="tg-diag-metrics";
+        telegramMetricRows(doc,body,entries);
+        details.append(summary,body);
+        container.appendChild(details);
+      });
+      doc.getElementById(emptyId).hidden=records.length>0;
+    }
+    renderRecords("tg-diag-routes","tg-diag-routes-empty",list(latest.route_health),function(route){
+      var ports=number(route.client_port)>0&&number(route.upstream_port)>0?route.client_port+" → "+route.upstream_port:null;
+      return [["", "DC "+telegramPretty(route.dc)+" · "+(route.is_media?"Медиа":"Основной")+" · "+telegramPretty(route.transport)],
+        ["Порты",ports],["Попытки",telegramCountText(route.attempts)],["Ответы",telegramCountText(route.responses)],
+        ["Ошибки",telegramCountText(route.failures)],["Пауза",number(route.cooldown_remaining_ms)>0?telegramAgeText(route.cooldown_remaining_ms):null]];
+    });
+    renderRecords("tg-diag-sessions","tg-diag-sessions-empty",list(latest.active_sessions),function(session){
+      var kind=session.is_media===true?"Медиа":session.is_media===false?"Основная":"Тип неизвестен";
+      var fromClient=telegramSessionRate(session,"bytes_from_clients"), fromUpstream=telegramSessionRate(session,"bytes_from_upstreams");
+      return [["","#"+telegramPretty(session.id)+" · DC "+telegramPretty(session.dc)+" · "+kind],
+        ["Маршрут",session.selected_transport||session.direct_transport||session.fallback_transport||null],
+        ["Возраст",telegramAgeText(session.age_ms)],
+        ["От клиента",telegramBytes(session.bytes_from_clients)+(fromClient===null?"":" · "+telegramBytes(fromClient)+"/с")],
+        ["От сервера",telegramBytes(session.bytes_from_upstreams)+(fromUpstream===null?"":" · "+telegramBytes(fromUpstream)+"/с")],
+        ["Первый ответ",number(session.first_response_latency_ms)===null?null:telegramAgeText(session.first_response_latency_ms)],
+        ["Без прогресса",telegramAgeText(session.no_progress_ms)],
+        ["Очередь к клиенту",telegramBytes(session.client_queue_bytes)+" / "+telegramBytes(session.client_queue_capacity_bytes)],
+        ["Очередь к серверу",telegramBytes(session.upstream_queue_bytes)+" / "+telegramBytes(session.upstream_queue_capacity_bytes)],
+        ["Основной маршрут",session.direct_state+(session.direct_transport?" · "+session.direct_transport:"")],
+        ["Запасной маршрут",session.fallback_state+(session.fallback_transport?" · "+session.fallback_transport:"")],
+        ["Состояние",session.read_paused?"Чтение приостановлено":session.stage]];
+    });
     var problems=doc.getElementById("tg-diag-problems");problems.replaceChildren();
     list(latest&&latest.problem_sessions).slice().reverse().slice(0,8).forEach(function(problem){var li=doc.createElement("li");
       li.textContent="DC "+telegramPretty(problem.dc)+" · "+telegramPretty(problem.failure_stage)+
