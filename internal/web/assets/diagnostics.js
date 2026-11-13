@@ -787,7 +787,7 @@
     var smaps=latest.smaps_rollup_status;
     setText(doc,"tg-diag-smaps-status",smaps==="ok"?"":smaps==="unsupported"?
       "PSS и разбивка страниц недоступны: ядро не предоставляет smaps_rollup.":
-      smaps==="parse_error"?"Не удалось разобрать smaps_rollup.":
+      (smaps==="parse_error"||smaps==="parse-error")?"Не удалось разобрать smaps_rollup.":
       "Снимок smaps_rollup недоступен."+(number(latest.smaps_rollup_errno)===null?"":" Код "+latest.smaps_rollup_errno+"."));
     var rate=history[history.length-1];
     telegramMetricRows(doc,doc.getElementById("tg-diag-rate-details"),[
@@ -843,24 +843,34 @@
       });
       doc.getElementById(emptyId).hidden=records.length>0;
     }
-    renderRecords("tg-diag-routes","tg-diag-routes-empty",list(latest.route_health),function(route){
+    var routeHealth=Array.isArray(latest.route_health);
+    var dcCard=doc.getElementById("tg-diag-dc-card");
+    if(dcCard)dcCard.hidden=Array.from(dcCard.querySelectorAll("[data-tg-field]"))
+      .every(function(element){return element.parentNode.hidden;});
+    setText(doc,"tg-diag-routes-empty",routeHealth?"Пока нет данных маршрута.":
+      "Маршрутов на паузе в снимке нет.");
+    setText(doc,"tg-diag-route-title",routeHealth?"Маршруты":"Маршруты на паузе");
+    renderRecords("tg-diag-routes","tg-diag-routes-empty",routeHealth?latest.route_health:list(latest.route_cooldowns),function(route){
       var ports=number(route.client_port)>0&&number(route.upstream_port)>0?route.client_port+" → "+route.upstream_port:null;
+      var pause=routeHealth?route.cooldown_remaining_ms:route.remaining_ms;
       return [["", "DC "+telegramPretty(route.dc)+" · "+(route.is_media?"Медиа":"Основной")+" · "+telegramPretty(route.transport)],
-        ["Порты",ports],["Попытки",telegramCountText(route.attempts)],["Ответы",telegramCountText(route.responses)],
-        ["Ошибки",telegramCountText(route.failures)],["Пауза",number(route.cooldown_remaining_ms)>0?telegramAgeText(route.cooldown_remaining_ms):null]];
+        ["Порты",ports],["Попытки",number(route.attempts)===null?null:telegramCountText(route.attempts)],
+        ["Ответы",number(route.responses)===null?null:telegramCountText(route.responses)],
+        ["Ошибки",number(route.failures)===null?null:telegramCountText(route.failures)],
+        ["Пауза",number(pause)>0?telegramAgeText(pause):null]];
     });
     renderRecords("tg-diag-sessions","tg-diag-sessions-empty",list(latest.active_sessions),function(session){
       var kind=session.is_media===true?"Медиа":session.is_media===false?"Основная":"Тип неизвестен";
       var fromClient=telegramSessionRate(session,"bytes_from_clients"), fromUpstream=telegramSessionRate(session,"bytes_from_upstreams");
       return [["","#"+telegramPretty(session.id)+" · DC "+telegramPretty(session.dc)+" · "+kind],
         ["Маршрут",session.selected_transport||session.direct_transport||session.fallback_transport||null],
-        ["Возраст",telegramAgeText(session.age_ms)],
+        ["Возраст",number(session.age_ms)===null?null:telegramAgeText(session.age_ms)],
         ["От клиента",telegramBytes(session.bytes_from_clients)+(fromClient===null?"":" · "+telegramBytes(fromClient)+"/с")],
         ["От сервера",telegramBytes(session.bytes_from_upstreams)+(fromUpstream===null?"":" · "+telegramBytes(fromUpstream)+"/с")],
         ["Первый ответ",number(session.first_response_latency_ms)===null?null:telegramAgeText(session.first_response_latency_ms)],
-        ["Без прогресса",telegramAgeText(session.no_progress_ms)],
-        ["Очередь к клиенту",telegramBytes(session.client_queue_bytes)+" / "+telegramBytes(session.client_queue_capacity_bytes)],
-        ["Очередь к серверу",telegramBytes(session.upstream_queue_bytes)+" / "+telegramBytes(session.upstream_queue_capacity_bytes)],
+        ["Без прогресса",number(session.no_progress_ms)===null?null:telegramAgeText(session.no_progress_ms)],
+        ["Очередь к клиенту",number(session.client_queue_bytes)===null?null:telegramBytes(session.client_queue_bytes)+" / "+telegramBytes(session.client_queue_capacity_bytes)],
+        ["Очередь к серверу",number(session.upstream_queue_bytes)===null?null:telegramBytes(session.upstream_queue_bytes)+" / "+telegramBytes(session.upstream_queue_capacity_bytes)],
         ["Основной маршрут",session.direct_state+(session.direct_transport?" · "+session.direct_transport:"")],
         ["Запасной маршрут",session.fallback_state+(session.fallback_transport?" · "+session.fallback_transport:"")],
         ["Состояние",session.read_paused?"Чтение приостановлено":session.stage]];
@@ -871,13 +881,20 @@
         (problem.http_status?" HTTP "+problem.http_status:"")+" · "+telegramPretty(problem.transport)+
         " · клиент/сервер "+telegramBytes(problem.bytes_from_clients)+" / "+telegramBytes(problem.bytes_from_upstreams);problems.appendChild(li);
     });
-    if(!problems.children.length){var empty=doc.createElement("li");empty.className="diag-transition-empty";empty.textContent="Зафиксированных ошибок нет.";problems.appendChild(empty);}
+    if(!Array.isArray(latest.problem_sessions)&&number(latest.last_failure_stage)>0){
+      var failure=doc.createElement("li"), flow=root.D2kTelegramFlow;
+      var lastFailure=flow&&flow.summarizeTelegramFlow(latest).latestFailure;
+      if(lastFailure){failure.textContent="Последняя ошибка: "+lastFailure.stage+" · "+lastFailure.dc+
+        " · "+lastFailure.route+" · "+telegramAgeText(lastFailure.ageMs)+" назад";problems.appendChild(failure);}
+    }
+    if(!problems.children.length){var empty=doc.createElement("li");empty.className="diag-transition-empty";
+      empty.textContent=Array.isArray(latest.problem_sessions)?"Зафиксированных ошибок нет.":"Последняя ошибка не указана в снимке.";problems.appendChild(empty);}
     var limitHistory=doc.getElementById("tg-diag-limit-history"),changes=telegramLimitChanges(tg).slice(-20).reverse();
     limitHistory.replaceChildren();
     if(!changes.length){var emptyLimit=doc.createElement("li"),limitValues=["buffer_bytes_limit","memory_ceiling_bytes","max_connections","soft_nofile_limit"];
       emptyLimit.className="diag-transition-empty";
       emptyLimit.textContent=history.some(function(row){return limitValues.some(function(key){return number(row[key])!==null;});})
-        ?"Изменений за сохранённые снимки нет.":"unavailable";limitHistory.appendChild(emptyLimit);}
+        ?"Изменений за сохранённые снимки нет.":"Лимиты в снимке отсутствуют.";limitHistory.appendChild(emptyLimit);}
     changes.forEach(function(change){var row=doc.createElement("li"),strong=doc.createElement("strong"),label=doc.createElement("span"),time=doc.createElement("small");
       var format=change.bytes?formatBytes:pretty;strong.textContent=change.label+": "+format(change.from)+" → "+format(change.to);
       label.textContent="Изменение между снимками";time.textContent=number(change.at)===null?"":new Date(change.at*1000).toLocaleString();

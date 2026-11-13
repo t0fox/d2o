@@ -190,6 +190,7 @@ TG_DC_MAP_ENDPOINTS_PATH=${TG_DC_MAP_ENDPOINTS_PATH:-$STATE_DIR/telegram-dc-endp
 export TG_DC_MAP_ENDPOINTS_PATH
 TGBIN=/opt/sbin/d2ktg
 TG_PID=$RUN/d2ktg.pid
+TG_STATS_SOCKET=${TG_STATS_SOCKET:-$STATE_DIR/telegram.stats.sock}
 TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
 TG_FIREWALL=$RELEASE/d2k-tg-firewall.sh
 TG_WATCHDOG=$RELEASE/d2k-tg-watchdog.sh
@@ -1510,7 +1511,7 @@ start_panel() {
 start_diag() {
     prepare_runtime
     if [ -x "$DIAGBIN" ] && ! running "$DIAG_PID" d2kdiag; then
-        spawn_daemon -S -b -m -p "$DIAG_PID" -x "$DIAGBIN" -- \
+        spawn_daemon -S -b -m -p "$DIAG_PID" -x "$DIAGBIN" -- "$TG_STATS_SOCKET" \
             || say "d2kdiag не запустился"
     fi
 }

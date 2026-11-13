@@ -12,7 +12,140 @@
 
 typedef struct tg_epoll_proxy tg_epoll_proxy;
 
-#include "tg_stats.h"
+typedef enum {
+    TG_EPOLL_FAILURE_NONE = 0,
+    TG_EPOLL_FAILURE_DNS = 1,
+    TG_EPOLL_FAILURE_TCP = 2,
+    TG_EPOLL_FAILURE_TLS = 3,
+    TG_EPOLL_FAILURE_WEBSOCKET = 4,
+    TG_EPOLL_FAILURE_MTPROTO = 5,
+    TG_EPOLL_FAILURE_SETUP = 6,
+    TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE = 7,
+    TG_EPOLL_FAILURE_WORKER_PORT = 8
+} tg_epoll_failure_stage;
+
+#define TG_EPOLL_MAX_ACTIVE_ROUTE_SESSIONS 64u
+#define TG_EPOLL_MAX_ROUTE_EVENTS 6u
+#define TG_EPOLL_MAX_ROUTE_COOLDOWNS 256u
+
+typedef enum {
+    TG_ROUTE_SESSION_STAGE_ACCEPTED = 0,
+    TG_ROUTE_SESSION_STAGE_ROUTING = 1,
+    TG_ROUTE_SESSION_STAGE_UPSTREAM_READY = 2,
+    TG_ROUTE_SESSION_STAGE_FIRST_WSS_BINARY_RESPONSE = 3
+} tg_route_session_stage;
+
+typedef enum {
+    TG_ROUTE_SESSION_IDLE = 0,
+    TG_ROUTE_SESSION_CONNECTING = 1,
+    TG_ROUTE_SESSION_CONNECTED = 2,
+    TG_ROUTE_SESSION_SELECTED = 3,
+    TG_ROUTE_SESSION_COOLDOWN = 4,
+    TG_ROUTE_SESSION_FAILED = 5,
+    TG_ROUTE_SESSION_CANCELLED = 6,
+    TG_ROUTE_SESSION_SKIPPED = 7,
+    TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE = 8
+} tg_route_session_state;
+
+typedef enum {
+    TG_ROUTE_SESSION_TRANSPORT_NONE = 0,
+    TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS = 1,
+    TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_WORKER = 2,
+    TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_PROXY = 3,
+    TG_ROUTE_SESSION_TRANSPORT_TCP_FALLBACK = 4,
+    TG_ROUTE_SESSION_TRANSPORT_TCP_PASSTHROUGH = 5
+} tg_route_session_transport;
+
+typedef struct {
+    uint64_t sequence;
+    uint64_t timestamp_ms;
+    uint8_t branch; /* 0 — direct, 1 — fallback */
+    uint8_t transport;
+    uint8_t state;
+    uint8_t failure_stage;
+} tg_route_session_event;
+
+typedef struct {
+    uint64_t id;
+    uint32_t dc;
+    uint8_t has_dc;
+    uint8_t is_media;
+    uint8_t has_media;
+    uint8_t stage;
+    uint8_t direct_state;
+    uint8_t direct_transport;
+    uint8_t fallback_state;
+    uint8_t fallback_transport;
+    uint8_t selected_transport;
+    uint8_t telegram_response_seen;
+    uint8_t event_count;
+    uint64_t next_event_sequence;
+    uint64_t bytes_from_clients;
+    uint64_t bytes_from_upstreams;
+    tg_route_session_event events[TG_EPOLL_MAX_ROUTE_EVENTS];
+} tg_active_route_session;
+
+typedef struct {
+    uint32_t dc;
+    uint64_t remaining_ms;
+    uint8_t is_media;
+    uint8_t transport;
+    uint8_t failure_stage;
+} tg_route_cooldown;
+
+typedef struct {
+    size_t active_connections;
+    uint64_t process_started_at;
+    uint64_t accepted_connections;
+    size_t active_sessions_count;
+    int route_sessions_truncated;
+    tg_active_route_session active_sessions[TG_EPOLL_MAX_ACTIVE_ROUTE_SESSIONS];
+    size_t route_cooldowns_count;
+    int route_cooldowns_truncated;
+    tg_route_cooldown route_cooldowns[TG_EPOLL_MAX_ROUTE_COOLDOWNS];
+    uint64_t monotonic_time_ms;
+    uint32_t route_cooldown_ms;
+    size_t max_connections;
+    size_t active_wss_connections;
+    size_t max_wss_connections;
+    size_t buffer_bytes_current;
+    size_t buffer_bytes_peak;
+    size_t buffer_bytes_limit;
+    uint64_t accept_limit_rejections;
+    uint64_t accept_fd_exhaustion;
+    uint64_t allocation_failures;
+    uint64_t buffer_budget_rejections;
+    uint64_t buffer_size_rejections;
+    uint64_t wss_read_pauses;
+    uint64_t wss_read_resumes;
+    uint64_t wss_paused_timeouts;
+    size_t wss_reads_paused;
+    uint64_t wss_oldest_pause_ms;
+    uint64_t connections_started;
+    uint64_t bytes_from_clients;
+    uint64_t bytes_from_upstreams;
+    uint64_t wss_attempts;
+    uint64_t wss_failures;
+    uint64_t wss_responses;
+    uint64_t cf_wss_responses;
+    uint32_t last_success_dc;
+    uint32_t last_success_route;
+    uint64_t last_success_latency_ms;
+    uint64_t last_success_age_ms;
+    uint32_t last_failure_dc;
+    uint32_t last_failure_route;
+    uint32_t last_failure_stage;
+    uint64_t last_failure_age_ms;
+    uint64_t worker_pool_hits;
+    uint64_t worker_pool_misses;
+    uint64_t worker_pool_responses;
+    /* Перцентили последних 128 успешных WSS-сессий: accept TCP → MTProto. */
+    uint64_t client_response_latency_total;
+    size_t client_response_latency_samples;
+    uint64_t client_response_latency_last_us;
+    uint64_t client_response_latency_p50_us;
+    uint64_t client_response_latency_p95_us;
+} tg_epoll_proxy_stats;
 
 typedef int (*tg_epoll_original_destination_fn)(
     void *context, int client_fd, tg_listener_destination *out);
@@ -71,8 +204,6 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config);
 /* The caller owns both the current and replacement descriptors. */
 #define TG_EPOLL_REBIND_LISTENER (-2)
 int tg_epoll_proxy_set_listener(tg_epoll_proxy *server, int listener_fd);
-/* Wake step() when the caller-owned stats listener has a pending connection. */
-int tg_epoll_proxy_watch_stats(tg_epoll_proxy *server, int stats_fd);
 /* Call on the event-loop thread. Headroom comes from available memory;
  * the ceiling comes from total memory. Existing connections are not evicted. */
 void tg_epoll_proxy_update_limits(tg_epoll_proxy *server, size_t connection_limit,

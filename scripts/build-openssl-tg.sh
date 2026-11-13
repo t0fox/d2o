@@ -135,5 +135,6 @@ file "$ROOT/build/telegram/openssl-link-smoke-$ARCH"
     "$ROOT/telegram/src/limits.c" \
     "$ROOT/telegram/src/epoll_proxy.c" \
     "$ROOT/telegram/src/transparent.c" \
+    "$ROOT/telegram/src/stats_socket.c" \
     -L"$LIBDIR" -L"$ZLIB_PREFIX/lib" -lssl -lcrypto -lz -ldl -pthread
 file "$OUT/d2ktg-linux-$ARCH"

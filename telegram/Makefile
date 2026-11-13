@@ -58,7 +58,7 @@ $(BUILD_DIR)/test-transparent: test_transparent.c src/transparent.c src/mtproto_
 test-epoll-proxy: $(BUILD_DIR)/test-epoll-proxy
 	./$(BUILD_DIR)/test-epoll-proxy
 
-$(BUILD_DIR)/test-epoll-proxy: test_epoll_proxy.c src/epoll_proxy.c src/stats_socket.c src/limits.c src/listener.c src/tls.c src/ws.c src/ws_pump.c src/memory_budget.c src/mtproto_crypto.c src/mtproto_splitter.c src/cf_domains.c src/route_plan.c src/route_dns.c include/tg_epoll_proxy.h include/tg_stats_socket.h include/tg_mtproto.h include/tg_mtproto_splitter.h include/tg_tls.h include/tg_ws.h include/tg_memory_budget.h include/tg_cf_domains.h include/tg_route_plan.h include/tg_route_dns.h include/tg_limits.h include/tg_stats.h ../runtime/d2k_diag_ipc.h
+$(BUILD_DIR)/test-epoll-proxy: test_epoll_proxy.c src/epoll_proxy.c src/stats_socket.c src/limits.c src/listener.c src/tls.c src/ws.c src/ws_pump.c src/memory_budget.c src/mtproto_crypto.c src/mtproto_splitter.c src/cf_domains.c src/route_plan.c src/route_dns.c include/tg_epoll_proxy.h include/tg_stats_socket.h include/tg_mtproto.h include/tg_mtproto_splitter.h include/tg_tls.h include/tg_ws.h include/tg_memory_budget.h include/tg_cf_domains.h include/tg_route_plan.h include/tg_route_dns.h include/tg_limits.h
 	mkdir -p $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -DTG_EPOLL_TESTING -DTG_ROUTE_HEALTH_COOLDOWN_MS=1000u -pthread -Wl,--wrap=connect -Wl,--wrap=epoll_ctl -Wl,--wrap=clock_gettime -Wl,--wrap=accept4 -o $@ test_epoll_proxy.c src/epoll_proxy.c src/stats_socket.c src/limits.c src/listener.c src/tls.c src/ws.c src/ws_pump.c src/memory_budget.c src/mtproto_crypto.c src/mtproto_splitter.c src/cf_domains.c src/route_plan.c src/route_dns.c $(OPENSSL_LIBS)
 
@@ -159,7 +159,7 @@ test-config: $(BUILD_DIR)/test-config
 d2ktg: $(BUILD_DIR)/d2ktg
 
 
-$(BUILD_DIR)/d2ktg: ../runtime/d2k_runtime.h ../runtime/d2k_protocol.h src/main.c src/config.c src/tls.c src/ws.c src/ws_pump.c src/memory_budget.c src/net.c src/listener.c src/mtproto_crypto.c src/mtproto_encrypted.c src/mtproto_config.c src/mtproto_probe.c src/mtproto_auth.c src/mtproto_auth_keys.inc src/mtproto_splitter.c src/dc_map.c src/dc_map_json.c src/dc_map_store.c src/cf_domains.c src/route_plan.c src/route_dns.c src/limits.c src/epoll_proxy.c src/transparent.c include/tg_limits.h include/tg_mtproto_auth.h include/tg_mtproto_discovery.h include/tg_tls.h include/tg_ws.h include/tg_mtproto.h include/tg_cf_domains.h include/tg_route_plan.h include/tg_route_dns.h include/tg_stats_socket.h include/tg_memory_budget.h include/tg_epoll_proxy.h include/tg_stats.h ../runtime/d2k_diag_ipc.h
+$(BUILD_DIR)/d2ktg: ../runtime/d2k_runtime.h ../runtime/d2k_protocol.h src/main.c src/config.c src/tls.c src/ws.c src/ws_pump.c src/memory_budget.c src/net.c src/listener.c src/mtproto_crypto.c src/mtproto_encrypted.c src/mtproto_config.c src/mtproto_probe.c src/mtproto_auth.c src/mtproto_auth_keys.inc src/mtproto_splitter.c src/dc_map.c src/dc_map_json.c src/dc_map_store.c src/cf_domains.c src/route_plan.c src/route_dns.c src/limits.c src/epoll_proxy.c src/transparent.c src/stats_socket.c include/tg_limits.h include/tg_mtproto_auth.h include/tg_mtproto_discovery.h include/tg_tls.h include/tg_ws.h include/tg_mtproto.h include/tg_cf_domains.h include/tg_route_plan.h include/tg_route_dns.h include/tg_stats_socket.h include/tg_memory_budget.h
 	mkdir -p $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(OPENSSL_CFLAGS) $(CFLAGS) -pthread -o $@ $(filter %.c,$^) $(OPENSSL_LIBS) $(ZLIB_LIBS)
 

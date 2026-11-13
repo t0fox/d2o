@@ -91,6 +91,7 @@ void d2k_diag_set_enabled(d2k_diag *d,int enabled);
 d2k_diag_telegram *d2k_diag_telegram_new(void);
 void d2k_diag_telegram_free(d2k_diag_telegram *d);
 int d2k_diag_telegram_record(d2k_diag_telegram *d,int64_t mono_ms,const char *json,size_t len);
+void d2k_diag_telegram_proc(FILE *f,const char *proc,long pid);
 void d2k_diag_telegram_error(d2k_diag_telegram *d,int error);
 int d2k_diag_write_combined(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f);
 #endif

@@ -432,7 +432,8 @@ function summarize(snapshot, error) {
             ? `Идёт параллельная гонка маршрутов · ${dcLabel}` : `Прокси устанавливает соединение · ${dcLabel}`)
             : allFailed ? `Для активных соединений маршрут недоступен · ${dcLabel}`
               : `Маршрут определяется · ${dcLabel}`;
-  const readPaused = sessions.filter(session => session.read_paused === true).length;
+  const readPaused = metricNumber(snapshot, "wss_reads_paused")
+    ?? sessions.filter(session => session.read_paused === true).length;
   const mediaIdle = sessions.filter(session => session.is_media === true)
     .map(session => metricNumber(session, "no_progress_ms")).filter(value => value !== null);
   if (readPaused) caption += ` · Чтение приостановлено: ${readPaused}`;

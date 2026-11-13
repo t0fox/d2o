@@ -1436,13 +1436,13 @@ clean-diagnostics-runtime:
 	$(RM) test_diagnostics_runtime
 clean: clean-diagnostics-runtime
 
-DIAG_SOURCES = d2kdiag.c diagnostics.c ../telegram/src/stats_socket.c
-DIAG_HEADERS = diag_transport.h include/d2k_diagnostics.h ../runtime/d2k_diag_ipc.h ../telegram/include/tg_stats.h ../telegram/include/tg_stats_socket.h
+DIAG_SOURCES = d2kdiag.c diagnostics.c
+DIAG_HEADERS = diag_transport.h include/d2k_diagnostics.h ../runtime/d2k_diag_ipc.h
 
 d2kdiag: $(DIAG_SOURCES) $(DIAG_HEADERS)
-	$(CC) $(CFLAGS) -std=c11 -I../telegram/include -o $@ $(DIAG_SOURCES)
+	$(CC) $(CFLAGS) -std=c11 -o $@ $(DIAG_SOURCES)
 
 .PHONY: d2kdiag-release
 d2kdiag-release: $(DIAG_SOURCES) $(DIAG_HEADERS)
 	@mkdir -p $(BUILDDIR)
-	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -std=c11 -I../telegram/include -static -Wl,-S -o $(BUILDDIR)/d2kdiag-linux-$(ARCH) $(DIAG_SOURCES)
+	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -std=c11 -static -Wl,-S -o $(BUILDDIR)/d2kdiag-linux-$(ARCH) $(DIAG_SOURCES)

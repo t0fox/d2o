@@ -40,7 +40,6 @@ typedef struct {
     char path[TG_DC_MAP_PATH_MAX];
     tg_dc_snapshot snapshot;
     int has_snapshot;
-    int loaded_last_good;
 } tg_dc_map_store;
 
 typedef struct {

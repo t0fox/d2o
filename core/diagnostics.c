@@ -406,16 +406,10 @@ static int optional_proc_status(const char *proc,long pid,int error,int *reporte
     *reported_error=error;
     return 1;
 }
-static void read_proc(proc_mem *m,const char *proc,const char *run,size_t i) {
-    char path[512],line[256];FILE *f;long pid=0;
-    *m=(proc_mem){.pid=0,.rss=-1,.hwm=-1,.anon=-1,.threads=-1,.vm_data=-1,.vm_swap=-1};
-    if(snprintf(path,sizeof path,"%s/%s",run,pidfiles[i])>=(int)sizeof path)return;
-    f=fopen(path,"r");if(!f)return;int ok=fscanf(f,"%ld",&pid)==1&&pid>0&&pid<=INT_MAX;fclose(f);if(!ok)return;
-    if(snprintf(path,sizeof path,"%s/%ld/comm",proc,pid)>=(int)sizeof path)return;
-    f=fopen(path,"r");if(!f)return;ok=fgets(line,sizeof line,f)!=NULL;fclose(f);
-    if(!ok)return;
-    line[strcspn(line,"\r\n")]=0;if(strcmp(line,names[i]))return;
-    m->pid=pid;
+static void read_proc_status(proc_mem *m,const char *proc,long pid) {
+    char path[512],line[256];FILE *f;
+    *m=(proc_mem){.pid=pid,.rss=-1,.hwm=-1,.anon=-1,.threads=-1,.vm_data=-1,.vm_swap=-1};
+    if(!pid)return;
     if(snprintf(path,sizeof path,"%s/%ld/status",proc,pid)>=(int)sizeof path)return;
     f=fopen(path,"r");if(!f)return;
     while(fgets(line,sizeof line,f)) {
@@ -427,6 +421,22 @@ static void read_proc(proc_mem *m,const char *proc,const char *run,size_t i) {
         if((v=value(line,"VmData:"))>=0)m->vm_data=v;
         if((v=value(line,"VmSwap:"))>=0)m->vm_swap=v;
     }fclose(f);
+}
+static void read_proc(proc_mem *m,const char *proc,const char *run,size_t i) {
+    char path[512],line[256];FILE *f;long pid=0;
+    if(snprintf(path,sizeof path,"%s/%s",run,pidfiles[i])<(int)sizeof path && (f=fopen(path,"r"))) {
+        int ok=fscanf(f,"%ld",&pid)==1&&pid>0&&pid<=INT_MAX;
+        fclose(f);if(!ok)pid=0;
+    }
+    if(pid) {
+        int ok=0;
+        if(snprintf(path,sizeof path,"%s/%ld/comm",proc,pid)<(int)sizeof path && (f=fopen(path,"r"))) {
+            if(fgets(line,sizeof line,f)) {line[strcspn(line,"\r\n")]=0;ok=!strcmp(line,names[i]);}
+            fclose(f);
+        }
+        if(!ok)pid=0;
+    }
+    read_proc_status(m,proc,pid);
 }
 static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms,const char *proc) {
     memset(m,0,sizeof *m);m->pid=p->pid;m->rss=p->rss;m->at=at;m->mono=ms;
@@ -477,6 +487,31 @@ static const char *read_status(int status) {
     switch(status){case 1:return "unavailable";case 2:return "ok";case 3:return "parse-error";
         case 4:return "unsupported";
         default:return "not-read";}
+}
+static void read_meminfo(const char *proc,int64_t *total,int64_t *available) {
+    char path[512],line[256];
+    *total=*available=-1;
+    if(snprintf(path,sizeof path,"%s/meminfo",proc)>=(int)sizeof path)return;
+    FILE *f=fopen(path,"r");if(!f)return;
+    while(fgets(line,sizeof line,f)) {
+        int64_t v;if((v=value(line,"MemTotal:"))>=0)*total=v;
+        if((v=value(line,"MemAvailable:"))>=0)*available=v;
+    }
+    fclose(f);
+}
+void d2k_diag_telegram_proc(FILE *f,const char *proc,long pid) {
+    proc_mem p;memory_detail m;int64_t total,available;
+    read_proc_status(&p,proc,pid);
+    read_detail(&m,&p,0,0,proc);
+    read_meminfo(proc,&total,&available);
+    fprintf(f,",\"process_id\":%ld",pid);
+    const char *keys[]={"process_generation","rss_kib","rss_hwm_kib","rss_anon_kib","vm_data_kib","vm_swap_kib","fd_count",
+        "mem_total_kib","mem_available_kib","smaps_pss_kib","smaps_private_dirty_kib","smaps_anonymous_kib","smaps_swap_kib"};
+    const int64_t values[]={m.start_ticks,p.rss,p.hwm,p.anon,p.vm_data,p.vm_swap,m.fds,total,available,
+        m.rollup[1],m.rollup[3],m.rollup[2],m.rollup[4]};
+    for(size_t i=0;i<sizeof values/sizeof values[0];i++){fprintf(f,",\"%s\":",keys[i]);number(f,values[i]);}
+    fprintf(f,",\"smaps_rollup_status\":\"%s\",\"smaps_rollup_errno\":",read_status(m.rollup_status));
+    number(f,m.rollup_errno?m.rollup_errno:-1);
 }
 static void write_detail(FILE *f,const memory_detail *m) {
     if(!m->pid){fputs("null",f);return;}
@@ -574,13 +609,8 @@ void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char 
     d->last_ms=ms;d->sampled=1;
     sample *s=&d->samples[d->sample_total++%SAMPLES];memset(s,0,sizeof *s);
     s->at=(int64_t)time(NULL);s->mono=ms;s->counts=*c;s->total=s->available=-1;
-    char path[512],line[256];
-    if(snprintf(path,sizeof path,"%s/meminfo",proc)<(int)sizeof path) {
-        FILE *f=fopen(path,"r");if(f){while(fgets(line,sizeof line,f)) {
-            int64_t v;if((v=value(line,"MemTotal:"))>=0)s->total=v;
-            if((v=value(line,"MemAvailable:"))>=0)s->available=v;
-        }fclose(f);}
-    }
+    char path[512];
+    read_meminfo(proc,&s->total,&s->available);
     s->conntrack=-1;
     if(snprintf(path,sizeof path,"%s/sys/net/netfilter/nf_conntrack_count",proc)<(int)sizeof path) {
         FILE *f=fopen(path,"r");if(f){long long v;if(fscanf(f,"%lld",&v)==1 && v>=0)s->conntrack=v;fclose(f);}

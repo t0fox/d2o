@@ -8,6 +8,28 @@
 
 ## 0. Фактическое состояние — читать первым
 
+### Возврат Telegram C11 к b46360f, 13.11.2026
+
+База main до правки: `a2a2953`. Дерево `telegram/` и
+`scripts/build-openssl-tg.sh` побайтно совпадают с `b46360f`.
+Вернулся штатный Unix stream stats socket, который формирует JSON в epoll
+прокси. Только `d2kdiag` обращается к нему, раз в две секунды, и записывает
+готовый снимок панели. При включённой истории раз в минуту добавляет память
+из procfs по PID Unix peer. По прежней схеме общий отчёт доступен как
+`d2k-diagnostics.json`. Паузу чтения WSS старый прокси отдаёт только
+суммарно; анимация не приписывает её маршруту или сессии.
+
+Проверки: `git diff --exit-code b46360f -- telegram scripts/build-openssl-tg.sh`,
+`make -C core d2kdiag test-diagnostics test-diagnostics-runtime`,
+`make -C telegram test-epoll-proxy`, `sh -n files/S99d2k`,
+`node panel/test_telegram_flow.cjs` и `node panel/test_diagnostics.cjs`.
+На OpenWrt ARM64 проверены хеши бинарников, первый снимок RSS (4032 КиБ),
+статус `smaps_rollup=unsupported`, подтверждённый ответ Telegram и состояние
+маршрута во встроенном браузере. PID d2kc/d2kd/d2kpanel не менялись,
+NFQUEUE 2000 осталась привязана к PID 29453. Предыдущие файлы сохранены на
+роутере в `/tmp/d2o-tg-restore-b46360f/old`. Сравнения полевой скорости,
+длительного прогона медиа и проверки Keenetic не было.
+
 ### Изоляция диагностики и вёрстка Telegram, 13.11.2026
 
 База main: `41a3176`. `d2kdiag` владеет историей и формирует общий JSON.

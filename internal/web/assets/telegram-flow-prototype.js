@@ -75,7 +75,7 @@ function mountTelegramFlow(canvas) {
   const parts = [], sparks = [], ripples = [], spikes = [];
   const hub = { pulse: 0, angle: 0 }, client = { pulse: 0 };
   let view = api.summarizeTelegramFlow(null);
-  let processStartedAt = 0, processGeneration = 0, acceptedConnections = null;
+  let processId = 0, processStartedAt = 0, processGeneration = 0, acceptedConnections = null;
   let now = performance.now(), lastFrame = now, canvasWidth = 900;
   let pixelRatio = 1, inView = true, destroyed = false, frameId = 0;
 
@@ -153,13 +153,16 @@ function mountTelegramFlow(canvas) {
 
   function readEvents(snapshot) {
     if (!snapshot) return;
+    const pid = Number(snapshot.process_id) || 0;
     const started = Number(snapshot.process_started_at) || 0;
     const generation = Number(snapshot.process_generation) || 0;
     const accepted = Number(snapshot.accepted_connections) || 0;
-    const restarted = (generation && processGeneration && generation !== processGeneration)
+    const restarted = (pid && processId && pid !== processId)
+      || (generation && processGeneration && generation !== processGeneration)
       || (started && processStartedAt && started !== processStartedAt)
       || (acceptedConnections !== null && accepted < acceptedConnections);
     if (restarted) resetProcess();
+    if (pid) processId = pid;
     if (started) processStartedAt = started;
     if (generation) processGeneration = generation;
     acceptedConnections = accepted;

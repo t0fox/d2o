@@ -326,6 +326,10 @@ assert.deepEqual(flow.prototypeGeometry, {
       no_progress_ms: 4300}]}));
   assert.equal(paused.lanes[1].readPaused, 1);
   assert.match(paused.caption, /Чтение приостановлено: 1.*4\.3 с/);
+  const legacy = flow.summarizeTelegramFlow(snapshot({active_connections: 3,
+    active_sessions: confirmed.sessions, route_sessions_truncated: true, wss_reads_paused: 2}));
+  assert.equal(legacy.lanes[1].readPaused, 0);
+  assert.match(legacy.caption, /Чтение приостановлено: 2.*Показано сессий: 1 из 3/);
 }
 
 {

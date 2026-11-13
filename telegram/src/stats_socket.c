@@ -2,15 +2,11 @@
 #include "tg_stats_socket.h"
 
 #include <errno.h>
-#include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -46,27 +42,6 @@ static const char *route_transport_name(uint8_t transport) {
     }
 }
 
-static const char *failure_stage_name(uint8_t stage) {
-    static const char *const names[TG_EPOLL_FAILURE_STAGE_COUNT] = {
-        "none", "dns", "tcp", "tls", "websocket", "mtproto",
-        "setup", "route_unavailable", "worker_port"
-    };
-    return stage < TG_EPOLL_FAILURE_STAGE_COUNT ? names[stage] : "unknown";
-}
-
-#ifdef TG_EPOLL_TESTING
-static uint64_t monotonic_generation(void) {
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0)
-        return (uint64_t)now.tv_sec * UINT64_C(1000000) +
-            (uint64_t)now.tv_nsec / 1000u;
-    uint64_t fallback = (uint64_t)time(NULL) * UINT64_C(1000000) +
-        (uint64_t)(unsigned)getpid();
-    return fallback ? fallback : 1;
-}
-
-#endif
-
 static int stats_append(char *buffer, size_t capacity, size_t *used,
                         const char *format, ...) {
     if (*used >= capacity) return -1;
@@ -80,13 +55,11 @@ static int stats_append(char *buffer, size_t capacity, size_t *used,
 }
 
 static int append_active_sessions(char *buffer, size_t capacity, size_t *used,
-                                  const tg_epoll_proxy_stats *stats,
-                                  uint64_t process_generation) {
+                                  const tg_epoll_proxy_stats *stats) {
     if (stats_append(buffer, capacity, used,
-        "\"process_started_at\":%" PRIu64 ",\"process_generation\":%" PRIu64
-        ",\"accepted_connections\":%" PRIu64
+        "\"process_started_at\":%" PRIu64 ",\"accepted_connections\":%" PRIu64
         ",\"active_sessions\":[", stats->process_started_at,
-        process_generation, stats->accepted_connections) != 0)
+        stats->accepted_connections) != 0)
         return -1;
     for (size_t i = 0; i < stats->active_sessions_count; ++i) {
         const tg_active_route_session *session = &stats->active_sessions[i];
@@ -105,7 +78,7 @@ static int append_active_sessions(char *buffer, size_t capacity, size_t *used,
             "\"direct_transport\":%s%s%s,\"fallback_state\":\"%s\","
             "\"fallback_transport\":%s%s%s,\"selected_transport\":%s%s%s,"
             "\"telegram_response_seen\":%s,\"bytes_from_clients\":%" PRIu64
-            ",\"bytes_from_upstreams\":%" PRIu64,
+            ",\"bytes_from_upstreams\":%" PRIu64 ",\"events\":[",
             session->has_media ? (session->is_media ? "true" : "false") : "null",
             route_stage_name(session->stage), route_state_name(session->direct_state),
             direct ? "\"" : "null", direct ? direct : "", direct ? "\"" : "",
@@ -114,36 +87,6 @@ static int append_active_sessions(char *buffer, size_t capacity, size_t *used,
             selected ? "\"" : "null", selected ? selected : "", selected ? "\"" : "",
             session->telegram_response_seen ? "true" : "false",
             session->bytes_from_clients, session->bytes_from_upstreams) != 0)
-            return -1;
-        if (stats_append(buffer, capacity, used,
-            ",\"client_port\":%u,\"upstream_port\":%u,\"age_ms\":%" PRIu64
-            ",\"no_progress_ms\":%" PRIu64 ",\"first_response_latency_ms\":",
-            (unsigned)session->client_port, (unsigned)session->upstream_port,
-            session->age_ms, session->no_progress_ms) != 0)
-            return -1;
-        if (session->telegram_response_seen) {
-            if (stats_append(buffer, capacity, used, "%" PRIu64,
-                             session->first_response_latency_ms) != 0)
-                return -1;
-        } else if (stats_append(buffer, capacity, used, "null") != 0) {
-            return -1;
-        }
-        if (stats_append(buffer, capacity, used,
-            ",\"read_paused\":%s,\"client_queue_bytes\":%" PRIu64
-            ",\"upstream_queue_bytes\":%" PRIu64
-            ",\"client_queue_capacity_bytes\":%" PRIu64
-            ",\"upstream_queue_capacity_bytes\":%" PRIu64
-            ",\"ws_rx_capacity_bytes\":%" PRIu64
-            ",\"ws_tx_memory_bytes\":%" PRIu64
-            ",\"mtproto_packet_capacity_bytes\":%" PRIu64,
-            session->read_paused ? "true" : "false",
-            session->client_queue_bytes, session->upstream_queue_bytes,
-            session->client_queue_capacity_bytes,
-            session->upstream_queue_capacity_bytes,
-            session->ws_rx_capacity_bytes, session->ws_tx_memory_bytes,
-            session->mtproto_packet_capacity_bytes) != 0)
-            return -1;
-        if (stats_append(buffer, capacity, used, ",\"events\":[") != 0)
             return -1;
         for (size_t j = 0; j < session->event_count; ++j) {
             const tg_route_session_event *event = &session->events[j];
@@ -184,475 +127,6 @@ static int append_active_sessions(char *buffer, size_t capacity, size_t *used,
         stats->route_cooldowns_truncated ? "true" : "false");
 }
 
-static int append_route_stats(char *buffer, size_t capacity, size_t *used,
-                              const tg_epoll_proxy_stats *stats) {
-    if (stats_append(buffer, capacity, used,
-        "\"route_health\":[") != 0) return -1;
-    for (size_t i = 0; i < stats->route_health_count; ++i) {
-        const tg_route_health_stat *route = &stats->route_health[i];
-        const char *transport = route_transport_name(route->transport);
-        if (!transport || stats_append(buffer, capacity, used,
-            "%s{\"dc\":%u,\"is_media\":%s,\"transport\":\"%s\","
-            "\"client_port\":%u,\"upstream_port\":%u,"
-            "\"attempts\":%" PRIu64 ",\"failures\":%" PRIu64
-            ",\"responses\":%" PRIu64 ",\"cf_responses\":%" PRIu64
-            ",\"latency_ms\":%" PRIu64 ",\"last_success_age_ms\":",
-            i ? "," : "", route->dc,
-            route->is_media ? "true" : "false", transport,
-            (unsigned)route->client_port, (unsigned)route->upstream_port,
-            route->attempts, route->failures, route->responses,
-            route->cf_responses, route->latency_ms) != 0)
-            return -1;
-        if (route->has_last_success) {
-            if (stats_append(buffer, capacity, used, "%" PRIu64,
-                             route->last_success_age_ms) != 0) return -1;
-        } else if (stats_append(buffer, capacity, used, "null") != 0) return -1;
-        if (stats_append(buffer, capacity, used, ",\"last_failure_age_ms\":") != 0)
-            return -1;
-        if (route->has_last_failure) {
-            if (stats_append(buffer, capacity, used, "%" PRIu64,
-                             route->last_failure_age_ms) != 0) return -1;
-        } else if (stats_append(buffer, capacity, used, "null") != 0) return -1;
-        if (stats_append(buffer, capacity, used,
-            ",\"cooldown_remaining_ms\":%" PRIu64
-            ",\"last_failure_stage\":\"%s\"}",
-            route->cooldown_remaining_ms,
-            failure_stage_name(route->last_failure_stage)) != 0) return -1;
-    }
-    if (stats_append(buffer, capacity, used,
-        "],\"route_health_truncated\":%s,\"problem_sessions\":[",
-        stats->route_health_truncated ? "true" : "false") != 0)
-        return -1;
-    for (size_t i = 0; i < stats->problem_sessions_count; ++i) {
-        const tg_problem_session *problem = &stats->problem_sessions[i];
-        const char *transport = route_transport_name(problem->transport);
-        if (stats_append(buffer, capacity, used,
-            "%s{\"sequence\":%" PRIu64 ",\"session_id\":%" PRIu64
-            ",\"dc\":%u,\"is_media\":%s,\"transport\":%s%s%s,"
-            "\"failure_stage\":\"%s\",\"http_status\":%u,"
-            "\"client_port\":%u,\"upstream_port\":%u,\"age_ms\":%" PRIu64
-            ",\"bytes_from_clients\":%" PRIu64
-            ",\"bytes_from_upstreams\":%" PRIu64 "}",
-            i ? "," : "", problem->sequence, problem->session_id,
-            problem->dc, problem->is_media ? "true" : "false",
-            transport ? "\"" : "null", transport ? transport : "", transport ? "\"" : "",
-            failure_stage_name(problem->failure_stage),
-            (unsigned)problem->http_status, (unsigned)problem->client_port,
-            (unsigned)problem->upstream_port, problem->age_ms,
-            problem->bytes_from_clients, problem->bytes_from_upstreams) != 0)
-            return -1;
-    }
-    if (stats_append(buffer, capacity, used, "],\"failure_by_stage\":{") != 0)
-        return -1;
-    for (size_t i = 0; i < TG_EPOLL_FAILURE_STAGE_COUNT; ++i) {
-        if (stats_append(buffer, capacity, used, "%s\"%s\":%" PRIu64,
-            i ? "," : "", failure_stage_name((uint8_t)i),
-            stats->failure_by_stage[i]) != 0)
-            return -1;
-    }
-    return stats_append(buffer, capacity, used, "},");
-}
-
-enum { PROC_SMAPS_OK = 1, PROC_SMAPS_UNSUPPORTED, PROC_SMAPS_UNAVAILABLE,
-       PROC_SMAPS_PARSE_ERROR };
-typedef struct {
-    int64_t rss_kib, hwm_kib, anon_kib, vm_data_kib, vm_swap_kib;
-    int64_t smaps_kib[8], mem_total_kib, mem_available_kib;
-    int64_t fd_count, soft_nofile;
-    int smaps_status, smaps_errno, status_ok;
-} process_memory;
-
-static int64_t proc_kib(const char *line, const char *key) {
-    if (strncmp(line, key, strlen(key)) != 0) return -1;
-    const char *p = line + strlen(key);
-    while (*p == ' ' || *p == '\t') ++p;
-    errno = 0;
-    char *end = NULL;
-    long long value = strtoll(p, &end, 10);
-    if (errno || end == p || value < 0 || strncmp(end, " kB", 3) != 0)
-        return -1;
-    return (int64_t)value;
-}
-
-static void read_process_memory(process_memory *memory, long pid, int64_t nofile, int detailed) {
-    static const char *const status_keys[] = {
-        "VmRSS:", "VmHWM:", "RssAnon:", "VmData:", "VmSwap:"
-    };
-    static const char *const rollup_keys[] = {
-        "Rss:", "Pss:", "Anonymous:", "Private_Clean:",
-        "Private_Dirty:", "Shared_Clean:", "Shared_Dirty:", "Swap:"
-    };
-    int64_t *status_values[] = {
-        &memory->rss_kib, &memory->hwm_kib, &memory->anon_kib,
-        &memory->vm_data_kib, &memory->vm_swap_kib
-    };
-    memory->rss_kib = memory->hwm_kib = memory->anon_kib = -1;
-    memory->vm_data_kib = memory->vm_swap_kib = -1;
-    memory->mem_total_kib = memory->mem_available_kib = -1;
-    memory->fd_count = memory->soft_nofile = -1;
-    memory->smaps_status = PROC_SMAPS_UNAVAILABLE;
-    memory->smaps_errno = 0;
-    memory->status_ok = 0;
-    for (size_t i = 0; i < 8; ++i) memory->smaps_kib[i] = -1;
-
-    if (!detailed) return;
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%ld/status", pid);
-    FILE *file = fopen(path, "r");
-    if (file) {
-        char line[256];
-        unsigned found = 0;
-        while (fgets(line, sizeof(line), file)) {
-            for (size_t i = 0; i < sizeof(status_keys) / sizeof(status_keys[0]); ++i) {
-                int64_t value = proc_kib(line, status_keys[i]);
-                if (value >= 0) { *status_values[i] = value; found |= 1u << i; }
-            }
-        }
-        fclose(file);
-        memory->status_ok = found == (1u << 5) - 1u;
-    }
-
-    errno = 0;
-    snprintf(path, sizeof(path), "/proc/%ld/smaps_rollup", pid);
-    file = fopen(path, "r");
-    if (!file) {
-        memory->smaps_errno = errno;
-        memory->smaps_status = errno == ENOENT || errno == ENOTDIR
-            ? PROC_SMAPS_UNSUPPORTED : PROC_SMAPS_UNAVAILABLE;
-    } else {
-        char line[256];
-        unsigned found = 0;
-        while (fgets(line, sizeof(line), file)) {
-            for (size_t i = 0; i < sizeof(rollup_keys) / sizeof(rollup_keys[0]); ++i) {
-                int64_t value = proc_kib(line, rollup_keys[i]);
-                if (value >= 0) { memory->smaps_kib[i] = value; found |= 1u << i; }
-            }
-        }
-        fclose(file);
-        memory->smaps_status = found ? PROC_SMAPS_OK : PROC_SMAPS_PARSE_ERROR;
-    }
-
-    file = fopen("/proc/meminfo", "r");
-    if (file) {
-        char line[256];
-        while (fgets(line, sizeof(line), file)) {
-            int64_t value = proc_kib(line, "MemTotal:");
-            if (value >= 0) memory->mem_total_kib = value;
-            value = proc_kib(line, "MemAvailable:");
-            if (value >= 0) memory->mem_available_kib = value;
-        }
-        fclose(file);
-    }
-
-    snprintf(path, sizeof(path), "/proc/%ld/fd", pid);
-    DIR *fd_dir = opendir(path);
-    if (fd_dir) {
-        int64_t count = 0;
-        struct dirent *entry;
-        while ((entry = readdir(fd_dir)) != NULL) {
-            if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
-            int numeric = 1;
-            for (const char *p = entry->d_name; *p; ++p)
-                if (*p < '0' || *p > '9') { numeric = 0; break; }
-            if (numeric) ++count;
-        }
-        closedir(fd_dir);
-        memory->fd_count = count - (pid == (long)getpid() && count > 0);
-    }
-    memory->soft_nofile = nofile;
-}
-
-static int append_nullable_i64(char *buffer, size_t capacity, size_t *used,
-                               int64_t value) {
-    return value < 0 ? stats_append(buffer, capacity, used, "null")
-                     : stats_append(buffer, capacity, used, "%" PRId64, value);
-}
-
-static const char *smaps_status_name(int status) {
-    switch (status) {
-    case PROC_SMAPS_OK: return "ok";
-    case PROC_SMAPS_UNSUPPORTED: return "unsupported";
-    case PROC_SMAPS_PARSE_ERROR: return "parse_error";
-    default: return "unavailable";
-    }
-}
-
-static int append_process_metrics(char *buffer, size_t capacity, size_t *used,
-                                 const tg_epoll_proxy_stats *stats,
-                                 const process_memory *memory, long pid) {
-    uint64_t known = stats->buffer_bytes_current + stats->proxy_struct_bytes +
-        stats->connection_struct_bytes + stats->retired_connection_struct_bytes +
-        stats->worker_pool_struct_bytes;
-    if (stats_append(buffer, capacity, used,
-        "\"process_id\":%ld,\"process_metrics_status\":\"%s\","
-        "\"rss_kib\":", pid, memory->status_ok ? "ok" : "unavailable") != 0 ||
-        append_nullable_i64(buffer, capacity, used, memory->rss_kib) != 0 ||
-        stats_append(buffer, capacity, used, ",\"rss_hwm_kib\":") != 0 ||
-        append_nullable_i64(buffer, capacity, used, memory->hwm_kib) != 0 ||
-        stats_append(buffer, capacity, used, ",\"rss_anon_kib\":") != 0 ||
-        append_nullable_i64(buffer, capacity, used, memory->anon_kib) != 0 ||
-        stats_append(buffer, capacity, used, ",\"vm_data_kib\":") != 0 ||
-        append_nullable_i64(buffer, capacity, used, memory->vm_data_kib) != 0 ||
-        stats_append(buffer, capacity, used, ",\"vm_swap_kib\":") != 0 ||
-        append_nullable_i64(buffer, capacity, used, memory->vm_swap_kib) != 0 ||
-        stats_append(buffer, capacity, used,
-            ",\"smaps_rollup_status\":\"%s\",\"smaps_rollup_errno\":",
-            smaps_status_name(memory->smaps_status)) != 0)
-        return -1;
-    if (memory->smaps_errno) {
-        if (stats_append(buffer, capacity, used, "%d", memory->smaps_errno) != 0)
-            return -1;
-    } else if (stats_append(buffer, capacity, used, "null") != 0) return -1;
-    static const char *const rollup_names[] = {
-        "smaps_rss_kib", "smaps_pss_kib", "smaps_anonymous_kib",
-        "smaps_private_clean_kib", "smaps_private_dirty_kib",
-        "smaps_shared_clean_kib", "smaps_shared_dirty_kib", "smaps_swap_kib"
-    };
-    for (size_t i = 0; i < sizeof(rollup_names) / sizeof(rollup_names[0]); ++i) {
-        if (stats_append(buffer, capacity, used, ",\"%s\":", rollup_names[i]) != 0 ||
-            append_nullable_i64(buffer, capacity, used, memory->smaps_kib[i]) != 0)
-            return -1;
-    }
-    int64_t residual = memory->rss_kib >= 0 &&
-        memory->rss_kib <= INT64_MAX / 1024
-        ? memory->rss_kib * 1024 - (known > INT64_MAX ? INT64_MAX : (int64_t)known)
-        : -1;
-    if (stats_append(buffer, capacity, used,
-        ",\"mem_total_kib\":") != 0 ||
-        append_nullable_i64(buffer, capacity, used, memory->mem_total_kib) != 0 ||
-        stats_append(buffer, capacity, used, ",\"mem_available_kib\":") != 0 ||
-        append_nullable_i64(buffer, capacity, used, memory->mem_available_kib) != 0 ||
-        stats_append(buffer, capacity, used, ",\"fd_count\":") != 0 ||
-        append_nullable_i64(buffer, capacity, used, memory->fd_count) != 0 ||
-        stats_append(buffer, capacity, used, ",\"soft_nofile_limit\":") != 0 ||
-        append_nullable_i64(buffer, capacity, used, memory->soft_nofile) != 0 ||
-        stats_append(buffer, capacity, used,
-            ",\"memory_accounted_allocations_bytes\":%" PRIu64
-            ",\"rss_minus_known_allocations_bytes\":", known) != 0 ||
-        append_nullable_i64(buffer, capacity, used, residual) != 0)
-        return -1;
-    return 0;
-}
-
-static int append_dc_map(char *buffer, size_t capacity, size_t *used,
-                         const tg_stats_socket_context *context) {
-    int has_map = context && context->has_map;
-    int64_t now = (int64_t)time(NULL);
-    const char *status = !has_map ? "unavailable" :
-        now < context->fetched_at ? "clock_skew" :
-        now >= context->config_expires ? "expired" : "fresh";
-    if (stats_append(buffer, capacity, used,
-        "\"dc_map_status\":\"%s\",\"dc_map_last_known_good\":%s,"
-        "\"dc_map_endpoint_count\":", status,
-        context && context->loaded_last_good
-            ? "true" : "false") != 0)
-        return -1;
-    if (has_map) {
-        if (stats_append(buffer, capacity, used, "%zu", context->endpoint_count) != 0)
-            return -1;
-    } else if (stats_append(buffer, capacity, used, "null") != 0) return -1;
-    if (stats_append(buffer, capacity, used, ",\"dc_map_fetched_at\":") != 0)
-        return -1;
-    if (has_map && stats_append(buffer, capacity, used, "%" PRId64,
-                                 context->fetched_at) != 0) return -1;
-    if (!has_map && stats_append(buffer, capacity, used, "null") != 0) return -1;
-    if (stats_append(buffer, capacity, used, ",\"dc_map_config_expires\":") != 0)
-        return -1;
-    if (has_map && stats_append(buffer, capacity, used, "%" PRId64,
-                                 context->config_expires) != 0) return -1;
-    if (!has_map && stats_append(buffer, capacity, used, "null") != 0) return -1;
-    if (stats_append(buffer, capacity, used, ",\"dc_map_age_seconds\":") != 0)
-        return -1;
-    if (has_map && stats_append(buffer, capacity, used, "%" PRId64,
-            now >= context->fetched_at ? now - context->fetched_at : 0) != 0)
-        return -1;
-    if (!has_map && stats_append(buffer, capacity, used, "null") != 0) return -1;
-    const char *result = context && context->last_refresh_result[0]
-        ? context->last_refresh_result : "never";
-    if (stats_append(buffer, capacity, used,
-        ",\"dc_map_refreshing\":%s,\"dc_map_last_refresh_result\":\"%s\","
-        "\"dc_map_last_attempt_at\":",
-        context && context->refreshing ? "true" : "false", result) != 0)
-        return -1;
-    if (context && context->last_attempt_at > 0 && stats_append(buffer, capacity, used,
-        "%" PRId64, context->last_attempt_at) != 0) return -1;
-    if ((!context || context->last_attempt_at <= 0) &&
-        stats_append(buffer, capacity, used, "null") != 0) return -1;
-    if (stats_append(buffer, capacity, used, ",\"dc_map_last_success_at\":") != 0)
-        return -1;
-    if (context && context->last_success_at > 0 && stats_append(buffer, capacity, used,
-        "%" PRId64, context->last_success_at) != 0) return -1;
-    if ((!context || context->last_success_at <= 0) &&
-        stats_append(buffer, capacity, used, "null") != 0) return -1;
-    if (stats_append(buffer, capacity, used, ",\"dc_map_last_failure_at\":") != 0)
-        return -1;
-    if (context && context->last_failure_at > 0 && stats_append(buffer, capacity, used,
-        "%" PRId64, context->last_failure_at) != 0) return -1;
-    if ((!context || context->last_failure_at <= 0) &&
-        stats_append(buffer, capacity, used, "null") != 0) return -1;
-    if (stats_append(buffer, capacity, used, ",\"dc_map_next_refresh_at\":") != 0)
-        return -1;
-    if (context && context->next_refresh_at > 0 && stats_append(buffer, capacity, used,
-        "%" PRId64, context->next_refresh_at) != 0) return -1;
-    if ((!context || context->next_refresh_at <= 0) &&
-        stats_append(buffer, capacity, used, "null") != 0) return -1;
-    if (stats_append(buffer, capacity, used,
-        ",\"dc_map_refresh_attempts\":%" PRIu64
-        ",\"dc_map_refresh_successes\":%" PRIu64
-        ",\"dc_map_refresh_failures\":%" PRIu64
-        ",\"dc_map_last_refresh_errno\":",
-        context ? context->refresh_attempts : 0,
-        context ? context->refresh_successes : 0,
-        context ? context->refresh_failures : 0) != 0)
-        return -1;
-    if (context && context->last_refresh_errno && stats_append(buffer, capacity, used,
-        "%d", context->last_refresh_errno) != 0) return -1;
-    if ((!context || !context->last_refresh_errno) &&
-        stats_append(buffer, capacity, used, "null") != 0) return -1;
-    if (stats_append(buffer, capacity, used, ",\"dc_map_last_manifest_errno\":") != 0)
-        return -1;
-    if (context && context->last_manifest_errno && stats_append(buffer, capacity, used,
-        "%d", context->last_manifest_errno) != 0) return -1;
-    if ((!context || !context->last_manifest_errno) &&
-        stats_append(buffer, capacity, used, "null") != 0) return -1;
-    return 0;
-}
-
-size_t tg_stats_encode(const tg_diag_snapshot *sample, int detailed, char *response, size_t capacity) {
-    tg_epoll_proxy_stats stats = sample->stats;
-    size_t count = stats.client_response_latency_samples;
-    if (count > TG_CLIENT_LATENCY_SAMPLE_COUNT) return 0;
-    for (size_t i = 1; i < count; ++i) {
-        uint64_t value = stats.latency_samples[i];
-        size_t j = i;
-        while (j && stats.latency_samples[j - 1] > value) {
-            stats.latency_samples[j] = stats.latency_samples[j - 1];
-            --j;
-        }
-        stats.latency_samples[j] = value;
-    }
-    if (count) {
-        stats.client_response_latency_p50_us = stats.latency_samples[(count * 50 + 99) / 100 - 1];
-        stats.client_response_latency_p95_us = stats.latency_samples[(count * 95 + 99) / 100 - 1];
-    }
-    process_memory memory;
-    size_t used = 0;
-    read_process_memory(&memory, sample->header.pid, sample->nofile, detailed);
-    int length = snprintf(response, capacity,
-        "{\"active_connections\":%zu,", stats.active_connections);
-    if (length > 0 && (size_t)length < capacity) {
-        used = (size_t)length;
-        if (append_active_sessions(response, capacity, &used,
-                                   &stats, sample->generation) == 0 &&
-            stats_append(response, capacity, &used,
-                "\"max_connections\":%zu,\"active_wss_connections\":%zu"
-                ",\"max_wss_connections\":%zu"
-                ",\"memory_headroom_bytes\":%zu,\"memory_ceiling_bytes\":%zu"
-                ",\"buffer_bytes_current\":%zu"
-                ",\"buffer_bytes_peak\":%zu"
-                ",\"buffer_bytes_limit\":%zu"
-                ",\"client_queue_bytes\":%zu,\"upstream_queue_bytes\":%zu"
-                ",\"client_queue_capacity_bytes\":%zu"
-                ",\"upstream_queue_capacity_bytes\":%zu"
-                ",\"ws_rx_capacity_bytes\":%zu,\"ws_tx_memory_bytes\":%zu"
-                ",\"mtproto_packet_capacity_bytes\":%zu"
-                ",\"proxy_struct_bytes\":%zu"
-                ",\"connection_struct_bytes\":%zu"
-                ",\"retired_connection_struct_bytes\":%zu"
-                ",\"tls_objects\":%zu,\"worker_pool_tls_objects\":%zu"
-                ",\"client_socket_fds\":%zu,\"upstream_socket_fds\":%zu"
-                ",\"worker_pool_entries\":%zu,\"worker_pool_capacity\":%zu"
-                ",\"worker_pool_struct_bytes\":%zu,\"worker_pool_started\":%s"
-                ",\"accept_limit_rejections\":%" PRIu64
-                ",\"accept_fd_exhaustion\":%" PRIu64
-                ",\"allocation_failures\":%" PRIu64
-                ",\"buffer_budget_rejections\":%" PRIu64
-                ",\"buffer_size_rejections\":%" PRIu64
-                ",\"wss_read_pauses\":%" PRIu64
-                ",\"wss_read_resumes\":%" PRIu64
-                ",\"wss_paused_timeouts\":%" PRIu64
-                ",\"http_403\":%" PRIu64 ",\"http_501\":%" PRIu64
-                ",\"http_502\":%" PRIu64 ",\"last_http_status\":%u"
-                ",\"wss_reads_paused\":%zu"
-                ",\"wss_oldest_pause_ms\":%" PRIu64
-                ",\"connections_started\":%" PRIu64
-                ",\"bytes_from_clients\":%" PRIu64
-                ",\"bytes_from_upstreams\":%" PRIu64
-                ",\"wss_attempts\":%" PRIu64 ",\"wss_failures\":%" PRIu64
-                ",\"wss_responses\":%" PRIu64
-                ",\"cf_wss_responses\":%" PRIu64
-                ",\"last_success_dc\":%u,\"last_success_route\":%u"
-                ",\"last_success_latency_ms\":%" PRIu64
-                ",\"last_success_age_ms\":%" PRIu64
-                ",\"last_failure_dc\":%u,\"last_failure_route\":%u"
-                ",\"last_failure_stage\":%u,\"last_failure_age_ms\":%" PRIu64
-                ",\"worker_pool_hits\":%" PRIu64
-                ",\"worker_pool_misses\":%" PRIu64
-                ",\"worker_pool_responses\":%" PRIu64
-                ",\"client_response_latency_total\":%" PRIu64
-                ",\"client_response_latency_samples\":%zu"
-                ",\"client_response_latency_last_us\":%" PRIu64
-                ",\"client_response_latency_p50_us\":%" PRIu64
-                ",\"client_response_latency_p95_us\":%" PRIu64
-                ",",
-                stats.max_connections, stats.active_wss_connections,
-                stats.max_wss_connections, stats.memory_headroom_bytes,
-                stats.memory_ceiling_bytes, stats.buffer_bytes_current,
-                stats.buffer_bytes_peak, stats.buffer_bytes_limit,
-                stats.client_queue_bytes, stats.upstream_queue_bytes,
-                stats.client_queue_capacity_bytes,
-                stats.upstream_queue_capacity_bytes,
-                stats.ws_rx_capacity_bytes, stats.ws_tx_memory_bytes,
-                stats.mtproto_packet_capacity_bytes,
-                stats.proxy_struct_bytes, stats.connection_struct_bytes,
-                stats.retired_connection_struct_bytes, stats.tls_objects,
-                stats.worker_pool_tls_objects, stats.client_socket_fds,
-                stats.upstream_socket_fds, stats.worker_pool_entries,
-                stats.worker_pool_capacity, stats.worker_pool_struct_bytes,
-                stats.worker_pool_started ? "true" : "false",
-                stats.accept_limit_rejections,
-                stats.accept_fd_exhaustion,
-                stats.allocation_failures,
-                stats.buffer_budget_rejections,
-                stats.buffer_size_rejections,
-                stats.wss_read_pauses,
-                stats.wss_read_resumes,
-                stats.wss_paused_timeouts,
-                stats.http_403, stats.http_501, stats.http_502,
-                stats.last_http_status,
-                stats.wss_reads_paused,
-                stats.wss_oldest_pause_ms,
-                stats.connections_started,
-                stats.bytes_from_clients, stats.bytes_from_upstreams,
-                stats.wss_attempts, stats.wss_failures, stats.wss_responses,
-                stats.cf_wss_responses, stats.last_success_dc,
-                stats.last_success_route, stats.last_success_latency_ms,
-                stats.last_success_age_ms, stats.last_failure_dc,
-                stats.last_failure_route, stats.last_failure_stage,
-                stats.last_failure_age_ms,
-                stats.worker_pool_hits, stats.worker_pool_misses,
-                stats.worker_pool_responses,
-                stats.client_response_latency_total,
-                stats.client_response_latency_samples,
-                stats.client_response_latency_last_us,
-                stats.client_response_latency_p50_us,
-                stats.client_response_latency_p95_us) == 0 &&
-            append_route_stats(response, capacity, &used, &stats) == 0 &&
-            append_process_metrics(response, capacity, &used,
-                                   &stats, &memory, sample->header.pid) == 0 &&
-            stats_append(response, capacity, &used, ",") == 0 &&
-            append_dc_map(response, capacity, &used, &sample->map) == 0 &&
-            stats_append(response, capacity, &used, "}\n") == 0)
-            length = (int)used;
-        else
-            length = -1;
-    } else {
-        length = -1;
-    }
-    return length > 0 ? (size_t)length : 0;
-}
-
-#ifdef TG_EPOLL_TESTING
 static int set_socket_flags(int fd) {
     int status_flags = fcntl(fd, F_GETFL, 0);
     int descriptor_flags = fcntl(fd, F_GETFD, 0);
@@ -750,7 +224,6 @@ int tg_stats_socket_open(tg_stats_socket *server, const char *path) {
         return -1;
     }
     server->fd = fd;
-    server->process_generation = monotonic_generation();
     memcpy(server->path, path, path_len + 1);
     server->device = secured.st_dev;
     server->inode = secured.st_ino;
@@ -758,8 +231,7 @@ int tg_stats_socket_open(tg_stats_socket *server, const char *path) {
 }
 
 int tg_stats_socket_serve(tg_stats_socket *server,
-                          const tg_epoll_proxy *proxy,
-                          const tg_stats_socket_context *context) {
+                          const tg_epoll_proxy *proxy) {
     if (!server || server->fd < 0 || !proxy) {
         errno = EINVAL;
         return -1;
@@ -775,13 +247,87 @@ int tg_stats_socket_serve(tg_stats_socket *server,
             close(client);
             continue;
         }
-        tg_diag_snapshot sample = {.header.pid = getpid(), .generation = server->process_generation,
-                                   .nofile = -1};
-        if (context) sample.map = *context;
-        char response[262144];
-        size_t length = tg_epoll_proxy_get_stats(proxy, &sample.stats) == 0
-            ? tg_stats_encode(&sample, 1, response, sizeof(response)) : 0;
-        if (length > 0) {
+        tg_epoll_proxy_stats stats;
+        char response[131072];
+        int n = tg_epoll_proxy_get_stats(proxy, &stats);
+        size_t used = 0;
+        int length = n == 0 ? snprintf(response, sizeof(response),
+            "{\"active_connections\":%zu,", stats.active_connections) : -1;
+        if (length > 0 && (size_t)length < sizeof(response)) {
+            used = (size_t)length;
+            if (append_active_sessions(response, sizeof(response), &used,
+                                       &stats) == 0 &&
+                stats_append(response, sizeof(response), &used,
+                    "\"max_connections\":%zu,\"active_wss_connections\":%zu"
+                    ",\"max_wss_connections\":%zu"
+                    ",\"buffer_bytes_current\":%zu"
+                    ",\"buffer_bytes_peak\":%zu"
+                    ",\"buffer_bytes_limit\":%zu"
+                    ",\"accept_limit_rejections\":%" PRIu64
+                    ",\"accept_fd_exhaustion\":%" PRIu64
+                    ",\"allocation_failures\":%" PRIu64
+                    ",\"buffer_budget_rejections\":%" PRIu64
+                    ",\"buffer_size_rejections\":%" PRIu64
+                    ",\"wss_read_pauses\":%" PRIu64
+                    ",\"wss_read_resumes\":%" PRIu64
+                    ",\"wss_paused_timeouts\":%" PRIu64
+                    ",\"wss_reads_paused\":%zu"
+                    ",\"wss_oldest_pause_ms\":%" PRIu64
+                    ",\"connections_started\":%" PRIu64
+                    ",\"bytes_from_clients\":%" PRIu64
+                    ",\"bytes_from_upstreams\":%" PRIu64
+                    ",\"wss_attempts\":%" PRIu64 ",\"wss_failures\":%" PRIu64
+                    ",\"wss_responses\":%" PRIu64
+                    ",\"cf_wss_responses\":%" PRIu64
+                    ",\"last_success_dc\":%u,\"last_success_route\":%u"
+                    ",\"last_success_latency_ms\":%" PRIu64
+                    ",\"last_success_age_ms\":%" PRIu64
+                    ",\"last_failure_dc\":%u,\"last_failure_route\":%u"
+                    ",\"last_failure_stage\":%u,\"last_failure_age_ms\":%" PRIu64
+                    ",\"worker_pool_hits\":%" PRIu64
+                    ",\"worker_pool_misses\":%" PRIu64
+                    ",\"worker_pool_responses\":%" PRIu64
+                    ",\"client_response_latency_total\":%" PRIu64
+                    ",\"client_response_latency_samples\":%zu"
+                    ",\"client_response_latency_last_us\":%" PRIu64
+                    ",\"client_response_latency_p50_us\":%" PRIu64
+                    ",\"client_response_latency_p95_us\":%" PRIu64
+                    "}\n",
+                    stats.max_connections, stats.active_wss_connections,
+                    stats.max_wss_connections, stats.buffer_bytes_current,
+                    stats.buffer_bytes_peak, stats.buffer_bytes_limit,
+                    stats.accept_limit_rejections,
+                    stats.accept_fd_exhaustion,
+                    stats.allocation_failures,
+                    stats.buffer_budget_rejections,
+                    stats.buffer_size_rejections,
+                    stats.wss_read_pauses,
+                    stats.wss_read_resumes,
+                    stats.wss_paused_timeouts,
+                    stats.wss_reads_paused,
+                    stats.wss_oldest_pause_ms,
+                    stats.connections_started,
+                    stats.bytes_from_clients, stats.bytes_from_upstreams,
+                    stats.wss_attempts, stats.wss_failures, stats.wss_responses,
+                    stats.cf_wss_responses, stats.last_success_dc,
+                    stats.last_success_route, stats.last_success_latency_ms,
+                    stats.last_success_age_ms, stats.last_failure_dc,
+                    stats.last_failure_route, stats.last_failure_stage,
+                    stats.last_failure_age_ms,
+                    stats.worker_pool_hits, stats.worker_pool_misses,
+                    stats.worker_pool_responses,
+                    stats.client_response_latency_total,
+                    stats.client_response_latency_samples,
+                    stats.client_response_latency_last_us,
+                    stats.client_response_latency_p50_us,
+                    stats.client_response_latency_p95_us) == 0)
+                length = (int)used;
+            else
+                length = -1;
+        } else {
+            length = -1;
+        }
+        if (length > 0 && (size_t)length == used) {
             size_t sent = 0;
             while (sent < (size_t)length) {
                 ssize_t written = send(client, response + sent,
@@ -811,4 +357,3 @@ void tg_stats_socket_close(tg_stats_socket *server) {
     memset(server, 0, sizeof(*server));
     server->fd = -1;
 }
-#endif

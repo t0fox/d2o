@@ -387,7 +387,7 @@
                   <div><dt>Отказы из-за нехватки FD</dt><dd data-tg-field="accept_fd_exhaustion" data-format="n">—</dd></div>
                 </dl><dl class="tg-diag-metrics" id="tg-diag-period-errors"></dl><dl class="tg-diag-metrics" id="tg-diag-stage-failures"></dl></details>
               </section>
-              <section class="diag-card tg-diag-detail"><h4>Карта Telegram DC</h4>
+              <section class="diag-card tg-diag-detail" id="tg-diag-dc-card"><h4>Карта Telegram DC</h4>
 <dl id="tg-diag-dc-details" class="tg-diag-metrics">
                   <div><dt>Состояние</dt><dd data-tg-field="dc_map_status" data-format="status">—</dd></div>
                   <div><dt>Адресов</dt><dd data-tg-field="dc_map_endpoint_count" data-format="n">—</dd></div>
@@ -403,7 +403,7 @@
                   <div><dt>Ошибка записи (errno)</dt><dd data-tg-field="dc_map_last_manifest_errno" data-format="n">—</dd></div>
                 </dl>
               </section>
-              <section class="diag-card diag-limiter-panel"><h4>Состояние маршрутов</h4>
+              <section class="diag-card diag-limiter-panel"><h4 id="tg-diag-route-title">Состояние маршрутов</h4>
                 <div id="tg-diag-routes" class="tg-diag-records"></div>
                 <p id="tg-diag-routes-empty" class="diag-history-note">Пока нет данных маршрута.</p>
               </section>

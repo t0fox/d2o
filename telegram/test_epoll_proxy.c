@@ -1105,9 +1105,6 @@ static void test_epoll_many_concurrent_tcp_clients(void) {
     assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
     assert(stats.connections_started == CLIENT_COUNT &&
            stats.active_connections == 0);
-    assert(stats.buffer_bytes_current == 0 &&
-           stats.connection_struct_bytes == 0 &&
-           stats.retired_connection_struct_bytes == 0);
     assert(stats.bytes_from_clients ==
            CLIENT_COUNT * (sizeof(test_handshake) + sizeof(payload)));
     tg_epoll_proxy_destroy(proxy);
@@ -1161,41 +1158,6 @@ static void test_pending_tcp_connect_expires_before_idle_timeout(void) {
     assert(count_open_fds() == fds_before);
 }
 
-static void test_idle_stats_wakeup(void) {
-    uint16_t listen_port;
-    int listener = create_listener(&listen_port);
-    proxy_fixture fixture = {0};
-    tg_epoll_proxy_config config = {
-        .listener_fd = listener,
-        .queue_bytes = 4096,
-        .memory_budget_bytes = 575u * 1024u,
-        .configured_max_connections = 8,
-        .handshake_timeout_ms = 1000,
-        .idle_timeout_ms = 5000,
-        .select_target = select_target,
-        .context = &fixture,
-    };
-    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
-    assert(proxy != NULL);
-
-    int stats[2];
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, stats) == 0);
-    assert(write(stats[0], "x", 1) == 1);
-    /* Pending stats data alone used to leave the proxy blocked in epoll_wait. */
-    assert(tg_epoll_proxy_step(proxy, 0) == 0);
-    assert(tg_epoll_proxy_watch_stats(proxy, stats[1]) == 0);
-    assert(tg_epoll_proxy_step(proxy, 0) == 1);
-    char byte;
-    assert(read(stats[1], &byte, 1) == 1 && byte == 'x');
-    assert(tg_epoll_proxy_step(proxy, 0) == 0);
-    assert(tg_epoll_proxy_active_connections(proxy) == 0);
-
-    close(stats[0]);
-    close(stats[1]);
-    tg_epoll_proxy_destroy(proxy);
-    close(listener);
-}
-
 static void test_read_only_stats_socket(void) {
     char directory[] = "/tmp/d2k-tg-stats-XXXXXX";
     assert(mkdtemp(directory) != NULL);
@@ -1243,8 +1205,6 @@ static void test_read_only_stats_socket(void) {
 
     tg_stats_socket stats_socket = {.fd = -1};
     assert(tg_stats_socket_open(&stats_socket, path) == 0);
-    assert(stats_socket.process_generation != 0);
-    assert(tg_epoll_proxy_watch_stats(proxy, stats_socket.fd) == 0);
     tg_stats_socket duplicate = {.fd = -1};
     assert(tg_stats_socket_open(&duplicate, path) != 0);
     assert(stat(path, &socket_stat) == 0 && S_ISSOCK(socket_stat.st_mode));
@@ -1253,10 +1213,7 @@ static void test_read_only_stats_socket(void) {
     int client = socket(AF_UNIX, SOCK_STREAM, 0);
     assert(client >= 0);
     assert(connect(client, (struct sockaddr *)&address, sizeof(address)) == 0);
-    /* An idle proxy must wake for the stats socket, even with no TCP clients. */
-    assert(tg_epoll_proxy_step(proxy, 0) > 0);
-    assert(tg_stats_socket_serve(&stats_socket, proxy, NULL) == 0);
-    assert(tg_epoll_proxy_step(proxy, 0) == 0);
+    assert(tg_stats_socket_serve(&stats_socket, proxy) == 0);
     char response[64u * 1024u];
     ssize_t length = recv(client, response, sizeof(response) - 1, 0);
     assert(length > 0);
@@ -1264,10 +1221,6 @@ static void test_read_only_stats_socket(void) {
     assert(strstr(response, "\"active_connections\":0") != NULL);
     assert(strstr(response, "\"connections_started\":0") != NULL);
     assert(strstr(response, "\"process_started_at\":") != NULL);
-    char expected_generation[64];
-    assert(snprintf(expected_generation, sizeof(expected_generation),
-        "\"process_generation\":%" PRIu64, stats_socket.process_generation) > 0);
-    assert(strstr(response, expected_generation) != NULL);
     assert(strstr(response, "\"accepted_connections\":0") != NULL);
     assert(strstr(response, "\"active_sessions\":[]") != NULL);
     assert(strstr(response, "\"route_sessions_truncated\":false") != NULL);
@@ -1279,19 +1232,6 @@ static void test_read_only_stats_socket(void) {
     assert(strstr(response, "\"buffer_bytes_current\":0") != NULL);
     assert(strstr(response, "\"buffer_bytes_peak\":0") != NULL);
     assert(strstr(response, "\"buffer_bytes_limit\":") != NULL);
-    assert(strstr(response, "\"process_id\":") != NULL);
-    assert(strstr(response, "\"rss_kib\":") != NULL);
-    assert(strstr(response, "\"rss_hwm_kib\":") != NULL);
-    assert(strstr(response, "\"rss_anon_kib\":") != NULL);
-    assert(strstr(response, "\"vm_data_kib\":") != NULL);
-    assert(strstr(response, "\"vm_swap_kib\":") != NULL);
-    assert(strstr(response, "\"smaps_rollup_status\":") != NULL);
-    assert(strstr(response, "\"rss_minus_known_allocations_bytes\":") != NULL);
-    assert(strstr(response, "\"fd_count\":") != NULL);
-    assert(strstr(response, "\"soft_nofile_limit\":") != NULL);
-    assert(strstr(response, "\"dc_map_status\":\"unavailable\"") != NULL);
-    assert(strstr(response, "\"route_health\":[]") != NULL);
-    assert(strstr(response, "\"problem_sessions\":[]") != NULL);
     assert(strstr(response, "\"last_success_dc\":0") != NULL);
     assert(strstr(response, "\"last_failure_stage\":0") != NULL);
     assert(strstr(response, "\"client_response_latency_total\":0") != NULL);
@@ -1534,26 +1474,6 @@ static void test_disabled_wss_does_not_enable_automatic_tcp(void) {
            stats.wss_attempts == 0 && stats.wss_failures == 0 &&
            stats.last_failure_route == TG_ROUTE_NONE &&
            stats.last_failure_stage == TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE);
-
-    char directory[] = "/tmp/d2k-tg-no-route-XXXXXX";
-    assert(mkdtemp(directory) != NULL);
-    struct sockaddr_un address = {.sun_family = AF_UNIX};
-    assert(snprintf(address.sun_path, sizeof(address.sun_path), "%s/stats.sock",
-                    directory) > 0);
-    tg_stats_socket stats_socket = {.fd = -1};
-    assert(tg_stats_socket_open(&stats_socket, address.sun_path) == 0);
-    int stats_client = socket(AF_UNIX, SOCK_STREAM, 0);
-    assert(stats_client >= 0);
-    assert(connect(stats_client, (struct sockaddr *)&address, sizeof(address)) == 0);
-    assert(tg_stats_socket_serve(&stats_socket, proxy, NULL) == 0);
-    char response[8192];
-    ssize_t length = recv(stats_client, response, sizeof(response) - 1, 0);
-    assert(length > 0);
-    response[length] = '\0';
-    assert(strstr(response, "\"transport\":null,\"failure_stage\":\"route_unavailable\"") != NULL);
-    close(stats_client);
-    tg_stats_socket_close(&stats_socket);
-    assert(rmdir(directory) == 0);
     tg_epoll_proxy_destroy(proxy);
     close(listener);
 }
@@ -1952,8 +1872,6 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
         assert(session->selected_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
     }
     assert(session->telegram_response_seen);
-    assert(session->client_port == 443 && session->upstream_port == ws_port);
-    assert(session->age_ms > 0 && session->first_response_latency_ms > 0);
     assert(session->bytes_from_clients >= wss.expected_packet_len);
     assert(session->bytes_from_upstreams >= wss.response_packet_len);
     assert(session->event_count >= 4);
@@ -1977,7 +1895,7 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     memcpy(stats_address.sun_path, stats_path, strlen(stats_path) + 1u);
     assert(connect(stats_client, (struct sockaddr *)&stats_address,
                    sizeof(stats_address)) == 0);
-    assert(tg_stats_socket_serve(&stats_socket, proxy, NULL) == 0);
+    assert(tg_stats_socket_serve(&stats_socket, proxy) == 0);
     char stats_json[64u * 1024u];
     size_t stats_json_len = 0;
     for (;;) {
@@ -1992,13 +1910,9 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     char expected_session_bytes[128];
     assert(snprintf(expected_session_bytes, sizeof(expected_session_bytes),
         "\"telegram_response_seen\":true,\"bytes_from_clients\":%" PRIu64
-        ",\"bytes_from_upstreams\":%" PRIu64,
+        ",\"bytes_from_upstreams\":%" PRIu64 ",\"events\":[",
         session->bytes_from_clients, session->bytes_from_upstreams) > 0);
     assert(strstr(stats_json, expected_session_bytes) != NULL);
-    assert(strstr(stats_json, "\"events\":[{\"sequence\":") != NULL);
-    assert(strstr(stats_json, "\"client_queue_capacity_bytes\":") != NULL);
-    assert(strstr(stats_json, "\"route_health\":[") != NULL);
-    assert(strstr(stats_json, "\"failure_by_stage\":{") != NULL);
     close(stats_client);
     tg_stats_socket_close(&stats_socket);
 
@@ -3764,7 +3678,6 @@ int main(int argc, char **argv) {
     test_epoll_bridge_preserves_handshake_and_half_close();
     test_epoll_many_concurrent_tcp_clients();
     test_pending_tcp_connect_expires_before_idle_timeout();
-    test_idle_stats_wakeup();
     test_read_only_stats_socket();
     test_invalid_handshake_fails_closed();
     test_client_disconnect_during_route_selection();

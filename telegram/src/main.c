@@ -305,7 +305,7 @@ static int read_memory_resources(size_t *total, size_t *available) {
     return *total && *available <= *total;
 }
 
-static int run_local_daemon(const char *config_path, const char *stats_path) {
+static int run_local_daemon(const char *config_path) {
     static const uint16_t allowed_ports[] = {443, 5222};
     static const char *const allowed_cidrs[] = {
         "149.154.160.0/20", "91.108.4.0/22", "91.108.8.0/22",
@@ -317,15 +317,12 @@ static int run_local_daemon(const char *config_path, const char *stats_path) {
     const uint16_t listen_ports[] = {TG_LISTEN_PORT};
     tg_config cfg;
     tg_dc_map_store map_store = {0};
-    tg_stats_socket_context stats_context = {
-        .last_refresh_result = "never"
-    };
     tg_cf_domain_pool cf_domain_pool = {0};
     tg_route_dns *discovery_dns = NULL;
     tg_epoll_proxy *proxy = NULL;
     SSL_CTX *tls_context = NULL;
     dc_refresh_job refresh_job = {0};
-    int stats_sender = -1;
+    tg_stats_socket stats_socket = {.fd = -1};
     int listener = -1, rc = 1;
     int64_t next_dc_refresh_at = 0;
     atomic_init(&refresh_job.done, 0);
@@ -358,12 +355,6 @@ static int run_local_daemon(const char *config_path, const char *stats_path) {
         tg_dc_map_store_load(&map_store, now) != 0) {
         log_msg("не удалось инициализировать проверенную карту Telegram DC");
         goto done;
-    }
-    if (map_store.has_snapshot) {
-        stats_context.last_success_at = map_store.snapshot.fetched_at;
-        strcpy(stats_context.last_refresh_result, map_store.loaded_last_good ? "loaded_last_good" : "loaded");
-    } else {
-        strcpy(stats_context.last_refresh_result, "no_snapshot");
     }
     if (tg_cf_domain_pool_init(&cf_domain_pool, cfg.cf_domain_cache_path,
             &cfg.cf_proxy_domains[0][0], cfg.cf_proxy_domain_count,
@@ -432,12 +423,8 @@ static int run_local_daemon(const char *config_path, const char *stats_path) {
         log_msg(resource_note);
         goto done;
     }
-    if (!stats_path) stats_path = D2K_DIAG_INPUT;
-    stats_sender = d2k_diag_sender();
-    const uint64_t stats_generation = monotonic_ms();
-    uint64_t stats_due = 0;
-    const long stats_pid = (long)getpid();
-    const int64_t stats_nofile = (int64_t)fd_limit;
+    if (tg_stats_socket_open(&stats_socket, cfg.stats_socket_path) != 0)
+        log_msg("не удалось открыть локальный read-only socket статистики Telegram");
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
@@ -493,6 +480,9 @@ static int run_local_daemon(const char *config_path, const char *stats_path) {
                 rebind_at_ms = monotonic_ms() + (100u << rebind_attempt);
             }
         }
+        if (stats_socket.fd >= 0 &&
+            tg_stats_socket_serve(&stats_socket, proxy) != 0)
+            log_msg("ошибка обслуживания локального socket статистики Telegram");
         int step_result = tg_epoll_proxy_step(proxy, listener < 0 ? 100 : 1000);
         if (step_result == TG_EPOLL_REBIND_LISTENER) {
             log_msg("ошибки accept: восстанавливается listener Telegram");
@@ -506,74 +496,32 @@ static int run_local_daemon(const char *config_path, const char *stats_path) {
             rc = 1;
             break;
         }
+        if (stats_socket.fd >= 0 &&
+            tg_stats_socket_serve(&stats_socket, proxy) != 0)
+            log_msg("ошибка обслуживания локального socket статистики Telegram");
         int64_t refresh_now = (int64_t)time(NULL);
         int refresh_result = finish_dc_refresh(&refresh_job, &map_store,
                                                 refresh_now);
         if (refresh_result > 0) {
-            stats_context.refreshing = 0;
-            ++stats_context.refresh_successes;
-            stats_context.last_success_at = refresh_now;
-            stats_context.last_refresh_errno = 0;
-            strcpy(stats_context.last_refresh_result, "success");
             if (tg_dc_write_endpoint_manifest(cfg.dc_map_endpoints_path,
                     tg_dc_map_store_current(&map_store), allowed_ports,
-                    sizeof(allowed_ports) / sizeof(allowed_ports[0]), refresh_now) != 0) {
-                stats_context.last_manifest_errno = errno;
+                    sizeof(allowed_ports) / sizeof(allowed_ports[0]), refresh_now) != 0)
                 log_msg("не удалось обновить пары IP:порт Telegram для firewall");
-            } else {
-                stats_context.last_manifest_errno = 0;
-            }
             next_dc_refresh_at = refresh_now + TG_DC_REFRESH_SECS;
-            stats_context.next_refresh_at = next_dc_refresh_at;
             log_msg("карта Telegram обновлена по подтверждённому help.getConfig");
         } else if (refresh_result < 0) {
-            stats_context.refreshing = 0;
-            ++stats_context.refresh_failures;
-            stats_context.last_failure_at = refresh_now;
-            stats_context.last_refresh_errno = refresh_job.result == 0 ? errno : 0;
-            strcpy(stats_context.last_refresh_result, refresh_job.result == 0 ? "install_failed" : "discovery_failed");
             next_dc_refresh_at = refresh_now + TG_DC_REFRESH_RETRY_SECS;
-            stats_context.next_refresh_at = next_dc_refresh_at;
             log_msg("обновление карты Telegram не подтвердилось; сохранена last-known-good карта");
         }
         if (discovery_dns && !refresh_job.started && refresh_now >= next_dc_refresh_at &&
             tg_dc_map_store_refresh_due(&map_store, refresh_now,
                                        TG_DC_REFRESH_SECS)) {
-            stats_context.last_attempt_at = refresh_now;
-            ++stats_context.refresh_attempts;
             if (start_dc_refresh(&refresh_job, &cfg, &cf_domain_pool,
                     discovery_dns, tls_context, refresh_now) == 0) {
-                stats_context.refreshing = 1;
-                strcpy(stats_context.last_refresh_result, "running");
-                stats_context.last_refresh_errno = 0;
                 log_msg("запущено фоновое обновление DC через Cloudflare Proxy и Worker");
             } else {
-                stats_context.refreshing = 0;
-                ++stats_context.refresh_failures;
-                stats_context.last_failure_at = refresh_now;
-                stats_context.last_refresh_errno = errno;
-                strcpy(stats_context.last_refresh_result, "thread_start_failed");
                 log_msg("не удалось запустить фоновое обновление карты Telegram");
                 next_dc_refresh_at = refresh_now + TG_DC_REFRESH_RETRY_SECS;
-                stats_context.next_refresh_at = next_dc_refresh_at;
-            }
-        }
-        if (stats_sender >= 0) {
-            uint64_t now = monotonic_ms();
-            if (now >= stats_due) {
-                stats_due = now + 1000;
-                tg_diag_snapshot snapshot = {
-                    .header = {D2K_DIAG_IPC_VERSION, D2K_DIAG_IPC_TELEGRAM, stats_pid},
-                    .generation = stats_generation, .nofile = stats_nofile,
-                    .map = stats_context
-                };
-                snapshot.map.has_map = map_store.has_snapshot;
-                snapshot.map.loaded_last_good = map_store.loaded_last_good;
-                snapshot.map.fetched_at = map_store.snapshot.fetched_at;
-                snapshot.map.config_expires = map_store.snapshot.config_expires;
-                snapshot.map.endpoint_count = map_store.snapshot.endpoint_count;
-                if (tg_epoll_proxy_get_stats(proxy, &snapshot.stats) == 0)
-                    d2k_diag_send(stats_sender, stats_path, &snapshot, sizeof(snapshot));
             }
         }
         int ready = d2k_runtime_listener_ready(listener);
@@ -582,7 +530,7 @@ static int run_local_daemon(const char *config_path, const char *stats_path) {
 done:
     (void)write_status(cfg.status_path, rc == 0 ? "stopped\n" : "error\n");
     stop_dc_refresh(&refresh_job);
-    if (stats_sender >= 0) close(stats_sender);
+    tg_stats_socket_close(&stats_socket);
     tg_epoll_proxy_destroy(proxy);
     tg_route_dns_destroy(discovery_dns);
     SSL_CTX_free(tls_context);
@@ -691,13 +639,13 @@ static int check_telegram_dc_map(const char *config_path) {
 int main(int argc,char **argv) {
     int offline = d2k_runtime_offline(argc, argv, "d2ktg", offline_self_check);
     if (offline >= 0) return offline;
-    const char *config="/opt/d2k/config",*log_path=NULL,*stats_path=NULL;
+    const char *config="/opt/d2k/config",*log_path=NULL;
     if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=instagram-ip-probe,meta-hosts-v3,telegram-local-tcp-epoll,mtproto-respq,mtproto-auth,mtproto-v2,mtproto-help-config,mtproto-gzip-config,telegram-cf-dc-discovery release=" D2K_RELEASE_ID);return 0;}
     if(argc==5&&strcmp(argv[1],"--check-instagram-ip")==0)return check_instagram_ip(argv[2],argv[3],argv[4]);
     if ((argc == 2 || argc == 3) && strcmp(argv[1], "--check-telegram-dc-map") == 0)
         return check_telegram_dc_map(argc == 3 ? argv[2] : config);
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
-        puts("d2ktg [--config FILE] [--stats-socket PATH] | --check-telegram-dc-map [CONFIG]");
+        puts("d2ktg [--config FILE] | --check-telegram-dc-map [CONFIG]");
         return 0;
     }
     if(argc==3&&strcmp(argv[1],"--check-config")==0)return check_config(argv[2]);
@@ -705,9 +653,8 @@ int main(int argc,char **argv) {
         if(strcmp(argv[i],"--health-file")==0&&i+1<argc)health_path=argv[++i];
         else if(strcmp(argv[i],"--config")==0&&i+1<argc)config=argv[++i];
         else if(strcmp(argv[i],"--log")==0&&i+1<argc)log_path=argv[++i];
-        else if(strcmp(argv[i],"--stats-socket")==0&&i+1<argc&&argv[i+1][0]=='/')stats_path=argv[++i];
-        else {fprintf(stderr,"usage: d2ktg [--config FILE] [--log FILE] [--stats-socket PATH]\n");return 2;}
+        else {fprintf(stderr,"usage: d2ktg [--config FILE] [--log FILE]\n");return 2;}
     }
     if(redirect_log(log_path)!=0){fprintf(stderr,"d2ktg: cannot open configured log file\n");return 1;}
-    return run_local_daemon(config, stats_path);
+    return run_local_daemon(config);
 }
