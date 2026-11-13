@@ -508,7 +508,7 @@ static int append_dc_map(char *buffer, size_t capacity, size_t *used,
         "%d", context->last_manifest_errno) != 0) return -1;
     if ((!context || !context->last_manifest_errno) &&
         stats_append(buffer, capacity, used, "null") != 0) return -1;
-    return stats_append(buffer, capacity, used, ",");
+    return 0;
 }
 
 static int set_socket_flags(int fd) {
