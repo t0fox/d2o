@@ -705,7 +705,8 @@
       var rates=["bytes_from_clients","bytes_from_upstreams"].map(function(key){var rate=telegramSessionRate(session,key);return rate===null?"—":formatBytes(rate)+"/с";});
       ["#"+pretty(session.id)+" / DC "+pretty(session.dc)+" / "+kind,
        pretty(session.selected_transport||session.direct_transport)+" / "+formatAge(session.age_ms)+" / простой "+formatAge(session.no_progress_ms),
-       formatBytes(session.bytes_from_clients)+" / "+formatBytes(session.bytes_from_upstreams),rates.join(" / ")].forEach(function(value){var td=doc.createElement("td");td.textContent=value;tr.appendChild(td);});sessions.appendChild(tr);
+       formatBytes(session.bytes_from_clients)+" / "+formatBytes(session.bytes_from_upstreams),rates.join(" / "),
+       session.read_paused?"чтение приостановлено":pretty(session.stage)].forEach(function(value){var td=doc.createElement("td");td.textContent=value;tr.appendChild(td);});sessions.appendChild(tr);
     });sessionEmpty.hidden=list(latest&&latest.active_sessions).length>0;
     var problems=doc.getElementById("tg-diag-problems");problems.replaceChildren();
     list(latest&&latest.problem_sessions).slice().reverse().slice(0,8).forEach(function(problem){var li=doc.createElement("li");
