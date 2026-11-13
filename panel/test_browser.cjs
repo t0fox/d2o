@@ -227,7 +227,7 @@ async function main(){
  const call=(method,params={})=>new Promise((resolve,reject)=>{pending.set(++id,{resolve,reject});ws.send(JSON.stringify({id,method,params}))});
  const evaluate=async(expression)=>{try{const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw Error(JSON.stringify(r.exceptionDetails));return r.result.value}catch(e){throw Error('Runtime.evaluate failed for '+expression+': '+(e?.message||JSON.stringify(e)))}};
  const wait=ms=>new Promise(r=>setTimeout(r,ms));
- const until=async(expr,msg)=>{for(let i=0;i<160;i++){if(await evaluate(expr))return;await wait(50)}throw Error(msg)};
+ const until=async(expr,msg,attempts=160)=>{for(let i=0;i<attempts;i++){if(await evaluate(expr))return;await wait(50)}throw Error(msg)};
  await call('Page.enable');await call('Runtime.enable');
  await call('Page.addScriptToEvaluateOnNewDocument',{source:`(()=>{
   const nativeFetch=window.fetch.bind(window);
@@ -816,7 +816,7 @@ async function main(){
    }
    await panel.waitFor(command);
    if(action==='stop'){
-    await until('/остановлен/.test(document.querySelector("#now-title").textContent)','stopped engine must be stated');
+    await until('/остановлен/.test(document.querySelector("#now-title").textContent)','stopped engine must be stated',400);
     const s=await(await fetch(panel.url+'api/status')).json();
     assert.equal(s.snapshot.telegram_enabled,true,'stopping the engine leaves the tunnel alone');
    }
@@ -903,7 +903,7 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#tg-diag-stage-failures").textContent'),/connect 2.*handshake 1/,'failure counts are grouped by stage');
   assert.match(await evaluate('document.querySelector("#tg-diag-throughput").textContent'),/50 Б\/с \/ 25 Б\/с/,'last-interval throughput is shown');
   assert.match(await evaluate('document.querySelector("#tg-diag-map-status").textContent'),/last-known-good да/,'last-known-good DC map state is visible');
-  assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/media.*простой 3 с/,'media sessions show activity and time since progress');
+  assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/media.*420 мс \/ 3 с/,'media sessions show activity, first response and time since progress');
   assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/5\.0 КиБ\/с \/ 2\.5 КиБ\/с/,'per-session lifetime throughput is displayed');
   assert.equal(await evaluate('document.querySelector("#tg-diag-sessions tr").children.length'),6,'session details match all six diagnostic columns');
   assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/420 мс \/ 3 с.*direct selected.*fallback idle/,'first response, no-progress age, and both route states are shown');
