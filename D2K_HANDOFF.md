@@ -36,13 +36,16 @@ PID и совпавшем `process_started_at` в секундах. Период
 socket; сбор выключен по умолчанию.
 
 История графиков завершена в `main`: `eca1c21` добавляет HWM RSS, VmSwap, PSS,
-Private_Dirty и MemAvailable в выбор рядов, а `fb23db1` уточняет браузерное
-ожидание форматирования smaps. CI для `fb23db1` (`43402853065`) прошёл 30/30,
-включая Chrome-интеграцию, Telegram, санитайзеры и кросс-сборки. Локально
-прошли `make -C core test-diagnostics`, проверки JavaScript и
-`node panel/test_diagnostics.cjs`; browser integration проверен в CI, поскольку
-локально Chrome/Edge недоступны. Существующие untracked-артефакты сохранены и
-не включены в коммиты.
+Private_Dirty и MemAvailable в выбор рядов, `fb23db1` уточняет браузерное
+ожидание форматирования smaps, а `fadd957` проверяет ротацию 1440 Telegram
+снимков и освобождение буферов/структур после закрытия соединений. CI для
+`fadd957` (`43406840780`) прошёл 30/30, включая Chrome-интеграцию, Telegram,
+санитайзеры и кросс-сборки. Локально прошли `make -C core test-diagnostics`,
+`make -C core test-diagnostics-runtime`, `make -C telegram test-limits` с
+`/usr/bin/gcc`, проверки JavaScript и `node panel/test_diagnostics.cjs`. Локальный
+`test-epoll-proxy` не собирается без OpenSSL dev headers; его проверил CI.
+Chrome/Edge локально недоступны, поэтому browser integration проверена в CI.
+Существующие untracked-артефакты сохранены и не включены в коммиты.
 
 Низкую память покрывает модельный тест, не полевое измерение: `test_limits`
 проверяет политику 128 MiB, а `test_epoll_proxy` запускает loopback-сценарий
