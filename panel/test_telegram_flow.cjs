@@ -52,6 +52,12 @@ assert.deepEqual(flow.prototypeGeometry, {
   assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [next]), [],
     "повторный poll без новых байтов не рисует пакеты");
   assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [
+    { ...next, selected_transport: "cloudflare_proxy", bytes_from_clients: 9000 },
+  ]), [], "байты предыдущего маршрута не переносятся на новый");
+  assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [
+    { ...next, bytes_from_clients: null },
+  ]), [], "пропущенный счётчик не превращается в ноль");
+  assert.deepEqual(flow.collectConfirmedTrafficDeltas(previous, [
     { ...next, bytes_from_clients: 3, bytes_from_upstreams: 2 },
   ]), [], "сброс счётчиков не выдаётся за новые пакеты");
   const unconfirmed = session({ id: 92, dc: 2, selected_transport: "cloudflare_proxy",
@@ -315,6 +321,11 @@ assert.deepEqual(flow.prototypeGeometry, {
   }));
   assert.equal(confirmed.hasConfirmedResponse, true);
   assert.match(confirmed.statusLabel, /Ответ Telegram подтверждён/);
+  const paused = flow.summarizeTelegramFlow(snapshot({active_connections: 1,
+    active_sessions: [{...confirmed.sessions[0], read_paused: true, is_media: true,
+      no_progress_ms: 4300}]}));
+  assert.equal(paused.lanes[1].readPaused, 1);
+  assert.match(paused.caption, /Чтение приостановлено: 1.*4\.3 с/);
 }
 
 {
@@ -388,5 +399,12 @@ console.log("telegram flow: active sessions and route states match C11 snapshots
   timestamp += 100;
   nextFrame(timestamp);
   assert.ok(paintedResponses > 0, "свежий ответ виден после переполнения кольца событий");
+  scene.update(snapshot({process_generation: 100, active_connections: traffic.length, active_sessions: traffic}));
+  paintedPackets = 0;
+  scene.update(snapshot({process_generation: 101, active_connections: traffic.length,
+    active_sessions: traffic.map(item => ({...item, bytes_from_clients: 9000}))}));
+  timestamp += 1000;
+  nextFrame(timestamp);
+  assert.equal(paintedPackets, 0, "новое поколение процесса сбрасывает анимацию старого");
   scene.destroy();
 }

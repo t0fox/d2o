@@ -203,14 +203,16 @@ function collectConfirmedTrafficDeltas(previousBySession, sessions) {
   const deltas = [];
   (Array.isArray(sessions) ? sessions : []).forEach(session => {
     const id = Number(session?.id);
-    const fromClients = Number(session?.bytes_from_clients);
-    const fromUpstreams = Number(session?.bytes_from_upstreams);
-    if (!Number.isSafeInteger(id) || id <= 0 || !Number.isFinite(fromClients) ||
-        !Number.isFinite(fromUpstreams) || fromClients < 0 || fromUpstreams < 0) return;
+    const fromClients = metricNumber(session, "bytes_from_clients");
+    const fromUpstreams = metricNumber(session, "bytes_from_upstreams");
+    if (!Number.isSafeInteger(id) || id <= 0 || fromClients === null || fromUpstreams === null) return;
     live.add(id);
     const previous = previousBySession.get(id);
-    previousBySession.set(id, { fromClients, fromUpstreams });
-    if (!previous || session.telegram_response_seen !== true) return;
+    const transport = session.selected_transport;
+    previousBySession.set(id, { fromClients, fromUpstreams, transport, dc: session.dc });
+    if (!previous || previous.transport !== transport || previous.dc !== session.dc ||
+        fromClients < previous.fromClients || fromUpstreams < previous.fromUpstreams ||
+        session.telegram_response_seen !== true) return;
     const laneIndex = selectedLaneFor(session);
     const dc = telegramDcNumber(session.dc);
     if (laneIndex < 0 || dc === null) return;
@@ -356,7 +358,9 @@ function summarize(snapshot, error) {
     const label = transports.length === 1 ? routeDescription(transports[0], index) : route.label;
     const confirmed = sessionViews.filter(({ session, selectedLane }) =>
       selectedLane === index && session.telegram_response_seen === true).length;
-    return { ...route, label, status, counts: laneCounts, confirmed };
+    const readPaused = sessionViews.filter(({ session, selectedLane }) =>
+      selectedLane === index && session.read_paused === true).length;
+    return { ...route, label, status, counts: laneCounts, confirmed, readPaused };
   });
   applyCooldowns(lanes, cooldowns);
   lanes.forEach(lane => {
@@ -419,7 +423,7 @@ function summarize(snapshot, error) {
     : anyConnecting ? "Соединение устанавливается"
       : anySelected ? "Маршрут выбран · ожидается ответ Telegram"
         : allFailed ? "Последняя попытка завершилась ошибкой" : "Соединение устанавливается";
-  const caption = hedged.length
+  let caption = hedged.length
     ? `Параллельная гонка: победил ${hedged[0].winner}, остальные попытки отменены · ${dcLabel}`
     : mixedRoutes ? `Сессии используют разные маршруты · ${dcLabel}`
       : selectedLanes.length > 1 ? `Активны несколько маршрутов · ${dcLabel}`
@@ -428,6 +432,13 @@ function summarize(snapshot, error) {
             ? `Идёт параллельная гонка маршрутов · ${dcLabel}` : `Прокси устанавливает соединение · ${dcLabel}`)
             : allFailed ? `Для активных соединений маршрут недоступен · ${dcLabel}`
               : `Маршрут определяется · ${dcLabel}`;
+  const readPaused = sessions.filter(session => session.read_paused === true).length;
+  const mediaIdle = sessions.filter(session => session.is_media === true)
+    .map(session => metricNumber(session, "no_progress_ms")).filter(value => value !== null);
+  if (readPaused) caption += ` · Чтение приостановлено: ${readPaused}`;
+  if (mediaIdle.length)
+    caption += ` · Макс. без новых байтов в медиа: ${(Math.max(...mediaIdle) / 1000).toFixed(1)} с`;
+  if (snapshot.route_sessions_truncated) caption += ` · Показано сессий: ${sessions.length} из ${activeConnections}`;
 
   return {
     state, statusLabel, caption, transportLabel, dcLabel, lanes, sessions,

@@ -2354,6 +2354,8 @@
       "маршрут используется, но ответ Telegram подтверждён не для всех его сессий; маркер пульсирует.");
     helpKey(scheme.list, "tg-flow-key-line", "wait", "Пунктир",
       "идёт попытка подключения; пунктирный маркер движется.");
+    helpKey(scheme.list, "tg-flow-key-line", "paused", "Жёлтый пунктир",
+      "чтение приостановлено у всех сессий на этом маршруте. Подпись показывает число пауз.");
     helpKey(scheme.list, "tg-flow-key-line", "bad", "Красная линия и крест",
       "красная линия — пауза после отказа; пульсирующий крест — отказ на этапе, где оборвалась попытка.");
     helpKey(scheme.list, "tg-flow-key-line", "idle", "Серая линия",
@@ -2369,7 +2371,7 @@
     helpKey(scheme.list, "tg-flow-key-node", "idle", "Клиент и d2o",
       "слева клиент, в центре туннель, справа дата-центры Telegram; шестиугольник пульсирует, вокруг вращается точка активной сессии. Зелёные точки уже получили ответ.");
     helpKey(scheme.list, "tg-flow-key-packet", "active", "Движущиеся пакеты",
-      "оранжевая точка — запрос к Telegram, зелёная — ответ обратно.");
+      "движение показывает прирост байтов между снимками. Оранжевый — от клиента, зелёный — от сервера.");
     scheme.section.appendChild(el(doc, "p", "tg-flow-help-note",
       "DNS → TCP → TLS → WS → MTP — этапы соединения. Отказ останавливает попытку на своём этапе."));
     helpBody.appendChild(helpGrid);
@@ -2444,6 +2446,8 @@
         : stateLabels[lane.status] || "Состояние неизвестно";
       if (lane.status === "selected" && lane.confirmed > 0)
         state += " · ответов сейчас: " + telegramCount(lane.confirmed);
+      if (lane.readPaused)
+        state += " · пауз чтения: " + telegramCount(lane.readPaused);
       if (lane.counts?.failed) state += " · сбоев сейчас: " + telegramCount(lane.counts.failed);
       if (lane.failureStage) state += " · " + telegramFailureStage(lane.failureStage);
       if (telegramNumber(lane.failureAgeMs) !== null)

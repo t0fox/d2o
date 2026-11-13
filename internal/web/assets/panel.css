@@ -937,6 +937,7 @@ main { min-width: 0; padding-bottom: 80px; }
 .tg-flow-key-line[data-tone="active"]::before { background: #e8470f; }
 .tg-flow-key-line[data-tone="active"]::after { content: ""; position: absolute; left: -8px; top: 50%; width: 13px; height: 8px; margin-top: -4px; background: radial-gradient(ellipse at center, rgba(255, 236, 225, .95), rgba(232, 71, 15, .65) 38%, transparent 72%); animation: tg-key-signal 1.25s linear infinite; }
 .tg-flow-key-line[data-tone="wait"]::before { background: repeating-linear-gradient(90deg, #e8470f 0 4px, transparent 4px 7px); animation: tg-key-march .6s linear infinite; }
+.tg-flow-key-line[data-tone="paused"]::before { background: repeating-linear-gradient(90deg, #e0b050 0 5px, transparent 5px 11px); }
 .tg-flow-key-line[data-tone="bad"]::before { background: repeating-linear-gradient(90deg, #ff967b 0 3px, transparent 3px 9px); animation: tg-key-march-slow 1.2s linear infinite; }
 .tg-flow-key-line[data-tone="bad"]::after { content: ""; position: absolute; left: 50%; top: 50%; width: 15px; height: 15px; transform: translate(-50%, -50%) rotate(45deg); background: linear-gradient(#ff967b, #ff967b) center / 2px 100% no-repeat, linear-gradient(#ff967b, #ff967b) center / 100% 2px no-repeat; animation: tg-key-cross 1.1s ease-in-out infinite; }
 .tg-flow-key-line[data-tone="idle"]::before { animation: tg-key-idle 3.6s ease-in-out infinite; }
