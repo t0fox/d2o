@@ -305,7 +305,7 @@ static int read_memory_resources(size_t *total, size_t *available) {
     return *total && *available <= *total;
 }
 
-static int run_local_daemon(const char *config_path) {
+static int run_local_daemon(const char *config_path, const char *stats_path) {
     static const uint16_t allowed_ports[] = {443, 5222};
     static const char *const allowed_cidrs[] = {
         "149.154.160.0/20", "91.108.4.0/22", "91.108.8.0/22",
@@ -434,8 +434,15 @@ static int run_local_daemon(const char *config_path) {
         log_msg(resource_note);
         goto done;
     }
-    if (tg_stats_socket_open(&stats_socket, cfg.stats_socket_path) != 0)
-        log_msg("не удалось открыть локальный read-only socket статистики Telegram");
+    if (!stats_path) stats_path = cfg.stats_socket_path;
+    if (tg_stats_socket_open(&stats_socket, stats_path) != 0 ||
+        tg_epoll_proxy_watch_stats(proxy, stats_socket.fd) != 0) {
+        char note[256];
+        snprintf(note, sizeof(note), "сокет статистики Telegram %s: %s",
+                 stats_path, strerror(errno));
+        log_msg(note);
+        tg_stats_socket_close(&stats_socket);
+    }
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
@@ -491,9 +498,6 @@ static int run_local_daemon(const char *config_path) {
                 rebind_at_ms = monotonic_ms() + (100u << rebind_attempt);
             }
         }
-        if (stats_socket.fd >= 0 &&
-            tg_stats_socket_serve(&stats_socket, proxy, &stats_context) != 0)
-            log_msg("ошибка обслуживания локального socket статистики Telegram");
         int step_result = tg_epoll_proxy_step(proxy, listener < 0 ? 100 : 1000);
         if (step_result == TG_EPOLL_REBIND_LISTENER) {
             log_msg("ошибки accept: восстанавливается listener Telegram");
@@ -678,13 +682,13 @@ static int check_telegram_dc_map(const char *config_path) {
 int main(int argc,char **argv) {
     int offline = d2k_runtime_offline(argc, argv, "d2ktg", offline_self_check);
     if (offline >= 0) return offline;
-    const char *config="/opt/d2k/config",*log_path=NULL;
+    const char *config="/opt/d2k/config",*log_path=NULL,*stats_path=NULL;
     if(argc==2&&strcmp(argv[1],"--version")==0){puts(TG_BUILD " features=instagram-ip-probe,meta-hosts-v3,telegram-local-tcp-epoll,mtproto-respq,mtproto-auth,mtproto-v2,mtproto-help-config,mtproto-gzip-config,telegram-cf-dc-discovery release=" D2K_RELEASE_ID);return 0;}
     if(argc==5&&strcmp(argv[1],"--check-instagram-ip")==0)return check_instagram_ip(argv[2],argv[3],argv[4]);
     if ((argc == 2 || argc == 3) && strcmp(argv[1], "--check-telegram-dc-map") == 0)
         return check_telegram_dc_map(argc == 3 ? argv[2] : config);
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
-        puts("d2ktg [--config FILE] | --check-telegram-dc-map [CONFIG]");
+        puts("d2ktg [--config FILE] [--stats-socket PATH] | --check-telegram-dc-map [CONFIG]");
         return 0;
     }
     if(argc==3&&strcmp(argv[1],"--check-config")==0)return check_config(argv[2]);
@@ -692,8 +696,9 @@ int main(int argc,char **argv) {
         if(strcmp(argv[i],"--health-file")==0&&i+1<argc)health_path=argv[++i];
         else if(strcmp(argv[i],"--config")==0&&i+1<argc)config=argv[++i];
         else if(strcmp(argv[i],"--log")==0&&i+1<argc)log_path=argv[++i];
-        else {fprintf(stderr,"usage: d2ktg [--config FILE] [--log FILE]\n");return 2;}
+        else if(strcmp(argv[i],"--stats-socket")==0&&i+1<argc&&argv[i+1][0]=='/')stats_path=argv[++i];
+        else {fprintf(stderr,"usage: d2ktg [--config FILE] [--log FILE] [--stats-socket PATH]\n");return 2;}
     }
     if(redirect_log(log_path)!=0){fprintf(stderr,"d2ktg: cannot open configured log file\n");return 1;}
-    return run_local_daemon(config);
+    return run_local_daemon(config, stats_path);
 }

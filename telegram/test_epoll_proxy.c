@@ -1161,6 +1161,41 @@ static void test_pending_tcp_connect_expires_before_idle_timeout(void) {
     assert(count_open_fds() == fds_before);
 }
 
+static void test_idle_stats_wakeup(void) {
+    uint16_t listen_port;
+    int listener = create_listener(&listen_port);
+    proxy_fixture fixture = {0};
+    tg_epoll_proxy_config config = {
+        .listener_fd = listener,
+        .queue_bytes = 4096,
+        .memory_budget_bytes = 575u * 1024u,
+        .configured_max_connections = 8,
+        .handshake_timeout_ms = 1000,
+        .idle_timeout_ms = 5000,
+        .select_target = select_target,
+        .context = &fixture,
+    };
+    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+    assert(proxy != NULL);
+
+    int stats[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, stats) == 0);
+    assert(write(stats[0], "x", 1) == 1);
+    /* Pending stats data alone used to leave the proxy blocked in epoll_wait. */
+    assert(tg_epoll_proxy_step(proxy, 0) == 0);
+    assert(tg_epoll_proxy_watch_stats(proxy, stats[1]) == 0);
+    assert(tg_epoll_proxy_step(proxy, 0) == 1);
+    char byte;
+    assert(read(stats[1], &byte, 1) == 1 && byte == 'x');
+    assert(tg_epoll_proxy_step(proxy, 0) == 0);
+    assert(tg_epoll_proxy_active_connections(proxy) == 0);
+
+    close(stats[0]);
+    close(stats[1]);
+    tg_epoll_proxy_destroy(proxy);
+    close(listener);
+}
+
 static void test_read_only_stats_socket(void) {
     char directory[] = "/tmp/d2k-tg-stats-XXXXXX";
     assert(mkdtemp(directory) != NULL);
@@ -1209,6 +1244,7 @@ static void test_read_only_stats_socket(void) {
     tg_stats_socket stats_socket = {.fd = -1};
     assert(tg_stats_socket_open(&stats_socket, path) == 0);
     assert(stats_socket.process_generation != 0);
+    assert(tg_epoll_proxy_watch_stats(proxy, stats_socket.fd) == 0);
     tg_stats_socket duplicate = {.fd = -1};
     assert(tg_stats_socket_open(&duplicate, path) != 0);
     assert(stat(path, &socket_stat) == 0 && S_ISSOCK(socket_stat.st_mode));
@@ -1217,7 +1253,10 @@ static void test_read_only_stats_socket(void) {
     int client = socket(AF_UNIX, SOCK_STREAM, 0);
     assert(client >= 0);
     assert(connect(client, (struct sockaddr *)&address, sizeof(address)) == 0);
+    /* An idle proxy must wake for the stats socket, even with no TCP clients. */
+    assert(tg_epoll_proxy_step(proxy, 0) > 0);
     assert(tg_stats_socket_serve(&stats_socket, proxy, NULL) == 0);
+    assert(tg_epoll_proxy_step(proxy, 0) == 0);
     char response[64u * 1024u];
     ssize_t length = recv(client, response, sizeof(response) - 1, 0);
     assert(length > 0);
@@ -3704,6 +3743,7 @@ int main(int argc, char **argv) {
     test_epoll_bridge_preserves_handshake_and_half_close();
     test_epoll_many_concurrent_tcp_clients();
     test_pending_tcp_connect_expires_before_idle_timeout();
+    test_idle_stats_wakeup();
     test_read_only_stats_socket();
     test_invalid_handshake_fails_closed();
     test_client_disconnect_during_route_selection();

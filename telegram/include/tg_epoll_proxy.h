@@ -285,6 +285,8 @@ tg_epoll_proxy *tg_epoll_proxy_create(const tg_epoll_proxy_config *config);
 /* The caller owns both the current and replacement descriptors. */
 #define TG_EPOLL_REBIND_LISTENER (-2)
 int tg_epoll_proxy_set_listener(tg_epoll_proxy *server, int listener_fd);
+/* Wake step() when the caller-owned stats listener has a pending connection. */
+int tg_epoll_proxy_watch_stats(tg_epoll_proxy *server, int stats_fd);
 /* Call on the event-loop thread. Headroom comes from available memory;
  * the ceiling comes from total memory. Existing connections are not evicted. */
 void tg_epoll_proxy_update_limits(tg_epoll_proxy *server, size_t connection_limit,

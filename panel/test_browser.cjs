@@ -146,14 +146,20 @@ function diagnosticFixture(kind='full'){
  const start=now-1439*60,history=[];
  for(let i=0;i<1440;i++)history.push(encode(record(i)));
  const current=record(1439);
-  if(kind==='telegram_generation_change'||kind==='telegram_unavailable'||kind==='telegram_socket_unavailable'||kind==='telegram_smaps_available'){
+  if(kind==='telegram_generation_change'||kind==='telegram_unavailable'||kind==='telegram_socket_unavailable'||kind==='telegram_socket_empty'||kind==='telegram_first_sample'||kind==='telegram_smaps_available'){
   const report=diagnosticFixture('full');
   if(kind==='telegram_generation_change'){
    const generation=report.telegram_diagnostics.memory_history.fields.indexOf('process_generation');
    report.telegram_diagnostics.memory_history.samples[2][generation]=9002;
    }else if(kind==='telegram_unavailable')report.telegram_diagnostics.latest.rss_kib=null;
-   else if(kind==='telegram_socket_unavailable'){
+   else if(kind==='telegram_socket_unavailable'||kind==='telegram_socket_empty'){
     report.telegram_diagnostics.collection_status='socket_unavailable';report.telegram_diagnostics.collection_failures=1;
+    report.telegram_diagnostics.last_error=110;
+    if(kind==='telegram_socket_empty'){
+     report.telegram_diagnostics.latest=null;report.telegram_diagnostics.memory_history.samples=[];
+    }
+   }else if(kind==='telegram_first_sample'){
+    report.telegram_diagnostics.memory_history.samples.splice(1);
    }else{
     const history=report.telegram_diagnostics.memory_history,pss=history.fields.indexOf('smaps_pss_kib');
     const dirty=history.fields.indexOf('smaps_private_dirty_kib');
@@ -952,7 +958,7 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#tg-diag-limit-history").textContent'),/Буферы: 64\.0 КиБ → 128\.0 КиБ/,'Telegram limit changes are shown from minute samples');
   diagnosticsReply=diagnosticFixture('telegram_generation_change');await call('Page.reload');
   await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','Telegram process generation fixture renders');
-  assert.equal(await evaluate('document.querySelectorAll("#telegram-diagnostic-memory-chart path.diag-line-rss").length'),2,'memory lines break when a PID is reused by a new process generation');
+  assert.equal(await evaluate('document.querySelectorAll("#telegram-diagnostic-memory-chart .diag-line-rss").length'),2,'memory lines break when a PID is reused by a new process generation');
   diagnosticsReply=diagnosticFixture('telegram_smaps_available');await call('Page.reload');
   await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','smaps history fixture renders');
   assert.equal(await evaluate('document.querySelector("[data-tg-memory-series=smaps_pss]").parentNode.hidden'),false,'PSS is charted when smaps_rollup is available');
@@ -964,7 +970,13 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#tg-diag-rss").textContent'),/^unavailable \/ 2\.0 МиБ$/,'unknown memory values are labelled unavailable');
   diagnosticsReply=diagnosticFixture('telegram_socket_unavailable');await call('Page.reload');
   await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','stale Telegram snapshot renders');
-  assert.match(await evaluate('document.querySelector("#telegram-diagnostic-status").textContent'),/Текущий срез unavailable; ниже последний успешный/,'failed socket reads do not present the previous sample as current');
+  assert.match(await evaluate('document.querySelector("#telegram-diagnostic-status").textContent'),/Текущий срез недоступен.*110.*последний успешный/,'failed socket reads do not present the previous sample as current');
+  diagnosticsReply=diagnosticFixture('telegram_socket_empty');await call('Page.reload');
+  await until('document.querySelector("#telegram-diagnostic-status").textContent.includes("код 110")','first failed read is explained');
+  assert.equal(await evaluate('document.querySelector("#telegram-diagnostic-data").hidden'),true,'empty panels are hidden before the first sample');
+  diagnosticsReply=diagnosticFixture('telegram_first_sample');await call('Page.reload');
+  await until('document.querySelector("#telegram-diagnostic-memory-chart circle.diag-line-rss")!==null','first RSS sample has a visible point');
+  assert.equal(await evaluate('document.querySelector("#telegram-diagnostic-data").hidden'),false,'data panels appear with the first sample');
   diagnosticsReply=diagnosticFixture('units');await call('Page.reload');
   await until('document.querySelector("#diagnostic-memory-chart").dataset.points==="2"','controlled metric fixture renders');
   await evaluate('document.querySelectorAll("[data-memory-series]").forEach(input=>{input.checked=true;input.dispatchEvent(new Event("change",{bubbles:true}))})');

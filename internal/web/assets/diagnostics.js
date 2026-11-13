@@ -698,7 +698,17 @@
     var start=svg(doc,"text",{x:left,y:248,"text-anchor":"start"}),end=svg(doc,"text",{x:right,y:248,"text-anchor":"end"});
     start.textContent=timeLabel(rows[0].at);end.textContent=timeLabel(rows[rows.length-1].at);chart.appendChild(start);chart.appendChild(end);
     active.forEach(function(item){
-      var points=[],previous=null;function flush(){if(points.length)chart.appendChild(svg(doc,"path",{"class":"diag-line diag-line-"+item.color,d:points.join(" ")}));points=[];}
+      var points=[],previous=null;
+      function flush(){
+        var style="diag-line diag-line-"+item.color;
+        if(points.length===1){
+          var xy=points[0].slice(1).split(",");
+          chart.appendChild(svg(doc,"circle",{"class":style,cx:xy[0],cy:xy[1],r:2}));
+        }else if(points.length){
+          chart.appendChild(svg(doc,"path",{"class":style,d:points.join(" ")}));
+        }
+        points=[];
+      }
       rows.forEach(function(row,index){var value=number(row[item.key]);
         if(previous&&!sameTelegramProcess(previous,row))flush();
         if(value===null){if(breakOnNull)flush();previous=row;return;}
@@ -749,10 +759,18 @@
     state.textContent=enabled?"Сбор включён":"Сбор выключен";state.dataset.enabled=String(enabled);data.hidden=!enabled;
     if(!enabled){setText(doc,"telegram-diagnostic-status","Сбор выключен. Включите его, чтобы записывать память и состояние Telegram прокси.");return;}
     tg=tg||{};var latest=tg.latest||null,history=telegramRows(tg),last=history[history.length-1];
-    if(!latest){setText(doc,"telegram-diagnostic-status",tg.collection_status==="socket_unavailable"?
-      "Локальный stats socket прокси недоступен; повторное чтение выполняется раз в минуту.":"Ожидаем первый срез Telegram прокси.");}
-    else setText(doc,"telegram-diagnostic-status",(tg.collection_status==="socket_unavailable"?
-      "Текущий срез unavailable; ниже последний успешный. ":"Снимков памяти: "+countWithCapacity(history.length,(tg.memory_history||{}).capacity)+" · ")+
+    var failed=tg.collection_status==="socket_unavailable";
+    var error=number(tg.last_error)===null?"":" (код "+tg.last_error+")";
+    data.hidden=!latest;
+    if(!latest){
+      setText(doc,"telegram-diagnostic-status",failed?
+        "Не удалось получить статистику Telegram-прокси"+error+". Повторяем подключение автоматически.":
+        "Ожидаем первый снимок Telegram-прокси.");
+      return;
+    }
+    setText(doc,"telegram-diagnostic-status",(failed?
+      "Текущий срез недоступен"+error+". Ниже последний успешный снимок. ":
+      "Снимков памяти: "+countWithCapacity(history.length,(tg.memory_history||{}).capacity)+" · ")+
       "последнее чтение: "+(number(tg.last_sample_at)===null?"unavailable":new Date(tg.last_sample_at*1000).toLocaleTimeString())+
       (tg.collection_failures?" · ошибок чтения: "+tg.collection_failures:""));
     drawTelegramMemory(doc,tg,range);drawTelegramTraffic(doc,tg,range);drawTelegramResources(doc,tg,range);
@@ -858,7 +876,9 @@
     var enabled = false, telegramEnabled = false, busy = false, range = 2, telegramRange = 2, currentReport = {};
     function redraw() { render(currentReport, enabled, range);renderTelegram(doc,currentReport.telegram_diagnostics,telegramEnabled,telegramRange); }
     var tabs=Array.prototype.slice.call(doc.querySelectorAll("[data-diagnostic-tab]"));
+    var selectedTab;
     function selectTab(name,focus) {
+      selectedTab=name;
       tabs.forEach(function(tab){var selected=tab.dataset.diagnosticTab===name;tab.setAttribute("aria-selected",String(selected));tab.tabIndex=selected?0:-1;
         var panel=doc.querySelector('[data-diagnostic-panel="'+tab.dataset.diagnosticTab+'"]');if(panel)panel.hidden=!selected;if(selected&&focus)tab.focus();});
     }
@@ -915,7 +935,16 @@
     toggle.addEventListener("click",function(){switchCollector(false);});
     tgToggle.addEventListener("click",function(){switchCollector(true);});
     selectTab("general",false);
-    refresh(); root.setInterval(function () { if (!busy && !doc.hidden) refresh(); }, 60000);
+    refresh();
+    var lastRefresh=Date.now();
+    root.setInterval(function () {
+      var waiting=selectedTab==="telegram"&&telegramEnabled&&
+        !(currentReport.telegram_diagnostics||{}).latest;
+      if(!busy&&!doc.hidden&&(waiting||Date.now()-lastRefresh>=60000)){
+        lastRefresh=Date.now();
+        refresh();
+      }
+    },5000);
   }
   if (root.document.readyState === "loading") root.document.addEventListener("DOMContentLoaded", boot); else boot();
 })(typeof window !== "undefined" ? window : this);

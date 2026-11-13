@@ -233,6 +233,7 @@ struct tg_epoll_proxy {
     int epoll_fd;
     int listener_fd;
     socket_watch listener_watch;
+    socket_watch stats_watch;
     uint64_t accept_retry_at_ms;
     unsigned accept_errors;
     unsigned accept_rebinds;
@@ -3808,6 +3809,15 @@ int tg_epoll_proxy_set_listener(tg_epoll_proxy *server, int listener_fd) {
     return 0;
 }
 
+int tg_epoll_proxy_watch_stats(tg_epoll_proxy *server, int stats_fd) {
+    if (!server || stats_fd < 0 || server->stats_watch.registered) {
+        errno = EINVAL;
+        return -1;
+    }
+    server->stats_watch.fd = stats_fd;
+    return watch_update(server, &server->stats_watch, EPOLLIN);
+}
+
 int tg_epoll_proxy_step(tg_epoll_proxy *server, int timeout_ms) {
     if (!server || timeout_ms < -1) {
         errno = EINVAL;
@@ -3821,7 +3831,7 @@ int tg_epoll_proxy_step(tg_epoll_proxy *server, int timeout_ms) {
     if (count > 0) {
         for (int i = 0; i < count; ++i) {
             socket_watch *watch = events[i].data.ptr;
-            if (!watch) continue;
+            if (!watch || watch == &server->stats_watch) continue;
             if (watch->kind == 0) {
                 accept_result = accept_clients(server);
             } else if (watch->connection && watch->side == 0) {
@@ -4121,6 +4131,12 @@ void tg_epoll_proxy_update_limits(tg_epoll_proxy *server, size_t connection_limi
 int tg_epoll_proxy_step(tg_epoll_proxy *server, int timeout_ms) {
     (void)server;
     (void)timeout_ms;
+    errno = ENOTSUP;
+    return -1;
+}
+int tg_epoll_proxy_watch_stats(tg_epoll_proxy *server, int stats_fd) {
+    (void)server;
+    (void)stats_fd;
     errno = ENOTSUP;
     return -1;
 }

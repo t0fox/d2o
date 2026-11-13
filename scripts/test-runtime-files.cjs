@@ -19,6 +19,9 @@ prev=; for arg in "$@"; do
 done
 `, { mode: 0o755 });
   const harness = `
+export D2K_DIR=$TEST_DIR/d2k
+mkdir -p "$D2K_DIR"
+printf 'STATE_DIR=%s/state\\nTG_STATS_SOCKET=%s/stats.sock\\n' "$D2K_DIR" "$TEST_DIR" > "$D2K_DIR/config"
 . "$TEST_DIR/init"
 PATH=$TEST_DIR/bin:$PATH
 DIR=$TEST_DIR/d2k; RUN=$DIR/run; LOG=$DIR/log; STATE_DIR=$DIR/state
@@ -63,6 +66,7 @@ spawn_daemon() {
             : > "$TG_WD_PID"
             ;;
         *" $TG_PID "*)
+            printf '%s\\n' "$*" >> "$TEST_DIR/calls"
             write_telegram_status "$launch_state"
             [ "$launch_state" != local ] || : > "$TG_PID"
             ;;
@@ -87,6 +91,10 @@ telegram_restart || exit 49
   const calls = fs.readFileSync(path.join(tmp, 'calls'), 'utf8').split('\n');
   const controller = calls.find(x => x.includes('--catalog'));
   const panel = calls.find(x => x.includes('--assets'));
+  const telegram = calls.find(x => x.includes('--config') && x.includes('/run/tg.pid'));
+  assert(controller.includes(`--telegram-stats ${tmp}/stats.sock`));
+  assert(panel.includes(`--telegram-stats ${tmp}/stats.sock`));
+  assert(telegram.includes(`--stats-socket ${tmp}/stats.sock`));
   assert(controller.includes(`--live ${tmp}/runtime/live.json`), 'controller must explicitly write runtime live snapshot');
   assert(controller.includes(`--health-file ${tmp}/runtime/d2kc.health`), 'controller heartbeat must use configured private runtime');
   assert(panel.includes(`--health-file ${tmp}/runtime/d2kpanel.health`), 'panel heartbeat must use configured private runtime');

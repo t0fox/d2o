@@ -1584,7 +1584,7 @@ telegram_launch() {
     rm -f "$RUNTIME_DIR/d2ktg.health"
     set -- --health-file "$RUNTIME_DIR/d2ktg.health"
     spawn_daemon -S -b -m -p "$TG_PID" -x "$TGBIN" -- \
-        --config "$CONF" "$@" --log "$LOG/telegram.log" || { write_telegram_status error; return 1; }
+        --config "$CONF" --stats-socket "$TG_STATS_SOCKET" "$@" --log "$LOG/telegram.log" || { write_telegram_status error; return 1; }
     tg_wait=0
     tg_ready=0
     while [ "$tg_wait" -lt 50 ]; do

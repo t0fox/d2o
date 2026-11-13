@@ -332,6 +332,22 @@ await "[ -f \"$DIR/run/d2ktg.pid\" ]" || fail "d2ktg не создал pid-фа�
 TG_PID_NOW=$(cat "$DIR/run/d2ktg.pid")
 [ -d "/proc/$TG_PID_NOW" ] || fail "d2ktg завершился после включения"
 await "\"$INIT\" status | grep -q 'Telegram tunnel: работает'" || fail "служба не показывает активный Telegram-туннель"
+# Exercise the production path from the idle proxy through d2kc to the panel.
+panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' \
+    'http://127.0.0.1:8090/api/diagnostics?telegram-enable' >/dev/null
+TG_DIAG_REPORT=/tmp/d2k-tg-diagnostics.json
+for _ in $(seq 1 20); do
+    if panel_curl -fsS 'http://127.0.0.1:8090/api/diagnostics?report' -o "$TG_DIAG_REPORT" 2>/dev/null &&
+       grep -q '"collection_status":"available"' "$TG_DIAG_REPORT"; then
+        break
+    fi
+    sleep 1
+done
+grep -q '"collection_status":"available"' "$TG_DIAG_REPORT" || fail "контроллер не получил статистику Telegram"
+grep -Eq '"rss_kib":[1-9][0-9]*' "$TG_DIAG_REPORT" || fail "в отчёте Telegram нет RSS"
+grep -Eq '"process_id":'"$TG_PID_NOW"'[,}]' "$TG_DIAG_REPORT" || fail "отчёт не относится к работающему прокси"
+panel_curl -fsS -X POST -H 'Origin: http://127.0.0.1:8090' \
+    'http://127.0.0.1:8090/api/diagnostics?telegram-disable' >/dev/null
 ipset test d2k_tg_dc 149.154.167.51 >/dev/null 2>&1 || fail "ipset не содержит Telegram DC IPv4"
 ! ipset test d2k_tg_dc 203.0.113.1 >/dev/null 2>&1 || fail "ipset ошибочно включает посторонний IPv4"
 iptables -t nat -C PREROUTING -p tcp --dport 443 -m set --match-set d2k_tg_dc dst -j REDIRECT --to-port 1443 || fail "нет Telegram PREROUTING redirect"

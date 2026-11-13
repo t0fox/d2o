@@ -475,6 +475,7 @@ static int telegram_stats_read(const char *path,char *buffer,size_t capacity,siz
 static void diagnostic_tick(d2k_sched *s,int64_t now) {
     static int64_t checked=-1000,written=-60000;
     static int64_t telegram_attempted=-60000;
+    static int telegram_error;
     static int previous_general=-1,previous_telegram=-1;
     if(now>=checked && now-checked<1000)return;
     checked=now;
@@ -485,6 +486,7 @@ static void diagnostic_tick(d2k_sched *s,int64_t now) {
         d2k_diag_telegram_free(telegram_diagnostics);telegram_diagnostics=NULL;
         free(telegram_stats_buffer);telegram_stats_buffer=NULL;
         telegram_attempted=now-60000;
+        telegram_error=0;
     }
     if(!general&&previous_general==1) {
         d2k_diag_memory_enable(0);
@@ -526,16 +528,20 @@ static void diagnostic_tick(d2k_sched *s,int64_t now) {
     if(telegram&&!telegram_diagnostics)telegram_diagnostics=d2k_diag_telegram_new();
     if(telegram&&!telegram_stats_buffer)telegram_stats_buffer=malloc(D2K_DIAG_TG_JSON_MAX+1u);
     if(telegram&&telegram_diagnostics&&telegram_stats_buffer&&
-       now>=telegram_attempted&&now-telegram_attempted>=60000) {
-        size_t length=0;int collected=telegram_stats_read(telegram_stats_path,
-            telegram_stats_buffer,D2K_DIAG_TG_JSON_MAX,&length);
-        if(collected==0) {
-            if(d2k_diag_telegram_record(telegram_diagnostics,now,telegram_stats_buffer,length)<0)
-                d2k_diag_telegram_error(telegram_diagnostics,EPROTO);
-        } else d2k_diag_telegram_error(telegram_diagnostics,errno);
+       now>=telegram_attempted&&now-telegram_attempted>=(telegram_error?5000:60000)) {
+        size_t length=0;
+        int error=0;
+        if(telegram_stats_read(telegram_stats_path,telegram_stats_buffer,D2K_DIAG_TG_JSON_MAX,&length)<0)
+            error=errno;
+        else if(d2k_diag_telegram_record(telegram_diagnostics,now,telegram_stats_buffer,length)<0)
+            error=EPROTO;
+        if(error)d2k_diag_telegram_error(telegram_diagnostics,error);
+        if(error!=telegram_error)written=now-60000;
+        telegram_error=error;
         telegram_attempted=now;
-    } else if(telegram&&!telegram_stats_buffer) {
-        d2k_diag_telegram_error(telegram_diagnostics,ENOMEM);telegram_attempted=now;
+    } else if(telegram&&telegram_diagnostics&&!telegram_stats_buffer&&!telegram_error) {
+        telegram_error=ENOMEM;
+        d2k_diag_telegram_error(telegram_diagnostics,telegram_error);
     }
     previous_general=general;previous_telegram=telegram;
     if(now>=written && now-written<60000)return;
@@ -592,7 +598,7 @@ int main(int argc, char **argv) {
     const char *livepath = NULL;
     const char *logpath = NULL;
     const char *https_path = NULL;
-    const char *telegram_path = NULL;
+    const char *telegram_path = "/opt/d2k/state/telegram.stats.sock";
     uint32_t mark = 0x2d;
     uint32_t measure_mark = 0;
     int have_measure_mark = 0;
