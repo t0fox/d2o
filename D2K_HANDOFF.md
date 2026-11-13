@@ -33,16 +33,26 @@ PID и совпавшем `process_started_at` в секундах. Период
 ошибки по этапам и последние проблемные сессии. Источник — локальный Unix stats
 socket; сбор выключен по умолчанию.
 
-Кодовая правка зафиксирована и отправлена в `main`: `19eb9f6`
-(`Harden Telegram diagnostic history`), remote `main` на том же SHA. CI
-`43396166229` завершился успешно: 33/33 задания, включая Chrome-интеграцию,
-Telegram, санитайзеры и кросс-сборки. Локально прошли
+Кодовая правка зафиксирована в `main`: `19eb9f6`
+(`Harden Telegram diagnostic history`). CI для этого SHA (`43396166229`)
+завершился успешно: 33/33 задания, включая Chrome-интеграцию, Telegram,
+санитайзеры и кросс-сборки. Локально прошли
 `make -C core test-diagnostics`, проверки JavaScript и `node
 panel/test_diagnostics.cjs`. Полный `make -C core check` был остановлен после
 длительного `test_sched`; CI core job завершился успешно. Локальный тест
 `telegram/test-epoll-proxy` не собрался из-за отсутствующих OpenSSL dev headers,
 а браузерный прогон локально недоступен без Chrome/Edge. Существующие
 untracked-артефакты сохранены и не включены в коммит.
+
+Низкую память покрывает модельный тест, не полевое измерение: `test_limits`
+проверяет политику 128 MiB, а `test_epoll_proxy` запускает loopback-сценарий
+с 128 MiB total, `MemAvailable=8 MiB` при старте, двумя текстовыми и двумя
+медиа-сессиями, затем восстановлением до 48 MiB. Он проверяет продолжение
+передачи, буферный пик ниже 1 MiB, отсутствие отказов буфера и баланс pause/resume.
+Тест не включает замер RSS диагностического сборщика. Его постоянные объекты
+ограничены compile-time: `d2k_diag` <256 KiB, Telegram history <1 MiB, плюс
+буфер чтения stats socket 256 KiB + 1 байт; это верхняя граница аллокаций, не полевой
+замер RSS с учётом allocator/runtime.
 
 Read-only срез default gateway от `2026-11-13T07:02:05Z`: OpenWrt `25.12.6`,
 `mediatek/filogic`, `aarch64_cortex-a53`, Linux `6.12.112`; процесс `d2ktg`,
