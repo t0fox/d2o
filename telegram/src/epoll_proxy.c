@@ -2296,6 +2296,7 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
     watch_remove(server, &candidate->upstream_watch);
 
     parent->upstream_fd = candidate->upstream_fd;
+    parent->upstream_target = candidate->upstream_target;
     parent->upstream_ssl = candidate->upstream_ssl;
     parent->ws_pump = candidate->ws_pump;
     parent->wss_read_paused_at_ms = candidate->wss_read_paused_at_ms;
