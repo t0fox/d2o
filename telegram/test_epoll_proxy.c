@@ -1885,7 +1885,7 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
         assert(session->selected_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
     }
     assert(session->telegram_response_seen);
-    assert(session->client_port == 443 && session->upstream_port == 443);
+    assert(session->client_port == 443 && session->upstream_port == ws_port);
     assert(session->age_ms > 0 && session->first_response_latency_ms > 0);
     assert(session->bytes_from_clients >= wss.expected_packet_len);
     assert(session->bytes_from_upstreams >= wss.response_packet_len);
