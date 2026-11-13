@@ -350,7 +350,7 @@ async function main(){
   assert.match(help.text,/DNS → TCP → TLS → WS → MTP/);
   assert.match(help.text,/маркер пульсирует/);
   assert.match(help.text,/пунктирное кольцо вращается/);
-  assert.match(help.text,/оранжевая точка — запрос к Telegram, зелёная — ответ обратно/);
+  assert.match(help.text,/Оранжевый — от клиента, зелёный — от сервера/);
   assert.equal(await evaluate('!!document.querySelector("[data-tg-route-lock]")'),true,
    'Telegram card exposes a route-only switch');
   assert.equal(await evaluate('document.querySelector("[data-tg-route-select]").disabled'),true,
