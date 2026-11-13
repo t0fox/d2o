@@ -66,7 +66,8 @@ const fixture={telegramStats:{
   measurements:{active:1,limit:4,queued:0,cores:2,free_pct:80},targets:4,confirms:7,probes_used:30,client_unfit:0}};
 function diagnosticFixture(kind='full'){
  const now=Math.floor(Date.now()/1000);
- const tgFields=['at_delta_s','mono_delta_s','rss_kib','rss_anon_kib','vm_data_kib','buffer_bytes_limit',
+  const tgFields=['at_delta_s','mono_delta_s','rss_kib','rss_hwm_kib','rss_anon_kib','vm_data_kib','vm_swap_kib',
+   'smaps_pss_kib','smaps_private_dirty_kib','mem_available_kib','mem_total_kib','buffer_bytes_limit',
   'memory_ceiling_bytes','max_connections','soft_nofile_limit','bytes_from_clients','bytes_from_upstreams',
   'process_id','process_started_at','process_generation','memory_accounted_allocations_bytes','buffer_bytes_current',
   'proxy_struct_bytes','connection_struct_bytes','retired_connection_struct_bytes','worker_pool_struct_bytes',
@@ -145,13 +146,21 @@ function diagnosticFixture(kind='full'){
  const start=now-1439*60,history=[];
  for(let i=0;i<1440;i++)history.push(encode(record(i)));
  const current=record(1439);
- if(kind==='telegram_generation_change'||kind==='telegram_unavailable'||kind==='telegram_socket_unavailable'){
+  if(kind==='telegram_generation_change'||kind==='telegram_unavailable'||kind==='telegram_socket_unavailable'||kind==='telegram_smaps_available'){
   const report=diagnosticFixture('full');
   if(kind==='telegram_generation_change'){
    const generation=report.telegram_diagnostics.memory_history.fields.indexOf('process_generation');
    report.telegram_diagnostics.memory_history.samples[2][generation]=9002;
-  }else if(kind==='telegram_unavailable')report.telegram_diagnostics.latest.rss_kib=null;
-  else {report.telegram_diagnostics.collection_status='socket_unavailable';report.telegram_diagnostics.collection_failures=1;}
+   }else if(kind==='telegram_unavailable')report.telegram_diagnostics.latest.rss_kib=null;
+   else if(kind==='telegram_socket_unavailable'){
+    report.telegram_diagnostics.collection_status='socket_unavailable';report.telegram_diagnostics.collection_failures=1;
+   }else{
+    const history=report.telegram_diagnostics.memory_history,pss=history.fields.indexOf('smaps_pss_kib');
+    const dirty=history.fields.indexOf('smaps_private_dirty_kib');
+    history.samples.forEach((sample,index)=>{sample[pss]=800+index*200;sample[dirty]=256+index*128;});
+    Object.assign(report.telegram_diagnostics.latest,{smaps_rollup_status:'ok',smaps_pss_kib:1200,
+     smaps_anonymous_kib:900,smaps_private_dirty_kib:640,smaps_swap_kib:2});
+   }
   return report;
  }
  return {schema:1,enabled:true,telegram_enabled:true,event_capacity:64,limit_transition_capacity:32,sample_capacity:120,
@@ -180,26 +189,30 @@ function diagnosticFixture(kind='full'){
   telegram_diagnostics:{enabled:true,last_sample_at:now,collection_failures:0,
    memory_history:{capacity:1440,sample_interval_ms:60000,fields:tgFields,
     time_base:[now-120,1000],samples:[
-     tgSample({at_delta_s:0,mono_delta_s:0,rss_kib:1024,rss_anon_kib:768,vm_data_kib:2048,buffer_bytes_limit:65536,
+      tgSample({at_delta_s:0,mono_delta_s:0,rss_kib:1024,rss_hwm_kib:1024,rss_anon_kib:768,vm_data_kib:2048,
+       vm_swap_kib:0,mem_available_kib:8192,mem_total_kib:131072,buffer_bytes_limit:65536,
       memory_ceiling_bytes:16777216,max_connections:128,soft_nofile_limit:1024,bytes_from_clients:1000,bytes_from_upstreams:500,
       process_id:77,process_started_at:now-3600,process_generation:9001,memory_accounted_allocations_bytes:4608,buffer_bytes_current:1024,
       proxy_struct_bytes:2048,connection_struct_bytes:1024,retired_connection_struct_bytes:0,worker_pool_struct_bytes:512,
       active_connections:1,fd_count:8,tls_objects:1,worker_pool_tls_objects:1,worker_pool_entries:1,
       http_403:1,http_501:1,http_502:0,wss_failures:1}),
-     tgSample({at_delta_s:60,mono_delta_s:60,rss_kib:1280,rss_anon_kib:896,vm_data_kib:2560,buffer_bytes_limit:131072,
+      tgSample({at_delta_s:60,mono_delta_s:60,rss_kib:1280,rss_hwm_kib:1280,rss_anon_kib:896,vm_data_kib:2560,
+       vm_swap_kib:0,mem_available_kib:7168,mem_total_kib:131072,buffer_bytes_limit:131072,
       memory_ceiling_bytes:33554432,max_connections:256,soft_nofile_limit:4096,bytes_from_clients:3000,bytes_from_upstreams:1500,
       process_id:77,process_started_at:now-3600,process_generation:9001,memory_accounted_allocations_bytes:6656,buffer_bytes_current:2048,
       proxy_struct_bytes:2048,connection_struct_bytes:2048,retired_connection_struct_bytes:0,worker_pool_struct_bytes:512,
       active_connections:2,fd_count:10,tls_objects:2,worker_pool_tls_objects:1,worker_pool_entries:1,
       http_403:2,http_501:1,http_502:0,wss_failures:2}),
-     tgSample({at_delta_s:120,mono_delta_s:120,rss_kib:1536,rss_anon_kib:1024,vm_data_kib:3072,buffer_bytes_limit:131072,
+      tgSample({at_delta_s:120,mono_delta_s:120,rss_kib:1536,rss_hwm_kib:1536,rss_anon_kib:1024,vm_data_kib:3072,
+       vm_swap_kib:2,mem_available_kib:6144,mem_total_kib:131072,buffer_bytes_limit:131072,
       memory_ceiling_bytes:33554432,max_connections:256,soft_nofile_limit:4096,bytes_from_clients:6000,bytes_from_upstreams:3000,
       process_id:77,process_started_at:now-3600,process_generation:9001,memory_accounted_allocations_bytes:8704,buffer_bytes_current:3072,
       proxy_struct_bytes:2048,connection_struct_bytes:2048,retired_connection_struct_bytes:1024,worker_pool_struct_bytes:512,
       active_connections:2,fd_count:10,tls_objects:2,worker_pool_tls_objects:1,worker_pool_entries:2,
       http_403:2,http_501:2,http_502:1,wss_failures:3})]},
    latest:{rss_kib:1536,rss_hwm_kib:2048,rss_anon_kib:1024,vm_data_kib:3072,vm_swap_kib:0,
-    smaps_pss_kib:1200,mem_available_kib:8192,memory_accounted_allocations_bytes:8704,
+    smaps_pss_kib:null,smaps_anonymous_kib:null,smaps_private_dirty_kib:null,smaps_swap_kib:null,
+    mem_available_kib:8192,mem_total_kib:131072,memory_accounted_allocations_bytes:8704,
     process_id:77,process_started_at:now-3600,process_generation:9001,smaps_rollup_status:'unsupported',smaps_rollup_errno:null,
     rss_minus_known_allocations_bytes:1564160,buffer_bytes_current:3072,buffer_bytes_peak:4096,
     buffer_bytes_limit:131072,memory_ceiling_bytes:33554432,active_connections:2,max_connections:256,
@@ -920,6 +933,9 @@ async function main(){
   assert.equal(await evaluate('document.querySelector("#telegram-diagnostic-data").hidden'),false,'Telegram diagnostics are independently visible');
   assert.equal(await evaluate('document.querySelector("#tg-diag-rss").textContent'),'1.5 МиБ / 2.0 МиБ','Telegram RSS and high-water mark are shown');
   assert.equal(await evaluate('document.querySelector("#tg-diag-smaps-status").textContent'),'нет в procfs','missing optional smaps data is shown as unavailable');
+  assert.equal(await evaluate('document.querySelector("#tg-diag-pss-available").textContent'),'unavailable / 8.0 МиБ / 128.0 МиБ','PSS and system memory remain separate and missing PSS is explicit');
+  assert.equal(await evaluate('document.querySelector("#tg-diag-smaps-details").textContent'),'unavailable / unavailable / unavailable','missing smaps components are not reported as zero');
+  assert.equal(await evaluate('document.querySelector("[data-tg-memory-series=vm_swap]").parentNode.hidden'),false,'VmSwap history is available as a selectable memory series');
   assert.equal(await evaluate('document.querySelector("#tg-diag-wss").textContent'),'12 / 3 / 8','WSS totals are visible');
   assert.equal(await evaluate('document.querySelector("#tg-diag-error-delta").textContent'),'1 / 1 / 1 / 2','HTTP status and WSS error deltas remain distinguishable');
   assert.equal(await evaluate('document.querySelector("#tg-diag-latency").textContent'),'42.7 мс / 187.0 мс','application response latency percentiles are shown');
@@ -937,6 +953,12 @@ async function main(){
   diagnosticsReply=diagnosticFixture('telegram_generation_change');await call('Page.reload');
   await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','Telegram process generation fixture renders');
   assert.equal(await evaluate('document.querySelectorAll("#telegram-diagnostic-memory-chart path.diag-line-rss").length'),2,'memory lines break when a PID is reused by a new process generation');
+  diagnosticsReply=diagnosticFixture('telegram_smaps_available');await call('Page.reload');
+  await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','smaps history fixture renders');
+  assert.equal(await evaluate('document.querySelector("[data-tg-memory-series=smaps_pss]").parentNode.hidden'),false,'PSS is charted when smaps_rollup is available');
+  assert.equal(await evaluate('document.querySelector("[data-tg-memory-series=smaps_private_dirty]").parentNode.hidden'),false,'Private_Dirty is charted when smaps_rollup is available');
+  assert.ok(await evaluate('document.querySelectorAll("#telegram-diagnostic-memory-chart path.diag-line-private_dirty").length>0'),'Private_Dirty history is drawn');
+  assert.match(await evaluate('document.querySelector("#tg-diag-smaps-details").textContent'),/900 КиБ.*640 КиБ.*2.0 КиБ/,'smaps Anonymous, Private_Dirty and Swap values are shown');
   diagnosticsReply=diagnosticFixture('telegram_unavailable');await call('Page.reload');
   await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','Telegram unavailable metric fixture renders');
   assert.match(await evaluate('document.querySelector("#tg-diag-rss").textContent'),/^unavailable \/ 2\.0 МиБ$/,'unknown memory values are labelled unavailable');

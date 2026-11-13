@@ -37,6 +37,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert tg_sample['worker_pool_struct_bytes'] == 1024
     assert tg_sample['smaps_pss_kib'] == 'unavailable'
     assert 'smaps_pss_kib' in tg['unavailable_fields']
+    assert tg_sample['smaps_private_dirty_kib'] == 64
     assert tg_sample['wss_attempts'] == 7
     assert tg_sample['client_response_latency_p95_us'] == 90000
     assert tg['memory_history']['samples'][0][2] == 1024

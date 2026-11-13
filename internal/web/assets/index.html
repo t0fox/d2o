@@ -273,6 +273,11 @@
                   <label><input type="checkbox" data-tg-memory-series="rss" checked><span>RSS</span></label>
                   <label><input type="checkbox" data-tg-memory-series="rss_anon" checked><span>RssAnon</span></label>
                   <label><input type="checkbox" data-tg-memory-series="vm_data"><span>VmData</span></label>
+                  <label><input type="checkbox" data-tg-memory-series="rss_hwm"><span>Peak RSS</span></label>
+                  <label><input type="checkbox" data-tg-memory-series="vm_swap"><span>VmSwap</span></label>
+                  <label><input type="checkbox" data-tg-memory-series="smaps_pss" checked><span>PSS</span></label>
+                  <label><input type="checkbox" data-tg-memory-series="smaps_private_dirty" checked><span>Private_Dirty</span></label>
+                  <label><input type="checkbox" data-tg-memory-series="mem_available"><span>MemAvailable</span></label>
                   <label><input type="checkbox" data-tg-memory-series="known_bytes"><span>Учтённые аллокации</span></label>
                   <label><input type="checkbox" data-tg-memory-series="buffer_current"><span>Буферы</span></label>
                   <label><input type="checkbox" data-tg-memory-series="proxy_bytes"><span>Структура прокси</span></label>
@@ -305,7 +310,8 @@
                 <dl class="diag-history-counts">
                   <div><dt>RSS / пик RSS</dt><dd id="tg-diag-rss">—</dd></div>
                   <div><dt>RssAnon / VmData / swap</dt><dd id="tg-diag-anon-data">—</dd></div>
-                  <div><dt>PSS / доступно в системе</dt><dd id="tg-diag-pss-available">—</dd></div>
+                  <div><dt>PSS / MemAvailable / MemTotal</dt><dd id="tg-diag-pss-available">—</dd></div>
+                  <div><dt>smaps: Anonymous / Private_Dirty / Swap</dt><dd id="tg-diag-smaps-details">—</dd></div>
                   <div><dt>smaps_rollup</dt><dd id="tg-diag-smaps-status">—</dd></div>
                   <div><dt>Учтённые выделения</dt><dd id="tg-diag-accounted">—</dd></div>
                   <div><dt>Разбивка: буферы / прокси / соединения / retired / worker pool</dt><dd id="tg-diag-allocation-breakdown">—</dd></div>

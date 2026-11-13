@@ -605,8 +605,11 @@
       var time=mono!==null&&monoDelta!==null?mono+monoDelta:at;
       return {at:at,time:time,process_id:field(row,"process_id"),process_started_at:field(row,"process_started_at"),
         process_generation:field(row,"process_generation"),
-        rss:kibBytes(field(row,"rss_kib")),
+        rss:kibBytes(field(row,"rss_kib")),rss_hwm:kibBytes(field(row,"rss_hwm_kib")),
         rss_anon:kibBytes(field(row,"rss_anon_kib")),vm_data:kibBytes(field(row,"vm_data_kib")),
+        vm_swap:kibBytes(field(row,"vm_swap_kib")),smaps_pss:kibBytes(field(row,"smaps_pss_kib")),
+        smaps_private_dirty:kibBytes(field(row,"smaps_private_dirty_kib")),
+        mem_available:kibBytes(field(row,"mem_available_kib")),mem_total:kibBytes(field(row,"mem_total_kib")),
         known_bytes:field(row,"memory_accounted_allocations_bytes"),buffer_current:field(row,"buffer_bytes_current"),
         proxy_bytes:field(row,"proxy_struct_bytes"),connection_bytes:field(row,"connection_struct_bytes"),
         retired_connection_bytes:field(row,"retired_connection_struct_bytes"),
@@ -709,7 +712,10 @@
   function drawTelegramMemory(doc,tg,hours) {
     var result=drawTelegramChart(doc,tg,hours,"telegram-diagnostic-memory-chart","telegram-diagnostic-memory-empty",
       [{key:"rss",color:"rss"},{key:"rss_anon",color:"rss_anon"},
-       {key:"vm_data",color:"vm_data"},{key:"known_bytes",color:"tracked_tcp"},
+       {key:"rss_hwm",color:"tracked_tcp"},{key:"vm_data",color:"vm_data"},
+       {key:"vm_swap",color:"tracked_tls"},{key:"smaps_pss",color:"anonymous"},
+       {key:"smaps_private_dirty",color:"private_dirty"},{key:"mem_available",color:"http"},
+       {key:"known_bytes",color:"tracked_tcp"},
        {key:"buffer_current",color:"snapshot"},{key:"proxy_bytes",color:"http"},
        {key:"connection_bytes",color:"anonymous"},{key:"retired_connection_bytes",color:"private_dirty"},
        {key:"worker_pool_bytes",color:"tracked_quic"}],"Память","","data-tg-memory-series",true);
@@ -752,7 +758,8 @@
     drawTelegramMemory(doc,tg,range);drawTelegramTraffic(doc,tg,range);drawTelegramResources(doc,tg,range);
     setText(doc,"tg-diag-rss",latest?telegramKib(latest.rss_kib)+" / "+telegramKib(latest.rss_hwm_kib):"unavailable");
     setText(doc,"tg-diag-anon-data",latest?[latest.rss_anon_kib,latest.vm_data_kib,latest.vm_swap_kib].map(telegramKib).join(" / "):"unavailable");
-    setText(doc,"tg-diag-pss-available",latest?telegramKib(latest.smaps_pss_kib)+" / "+telegramKib(latest.mem_available_kib):"unavailable");
+    setText(doc,"tg-diag-pss-available",latest?[latest.smaps_pss_kib,latest.mem_available_kib,latest.mem_total_kib].map(telegramKib).join(" / "):"unavailable");
+    setText(doc,"tg-diag-smaps-details",latest?[latest.smaps_anonymous_kib,latest.smaps_private_dirty_kib,latest.smaps_swap_kib].map(telegramKib).join(" / "):"unavailable");
     var smapsStatus=latest&&latest.smaps_rollup_status;
     setText(doc,"tg-diag-smaps-status",!latest?"unavailable":smapsStatus==="ok"?"доступен":smapsStatus==="unsupported"?"нет в procfs":
       smapsStatus==="parse_error"?"ошибка разбора":smapsStatus==="unavailable"?"ошибка чтения"+(

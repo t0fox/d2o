@@ -110,7 +110,7 @@ struct d2k_diag_telegram {
 };
 static const char *const telegram_fields[D2K_DIAG_TG_FIELD_COUNT]={
     "rss_kib","rss_hwm_kib","rss_anon_kib","vm_data_kib","vm_swap_kib",
-    "smaps_pss_kib","mem_total_kib","mem_available_kib",
+    "smaps_pss_kib","smaps_private_dirty_kib","mem_total_kib","mem_available_kib",
     "memory_accounted_allocations_bytes","rss_minus_known_allocations_bytes",
     "active_connections","max_connections","memory_headroom_bytes","memory_ceiling_bytes",
     "buffer_bytes_current","buffer_bytes_peak","buffer_bytes_limit",

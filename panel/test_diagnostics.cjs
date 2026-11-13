@@ -61,11 +61,22 @@ assert.equal(memoryRows(legacyHistory)[0].catalog,10*1024,'old positional KiB fi
 const noTime={memory_history:{fields,time_base:[null,null],samples:[encode({rss_kib:1024,at_delta_s:0,mono_delta_s:0})]}};
 assert.equal(memoryRows(noTime)[0].time,null,'missing time bases do not become zero');
 assert.match(coverageText(rowsInRange(memoryRows(noTime),24,60000),24),/Время снимков отсутствует/);
-const tgRows=telegramRows({memory_history:{fields:['at_delta_s','mono_delta_s','rss_kib','rss_anon_kib','vm_data_kib'],
- time_base:[1700000000,500],samples:[[0,0,2048,1024,4096],[60,60,3072,1536,6144]]}});
+const tgRows=telegramRows({memory_history:{fields:['at_delta_s','mono_delta_s','rss_kib','rss_hwm_kib','rss_anon_kib',
+ 'vm_data_kib','vm_swap_kib','smaps_pss_kib','smaps_private_dirty_kib','mem_available_kib','mem_total_kib'],
+ time_base:[1700000000,500],samples:[[0,0,2048,3072,1024,4096,0,800,64,8192,131072],
+  [60,60,3072,4096,1536,6144,2,1200,96,7168,131072]]}});
 assert.equal(tgRows[0].rss,2*1024*1024);
 assert.equal(tgRows[1].rss_anon,1536*1024);
+assert.equal(tgRows[1].rss_hwm,4096*1024,'peak RSS is retained in history');
+assert.equal(tgRows[1].vm_swap,2*1024,'VmSwap is retained in history');
+assert.equal(tgRows[1].smaps_pss,1200*1024,'PSS is retained in history');
+assert.equal(tgRows[1].smaps_private_dirty,96*1024,'Private_Dirty is retained in history');
+assert.equal(tgRows[1].mem_available,7168*1024,'system headroom is retained in history');
 assert.equal(tgRows[1].time,560);
+const unavailableTelegram=telegramRows({memory_history:{fields:['at_delta_s','mono_delta_s','vm_swap_kib','smaps_private_dirty_kib'],
+ time_base:[1700000000,500],samples:[[0,0,'unavailable','unavailable']]}});
+assert.equal(unavailableTelegram[0].vm_swap,null,'unavailable VmSwap is not rendered as zero');
+assert.equal(unavailableTelegram[0].smaps_private_dirty,null,'unavailable smaps is not rendered as zero');
 const trafficFields=['at_delta_s','mono_delta_s','process_id','process_started_at','bytes_from_clients','bytes_from_upstreams'];
 const trafficRows=telegramRows({memory_history:{fields:trafficFields,time_base:[1700000000,1000],samples:[
  [0,0,42,1700000000,1000,500],[60,60,42,1700000000,4000,2000],
