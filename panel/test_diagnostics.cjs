@@ -66,4 +66,12 @@ const tgRows=telegramRows({memory_history:{fields:['at_delta_s','mono_delta_s','
 assert.equal(tgRows[0].rss,2*1024*1024);
 assert.equal(tgRows[1].rss_anon,1536*1024);
 assert.equal(tgRows[1].time,560);
+const trafficFields=['at_delta_s','mono_delta_s','process_id','process_started_at','bytes_from_clients','bytes_from_upstreams'];
+const trafficRows=telegramRows({memory_history:{fields:trafficFields,time_base:[1700000000,1000],samples:[
+ [0,0,42,1700000000,1000,500],[60,60,42,1700000000,4000,2000],
+ [120,120,42,1700000060,10,10],[180,180,42,1700000060,1010,1010]]}});
+assert.equal(trafficRows[1].client_rate,50,'rates use the same process generation');
+assert.equal(trafficRows[1].upstream_rate,25);
+assert.equal(trafficRows[2].client_rate,null,'reused PID with a new start time does not create a negative rate');
+assert.equal(trafficRows[3].client_rate,1000/60,'rates resume within the new generation');
 console.log('сводка диагностики панели прошла');

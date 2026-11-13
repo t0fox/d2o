@@ -66,6 +66,11 @@ const fixture={telegramStats:{
   measurements:{active:1,limit:4,queued:0,cores:2,free_pct:80},targets:4,confirms:7,probes_used:30,client_unfit:0}};
 function diagnosticFixture(kind='full'){
  const now=Math.floor(Date.now()/1000);
+ const tgFields=['at_delta_s','mono_delta_s','rss_kib','rss_anon_kib','vm_data_kib','buffer_bytes_limit',
+  'memory_ceiling_bytes','max_connections','soft_nofile_limit','bytes_from_clients','bytes_from_upstreams',
+  'process_id','process_started_at','memory_accounted_allocations_bytes','buffer_bytes_current',
+  'http_403','http_501','http_502','wss_failures'];
+ const tgSample=row=>tgFields.map(name=>Object.prototype.hasOwnProperty.call(row,name)?row[name]:null);
  const fields=['mono_delta_s','catalog_bytes','at_delta_s','rss_kib','vm_data_kib','vm_swap_kib','smaps_rollup_status_code',
   'smaps_rollup_errno','smaps_rollup_kib','rss_anon_kib','http_bytes','snapshot_bytes','tracked_tcp_bytes','tracked_quic_bytes',
   'tracked_tls_bytes','tasks','workers_live','workers_result_pending','workers_join_pending','d2kc_epoch'];
@@ -162,16 +167,39 @@ function diagnosticFixture(kind='full'){
    {kind:'diagnostic-json-write-error',at:now,stage:'open-temp',error_code:13}],
   memory_details:[{name:'d2kc',latest:{smaps_rollup_status:'unsupported',smaps_rollup_source:'smaps-fallback',smaps_rollup_errno:2,smaps_status:'ok',smaps_errno:null,smaps_rollup:{rss_kib:42399,anonymous_kib:23439,private_dirty_kib:13439}}}],
   telegram_diagnostics:{enabled:true,last_sample_at:now,collection_failures:0,
-   memory_history:{capacity:1440,sample_interval_ms:60000,fields:['at_delta_s','mono_delta_s','rss_kib','rss_anon_kib','vm_data_kib',
-    'buffer_bytes_limit','memory_ceiling_bytes','max_connections','soft_nofile_limit','bytes_from_clients','bytes_from_upstreams'],
-    time_base:[now-60,1000],samples:[[0,0,1024,768,2048,65536,16777216,128,1024,1000,500],
-     [60,60,1536,1024,3072,131072,33554432,256,4096,2000,1000]]},
+   memory_history:{capacity:1440,sample_interval_ms:60000,fields:tgFields,
+    time_base:[now-120,1000],samples:[
+     tgSample({at_delta_s:0,mono_delta_s:0,rss_kib:1024,rss_anon_kib:768,vm_data_kib:2048,buffer_bytes_limit:65536,
+      memory_ceiling_bytes:16777216,max_connections:128,soft_nofile_limit:1024,bytes_from_clients:1000,bytes_from_upstreams:500,
+      process_id:77,process_started_at:now-3600,memory_accounted_allocations_bytes:2048,buffer_bytes_current:1024,
+      http_403:1,http_501:1,http_502:0,wss_failures:1}),
+     tgSample({at_delta_s:60,mono_delta_s:60,rss_kib:1280,rss_anon_kib:896,vm_data_kib:2560,buffer_bytes_limit:131072,
+      memory_ceiling_bytes:33554432,max_connections:256,soft_nofile_limit:4096,bytes_from_clients:3000,bytes_from_upstreams:1500,
+      process_id:77,process_started_at:now-3600,memory_accounted_allocations_bytes:3072,buffer_bytes_current:2048,
+      http_403:2,http_501:1,http_502:0,wss_failures:2}),
+     tgSample({at_delta_s:120,mono_delta_s:120,rss_kib:1536,rss_anon_kib:1024,vm_data_kib:3072,buffer_bytes_limit:131072,
+      memory_ceiling_bytes:33554432,max_connections:256,soft_nofile_limit:4096,bytes_from_clients:6000,bytes_from_upstreams:3000,
+      process_id:77,process_started_at:now-3600,memory_accounted_allocations_bytes:4096,buffer_bytes_current:3072,
+      http_403:2,http_501:2,http_502:1,wss_failures:3})]},
    latest:{rss_kib:1536,rss_hwm_kib:2048,rss_anon_kib:1024,vm_data_kib:3072,vm_swap_kib:0,
     smaps_pss_kib:1200,mem_available_kib:8192,memory_accounted_allocations_bytes:4096,
+    process_id:77,process_started_at:now-3600,smaps_rollup_status:'unsupported',smaps_rollup_errno:null,
     rss_minus_known_allocations_bytes:1572864,buffer_bytes_current:2048,buffer_bytes_peak:4096,
-    buffer_bytes_limit:131072,memory_ceiling_bytes:33554432,active_connections:2,max_connections:256,route_health:[],
-    active_sessions:[{id:71,dc:2,is_media:true,selected_transport:'cloudflare_proxy',age_ms:60000,no_progress_ms:3000,
-     bytes_from_clients:307200,bytes_from_upstreams:153600,stage:'first_wss_binary_response'}],problem_sessions:[]}}};
+    buffer_bytes_limit:131072,memory_ceiling_bytes:33554432,active_connections:2,max_connections:256,
+    active_wss_connections:1,max_wss_connections:16,client_queue_bytes:512,upstream_queue_bytes:256,
+    client_queue_capacity_bytes:4096,upstream_queue_capacity_bytes:2048,ws_rx_capacity_bytes:8192,
+    ws_tx_memory_bytes:1024,mtproto_packet_capacity_bytes:16384,route_health:[],
+    allocation_failures:0,buffer_budget_rejections:1,buffer_size_rejections:2,accept_limit_rejections:3,accept_fd_exhaustion:4,
+    wss_read_pauses:5,wss_read_resumes:4,wss_paused_timeouts:1,wss_reads_paused:1,wss_oldest_pause_ms:1200,
+    wss_attempts:12,wss_failures:3,wss_responses:8,cf_wss_responses:2,worker_pool_hits:4,worker_pool_misses:1,
+    worker_pool_responses:3,client_response_latency_samples:5,client_response_latency_p50_us:42700,
+    client_response_latency_p95_us:187000,failure_by_stage:{connect:2,handshake:1},
+    dc_map_status:'fresh',dc_map_endpoint_count:4,dc_map_last_known_good:true,
+    active_sessions:[{id:71,dc:2,is_media:true,direct_state:'selected',direct_transport:'cloudflare_proxy',
+     fallback_state:'idle',fallback_transport:null,selected_transport:'cloudflare_proxy',first_response_latency_ms:420,
+     client_queue_bytes:512,upstream_queue_bytes:256,client_queue_capacity_bytes:4096,upstream_queue_capacity_bytes:2048,
+     age_ms:60000,no_progress_ms:3000,bytes_from_clients:307200,bytes_from_upstreams:153600,
+     read_paused:false,stage:'first_wss_binary_response'}],problem_sessions:[]}}};
 }
 let ws,diagnosticsReply=null;
 async function main(){
@@ -863,11 +891,22 @@ async function main(){
   assert.match(await evaluate('document.querySelector("#diagnostic-aimd-history").textContent'),/1 \/ 1.*память/,'AIMD transition history includes the 1/1 cause');
   assert.equal(await evaluate('document.querySelector("#diagnostic-download").getAttribute("href")'),'/api/diagnostics?download','the complete JSON download endpoint stays linked');
   await evaluate('document.querySelector("#diagnostic-telegram-tab").click()');
-  await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="2"','Telegram memory history renders in its tab');
+  await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','Telegram memory history renders in its tab');
+  assert.equal(await evaluate('document.querySelector("#telegram-diagnostic-traffic-chart").dataset.points'),'3','Telegram throughput history uses the same time range');
   assert.equal(await evaluate('document.querySelector("#telegram-diagnostic-data").hidden'),false,'Telegram diagnostics are independently visible');
   assert.equal(await evaluate('document.querySelector("#tg-diag-rss").textContent'),'1.5 МиБ / 2.0 МиБ','Telegram RSS and high-water mark are shown');
+  assert.equal(await evaluate('document.querySelector("#tg-diag-smaps-status").textContent'),'нет в procfs','missing optional smaps data is shown as unavailable');
+  assert.equal(await evaluate('document.querySelector("#tg-diag-wss").textContent'),'12 / 3 / 8','WSS totals are visible');
+  assert.equal(await evaluate('document.querySelector("#tg-diag-error-delta").textContent'),'3 / 2','period error deltas stay within one process generation');
+  assert.equal(await evaluate('document.querySelector("#tg-diag-latency").textContent'),'42.7 мс / 187.0 мс','application response latency percentiles are shown');
+  assert.match(await evaluate('document.querySelector("#tg-diag-queues").textContent'),/клиент 512 Б \/ 4\.0 КиБ.*upstream 256 Б \/ 2\.0 КиБ/,'current queue fill is shown next to capacity');
+  assert.match(await evaluate('document.querySelector("#tg-diag-stage-failures").textContent'),/connect 2.*handshake 1/,'failure counts are grouped by stage');
+  assert.match(await evaluate('document.querySelector("#tg-diag-throughput").textContent'),/50 Б\/с \/ 25 Б\/с/,'last-interval throughput is shown');
+  assert.match(await evaluate('document.querySelector("#tg-diag-map-status").textContent'),/last-known-good да/,'last-known-good DC map state is visible');
   assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/media.*простой 3 с/,'media sessions show activity and time since progress');
   assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/5\.0 КиБ\/с \/ 2\.5 КиБ\/с/,'per-session lifetime throughput is displayed');
+  assert.equal(await evaluate('document.querySelector("#tg-diag-sessions tr").children.length'),6,'session details match all six diagnostic columns');
+  assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/420 мс \/ 3 с.*direct selected.*fallback idle/,'first response, no-progress age, and both route states are shown');
   assert.match(await evaluate('document.querySelector("#tg-diag-limit-history").textContent'),/Буферы: 64\.0 КиБ → 128\.0 КиБ/,'Telegram limit changes are shown from minute samples');
   diagnosticsReply=diagnosticFixture('units');await call('Page.reload');
   await until('document.querySelector("#diagnostic-memory-chart").dataset.points==="2"','controlled metric fixture renders');

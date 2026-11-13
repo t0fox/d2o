@@ -120,8 +120,19 @@ static const char *const telegram_fields[D2K_DIAG_TG_FIELD_COUNT]={
     "worker_pool_tls_objects","worker_pool_entries","worker_pool_capacity","fd_count",
     "soft_nofile_limit","allocation_failures","http_403","http_501","http_502",
     "last_http_status","wss_read_pauses","wss_read_resumes","wss_paused_timeouts",
-    "connections_started","bytes_from_clients","bytes_from_upstreams"
+    "connections_started","bytes_from_clients","bytes_from_upstreams",
+    "process_id","active_wss_connections","buffer_budget_rejections",
+    "buffer_size_rejections","client_queue_bytes","upstream_queue_bytes",
+    "wss_reads_paused","wss_oldest_pause_ms","accept_limit_rejections",
+    "accept_fd_exhaustion","wss_attempts","wss_failures","wss_responses",
+    "cf_wss_responses","client_response_latency_samples",
+    "client_response_latency_last_us","client_response_latency_p50_us",
+    "client_response_latency_p95_us","worker_pool_hits","worker_pool_misses",
+    "worker_pool_responses","last_success_latency_ms","last_success_age_ms",
+    "process_started_at"
 };
+typedef char telegram_history_is_bounded[
+    (sizeof(struct d2k_diag_telegram)<=1024u*1024u)?1:-1];
 static void copy(char *to,size_t cap,const char *s) {
     if(!s)s="";
     size_t n=strlen(s);if(n>=cap)n=cap-1;

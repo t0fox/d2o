@@ -264,7 +264,7 @@
             <div id="telegram-diagnostic-data" class="diag-history-data" hidden>
               <section class="diag-card diag-memory-panel" aria-labelledby="telegram-diagnostic-memory-title">
                 <div class="diag-card-head"><div><h4 id="telegram-diagnostic-memory-title">Память Telegram прокси</h4><p id="telegram-diagnostic-memory-interval">Снимок раз в минуту · значения в МиБ</p></div>
-                  <div class="diag-range" role="group" aria-label="Период графика Telegram">
+                  <div class="diag-range" role="group" aria-label="Период графиков Telegram">
                     <button type="button" data-tg-memory-range="2" aria-pressed="true">2 часа</button>
                     <button type="button" data-tg-memory-range="24" aria-pressed="false">24 часа</button>
                   </div>
@@ -273,17 +273,24 @@
                   <label><input type="checkbox" data-tg-memory-series="rss" checked><span>RSS</span></label>
                   <label><input type="checkbox" data-tg-memory-series="rss_anon" checked><span>RssAnon</span></label>
                   <label><input type="checkbox" data-tg-memory-series="vm_data"><span>VmData</span></label>
+                  <label><input type="checkbox" data-tg-memory-series="known_bytes"><span>Учтённые аллокации</span></label>
+                  <label><input type="checkbox" data-tg-memory-series="buffer_current"><span>Буферы</span></label>
                 </div>
                 <p id="telegram-diagnostic-history-coverage" class="diag-history-note" role="status">Длительность истории определяется по снимкам.</p>
                 <svg id="telegram-diagnostic-memory-chart" class="diag-memory-chart" viewBox="0 0 960 260" role="img" aria-label="Память Telegram прокси"></svg>
                 <p id="telegram-diagnostic-memory-empty" class="diag-empty" hidden>Для выбранного периода нет доступных снимков памяти.</p>
-                <p class="diag-history-note">RSS процесса — используемая резидентная память. «RSS минус учтённые выделения» — остаток неинструментированных областей, это не диагноз утечки.</p>
+                <p class="diag-history-note">RSS — резидентная память. VmData — виртуальная область данных. Учтённые аллокации и буферы входят в память прокси и не складываются с RSS.</p>
+                <p class="diag-history-note">Суммарная скорость прокси между минутными снимками; после перезапуска процесса интервал не рассчитывается.</p>
+                <svg id="telegram-diagnostic-traffic-chart" class="diag-memory-chart" viewBox="0 0 960 260" role="img" aria-label="Скорость передачи Telegram прокси"></svg>
+                <p class="diag-history-note">Линии по порядку: клиент → прокси и upstream → клиент. Разрыв на графике отмечает перезапуск прокси.</p>
+                <p id="telegram-diagnostic-traffic-empty" class="diag-empty" hidden>Скорость недоступна: нужны два снимка одного запуска с доступными счётчиками.</p>
               </section>
               <section class="diag-card diag-process-panel"><h4>Сводка памяти</h4>
                 <dl class="diag-history-counts">
                   <div><dt>RSS / пик RSS</dt><dd id="tg-diag-rss">—</dd></div>
                   <div><dt>RssAnon / VmData / swap</dt><dd id="tg-diag-anon-data">—</dd></div>
                   <div><dt>PSS / доступно в системе</dt><dd id="tg-diag-pss-available">—</dd></div>
+                  <div><dt>smaps_rollup</dt><dd id="tg-diag-smaps-status">—</dd></div>
                   <div><dt>Учтённые выделения</dt><dd id="tg-diag-accounted">—</dd></div>
                   <div><dt>RSS минус известные выделения</dt><dd id="tg-diag-residual">—</dd></div>
                 </dl>
@@ -291,7 +298,7 @@
               <section class="diag-card diag-workers-panel"><h4>Буферы и лимиты</h4>
                 <dl class="diag-history-counts">
                   <div><dt>Буферы: сейчас / пик / предел</dt><dd id="tg-diag-buffers">—</dd></div>
-                  <div><dt>Очереди / WebSocket / MTProto</dt><dd id="tg-diag-queues">—</dd></div>
+                  <div><dt>Заполнение очередей / WS / MTProto</dt><dd id="tg-diag-queues">—</dd></div>
                   <div><dt>Соединения / максимум</dt><dd id="tg-diag-connections">—</dd></div>
                   <div><dt>Свободная память / резерв</dt><dd id="tg-diag-headroom">—</dd></div>
                   <div><dt>FD / предел</dt><dd id="tg-diag-fds">—</dd></div>
@@ -305,11 +312,19 @@
                   <div><dt>Отказы выделения памяти</dt><dd id="tg-diag-alloc-failures">—</dd></div>
                   <div><dt>HTTP 403 / 501 / 502</dt><dd id="tg-diag-http-errors">—</dd></div>
                   <div><dt>Клиент → прокси / прокси → клиент</dt><dd id="tg-diag-traffic">—</dd></div>
+                  <div><dt>Скорость за последний интервал</dt><dd id="tg-diag-throughput">—</dd></div>
+                  <div><dt>Период: новые HTTP / WSS ошибки</dt><dd id="tg-diag-error-delta">—</dd></div>
+                  <div><dt>WS попытки / ошибки / ответы</dt><dd id="tg-diag-wss">—</dd></div>
+                  <div><dt>CF ответы / worker hits / misses / ответы</dt><dd id="tg-diag-fallback">—</dd></div>
+                  <div><dt>Ответ приложения p50 / p95</dt><dd id="tg-diag-latency">—</dd></div>
+                  <div><dt>Read pause / resume / timeout / paused</dt><dd id="tg-diag-pauses">—</dd></div>
+                  <div><dt>Ограничения buffer / accept / FD</dt><dd id="tg-diag-rejections">—</dd></div>
+                  <div><dt>Ошибки по этапам</dt><dd id="tg-diag-stage-failures">—</dd></div>
                 </dl>
               </section>
               <section class="diag-card diag-http-panel"><h4>Карта Telegram DC</h4>
                 <dl class="diag-history-counts">
-                  <div><dt>Состояние / адресов</dt><dd id="tg-diag-map-status">—</dd></div>
+                  <div><dt>Состояние / адресов / last-known-good</dt><dd id="tg-diag-map-status">—</dd></div>
                   <div><dt>Последнее обновление</dt><dd id="tg-diag-map-refresh">—</dd></div>
                   <div><dt>Попытки / успехи / ошибки</dt><dd id="tg-diag-map-counts">—</dd></div>
                 </dl>
@@ -319,7 +334,7 @@
                 <p id="tg-diag-routes-empty" class="diag-history-note">Пока нет данных маршрута.</p>
               </section>
               <section class="diag-card diag-search-panel"><h4>Активные сессии и последние ошибки</h4>
-                <div class="diag-table-scroll"><table class="diag-memory"><thead><tr><th>Сессия / DC / тип</th><th>Транспорт / возраст / простой</th><th>Байты клиент / сервер</th><th>Средняя скорость за жизнь</th><th>Состояние</th></tr></thead><tbody id="tg-diag-sessions"></tbody></table></div>
+                <div class="diag-table-scroll"><table class="diag-memory"><thead><tr><th>Сессия / DC / тип</th><th>Маршрут / возраст</th><th>Байты и средняя скорость</th><th>Первый ответ / без прогресса</th><th>Очереди клиент / upstream</th><th>Состояние direct / fallback</th></tr></thead><tbody id="tg-diag-sessions"></tbody></table></div>
                 <p id="tg-diag-sessions-empty" class="diag-history-note">Активных сессий нет.</p>
                 <ul id="tg-diag-problems" class="diag-transition-list"></ul>
               </section>
