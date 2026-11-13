@@ -66,7 +66,9 @@ typedef struct proxy_connection proxy_connection;
 
 typedef struct {
     tg_route_kind kind;
+    uint8_t transport;
     uint32_t dc_id;
+    uint16_t upstream_port;
     int is_media;
     char hostname[TG_CF_DOMAIN_LEN];
     tg_listener_destination original;
@@ -242,6 +244,8 @@ struct tg_epoll_proxy {
     worker_pool *worker_pool;
     uint16_t listen_ports[TG_EPOLL_MAX_LISTEN_PORTS];
     size_t max_connections;
+    size_t memory_headroom_bytes;
+    size_t memory_ceiling_bytes;
     size_t active_connections;
     size_t tracked_sessions;
     size_t max_wss_connections;
@@ -254,6 +258,13 @@ struct tg_epoll_proxy {
     uint64_t wss_read_pauses;
     uint64_t wss_read_resumes;
     uint64_t wss_paused_timeouts;
+    uint64_t http_403;
+    uint64_t http_501;
+    uint64_t http_502;
+    uint32_t last_http_status;
+    uint64_t failure_by_stage[TG_EPOLL_FAILURE_STAGE_COUNT];
+    tg_problem_session problem_sessions[TG_EPOLL_MAX_PROBLEM_SESSIONS];
+    uint64_t problem_session_total;
     uint64_t process_started_at;
     uint64_t bytes_from_clients;
     uint64_t bytes_from_upstreams;
@@ -342,6 +353,7 @@ static void route_session_add_bytes(proxy_connection *connection,
                                     int from_client, size_t amount) {
     proxy_connection *owner = route_session_owner(connection);
     if (!owner || !owner->route_session_tracked) return;
+    if (amount) owner->route_session.no_progress_ms = monotonic_ms();
     uint64_t *total = from_client
         ? &owner->route_session.bytes_from_clients
         : &owner->route_session.bytes_from_upstreams;
@@ -440,6 +452,9 @@ static void route_session_first_response(proxy_connection *connection) {
     if (session->selected_transport == TG_ROUTE_SESSION_TRANSPORT_NONE)
         route_session_selected(connection, kind);
     session->telegram_response_seen = 1;
+    uint64_t now = monotonic_ms();
+    if (session->started_ms && now >= session->started_ms)
+        session->first_response_latency_ms = now - session->started_ms;
     route_session_event(connection, kind,
                         TG_ROUTE_SESSION_FIRST_BINARY_RESPONSE);
     session->stage = TG_ROUTE_SESSION_STAGE_FIRST_WSS_BINARY_RESPONSE;
@@ -773,6 +788,8 @@ static int route_health_get(tg_epoll_proxy *server,
     route_health *health = &server->route_health[index];
     memset(health, 0, sizeof(*health));
     health->kind = connection->route_kind;
+    health->transport = route_session_transport_for(connection,
+                                                     connection->route_kind);
     health->dc_id = connection->route_dc_id;
     health->is_media = connection->route_is_media;
     memcpy(health->hostname, connection->tls_hostname,
@@ -855,6 +872,42 @@ static void route_failure_record(proxy_connection *connection,
     connection->route_failure_stage = (uint8_t)stage;
     uint64_t now = monotonic_ms();
     tg_epoll_proxy *server = connection->server;
+    if (stage < TG_EPOLL_FAILURE_STAGE_COUNT &&
+        server->failure_by_stage[stage] != UINT64_MAX)
+        ++server->failure_by_stage[stage];
+    uint32_t http_status = stage == TG_EPOLL_FAILURE_WEBSOCKET
+        ? connection->ws_upgrade.http_status : 0;
+    if (http_status) {
+        server->last_http_status = http_status;
+        if (http_status == 403 && server->http_403 != UINT64_MAX)
+            ++server->http_403;
+        else if (http_status == 501 && server->http_501 != UINT64_MAX)
+            ++server->http_501;
+        else if (http_status == 502 && server->http_502 != UINT64_MAX)
+            ++server->http_502;
+    }
+    uint64_t sequence = server->problem_session_total;
+    if (server->problem_session_total != UINT64_MAX)
+        ++server->problem_session_total;
+    tg_problem_session *problem = &server->problem_sessions[
+        sequence % TG_EPOLL_MAX_PROBLEM_SESSIONS];
+    memset(problem, 0, sizeof(*problem));
+    problem->sequence = sequence == UINT64_MAX ? UINT64_MAX : sequence + 1u;
+    problem->dc = connection->route_dc_id;
+    problem->client_port = connection->original.port;
+    problem->upstream_port = connection->upstream_target.port;
+    problem->http_status = (uint16_t)http_status;
+    problem->is_media = (uint8_t)(connection->route_is_media != 0);
+    problem->transport = route_session_transport_for(connection, kind);
+    problem->failure_stage = (uint8_t)stage;
+    proxy_connection *owner = route_session_owner(connection);
+    if (owner) {
+        problem->session_id = owner->route_session.id;
+        problem->bytes_from_clients = owner->route_session.bytes_from_clients;
+        problem->bytes_from_upstreams = owner->route_session.bytes_from_upstreams;
+    }
+    uint64_t accepted_ms = connection->accepted_at_us / 1000u;
+    problem->age_ms = now >= accepted_ms ? now - accepted_ms : 0;
     if (now >= server->last_failure_ms) {
         server->last_failure_ms = now;
         server->last_failure_dc = connection->route_dc_id;
@@ -1915,6 +1968,7 @@ static int start_next_route(proxy_connection *connection) {
         int health_index = route_health_get(server, connection, 1);
         if (health_index >= 0) {
             route_health *health = &server->route_health[health_index];
+            health->upstream_port = target.port;
             if (health->cooldown_until_ms > monotonic_ms()) {
                 route_session_event(connection, step.kind,
                                     TG_ROUTE_SESSION_COOLDOWN);
@@ -2138,6 +2192,7 @@ static int hedge_launch_next(proxy_connection *parent) {
                 free(candidate);
                 continue;
             }
+            health->upstream_port = candidate->upstream_target.port;
             candidate->route_health_index = health_index;
             candidate->route_started_ms = monotonic_ms();
             if (health->attempts != UINT64_MAX) ++health->attempts;
@@ -3405,13 +3460,16 @@ static int accept_clients(tg_epoll_proxy *server) {
         ++server->active_connections;
         if (server->connections_started != UINT64_MAX)
             ++server->connections_started;
+        connection->route_session.id = server->connections_started;
         if (server->tracked_sessions < TG_EPOLL_MAX_ACTIVE_ROUTE_SESSIONS) {
             connection->route_session_tracked = 1;
-            connection->route_session.id = server->connections_started;
             connection->route_session.stage = TG_ROUTE_SESSION_STAGE_ACCEPTED;
             connection->route_session.direct_state = TG_ROUTE_SESSION_IDLE;
             connection->route_session.fallback_state = TG_ROUTE_SESSION_IDLE;
             connection->route_session.next_event_sequence = 1;
+            connection->route_session.started_ms = monotonic_ms();
+            connection->route_session.no_progress_ms =
+                connection->route_session.started_ms;
             ++server->tracked_sessions;
         }
         if (watch_update(server, &connection->client_watch,
@@ -3628,6 +3686,8 @@ static void expire_connections(tg_epoll_proxy *server) {
 void tg_epoll_proxy_update_limits(tg_epoll_proxy *server, size_t connection_limit,
                                   size_t memory_headroom_bytes, size_t memory_ceiling_bytes) {
     if (!server) return;
+    server->memory_headroom_bytes = memory_headroom_bytes;
+    server->memory_ceiling_bytes = memory_ceiling_bytes;
     const tg_epoll_proxy_config *config = &server->config;
     const size_t connection_reserve =
         sizeof(proxy_connection) + TG_EPOLL_RUNTIME_RESERVE_PER_CONNECTION;
@@ -3793,6 +3853,26 @@ void tg_epoll_proxy_destroy(tg_epoll_proxy *server) {
     free(server);
 }
 
+static void add_connection_memory_stats(const proxy_connection *connection,
+                                        tg_epoll_proxy_stats *out) {
+    if (!connection) return;
+    out->connection_struct_bytes += sizeof(*connection);
+    if (connection->client_fd >= 0) ++out->client_socket_fds;
+    if (connection->upstream_fd >= 0) ++out->upstream_socket_fds;
+    if (connection->upstream_ssl) ++out->tls_objects;
+    out->client_queue_bytes += connection->to_client.len;
+    out->upstream_queue_bytes += connection->to_upstream.len;
+    out->client_queue_capacity_bytes += connection->to_client.dynamic_bytes;
+    out->upstream_queue_capacity_bytes += connection->to_upstream.dynamic_bytes;
+    if (connection->ws_pump_ready) {
+        out->ws_rx_capacity_bytes += connection->ws_pump.rx_cap;
+        out->ws_tx_memory_bytes += connection->ws_pump.tx_memory_bytes;
+        out->ws_rx_capacity_bytes += connection->ws_pump.reassembly.cap;
+    }
+    if (connection->splitter_ready)
+        out->mtproto_packet_capacity_bytes += connection->splitter.packet_cap;
+}
+
 size_t tg_epoll_proxy_active_connections(const tg_epoll_proxy *server) {
     return server ? server->active_connections : 0;
 }
@@ -3813,9 +3893,14 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
     out->route_cooldown_ms = TG_ROUTE_HEALTH_COOLDOWN_MS;
     out->active_connections = server->active_connections;
     out->process_started_at = server->process_started_at;
+    out->proxy_struct_bytes = sizeof(*server);
     out->accepted_connections = server->connections_started;
     for (const proxy_connection *connection = server->connections; connection;
          connection = connection->next) {
+        add_connection_memory_stats(connection, out);
+        for (size_t j = 0; j < TG_HEDGE_CANDIDATES; ++j)
+            if (connection->hedges[j])
+                add_connection_memory_stats(connection->hedges[j], out);
         if (connection->ws_pump.read_paused && !connection->upstream_eof) {
             ++out->wss_reads_paused;
             uint64_t age = now - connection->wss_read_paused_at_ms;
@@ -3826,6 +3911,33 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
             continue;
         size_t at = out->active_sessions_count++;
         out->active_sessions[at] = connection->route_session;
+        tg_active_route_session *session = &out->active_sessions[at];
+        session->client_port = connection->original.port;
+        session->upstream_port = connection->upstream_target.port;
+        session->age_ms = now >= session->started_ms
+            ? now - session->started_ms : 0;
+        session->no_progress_ms = now >= session->no_progress_ms
+            ? now - session->no_progress_ms : 0;
+        session->read_paused = (uint8_t)(connection->ws_pump.read_paused &&
+                                         !connection->upstream_eof);
+        session->client_queue_bytes = connection->to_client.len;
+        session->upstream_queue_bytes = connection->to_upstream.len;
+        session->client_queue_capacity_bytes = connection->to_client.dynamic_bytes;
+        session->upstream_queue_capacity_bytes = connection->to_upstream.dynamic_bytes;
+        session->ws_rx_capacity_bytes = connection->ws_pump_ready
+            ? connection->ws_pump.rx_cap + connection->ws_pump.reassembly.cap : 0;
+        session->ws_tx_memory_bytes = connection->ws_pump_ready
+            ? connection->ws_pump.tx_memory_bytes : 0;
+        session->mtproto_packet_capacity_bytes = connection->splitter_ready
+            ? connection->splitter.packet_cap : 0;
+    }
+    for (const proxy_connection *connection = server->retired; connection;
+         connection = connection->retired_next) {
+        out->retired_connection_struct_bytes += sizeof(*connection);
+        out->client_queue_bytes += connection->to_client.len;
+        out->upstream_queue_bytes += connection->to_upstream.len;
+        out->client_queue_capacity_bytes += connection->to_client.dynamic_bytes;
+        out->upstream_queue_capacity_bytes += connection->to_upstream.dynamic_bytes;
     }
     for (size_t i = 1; i < out->active_sessions_count; ++i) {
         tg_active_route_session value = out->active_sessions[i];
@@ -3839,6 +3951,8 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
     out->route_sessions_truncated =
         server->active_connections > out->active_sessions_count;
     out->max_connections = server->max_connections;
+    out->memory_headroom_bytes = server->memory_headroom_bytes;
+    out->memory_ceiling_bytes = server->memory_ceiling_bytes;
     out->active_wss_connections = server->active_wss_connections;
     out->max_wss_connections = server->max_wss_connections;
     out->buffer_bytes_current = server->buffer_budget.used;
@@ -3852,6 +3966,12 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
     out->wss_read_pauses = server->wss_read_pauses;
     out->wss_read_resumes = server->wss_read_resumes;
     out->wss_paused_timeouts = server->wss_paused_timeouts;
+    out->http_403 = server->http_403;
+    out->http_501 = server->http_501;
+    out->http_502 = server->http_502;
+    out->last_http_status = server->last_http_status;
+    memcpy(out->failure_by_stage, server->failure_by_stage,
+           sizeof(out->failure_by_stage));
     out->connections_started = server->connections_started;
     out->bytes_from_clients = server->bytes_from_clients;
     out->bytes_from_upstreams = server->bytes_from_upstreams;
@@ -3870,6 +3990,20 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
     out->worker_pool_hits = server->worker_pool_hits;
     out->worker_pool_misses = server->worker_pool_misses;
     out->worker_pool_responses = server->worker_pool_responses;
+    if (server->worker_pool) {
+        worker_pool *pool = server->worker_pool;
+        out->worker_pool_capacity = pool->capacity;
+        out->worker_pool_struct_bytes = sizeof(*pool);
+        pthread_mutex_lock(&pool->lock);
+        out->worker_pool_started = pool->started;
+        out->worker_pool_entries = pool->count;
+        for (size_t i = 0; i < pool->capacity; ++i)
+            if (pool->entries[i].ssl) {
+                ++out->tls_objects;
+                ++out->worker_pool_tls_objects;
+            }
+        pthread_mutex_unlock(&pool->lock);
+    }
     out->client_response_latency_total =
         server->client_response_latency_total;
     out->client_response_latency_samples =
@@ -3908,14 +4042,33 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
         add_u64(&out->wss_failures, health->failures);
         add_u64(&out->wss_responses, health->responses);
         add_u64(&out->cf_wss_responses, health->cf_responses);
+        if (out->route_health_count < TG_EPOLL_MAX_ROUTE_STATS) {
+            tg_route_health_stat *route =
+                &out->route_health[out->route_health_count++];
+            route->dc = health->dc_id;
+            route->client_port = health->original.port;
+            route->upstream_port = health->upstream_port;
+            route->is_media = (uint8_t)(health->is_media != 0);
+            route->transport = health->transport;
+            route->has_last_success = (uint8_t)(health->last_success_ms != 0);
+            route->has_last_failure = (uint8_t)(health->last_failure_ms != 0);
+            route->last_failure_stage = (uint8_t)health->last_failure_stage;
+            route->attempts = health->attempts;
+            route->failures = health->failures;
+            route->responses = health->responses;
+            route->cf_responses = health->cf_responses;
+            route->latency_ms = health->latency_ms;
+            route->last_success_age_ms = health->last_success_ms &&
+                now >= health->last_success_ms ? now - health->last_success_ms : 0;
+            route->last_failure_age_ms = health->last_failure_ms &&
+                now >= health->last_failure_ms ? now - health->last_failure_ms : 0;
+            route->cooldown_remaining_ms = health->cooldown_until_ms > now
+                ? health->cooldown_until_ms - now : 0;
+        } else {
+            out->route_health_truncated = 1;
+        }
         if (health->cooldown_until_ms <= now) continue;
-        uint8_t transport = health->kind == TG_ROUTE_DIRECT_WSS
-            ? TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS
-            : health->kind == TG_ROUTE_CF_WORKER
-                ? TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_WORKER
-                : health->kind == TG_ROUTE_CF_PROXY
-                    ? TG_ROUTE_SESSION_TRANSPORT_CLOUDFLARE_PROXY
-                    : TG_ROUTE_SESSION_TRANSPORT_NONE;
+        uint8_t transport = health->transport;
         if (transport == TG_ROUTE_SESSION_TRANSPORT_NONE) continue;
         if (out->route_cooldowns_count >= TG_EPOLL_MAX_ROUTE_COOLDOWNS) {
             out->route_cooldowns_truncated = 1;
@@ -3929,6 +4082,17 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
         cooldown->failure_stage = (uint8_t)health->last_failure_stage;
         cooldown->remaining_ms = health->cooldown_until_ms - now;
     }
+    size_t problem_count = server->problem_session_total <
+        TG_EPOLL_MAX_PROBLEM_SESSIONS ? (size_t)server->problem_session_total :
+        TG_EPOLL_MAX_PROBLEM_SESSIONS;
+    size_t problem_oldest = server->problem_session_total >
+        TG_EPOLL_MAX_PROBLEM_SESSIONS
+        ? (size_t)(server->problem_session_total % TG_EPOLL_MAX_PROBLEM_SESSIONS)
+        : 0;
+    out->problem_sessions_count = problem_count;
+    for (size_t i = 0; i < problem_count; ++i)
+        out->problem_sessions[i] = server->problem_sessions[
+            (problem_oldest + i) % TG_EPOLL_MAX_PROBLEM_SESSIONS];
     return 0;
 }
 

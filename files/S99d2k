@@ -1465,7 +1465,7 @@ start_engine() {
     set -- --health-file "$RUNTIME_DIR/d2kc.health"
     spawn_daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
         --control "$SOCK" --catalog "$DIR/state/catalog.json" --live "$LIVE" --mark "$PROBE_MARK" \
-        --measure-mark "$MEASURE_MARK" \
+        --measure-mark "$MEASURE_MARK" --telegram-stats "$TG_STATS_SOCKET" \
         "$@" --log "$LOG/d2kc.log" || { engine_stop; die_with_log "контроллер не запустился" "$LOG/d2kc.log"; }
     if ! wait_running "$CT_PID" d2kc; then
         engine_stop

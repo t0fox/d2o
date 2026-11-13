@@ -1247,6 +1247,13 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
 }
 
 /* Ограниченная история диагностики с отдельными от настроек движка показателями. */
+.diag-tabs { display: flex; gap: 6px; margin: 8px 0 20px; padding-bottom: 8px; border-bottom: 1px solid var(--rule); }
+.diag-tabs button { min-height: 38px; padding: 0 14px; border: 1px solid transparent; border-radius: 8px; color: var(--ink-2); background: transparent; font: inherit; font-size: .875rem; cursor: pointer; }
+.diag-tabs button[aria-selected="true"] { border-color: var(--rule); color: var(--ink); background: var(--paper); box-shadow: 0 1px 3px rgba(0,0,0,.08); font-weight: 650; }
+.diag-tabs button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.diag-shared-footer { justify-content: flex-end; margin: -10px 0 30px; }
+.diag-table-scroll { max-width: 100%; overflow-x: auto; }
+.diag-table-scroll .diag-memory { min-width: 620px; }
 .diag-history { margin-bottom: 40px; padding: 24px 0 28px; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
 .diag-history-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 16px; }
 .diag-history-head h3 { font-size: 1.25rem; font-weight: 700; letter-spacing: -.02em; }

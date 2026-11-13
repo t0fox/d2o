@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <ctype.h>
 #ifndef D2K_RELEASE_ID
 #define D2K_RELEASE_ID "dev"
 #endif
@@ -64,6 +65,10 @@ typedef struct {
     uint8_t tasks,workers_live,workers_result_pending,workers_join_pending;
 } memory_sample;
 typedef struct {
+    uint32_t at_s,mono_s;
+    int64_t values[D2K_DIAG_TG_FIELD_COUNT];
+} telegram_sample;
+typedef struct {
     int64_t mono;
     int32_t rss,accounted;
 } growth_point;
@@ -92,9 +97,31 @@ struct d2k_diag {
     size_t ne,nl,ns,nm,na,ng,growth_next;uint64_t event_total,limit_total,sample_total,memory_total,anomaly_total,write_failures;
     int32_t growth_pid;long memory_pid;int64_t memory_start_ticks,last_unattributed_ms,last_ms;
     /* One generation change per retained row fits in this 16-bit value. */
-    uint16_t d2kc_epoch;int memory_pid_seen,sampled;
+    uint16_t d2kc_epoch;int memory_pid_seen,sampled,general_enabled;
 };
 typedef char bounded_ring[(sizeof(struct d2k_diag)<=256*1024)?1:-1];
+struct d2k_diag_telegram {
+    telegram_sample history[D2K_DIAG_TG_HISTORY];
+    char latest_json[D2K_DIAG_TG_JSON_MAX+1u];
+    size_t latest_len,nh;
+    uint64_t total,collection_failures;
+    int64_t last_ms,last_error,last_at;
+    uint8_t sampled,available;
+};
+static const char *const telegram_fields[D2K_DIAG_TG_FIELD_COUNT]={
+    "rss_kib","rss_hwm_kib","rss_anon_kib","vm_data_kib","vm_swap_kib",
+    "smaps_pss_kib","mem_total_kib","mem_available_kib",
+    "memory_accounted_allocations_bytes","rss_minus_known_allocations_bytes",
+    "active_connections","max_connections","memory_headroom_bytes","memory_ceiling_bytes",
+    "buffer_bytes_current","buffer_bytes_peak","buffer_bytes_limit",
+    "client_queue_capacity_bytes","upstream_queue_capacity_bytes","ws_rx_capacity_bytes",
+    "ws_tx_memory_bytes","mtproto_packet_capacity_bytes","proxy_struct_bytes",
+    "connection_struct_bytes","retired_connection_struct_bytes","tls_objects",
+    "worker_pool_tls_objects","worker_pool_entries","worker_pool_capacity","fd_count",
+    "soft_nofile_limit","allocation_failures","http_403","http_501","http_502",
+    "last_http_status","wss_read_pauses","wss_read_resumes","wss_paused_timeouts",
+    "connections_started","bytes_from_clients","bytes_from_upstreams"
+};
 static void copy(char *to,size_t cap,const char *s) {
     if(!s)s="";
     size_t n=strlen(s);if(n>=cap)n=cap-1;
@@ -129,8 +156,11 @@ static void js(FILE *f,const char *s) {
     fputc('"',f);
 }
 static void number(FILE *f,int64_t v) {if(v<0)fputs("null",f);else fprintf(f,"%lld",(long long)v);}
-d2k_diag *d2k_diag_new(void){return calloc(1,sizeof(d2k_diag));}
+d2k_diag *d2k_diag_new(void){d2k_diag *d=calloc(1,sizeof(d2k_diag));if(d)d->general_enabled=1;return d;}
 void d2k_diag_free(d2k_diag *d){free(d);}
+void d2k_diag_set_enabled(d2k_diag *d,int enabled){if(d)d->general_enabled=enabled!=0;}
+d2k_diag_telegram *d2k_diag_telegram_new(void){return calloc(1,sizeof(d2k_diag_telegram));}
+void d2k_diag_telegram_free(d2k_diag_telegram *d){free(d);}
 size_t d2k_diag_bytes(const d2k_diag *d){return d?sizeof *d:0;}
 size_t d2k_diag_event_count(const d2k_diag *d){return d?d->ne:0;}
 size_t d2k_diag_sample_count(const d2k_diag *d){return d?d->ns:0;}
@@ -188,6 +218,134 @@ static void record_anomaly(d2k_diag *d,unsigned kind,const char *stage,int code,
 void d2k_diag_record_write_error(d2k_diag *d,const char *stage,int error){
     if(!d)return;
     d->write_failures++;record_anomaly(d,2,stage,error,0,0);
+}
+static void telegram_json_space(const char *json,size_t len,size_t *at) {
+    while(*at<len&&isspace((unsigned char)json[*at]))++*at;
+}
+static int telegram_json_string(const char *json,size_t len,size_t *at) {
+    if(*at>=len||json[(*at)++]!='"')return 0;
+    while(*at<len) {
+        unsigned char c=(unsigned char)json[(*at)++];
+        if(c=='"')return 1;
+        if(c<32)return 0;
+        if(c=='\\') {
+            if(*at>=len)return 0;
+            char escape=json[(*at)++];
+            if(escape=='u') {
+                for(int i=0;i<4;i++) {
+                    if(*at>=len||!isxdigit((unsigned char)json[(*at)++]))return 0;
+                }
+            } else if(!escape||!strchr("\\\"/bfnrt",escape))return 0;
+        }
+    }
+    return 0;
+}
+static int telegram_json_value(const char *json,size_t len,size_t *at,unsigned depth) {
+    if(depth>64||*at>=len)return 0;
+    telegram_json_space(json,len,at);
+    if(*at>=len)return 0;
+    if(json[*at]=='"')return telegram_json_string(json,len,at);
+    if(json[*at]=='{') {
+        ++*at;telegram_json_space(json,len,at);
+        if(*at<len&&json[*at]=='}'){++*at;return 1;}
+        for(;;) {
+            if(!telegram_json_string(json,len,at))return 0;
+            telegram_json_space(json,len,at);
+            if(*at>=len||json[(*at)++]!=':')return 0;
+            if(!telegram_json_value(json,len,at,depth+1))return 0;
+            telegram_json_space(json,len,at);
+            if(*at>=len)return 0;
+            if(json[*at]=='}'){++*at;return 1;}
+            if(json[(*at)++]!=',')return 0;
+            telegram_json_space(json,len,at);
+        }
+    }
+    if(json[*at]=='[') {
+        ++*at;telegram_json_space(json,len,at);
+        if(*at<len&&json[*at]==']'){++*at;return 1;}
+        for(;;) {
+            if(!telegram_json_value(json,len,at,depth+1))return 0;
+            telegram_json_space(json,len,at);
+            if(*at>=len)return 0;
+            if(json[*at]==']'){++*at;return 1;}
+            if(json[(*at)++]!=',')return 0;
+            telegram_json_space(json,len,at);
+        }
+    }
+    if(len-*at>=4&&!memcmp(json+*at,"true",4)){*at+=4;return 1;}
+    if(len-*at>=5&&!memcmp(json+*at,"false",5)){*at+=5;return 1;}
+    if(len-*at>=4&&!memcmp(json+*at,"null",4)){*at+=4;return 1;}
+    size_t start=*at;
+    if(json[*at]=='-')++*at;
+    if(*at>=len)return 0;
+    if(json[*at]=='0')++*at;
+    else {
+        if(json[*at]<'1'||json[*at]>'9')return 0;
+        while(*at<len&&json[*at]>='0'&&json[*at]<='9')++*at;
+    }
+    if(*at<len&&json[*at]=='.') {
+        ++*at;size_t digits=*at;
+        while(*at<len&&json[*at]>='0'&&json[*at]<='9')++*at;
+        if(*at==digits)return 0;
+    }
+    if(*at<len&&(json[*at]=='e'||json[*at]=='E')) {
+        ++*at;if(*at<len&&(json[*at]=='+'||json[*at]=='-'))++*at;
+        size_t digits=*at;while(*at<len&&json[*at]>='0'&&json[*at]<='9')++*at;
+        if(*at==digits)return 0;
+    }
+    return *at>start;
+}
+static int telegram_json_valid(const char *json,size_t len) {
+    size_t at=0;telegram_json_space(json,len,&at);
+    if(at>=len||json[at]!='{'||!telegram_json_value(json,len,&at,0))return 0;
+    telegram_json_space(json,len,&at);return at==len;
+}
+static int64_t telegram_json_number(const char *json,size_t len,const char *wanted) {
+    size_t at=0;telegram_json_space(json,len,&at);if(at>=len||json[at++]!='{')return INT64_MIN;
+    size_t wanted_len=strlen(wanted);
+    while(at<len) {
+        telegram_json_space(json,len,&at);if(at<len&&json[at]=='}')break;
+        if(at>=len||json[at]!='"')return INT64_MIN;
+        size_t key_quote=at;if(!telegram_json_string(json,len,&at))return INT64_MIN;
+        size_t key_start=key_quote+1,key_len=at-key_quote-2;
+        int matches=key_len==wanted_len&&memcmp(json+key_start,wanted,key_len)==0;
+        telegram_json_space(json,len,&at);if(at>=len||json[at++]!=':')return INT64_MIN;
+        telegram_json_space(json,len,&at);size_t value_start=at;
+        if(matches&&(at<len&&(json[at]=='-'||(json[at]>='0'&&json[at]<='9')))) {
+            if(!telegram_json_value(json,len,&at,1))return INT64_MIN;
+            size_t number_len=at-value_start;
+            if(number_len>=64)return INT64_MIN;
+            char number_text[64];memcpy(number_text,json+value_start,number_len);number_text[number_len]=0;
+            errno=0;char *end=NULL;long long value=strtoll(number_text,&end,10);
+            return !errno&&end==number_text+number_len?(int64_t)value:INT64_MIN;
+        }
+        if(matches)return INT64_MIN;
+        if(!telegram_json_value(json,len,&at,1))return INT64_MIN;
+        telegram_json_space(json,len,&at);
+        if(at<len&&json[at]==','){++at;continue;}
+        break;
+    }
+    return INT64_MIN;
+}
+int d2k_diag_telegram_record(d2k_diag_telegram *d,int64_t ms,const char *json,size_t len) {
+    if(!d||!json||!len||len>D2K_DIAG_TG_JSON_MAX||!telegram_json_valid(json,len))return -1;
+    if(d->sampled&&ms>=d->last_ms&&ms-d->last_ms<60000)return 0;
+    uint64_t slot=d->total%D2K_DIAG_TG_HISTORY;
+    telegram_sample *sample=&d->history[slot];memset(sample,0,sizeof *sample);
+    sample->at_s=(uint32_t)time(NULL);sample->mono_s=ms<0?0:(uint32_t)((uint64_t)ms/1000u);
+    for(size_t i=0;i<D2K_DIAG_TG_FIELD_COUNT;i++)
+        sample->values[i]=telegram_json_number(json,len,telegram_fields[i]);
+    if(d->total!=UINT64_MAX)d->total++;
+    if(d->nh<D2K_DIAG_TG_HISTORY)d->nh++;
+    memcpy(d->latest_json,json,len);d->latest_json[len]=0;d->latest_len=len;
+    d->last_ms=ms;d->last_at=(int64_t)sample->at_s;d->last_error=0;
+    d->sampled=1;d->available=1;
+    return 1;
+}
+void d2k_diag_telegram_error(d2k_diag_telegram *d,int error) {
+    if(!d)return;
+    if(d->collection_failures!=UINT64_MAX)d->collection_failures++;
+    d->last_error=error;d->available=0;
 }
 void d2k_diag_record(d2k_diag *d,const d2k_diag_event *v) {
     if(!d||!v)return;
@@ -466,9 +624,44 @@ void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char 
         }
     }
 }
-int d2k_diag_write(const d2k_diag *d,FILE *f) {
+static void write_telegram(FILE *f,const d2k_diag_telegram *tg) {
+    fputs(",\"telegram_diagnostics\":{\"enabled\":",f);
+    fputs(tg?"true":"false",f);
+    fprintf(f,",\"sample_capacity\":%u,\"sample_interval_ms\":60000,\"samples_overwritten\":%llu,\"collection_failures\":%llu,\"collection_status\":",
+        D2K_DIAG_TG_HISTORY,(unsigned long long)(tg?tg->total-tg->nh:0),
+        (unsigned long long)(tg?tg->collection_failures:0));
+    js(f,!tg?"disabled":tg->available?"available":"socket_unavailable");
+    fputs(",\"last_error\":",f);
+    if(tg&&tg->last_error)fprintf(f,"%lld",(long long)tg->last_error);else fputs("null",f);
+    fputs(",\"last_sample_at\":",f);
+    if(tg&&tg->last_at>0)fprintf(f,"%lld",(long long)tg->last_at);else fputs("null",f);
+    const telegram_sample *base=tg&&tg->nh?&tg->history[(tg->total-tg->nh)%D2K_DIAG_TG_HISTORY]:NULL;
+    fprintf(f,",\"memory_history\":{\"capacity\":%u,\"sample_interval_ms\":60000,\"time_base\":[",
+        D2K_DIAG_TG_HISTORY);
+    if(base)fprintf(f,"%u,%u",base->at_s,base->mono_s);else fputs("null,null",f);
+    fputs("],\"fields\":[\"at_delta_s\",\"mono_delta_s\"",f);
+    for(size_t k=0;k<D2K_DIAG_TG_FIELD_COUNT;k++){fputc(',',f);js(f,telegram_fields[k]);}
+    fputs("],\"samples\":[",f);
+    for(size_t i=0;tg&&i<tg->nh;i++) {
+        const telegram_sample *sample=&tg->history[(tg->total-tg->nh+i)%D2K_DIAG_TG_HISTORY];
+        if(i)fputc(',',f);
+        fprintf(f,"[%lld,%u",(long long)sample->at_s-(base?(long long)base->at_s:0),
+            (unsigned)(sample->mono_s-(base?base->mono_s:0)));
+        for(size_t k=0;k<D2K_DIAG_TG_FIELD_COUNT;k++) {
+            fputc(',',f);
+            if(sample->values[k]==INT64_MIN)fputs("null",f);
+            else fprintf(f,"%lld",(long long)sample->values[k]);
+        }
+        fputc(']',f);
+    }
+    fputs("]},\"latest\":",f);
+    if(tg&&tg->latest_len)fwrite(tg->latest_json,1,tg->latest_len,f);else fputs("null",f);
+    fputc('}',f);
+}
+static int diag_write(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f) {
     if(!d||!f)return -1;
-    fprintf(f,"{\"schema\":1,\"enabled\":true,\"controller_pid\":%ld,\"release\":",(long)getpid());js(f,D2K_RELEASE_ID);
+    fprintf(f,"{\"schema\":1,\"enabled\":%s,\"general_enabled\":%s,\"telegram_enabled\":%s,\"controller_pid\":%ld,\"release\":",
+        (d->general_enabled||tg)?"true":"false",d->general_enabled?"true":"false",tg?"true":"false",(long)getpid());js(f,D2K_RELEASE_ID);
     fprintf(f,",\"ring_bytes\":%zu,\"event_capacity\":64,\"limit_transition_capacity\":32,\"sample_capacity\":120,\"sample_interval_ms\":60000,\"memory_history_capacity\":1440,\"memory_history_interval_ms\":60000,\"events_overwritten\":%llu,\"limit_transitions_overwritten\":%llu,\"samples_overwritten\":%llu,\"memory_history_overwritten\":%llu",sizeof *d,
         (unsigned long long)(d->event_total-d->ne),(unsigned long long)(d->limit_total-d->nl),
         (unsigned long long)(d->sample_total-d->ns),
@@ -601,5 +794,7 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         if(i)fputc(',',f);
         fputs("{\"name\":",f);js(f,names[i]);fputs(",\"first\":",f);write_detail(f,&d->first[i]);
         fputs(",\"latest\":",f);write_detail(f,&d->latest[i]);fputc('}',f);
-    }fputs("]}\n",f);return ferror(f)?-1:0;
+    }fputc(']',f);write_telegram(f,tg);fputs("}\n",f);return ferror(f)?-1:0;
 }
+int d2k_diag_write(const d2k_diag *d,FILE *f){return diag_write(d,NULL,f);}
+int d2k_diag_write_combined(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f){return diag_write(d,tg,f);}

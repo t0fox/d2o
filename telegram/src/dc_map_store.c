@@ -279,9 +279,11 @@ int tg_dc_map_store_load(tg_dc_map_store *store, int64_t now) {
     if (!store || !store->path[0] ||
         snprintf(backup, sizeof(backup), "%s.last-good", store->path) >= (int)sizeof(backup))
         return -1;
-    if (read_snapshot_file(store->path, now, &loaded) != 0 &&
-        read_snapshot_file(backup, now, &loaded) != 0)
-        return 0;
+    int from_backup = 0;
+    if (read_snapshot_file(store->path, now, &loaded) != 0) {
+        if (read_snapshot_file(backup, now, &loaded) != 0) return 0;
+        from_backup = 1;
+    }
     size_t before = loaded.endpoint_count;
     if (append_builtin_endpoints(&loaded, now) != 0 ||
         tg_dc_snapshot_validate(&loaded, now) != 0) {
@@ -293,6 +295,7 @@ int tg_dc_map_store_load(tg_dc_map_store *store, int64_t now) {
     if (store->has_snapshot) tg_dc_snapshot_destroy(&store->snapshot);
     store->snapshot = loaded;
     store->has_snapshot = 1;
+    store->loaded_last_good = from_backup;
     return 0;
 }
 
@@ -332,6 +335,7 @@ int tg_dc_map_store_install(tg_dc_map_store *store,
     if (store->has_snapshot) tg_dc_snapshot_destroy(&store->snapshot);
     store->snapshot = merged;
     store->has_snapshot = 1;
+    store->loaded_last_good = 0;
     return 0;
 }
 

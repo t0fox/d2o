@@ -26,7 +26,7 @@
 
 #define REQUEST_MAX (32u * 1024u)
 #define BODY_MAX (1024u * 1024u)
-#define TELEGRAM_STATS_MAX 131072u
+#define TELEGRAM_STATS_MAX 262144u
 #ifndef D2K_PANEL_HEADER_TIMEOUT_MS
 #define D2K_PANEL_HEADER_TIMEOUT_MS 5000
 #endif
@@ -2104,20 +2104,37 @@ static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
     if(!strcmp(method,"POST")) {
         if(!cfg||!cfg->control_enabled||!d2k_panel_same_origin(req))
             return diagnostic_response(fd,403,"Forbidden","application/json","{\"error\":\"требуется запрос с того же источника\"}",sizeof "{\"error\":\"требуется запрос с того же источника\"}"-1);
-        if(strcmp(action,"enable")&&strcmp(action,"disable"))
+        int telegram_action=!strcmp(action,"telegram-enable")||!strcmp(action,"telegram-disable");
+        if(strcmp(action,"enable")&&strcmp(action,"disable")&&!telegram_action)
             return diagnostic_response(fd,400,"Bad Request","application/json","{}",2);
-        if(d2k_diag_toggle(dir,!strcmp(action,"enable")))
+        int enable=!strcmp(action,"enable")||!strcmp(action,"telegram-enable");
+        int toggle_result=telegram_action?d2k_diag_telegram_toggle(dir,enable):d2k_diag_toggle(dir,enable);
+        if(toggle_result)
             return diagnostic_response(fd,500,"Internal Server Error","application/json","{\"error\":\"не удалось изменить состояние диагностики\"}",sizeof "{\"error\":\"не удалось изменить состояние диагностики\"}"-1);
-        const char *body=d2k_diag_enabled(dir)?"{\"enabled\":true}":"{\"enabled\":false}";
-        return diagnostic_response(fd,200,"OK","application/json",body,strlen(body));
+        char body[96];int n=snprintf(body,sizeof body,"{\"enabled\":%s,\"telegram_enabled\":%s}",
+            d2k_diag_enabled(dir)?"true":"false",d2k_diag_telegram_enabled(dir)?"true":"false");
+        return n>0&&(size_t)n<sizeof body?diagnostic_response(fd,200,"OK","application/json",body,(size_t)n):
+            diagnostic_response(fd,500,"Internal Server Error","application/json","{}",2);
     }
     if(strcmp(method,"GET"))return diagnostic_response(fd,405,"Method Not Allowed","text/plain","",0);
-    if(!d2k_diag_enabled(dir))return diagnostic_response(fd,200,"OK","application/json","{\"enabled\":false}",17);
-    if(!strcmp(action,"status"))return diagnostic_response(fd,200,"OK","application/json","{\"enabled\":true}",16);
+    int general_enabled=d2k_diag_enabled(dir),telegram_enabled=d2k_diag_telegram_enabled(dir);
+    if(!general_enabled&&!telegram_enabled)return diagnostic_response(fd,200,"OK","application/json","{\"enabled\":false,\"telegram_enabled\":false}",sizeof "{\"enabled\":false,\"telegram_enabled\":false}"-1);
+    if(!strcmp(action,"status")) {
+        char body[96];int n=snprintf(body,sizeof body,"{\"enabled\":%s,\"telegram_enabled\":%s}",
+            general_enabled?"true":"false",telegram_enabled?"true":"false");
+        return n>0&&(size_t)n<sizeof body?diagnostic_response(fd,200,"OK","application/json",body,(size_t)n):
+            diagnostic_response(fd,500,"Internal Server Error","application/json","{}",2);
+    }
     char path[512];struct stat st;
     if(d2k_diag_path(path,sizeof path,dir,"report.json"))return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
     int in=open(path,O_RDONLY|O_NOFOLLOW);
-    if(in<0)return diagnostic_response(fd,503,"Service Unavailable","application/json","{\"enabled\":true,\"pending\":true}",31);
+    if(in<0) {
+        char pending[112];int n=snprintf(pending,sizeof pending,
+            "{\"enabled\":%s,\"telegram_enabled\":%s,\"pending\":true}",
+            general_enabled?"true":"false",telegram_enabled?"true":"false");
+        return n>0&&(size_t)n<sizeof pending?diagnostic_response(fd,503,"Service Unavailable","application/json",pending,(size_t)n):
+            diagnostic_response(fd,503,"Service Unavailable","application/json","{}",2);
+    }
     if(fstat(in,&st)||!S_ISREG(st.st_mode)||st.st_size<0||(uint64_t)st.st_size>D2K_DIAG_REPORT_MAX) {
         close(in);return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
     }

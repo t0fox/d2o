@@ -23,6 +23,7 @@
 #include "../runtime/d2k_runtime.h"
 #include "d2k_crypto.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -40,6 +41,7 @@
 #include "d2k_plantlv.h"
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include "d2k_link.h"
 
 /* Переходник к перенесённому измерителю (detect/bridge.c). Объявлен здесь, а
@@ -393,7 +395,7 @@ static void hs_measured_poisons(d2k_httpsearch *hs, const d2k_catalog *cat) {
 
 static void usage(void) {
     fprintf(stderr,
-        "использование: d2kc --control <сокет> [--catalog <файл>] [--mark 0x2e] [--measure-mark 0x2f]\n"
+        "использование: d2kc --control <сокет> [--catalog <файл>] [--telegram-stats <сокет>] [--mark 0x2e] [--measure-mark 0x2f]\n"
         "  --control  управляющий сокет датапата (обязателен)\n"
         "  --catalog  где держать знание (умолчание /opt/d2k/catalog.json)\n"
         "  --live     куда писать вид для панели (умолчание — рядом с каталогом)\n"
@@ -412,41 +414,139 @@ static int offline_self_check(void) {
 
 /* Ограниченный необязательный наблюдатель; его состояние не влияет на поиск. */
 static d2k_diag *diagnostics;
+static d2k_diag_telegram *telegram_diagnostics;
+static const char *telegram_stats_path;
+static char *telegram_stats_buffer;
 static void diagnostic_event(void *ctx,const d2k_diag_event *e) {
     (void)ctx;d2k_diag_record(diagnostics,e);
 }
 static void diagnostic_limit(void *ctx,int64_t mono,const d2k_diag_counts *c) {
     (void)ctx;d2k_diag_record_limit(diagnostics,mono,c);
 }
+static int telegram_stats_read(const char *path,char *buffer,size_t capacity,size_t *length) {
+    if(!path||!buffer||!capacity||!length){errno=EINVAL;return -1;}
+    size_t path_len=strlen(path);
+    if(!path_len||path_len>=sizeof(((struct sockaddr_un *)0)->sun_path)){errno=ENAMETOOLONG;return -1;}
+    int fd=socket(AF_UNIX,SOCK_STREAM,0);
+    if(fd<0)return -1;
+    int status=fcntl(fd,F_GETFL,0),descriptor=fcntl(fd,F_GETFD,0);
+    if(status<0||descriptor<0||fcntl(fd,F_SETFL,status|O_NONBLOCK)<0||
+       fcntl(fd,F_SETFD,descriptor|FD_CLOEXEC)<0){int error=errno;close(fd);errno=error;return -1;}
+    struct sockaddr_un address;memset(&address,0,sizeof address);
+    address.sun_family=AF_UNIX;memcpy(address.sun_path,path,path_len+1);
+    int connecting=0;
+    if(connect(fd,(struct sockaddr *)&address,sizeof address)!=0) {
+        if(errno!=EINPROGRESS){int error=errno;close(fd);errno=error;return -1;}
+        connecting=1;
+    }
+    int64_t deadline=now_ms()+250;
+    size_t used=0;int done=0;
+    while(!done&&used<capacity) {
+        int64_t remaining=deadline-now_ms();
+        if(remaining<=0){errno=ETIMEDOUT;close(fd);return -1;}
+        struct pollfd pfd={.fd=fd,.events=connecting?POLLOUT:POLLIN};
+        int ready=poll(&pfd,1,(int)remaining);
+        if(ready<0&&errno==EINTR)continue;
+        if(ready<=0){if(!ready)errno=ETIMEDOUT;int error=errno;close(fd);errno=error;return -1;}
+        if(connecting&&(pfd.revents&POLLOUT)) {
+            int error=0;socklen_t error_len=sizeof error;
+            if(getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&error_len)!=0||error) {
+                if(error)errno=error;
+                int saved=errno;close(fd);errno=saved;return -1;
+            }
+            connecting=0;continue;
+        }
+        ssize_t n=recv(fd,buffer+used,capacity-used,0);
+        if(n>0) {
+            size_t prior=used;used+=(size_t)n;
+            char *newline=memchr(buffer+prior,'\n',(size_t)n);
+            if(newline){used=(size_t)(newline-buffer);done=1;}
+            continue;
+        }
+        if(n==0){if(!used){errno=ECONNRESET;close(fd);return -1;}done=1;break;}
+        if(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK)continue;
+        int error=errno;close(fd);errno=error;return -1;
+    }
+    close(fd);
+    if(!done){errno=EMSGSIZE;return -1;}
+    if(!used){errno=EPROTO;return -1;}
+    *length=used;return 0;
+}
 static void diagnostic_tick(d2k_sched *s,int64_t now) {
     static int64_t checked=-1000,written=-60000;
+    static int64_t telegram_attempted=-60000;
+    static int previous_general=-1,previous_telegram=-1;
     if(now>=checked && now-checked<1000)return;
     checked=now;
-    if(!d2k_diag_enabled(D2K_DIAG_DIR)) {
-        /* Если выгрузка совпала с выключением, очистить её в следующем цикле. */
-        if(diagnostics) (void)d2k_diag_toggle(D2K_DIAG_DIR,0);
-        d2k_diag_memory_enable(0);d2k_diag_free(diagnostics);diagnostics=NULL;
-        d2k_sched_diagnostics(s,NULL,NULL);
-        d2k_sched_limit_diagnostics(s,NULL,NULL);
+    int general=d2k_diag_enabled(D2K_DIAG_DIR);
+    int telegram=d2k_diag_telegram_enabled(D2K_DIAG_DIR);
+    if(general!=previous_general||telegram!=previous_telegram)written=now-60000;
+    if(previous_telegram==1&&!telegram) {
+        d2k_diag_telegram_free(telegram_diagnostics);telegram_diagnostics=NULL;
+        free(telegram_stats_buffer);telegram_stats_buffer=NULL;
+        telegram_attempted=now-60000;
+    }
+    if(!general&&previous_general==1) {
+        d2k_diag_memory_enable(0);
+        d2k_sched_diagnostics(s,NULL,NULL);d2k_sched_limit_diagnostics(s,NULL,NULL);
         d2k_httpsearch_diagnostics(g_hs,NULL,NULL);
+        d2k_diag_free(diagnostics);diagnostics=NULL;
+    }
+    if(!general&&!telegram) {
+        /* A disable racing with an atomic write must not leave either report behind. */
+        (void)d2k_diag_toggle(D2K_DIAG_DIR,0);
+        d2k_diag_telegram_free(telegram_diagnostics);telegram_diagnostics=NULL;
+        d2k_diag_memory_enable(0);d2k_diag_free(diagnostics);diagnostics=NULL;
+        d2k_sched_diagnostics(s,NULL,NULL);d2k_sched_limit_diagnostics(s,NULL,NULL);
+        d2k_httpsearch_diagnostics(g_hs,NULL,NULL);
+        free(telegram_stats_buffer);telegram_stats_buffer=NULL;
+        previous_general=general;previous_telegram=telegram;
         return;
     }
     if(!diagnostics) {
         diagnostics=d2k_diag_new();if(!diagnostics)return;
-        d2k_sched_diagnostic_madvise_reset(s);
-        d2k_diag_memory_enable(1);
-        d2k_sched_diagnostics(s,diagnostic_event,NULL);
-        d2k_sched_limit_diagnostics(s,diagnostic_limit,NULL);
-        d2k_httpsearch_diagnostics(g_hs,diagnostic_event,NULL);
+        d2k_diag_set_enabled(diagnostics,general);
+        if(general) {
+            d2k_sched_diagnostic_madvise_reset(s);
+            d2k_diag_memory_enable(1);
+            d2k_sched_diagnostics(s,diagnostic_event,NULL);
+            d2k_sched_limit_diagnostics(s,diagnostic_limit,NULL);
+            d2k_httpsearch_diagnostics(g_hs,diagnostic_event,NULL);
+        }
         written=now-60000;
     }
+    if(general&&previous_general==0) {
+        d2k_diag_set_enabled(diagnostics,1);d2k_sched_diagnostic_madvise_reset(s);
+        d2k_diag_memory_enable(1);d2k_sched_diagnostics(s,diagnostic_event,NULL);
+        d2k_sched_limit_diagnostics(s,diagnostic_limit,NULL);
+        d2k_httpsearch_diagnostics(g_hs,diagnostic_event,NULL);
+    } else if(!general) {
+        d2k_diag_set_enabled(diagnostics,0);d2k_diag_memory_enable(0);
+    }
+    if(telegram&&!telegram_diagnostics)telegram_diagnostics=d2k_diag_telegram_new();
+    if(telegram&&!telegram_stats_buffer)telegram_stats_buffer=malloc(D2K_DIAG_TG_JSON_MAX+1u);
+    if(telegram&&telegram_diagnostics&&telegram_stats_buffer&&
+       now>=telegram_attempted&&now-telegram_attempted>=60000) {
+        size_t length=0;int collected=telegram_stats_read(telegram_stats_path,
+            telegram_stats_buffer,D2K_DIAG_TG_JSON_MAX,&length);
+        if(collected==0) {
+            if(d2k_diag_telegram_record(telegram_diagnostics,now,telegram_stats_buffer,length)<0)
+                d2k_diag_telegram_error(telegram_diagnostics,EPROTO);
+        } else d2k_diag_telegram_error(telegram_diagnostics,errno);
+        telegram_attempted=now;
+    } else if(telegram&&!telegram_stats_buffer) {
+        d2k_diag_telegram_error(telegram_diagnostics,ENOMEM);telegram_attempted=now;
+    }
+    previous_general=general;previous_telegram=telegram;
     if(now>=written && now-written<60000)return;
     written=now;
-    d2k_diag_counts counts;d2k_sched_diagnostic_counts(s,&counts);
-    d2k_httpsearch_diagnostic_counts(g_hs,&counts);
-    d2k_diag_memory_counts(&counts);
-    d2k_diag_madvise madvise;d2k_sched_diagnostic_madvise(s,&madvise);d2k_diag_set_madvise(diagnostics,&madvise);
-    d2k_diag_sample(diagnostics,now,&counts,"/proc","/opt/d2k/run");
+    if(general) {
+        d2k_diag_counts counts;d2k_sched_diagnostic_counts(s,&counts);
+        d2k_httpsearch_diagnostic_counts(g_hs,&counts);
+        d2k_diag_memory_counts(&counts);
+        d2k_diag_madvise madvise;d2k_sched_diagnostic_madvise(s,&madvise);d2k_diag_set_madvise(diagnostics,&madvise);
+        d2k_diag_sample(diagnostics,now,&counts,"/proc","/opt/d2k/run");
+    }
     char path[512],tmp[512];
     if(d2k_diag_path(path,sizeof path,D2K_DIAG_DIR,"report.json") ||
        d2k_diag_path(tmp,sizeof tmp,D2K_DIAG_DIR,"report.new")){
@@ -458,12 +558,13 @@ static void diagnostic_tick(d2k_sched *s,int64_t now) {
     if(fd<0){d2k_diag_record_write_error(diagnostics,"open-temp",errno);return;}
     FILE *f=fdopen(fd,"w");if(!f){int error=errno;close(fd);unlink(tmp);d2k_diag_record_write_error(diagnostics,"fdopen",error);return;}
     int bad=0;
-    if(d2k_diag_write(diagnostics,f)){d2k_diag_record_write_error(diagnostics,"serialize",errno);bad=1;}
+    if(d2k_diag_write_combined(diagnostics,telegram_diagnostics,f)){d2k_diag_record_write_error(diagnostics,"serialize",errno);bad=1;}
     long size=ftell(f);
     if(size<0){d2k_diag_record_write_error(diagnostics,"size",errno);bad=1;}
     else if((unsigned long)size>D2K_DIAG_REPORT_MAX){d2k_diag_record_write_error(diagnostics,"size-limit",EFBIG);bad=1;}
     if(fclose(f)){d2k_diag_record_write_error(diagnostics,"flush-close",errno);bad=1;}
-    if(bad||!d2k_diag_enabled(D2K_DIAG_DIR)){unlink(tmp);return;}
+    if(bad||(!d2k_diag_enabled(D2K_DIAG_DIR)&&
+             !d2k_diag_telegram_enabled(D2K_DIAG_DIR))){unlink(tmp);return;}
     if(rename(tmp,path)){d2k_diag_record_write_error(diagnostics,"rename",errno);unlink(tmp);}
 }
 
@@ -491,6 +592,7 @@ int main(int argc, char **argv) {
     const char *livepath = NULL;
     const char *logpath = NULL;
     const char *https_path = NULL;
+    const char *telegram_path = NULL;
     uint32_t mark = 0x2d;
     uint32_t measure_mark = 0;
     int have_measure_mark = 0;
@@ -503,6 +605,7 @@ int main(int argc, char **argv) {
         else if (strcmp(f, "--live") == 0 && i + 1 < argc) { livepath = argv[++i]; }
         else if (strcmp(f, "--log") == 0 && i + 1 < argc) { logpath = argv[++i]; }
         else if (strcmp(f, "--https-cache") == 0 && i + 1 < argc) { https_path = argv[++i]; }
+        else if (strcmp(f, "--telegram-stats") == 0 && i + 1 < argc) { telegram_path = argv[++i]; }
         else if (strcmp(f, "--mark") == 0 && i + 1 < argc) {
             mark = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(f, "--measure-mark") == 0 && i + 1 < argc) {
@@ -514,6 +617,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!sock) { usage(); return 2; }
+    telegram_stats_path=telegram_path;
 
     /* Тот же приём, что в d2kd.c и ctlprobe.c: процесс не имеет права умирать
        оттого, что собеседник отвалился между записями. */

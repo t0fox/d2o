@@ -10,6 +10,9 @@
 #define D2K_DIAG_LIMIT_SLOTS 8u
 #define D2K_DIAG_MEMORY_SITE_COUNT 6u
 #define D2K_DIAG_MADVISE_ERRNO_SLOTS 4u
+#define D2K_DIAG_TG_HISTORY 1440u
+#define D2K_DIAG_TG_JSON_MAX (256u*1024u)
+#define D2K_DIAG_TG_FIELD_COUNT 42u
 enum {
     D2K_DIAG_MEM_SCHED_TCP_WORKER_ARG,
     D2K_DIAG_MEM_TLS12_SESSION,
@@ -63,6 +66,7 @@ typedef struct {
 } d2k_diag_counts;
 typedef void (*d2k_diag_limit_observer)(void *, int64_t, const d2k_diag_counts *);
 typedef struct d2k_diag d2k_diag;
+typedef struct d2k_diag_telegram d2k_diag_telegram;
 d2k_diag *d2k_diag_new(void);
 void d2k_diag_free(d2k_diag *d);
 size_t d2k_diag_bytes(const d2k_diag *d);
@@ -82,4 +86,10 @@ void d2k_diag_memory_counts(d2k_diag_counts *counts);
 void d2k_diag_set_madvise(d2k_diag *d,const d2k_diag_madvise *stats);
 void d2k_diag_record_write_error(d2k_diag *d,const char *stage,int error);
 int d2k_diag_write(const d2k_diag *d,FILE *f);
+void d2k_diag_set_enabled(d2k_diag *d,int enabled);
+d2k_diag_telegram *d2k_diag_telegram_new(void);
+void d2k_diag_telegram_free(d2k_diag_telegram *d);
+int d2k_diag_telegram_record(d2k_diag_telegram *d,int64_t mono_ms,const char *json,size_t len);
+void d2k_diag_telegram_error(d2k_diag_telegram *d,int error);
+int d2k_diag_write_combined(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f);
 #endif

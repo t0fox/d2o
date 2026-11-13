@@ -6,9 +6,12 @@ import subprocess
 import tempfile
 with tempfile.TemporaryDirectory() as directory:
     dest = Path(directory) / 'report.json'
+    telegram_dest = Path(directory) / 'telegram-report.json'
     subprocess.run([str(Path(__file__).resolve().parent / 'test_diagnostics')],
-                   env=dict(os.environ, D2K_TEST_DIAG_JSON=str(dest)), check=True)
+                   env=dict(os.environ, D2K_TEST_DIAG_JSON=str(dest),
+                            D2K_TEST_TG_DIAG_JSON=str(telegram_dest)), check=True)
     report = json.loads(dest.read_text())
+    telegram_report = json.loads(telegram_dest.read_text())
     assert report['schema'] == 1 and report['enabled'] is True
     assert report['ring_bytes'] <= 256 * 1024
     history = report['memory_history']
@@ -18,6 +21,16 @@ with tempfile.TemporaryDirectory() as directory:
     assert report['memory_history_overwritten'] == 1
     assert report['diagnostic_write_failures'] == 1
     assert report['memory_tracking']['enabled'] is True
+    tg = telegram_report['telegram_diagnostics']
+    assert telegram_report['enabled'] is True and telegram_report['general_enabled'] is False
+    assert telegram_report['telegram_enabled'] is True
+    assert tg['enabled'] is True and tg['collection_status'] == 'socket_unavailable'
+    assert tg['collection_failures'] == 1 and tg['last_error'] == 110
+    assert tg['memory_history']['fields'][2] == 'rss_kib'
+    assert len(tg['memory_history']['samples']) == 2
+    assert tg['memory_history']['samples'][0][2] == 1024
+    assert tg['latest']['rss_kib'] == 1024
+    assert tg['latest']['route_health'][0]['rss_kib'] == 999
     tcp_site = next(site for site in report['memory_tracking']['sites'] if site['id'] == 'tcp.worker_arg')
     assert (tcp_site['live_bytes'], tcp_site['live_objects'], tcp_site['created'], tcp_site['destroyed']) == (512, 1, 1, 0)
     assert report['madvise']['successes'] == 4

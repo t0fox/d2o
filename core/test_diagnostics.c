@@ -17,6 +17,11 @@ static char *report(d2k_diag *d) {
     assert(n>0 && (unsigned long)n<D2K_DIAG_REPORT_MAX);rewind(f);char *s=malloc((size_t)n+1);assert(s);
     assert(fread(s,1,(size_t)n,f)==(size_t)n);s[n]=0;fclose(f);return s;
 }
+static char *combined_report(d2k_diag *d,d2k_diag_telegram *tg) {
+    FILE *f=tmpfile();assert(f);assert(!d2k_diag_write_combined(d,tg,f));long n=ftell(f);
+    assert(n>0&&(unsigned long)n<D2K_DIAG_REPORT_MAX);rewind(f);char *s=malloc((size_t)n+1);assert(s);
+    assert(fread(s,1,(size_t)n,f)==(size_t)n);s[n]=0;fclose(f);return s;
+}
 static int history_epoch_present(const char *json,unsigned epoch) {
     char suffix[40];snprintf(suffix,sizeof suffix,",2,3,1,1,%u]",epoch);
     const char *history=strstr(json,"\"memory_history\":");
@@ -89,6 +94,30 @@ int main(void) {
         assert(json_size>0&&(unsigned long)json_size<D2K_DIAG_REPORT_MAX);fclose(f);
         e.target="a\".example";e.reason="local\nerror";
         d2k_diag_free(d);d=NULL;
+    }
+    {
+        const char tg_json[]={"{\"rss_kib\":1024,\"rss_hwm_kib\":2048,\"rss_anon_kib\":512,"
+            "\"vm_data_kib\":1536,\"memory_accounted_allocations_bytes\":262144,"
+            "\"rss_minus_known_allocations_bytes\":786432,\"active_connections\":2,"
+            "\"buffer_bytes_current\":4096,\"bytes_from_clients\":8192,"
+            "\"route_health\":[{\"rss_kib\":999}],\"problem_sessions\":[]}"};
+        d=d2k_diag_new();d2k_diag_telegram *tg=d2k_diag_telegram_new();assert(d&&tg);
+        d2k_diag_set_enabled(d,0);
+        assert(d2k_diag_telegram_record(tg,0,tg_json,sizeof tg_json-1)==1);
+        assert(d2k_diag_telegram_record(tg,30000,tg_json,sizeof tg_json-1)==0);
+        assert(d2k_diag_telegram_record(tg,60000,tg_json,sizeof tg_json-1)==1);
+        assert(d2k_diag_telegram_record(tg,120000,"{bad}",5)<0);
+        d2k_diag_telegram_error(tg,ETIMEDOUT);
+        all=combined_report(d,tg);
+        assert(strstr(all,"\"enabled\":true,\"general_enabled\":false,\"telegram_enabled\":true"));
+        assert(strstr(all,"\"collection_status\":\"socket_unavailable\""));
+        assert(strstr(all,"\"rss_kib\":1024"));assert(strstr(all,"\"active_connections\":2"));
+        assert(strstr(all,"\"samples\":[[0,0,1024"));assert(strstr(all,"[0,60,1024"));
+        assert(strstr(all,"\"latest\":{\"rss_kib\":1024"));
+        const char *tg_export_path=getenv("D2K_TEST_TG_DIAG_JSON");
+        if(tg_export_path){FILE *out=fopen(tg_export_path,"w");assert(out);
+            assert(fwrite(all,1,strlen(all),out)==strlen(all));assert(!fclose(out));}
+        free(all);d2k_diag_telegram_free(tg);d2k_diag_free(d);d=NULL;
     }
     char dir[]="/tmp/d2k-diag-proc-XXXXXX",path[512];assert(mkdtemp(dir));
     snprintf(path,sizeof path,"%s/123",dir);assert(!mkdir(path,0700));

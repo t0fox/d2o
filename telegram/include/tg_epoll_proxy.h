@@ -27,6 +27,9 @@ typedef enum {
 #define TG_EPOLL_MAX_ACTIVE_ROUTE_SESSIONS 64u
 #define TG_EPOLL_MAX_ROUTE_EVENTS 6u
 #define TG_EPOLL_MAX_ROUTE_COOLDOWNS 256u
+#define TG_EPOLL_MAX_ROUTE_STATS 256u
+#define TG_EPOLL_MAX_PROBLEM_SESSIONS 16u
+#define TG_EPOLL_FAILURE_STAGE_COUNT 9u
 
 typedef enum {
     TG_ROUTE_SESSION_STAGE_ACCEPTED = 0,
@@ -79,11 +82,59 @@ typedef struct {
     uint8_t selected_transport;
     uint8_t telegram_response_seen;
     uint8_t event_count;
+    uint16_t client_port;
+    uint16_t upstream_port;
+    uint8_t read_paused;
     uint64_t next_event_sequence;
+    uint64_t started_ms;
+    uint64_t age_ms;
+    uint64_t no_progress_ms;
+    uint64_t first_response_latency_ms;
     uint64_t bytes_from_clients;
     uint64_t bytes_from_upstreams;
+    uint64_t client_queue_bytes;
+    uint64_t upstream_queue_bytes;
+    uint64_t client_queue_capacity_bytes;
+    uint64_t upstream_queue_capacity_bytes;
+    uint64_t ws_rx_capacity_bytes;
+    uint64_t ws_tx_memory_bytes;
+    uint64_t mtproto_packet_capacity_bytes;
     tg_route_session_event events[TG_EPOLL_MAX_ROUTE_EVENTS];
 } tg_active_route_session;
+
+typedef struct {
+    uint32_t dc;
+    uint16_t client_port;
+    uint16_t upstream_port;
+    uint16_t http_status;
+    uint8_t is_media;
+    uint8_t transport;
+    uint8_t failure_stage;
+    uint64_t sequence;
+    uint64_t session_id;
+    uint64_t age_ms;
+    uint64_t bytes_from_clients;
+    uint64_t bytes_from_upstreams;
+} tg_problem_session;
+
+typedef struct {
+    uint32_t dc;
+    uint16_t client_port;
+    uint16_t upstream_port;
+    uint8_t is_media;
+    uint8_t transport;
+    uint8_t has_last_success;
+    uint8_t has_last_failure;
+    uint8_t last_failure_stage;
+    uint64_t attempts;
+    uint64_t failures;
+    uint64_t responses;
+    uint64_t cf_responses;
+    uint64_t latency_ms;
+    uint64_t last_success_age_ms;
+    uint64_t last_failure_age_ms;
+    uint64_t cooldown_remaining_ms;
+} tg_route_health_stat;
 
 typedef struct {
     uint32_t dc;
@@ -106,11 +157,31 @@ typedef struct {
     uint64_t monotonic_time_ms;
     uint32_t route_cooldown_ms;
     size_t max_connections;
+    size_t memory_headroom_bytes;
+    size_t memory_ceiling_bytes;
     size_t active_wss_connections;
     size_t max_wss_connections;
     size_t buffer_bytes_current;
     size_t buffer_bytes_peak;
     size_t buffer_bytes_limit;
+    size_t client_queue_bytes;
+    size_t upstream_queue_bytes;
+    size_t client_queue_capacity_bytes;
+    size_t upstream_queue_capacity_bytes;
+    size_t ws_rx_capacity_bytes;
+    size_t ws_tx_memory_bytes;
+    size_t mtproto_packet_capacity_bytes;
+    size_t proxy_struct_bytes;
+    size_t connection_struct_bytes;
+    size_t retired_connection_struct_bytes;
+    size_t tls_objects;
+    size_t worker_pool_tls_objects;
+    size_t client_socket_fds;
+    size_t upstream_socket_fds;
+    size_t worker_pool_entries;
+    size_t worker_pool_capacity;
+    size_t worker_pool_struct_bytes;
+    int worker_pool_started;
     uint64_t accept_limit_rejections;
     uint64_t accept_fd_exhaustion;
     uint64_t allocation_failures;
@@ -119,6 +190,16 @@ typedef struct {
     uint64_t wss_read_pauses;
     uint64_t wss_read_resumes;
     uint64_t wss_paused_timeouts;
+    uint64_t http_403;
+    uint64_t http_501;
+    uint64_t http_502;
+    uint32_t last_http_status;
+    uint64_t failure_by_stage[TG_EPOLL_FAILURE_STAGE_COUNT];
+    size_t route_health_count;
+    int route_health_truncated;
+    tg_route_health_stat route_health[TG_EPOLL_MAX_ROUTE_STATS];
+    size_t problem_sessions_count;
+    tg_problem_session problem_sessions[TG_EPOLL_MAX_PROBLEM_SESSIONS];
     size_t wss_reads_paused;
     uint64_t wss_oldest_pause_ms;
     uint64_t connections_started;

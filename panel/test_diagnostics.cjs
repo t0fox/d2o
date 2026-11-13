@@ -1,6 +1,6 @@
 'use strict';
 const assert=require('node:assert/strict');
-const {summary,memoryRows,rowsInRange,seriesEndpoints,formatBytes,coverageText}=require('../internal/web/assets/diagnostics.js');
+const {summary,memoryRows,rowsInRange,seriesEndpoints,formatBytes,coverageText,telegramRows}=require('../internal/web/assets/diagnostics.js');
 assert.match(summary({}),/первый снимок/);
 const samples=[{at:1,bindings:2,plans:1,processes:[{name:'d2kc',pid:1,rss_kib:1024}]},
  {at:2,bindings:3,plans:1,processes:[{name:'d2kc',pid:2,rss_kib:512}]}];
@@ -61,4 +61,9 @@ assert.equal(memoryRows(legacyHistory)[0].catalog,10*1024,'old positional KiB fi
 const noTime={memory_history:{fields,time_base:[null,null],samples:[encode({rss_kib:1024,at_delta_s:0,mono_delta_s:0})]}};
 assert.equal(memoryRows(noTime)[0].time,null,'missing time bases do not become zero');
 assert.match(coverageText(rowsInRange(memoryRows(noTime),24,60000),24),/Время снимков отсутствует/);
+const tgRows=telegramRows({memory_history:{fields:['at_delta_s','mono_delta_s','rss_kib','rss_anon_kib','vm_data_kib'],
+ time_base:[1700000000,500],samples:[[0,0,2048,1024,4096],[60,60,3072,1536,6144]]}});
+assert.equal(tgRows[0].rss,2*1024*1024);
+assert.equal(tgRows[1].rss_anon,1536*1024);
+assert.equal(tgRows[1].time,560);
 console.log('сводка диагностики панели прошла');

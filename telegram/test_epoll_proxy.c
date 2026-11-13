@@ -1213,7 +1213,7 @@ static void test_read_only_stats_socket(void) {
     int client = socket(AF_UNIX, SOCK_STREAM, 0);
     assert(client >= 0);
     assert(connect(client, (struct sockaddr *)&address, sizeof(address)) == 0);
-    assert(tg_stats_socket_serve(&stats_socket, proxy) == 0);
+    assert(tg_stats_socket_serve(&stats_socket, proxy, NULL) == 0);
     char response[64u * 1024u];
     ssize_t length = recv(client, response, sizeof(response) - 1, 0);
     assert(length > 0);
@@ -1232,6 +1232,19 @@ static void test_read_only_stats_socket(void) {
     assert(strstr(response, "\"buffer_bytes_current\":0") != NULL);
     assert(strstr(response, "\"buffer_bytes_peak\":0") != NULL);
     assert(strstr(response, "\"buffer_bytes_limit\":") != NULL);
+    assert(strstr(response, "\"process_id\":") != NULL);
+    assert(strstr(response, "\"rss_kib\":") != NULL);
+    assert(strstr(response, "\"rss_hwm_kib\":") != NULL);
+    assert(strstr(response, "\"rss_anon_kib\":") != NULL);
+    assert(strstr(response, "\"vm_data_kib\":") != NULL);
+    assert(strstr(response, "\"vm_swap_kib\":") != NULL);
+    assert(strstr(response, "\"smaps_rollup_status\":") != NULL);
+    assert(strstr(response, "\"rss_minus_known_allocations_bytes\":") != NULL);
+    assert(strstr(response, "\"fd_count\":") != NULL);
+    assert(strstr(response, "\"soft_nofile_limit\":") != NULL);
+    assert(strstr(response, "\"dc_map_status\":\"unavailable\"") != NULL);
+    assert(strstr(response, "\"route_health\":[]") != NULL);
+    assert(strstr(response, "\"problem_sessions\":[]") != NULL);
     assert(strstr(response, "\"last_success_dc\":0") != NULL);
     assert(strstr(response, "\"last_failure_stage\":0") != NULL);
     assert(strstr(response, "\"client_response_latency_total\":0") != NULL);
@@ -1872,6 +1885,8 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
         assert(session->selected_transport == TG_ROUTE_SESSION_TRANSPORT_DIRECT_WSS);
     }
     assert(session->telegram_response_seen);
+    assert(session->client_port == 443 && session->upstream_port == 443);
+    assert(session->age_ms > 0 && session->first_response_latency_ms > 0);
     assert(session->bytes_from_clients >= wss.expected_packet_len);
     assert(session->bytes_from_upstreams >= wss.response_packet_len);
     assert(session->event_count >= 4);
@@ -1895,7 +1910,7 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     memcpy(stats_address.sun_path, stats_path, strlen(stats_path) + 1u);
     assert(connect(stats_client, (struct sockaddr *)&stats_address,
                    sizeof(stats_address)) == 0);
-    assert(tg_stats_socket_serve(&stats_socket, proxy) == 0);
+    assert(tg_stats_socket_serve(&stats_socket, proxy, NULL) == 0);
     char stats_json[64u * 1024u];
     size_t stats_json_len = 0;
     for (;;) {
@@ -1910,9 +1925,12 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
     char expected_session_bytes[128];
     assert(snprintf(expected_session_bytes, sizeof(expected_session_bytes),
         "\"telegram_response_seen\":true,\"bytes_from_clients\":%" PRIu64
-        ",\"bytes_from_upstreams\":%" PRIu64 ",\"events\":[",
+        ",\"bytes_from_upstreams\":%" PRIu64,
         session->bytes_from_clients, session->bytes_from_upstreams) > 0);
     assert(strstr(stats_json, expected_session_bytes) != NULL);
+    assert(strstr(stats_json, "\"client_queue_capacity_bytes\":") != NULL);
+    assert(strstr(stats_json, "\"route_health\":[") != NULL);
+    assert(strstr(stats_json, "\"failure_by_stage\":{") != NULL);
     close(stats_client);
     tg_stats_socket_close(&stats_socket);
 

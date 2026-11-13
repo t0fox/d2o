@@ -10,9 +10,16 @@ int main(void) {
  const char *good="POST / HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\n\r\n";
  assert(api_diagnostics(sv[0],&c,good,"POST","enable")==0);
  char buf[2048];ssize_t n=read(sv[1],buf,sizeof buf-1);assert(n>0);buf[n]=0;assert(strstr(buf,"200 OK"));assert(d2k_diag_enabled(dir));
+ assert(api_diagnostics(sv[0],&c,good,"POST","telegram-enable")==0);
+ n=read(sv[1],buf,sizeof buf-1);assert(n>0);buf[n]=0;assert(strstr(buf,"\"telegram_enabled\":true"));assert(d2k_diag_telegram_enabled(dir));
+ char report[512];assert(!d2k_diag_path(report,sizeof report,dir,"report.json"));FILE *saved=fopen(report,"w");assert(saved);fputs("{}",saved);assert(!fclose(saved));
  assert(api_diagnostics(sv[0],&c,"POST / HTTP/1.1\r\nHost: localhost\r\n\r\n","POST","disable")==0);
  n=read(sv[1],buf,sizeof buf-1);assert(n>0);buf[n]=0;assert(strstr(buf,"403"));assert(d2k_diag_enabled(dir));
  assert(api_diagnostics(sv[0],&c,good,"POST","disable")==0);
- n=read(sv[1],buf,sizeof buf-1);assert(n>0);assert(!d2k_diag_enabled(dir));
+ n=read(sv[1],buf,sizeof buf-1);assert(n>0);buf[n]=0;assert(strstr(buf,"\"enabled\":false,\"telegram_enabled\":true"));
+ struct stat st;assert(!stat(report,&st));
+ assert(api_diagnostics(sv[0],&c,good,"POST","telegram-disable")==0);
+ n=read(sv[1],buf,sizeof buf-1);assert(n>0);buf[n]=0;assert(strstr(buf,"\"enabled\":false,\"telegram_enabled\":false"));
+ assert(!d2k_diag_telegram_enabled(dir));assert(stat(report,&st)<0);
  close(sv[0]);close(sv[1]);rmdir(dir);puts("управление диагностикой панели прошло");
 }

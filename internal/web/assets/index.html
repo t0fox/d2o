@@ -143,6 +143,11 @@
           <h2 id="diagnostics-title">Диагностика</h2>
           <p>Что движок может подтвердить сам, чего не измеряет, и с какими настройками запущен.</p>
         </header>
+        <nav class="diag-tabs" role="tablist" aria-label="Раздел диагностики">
+          <button type="button" role="tab" id="diagnostic-general-tab" aria-selected="true" aria-controls="diagnostic-general-panel" data-diagnostic-tab="general">Общая</button>
+          <button type="button" role="tab" id="diagnostic-telegram-tab" aria-selected="false" aria-controls="diagnostic-telegram-panel" data-diagnostic-tab="telegram">Telegram</button>
+        </nav>
+        <div id="diagnostic-general-panel" class="diag-tab-panel" role="tabpanel" aria-labelledby="diagnostic-general-tab" data-diagnostic-panel="general">
         <section class="diag-history" aria-labelledby="diagnostic-history-title">
           <div class="diag-history-head">
             <div><h3 id="diagnostic-history-title">Память и подборы</h3><p>Локальная история работы движка</p></div>
@@ -243,12 +248,89 @@
           </div>
           <div class="diag-history-footer">
             <div class="diag-history-actions">
-              <a class="btn" data-variant="primary" id="diagnostic-download" href="/api/diagnostics?download" download="d2k-diagnostics.json" hidden>Скачать отчёт</a>
               <button type="button" class="btn" id="diagnostic-toggle">Включить сбор</button>
             </div>
             <details class="diag-history-help"><summary>Что сохраняется</summary><p>Пока сбор включён, d2kc раз в указанный в отчёте интервал сохраняет ограниченную историю до указанной ёмкости: RSS, RssAnon, VmData, доступные показатели smaps_rollup, память каталога и HTTP-хранилища, задачи, workers и учтённые объекты TCP/QUIC/TLS. Отдельно сохраняются текущие счётчики madvise, аномалии, ошибки записи отчёта, переходы AIMD, исходы поиска и подробные снимки процессов. smaps_rollup необязателен и в OpenWrt может отсутствовать из-за конфигурации ядра; полный smaps не обходится. RssAnon читается из /proc/PID/status, дополнительных пакетов не требуется. Отсутствующий необязательный интерфейс отмечается как unsupported, а реальные ошибки чтения сохраняются в полном JSON. В отчёте видны вытесненные записи и доступность источников. Учёт объектов покрывает только перечисленные места выделения и не пересчитывает уже существующие объекты. Данные не отправляются автоматически. Полный отчёт содержит домены и IP-адреса: проверьте его перед отправкой в issue. Сбор по умолчанию выключен и отключается после перезагрузки; выключение удаляет историю.</p></details>
           </div>
         </section>
+        </div>
+        <div id="diagnostic-telegram-panel" class="diag-tab-panel" role="tabpanel" aria-labelledby="diagnostic-telegram-tab" data-diagnostic-panel="telegram" hidden>
+          <section class="diag-history" aria-labelledby="telegram-diagnostic-title">
+            <div class="diag-history-head">
+              <div><h3 id="telegram-diagnostic-title">Telegram прокси</h3><p>Память процесса, буферы, маршруты, сессии и карта DC</p></div>
+              <span class="diag-collection-state" id="telegram-diagnostic-state">Проверяем…</span>
+            </div>
+            <p id="telegram-diagnostic-status" class="diag-history-note" role="status">Проверяем состояние сбора…</p>
+            <div id="telegram-diagnostic-data" class="diag-history-data" hidden>
+              <section class="diag-card diag-memory-panel" aria-labelledby="telegram-diagnostic-memory-title">
+                <div class="diag-card-head"><div><h4 id="telegram-diagnostic-memory-title">Память Telegram прокси</h4><p id="telegram-diagnostic-memory-interval">Снимок раз в минуту · значения в МиБ</p></div>
+                  <div class="diag-range" role="group" aria-label="Период графика Telegram">
+                    <button type="button" data-tg-memory-range="2" aria-pressed="true">2 часа</button>
+                    <button type="button" data-tg-memory-range="24" aria-pressed="false">24 часа</button>
+                  </div>
+                </div>
+                <div class="diag-series" aria-label="Показатели памяти Telegram">
+                  <label><input type="checkbox" data-tg-memory-series="rss" checked><span>RSS</span></label>
+                  <label><input type="checkbox" data-tg-memory-series="rss_anon" checked><span>RssAnon</span></label>
+                  <label><input type="checkbox" data-tg-memory-series="vm_data"><span>VmData</span></label>
+                </div>
+                <p id="telegram-diagnostic-history-coverage" class="diag-history-note" role="status">Длительность истории определяется по снимкам.</p>
+                <svg id="telegram-diagnostic-memory-chart" class="diag-memory-chart" viewBox="0 0 960 260" role="img" aria-label="Память Telegram прокси"></svg>
+                <p id="telegram-diagnostic-memory-empty" class="diag-empty" hidden>Для выбранного периода нет доступных снимков памяти.</p>
+                <p class="diag-history-note">RSS процесса — используемая резидентная память. «RSS минус учтённые выделения» — остаток неинструментированных областей, это не диагноз утечки.</p>
+              </section>
+              <section class="diag-card diag-process-panel"><h4>Сводка памяти</h4>
+                <dl class="diag-history-counts">
+                  <div><dt>RSS / пик RSS</dt><dd id="tg-diag-rss">—</dd></div>
+                  <div><dt>RssAnon / VmData / swap</dt><dd id="tg-diag-anon-data">—</dd></div>
+                  <div><dt>PSS / доступно в системе</dt><dd id="tg-diag-pss-available">—</dd></div>
+                  <div><dt>Учтённые выделения</dt><dd id="tg-diag-accounted">—</dd></div>
+                  <div><dt>RSS минус известные выделения</dt><dd id="tg-diag-residual">—</dd></div>
+                </dl>
+              </section>
+              <section class="diag-card diag-workers-panel"><h4>Буферы и лимиты</h4>
+                <dl class="diag-history-counts">
+                  <div><dt>Буферы: сейчас / пик / предел</dt><dd id="tg-diag-buffers">—</dd></div>
+                  <div><dt>Очереди / WebSocket / MTProto</dt><dd id="tg-diag-queues">—</dd></div>
+                  <div><dt>Соединения / максимум</dt><dd id="tg-diag-connections">—</dd></div>
+                  <div><dt>Свободная память / резерв</dt><dd id="tg-diag-headroom">—</dd></div>
+                  <div><dt>FD / предел</dt><dd id="tg-diag-fds">—</dd></div>
+                </dl>
+              </section>
+              <section class="diag-card diag-catalog-panel"><h4>Процессы и ошибки</h4>
+                <dl class="diag-history-counts">
+                  <div><dt>TLS-объекты / worker pool</dt><dd id="tg-diag-workers">—</dd></div>
+                  <div><dt>Отказы выделения памяти</dt><dd id="tg-diag-alloc-failures">—</dd></div>
+                  <div><dt>HTTP 403 / 501 / 502</dt><dd id="tg-diag-http-errors">—</dd></div>
+                  <div><dt>Клиент → прокси / прокси → клиент</dt><dd id="tg-diag-traffic">—</dd></div>
+                </dl>
+              </section>
+              <section class="diag-card diag-http-panel"><h4>Карта Telegram DC</h4>
+                <dl class="diag-history-counts">
+                  <div><dt>Состояние / адресов</dt><dd id="tg-diag-map-status">—</dd></div>
+                  <div><dt>Последнее обновление</dt><dd id="tg-diag-map-refresh">—</dd></div>
+                  <div><dt>Попытки / успехи / ошибки</dt><dd id="tg-diag-map-counts">—</dd></div>
+                </dl>
+              </section>
+              <section class="diag-card diag-limiter-panel"><h4>Состояние маршрутов</h4>
+                <div class="diag-table-scroll"><table class="diag-memory"><thead><tr><th>DC / тип</th><th>Транспорт / порт</th><th>Попытки / ответы</th><th>Ошибки / пауза</th></tr></thead><tbody id="tg-diag-routes"></tbody></table></div>
+                <p id="tg-diag-routes-empty" class="diag-history-note">Пока нет данных маршрута.</p>
+              </section>
+              <section class="diag-card diag-search-panel"><h4>Активные сессии и последние ошибки</h4>
+                <div class="diag-table-scroll"><table class="diag-memory"><thead><tr><th>Сессия / DC</th><th>Транспорт / возраст</th><th>Байты клиент / сервер</th><th>Состояние</th></tr></thead><tbody id="tg-diag-sessions"></tbody></table></div>
+                <p id="tg-diag-sessions-empty" class="diag-history-note">Активных сессий нет.</p>
+                <ul id="tg-diag-problems" class="diag-transition-list"></ul>
+              </section>
+            </div>
+            <div class="diag-history-footer">
+              <div class="diag-history-actions"><button type="button" class="btn" id="telegram-diagnostic-toggle">Включить сбор</button></div>
+              <details class="diag-history-help"><summary>Что сохраняется</summary><p>Прокси-срез читается через его локальный stats socket раз в минуту. В течение суток сохраняются память процесса, известные выделения, буферные лимиты, соединения и ошибки; в отчёт также попадает последний полный срез с маршрутами и активными сессиями. Сбор выключен по умолчанию и не меняет настройки прокси. Данные остаются локально. Перед отправкой отчёта проверьте его содержимое.</p></details>
+            </div>
+          </section>
+        </div>
+        <div class="diag-history-footer diag-shared-footer">
+          <a class="btn" data-variant="primary" id="diagnostic-download" href="/api/diagnostics?download" download="d2k-diagnostics.json" hidden>Скачать общий отчёт</a>
+        </div>
         <div id="diagnostics-body"></div>
       </section>
 
