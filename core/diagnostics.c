@@ -119,17 +119,17 @@ static const char *const telegram_fields[D2K_DIAG_TG_FIELD_COUNT]={
     "connection_struct_bytes","retired_connection_struct_bytes","tls_objects",
     "worker_pool_tls_objects","worker_pool_entries","worker_pool_capacity","fd_count",
     "soft_nofile_limit","allocation_failures","http_403","http_501","http_502",
-    "last_http_status","wss_read_pauses","wss_read_resumes","wss_paused_timeouts",
+    "wss_read_pauses","wss_read_resumes","wss_paused_timeouts",
     "connections_started","bytes_from_clients","bytes_from_upstreams",
     "process_id","active_wss_connections","buffer_budget_rejections",
     "buffer_size_rejections","client_queue_bytes","upstream_queue_bytes",
     "wss_reads_paused","wss_oldest_pause_ms","accept_limit_rejections",
     "accept_fd_exhaustion","wss_attempts","wss_failures","wss_responses",
     "cf_wss_responses","client_response_latency_samples",
-    "client_response_latency_last_us","client_response_latency_p50_us",
+    "client_response_latency_p50_us",
     "client_response_latency_p95_us","worker_pool_hits","worker_pool_misses",
     "worker_pool_responses","last_success_latency_ms","last_success_age_ms",
-    "process_started_at"
+    "process_started_at","process_generation","worker_pool_struct_bytes"
 };
 typedef char telegram_history_is_bounded[
     (sizeof(struct d2k_diag_telegram)<=1024u*1024u)?1:-1];
@@ -660,12 +660,21 @@ static void write_telegram(FILE *f,const d2k_diag_telegram *tg) {
             (unsigned)(sample->mono_s-(base?base->mono_s:0)));
         for(size_t k=0;k<D2K_DIAG_TG_FIELD_COUNT;k++) {
             fputc(',',f);
-            if(sample->values[k]==INT64_MIN)fputs("null",f);
+            if(sample->values[k]==INT64_MIN)js(f,"unavailable");
             else fprintf(f,"%lld",(long long)sample->values[k]);
         }
         fputc(']',f);
     }
-    fputs("]},\"latest\":",f);
+    fputs("]},\"unavailable_fields\":[",f);
+    if(tg&&tg->nh) {
+        const telegram_sample *latest=&tg->history[(tg->total-1)%D2K_DIAG_TG_HISTORY];
+        int first=1;
+        for(size_t k=0;k<D2K_DIAG_TG_FIELD_COUNT;k++)if(latest->values[k]==INT64_MIN) {
+            if(!first)fputc(',',f);
+            js(f,telegram_fields[k]);first=0;
+        }
+    }
+    fputs("],\"latest\":",f);
     if(tg&&tg->latest_len)fwrite(tg->latest_json,1,tg->latest_len,f);else fputs("null",f);
     fputc('}',f);
 }

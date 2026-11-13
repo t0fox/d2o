@@ -68,7 +68,9 @@ function diagnosticFixture(kind='full'){
  const now=Math.floor(Date.now()/1000);
  const tgFields=['at_delta_s','mono_delta_s','rss_kib','rss_anon_kib','vm_data_kib','buffer_bytes_limit',
   'memory_ceiling_bytes','max_connections','soft_nofile_limit','bytes_from_clients','bytes_from_upstreams',
-  'process_id','process_started_at','memory_accounted_allocations_bytes','buffer_bytes_current',
+  'process_id','process_started_at','process_generation','memory_accounted_allocations_bytes','buffer_bytes_current',
+  'proxy_struct_bytes','connection_struct_bytes','retired_connection_struct_bytes','worker_pool_struct_bytes',
+  'active_connections','fd_count','tls_objects','worker_pool_tls_objects','worker_pool_entries',
   'http_403','http_501','http_502','wss_failures'];
  const tgSample=row=>tgFields.map(name=>Object.prototype.hasOwnProperty.call(row,name)?row[name]:null);
  const fields=['mono_delta_s','catalog_bytes','at_delta_s','rss_kib','vm_data_kib','vm_swap_kib','smaps_rollup_status_code',
@@ -143,6 +145,15 @@ function diagnosticFixture(kind='full'){
  const start=now-1439*60,history=[];
  for(let i=0;i<1440;i++)history.push(encode(record(i)));
  const current=record(1439);
+ if(kind==='telegram_generation_change'||kind==='telegram_unavailable'||kind==='telegram_socket_unavailable'){
+  const report=diagnosticFixture('full');
+  if(kind==='telegram_generation_change'){
+   const generation=report.telegram_diagnostics.memory_history.fields.indexOf('process_generation');
+   report.telegram_diagnostics.memory_history.samples[2][generation]=9002;
+  }else if(kind==='telegram_unavailable')report.telegram_diagnostics.latest.rss_kib=null;
+  else {report.telegram_diagnostics.collection_status='socket_unavailable';report.telegram_diagnostics.collection_failures=1;}
+  return report;
+ }
  return {schema:1,enabled:true,telegram_enabled:true,event_capacity:64,limit_transition_capacity:32,sample_capacity:120,
   events:[{id:1,at:now,outcome:'failed'}],events_overwritten:6,samples_overwritten:2,
   limit_transitions_overwritten:1,memory_history_overwritten:20,
@@ -171,23 +182,32 @@ function diagnosticFixture(kind='full'){
     time_base:[now-120,1000],samples:[
      tgSample({at_delta_s:0,mono_delta_s:0,rss_kib:1024,rss_anon_kib:768,vm_data_kib:2048,buffer_bytes_limit:65536,
       memory_ceiling_bytes:16777216,max_connections:128,soft_nofile_limit:1024,bytes_from_clients:1000,bytes_from_upstreams:500,
-      process_id:77,process_started_at:now-3600,memory_accounted_allocations_bytes:2048,buffer_bytes_current:1024,
+      process_id:77,process_started_at:now-3600,process_generation:9001,memory_accounted_allocations_bytes:4608,buffer_bytes_current:1024,
+      proxy_struct_bytes:2048,connection_struct_bytes:1024,retired_connection_struct_bytes:0,worker_pool_struct_bytes:512,
+      active_connections:1,fd_count:8,tls_objects:1,worker_pool_tls_objects:1,worker_pool_entries:1,
       http_403:1,http_501:1,http_502:0,wss_failures:1}),
      tgSample({at_delta_s:60,mono_delta_s:60,rss_kib:1280,rss_anon_kib:896,vm_data_kib:2560,buffer_bytes_limit:131072,
       memory_ceiling_bytes:33554432,max_connections:256,soft_nofile_limit:4096,bytes_from_clients:3000,bytes_from_upstreams:1500,
-      process_id:77,process_started_at:now-3600,memory_accounted_allocations_bytes:3072,buffer_bytes_current:2048,
+      process_id:77,process_started_at:now-3600,process_generation:9001,memory_accounted_allocations_bytes:6656,buffer_bytes_current:2048,
+      proxy_struct_bytes:2048,connection_struct_bytes:2048,retired_connection_struct_bytes:0,worker_pool_struct_bytes:512,
+      active_connections:2,fd_count:10,tls_objects:2,worker_pool_tls_objects:1,worker_pool_entries:1,
       http_403:2,http_501:1,http_502:0,wss_failures:2}),
      tgSample({at_delta_s:120,mono_delta_s:120,rss_kib:1536,rss_anon_kib:1024,vm_data_kib:3072,buffer_bytes_limit:131072,
       memory_ceiling_bytes:33554432,max_connections:256,soft_nofile_limit:4096,bytes_from_clients:6000,bytes_from_upstreams:3000,
-      process_id:77,process_started_at:now-3600,memory_accounted_allocations_bytes:4096,buffer_bytes_current:3072,
+      process_id:77,process_started_at:now-3600,process_generation:9001,memory_accounted_allocations_bytes:8704,buffer_bytes_current:3072,
+      proxy_struct_bytes:2048,connection_struct_bytes:2048,retired_connection_struct_bytes:1024,worker_pool_struct_bytes:512,
+      active_connections:2,fd_count:10,tls_objects:2,worker_pool_tls_objects:1,worker_pool_entries:2,
       http_403:2,http_501:2,http_502:1,wss_failures:3})]},
    latest:{rss_kib:1536,rss_hwm_kib:2048,rss_anon_kib:1024,vm_data_kib:3072,vm_swap_kib:0,
-    smaps_pss_kib:1200,mem_available_kib:8192,memory_accounted_allocations_bytes:4096,
-    process_id:77,process_started_at:now-3600,smaps_rollup_status:'unsupported',smaps_rollup_errno:null,
-    rss_minus_known_allocations_bytes:1572864,buffer_bytes_current:2048,buffer_bytes_peak:4096,
+    smaps_pss_kib:1200,mem_available_kib:8192,memory_accounted_allocations_bytes:8704,
+    process_id:77,process_started_at:now-3600,process_generation:9001,smaps_rollup_status:'unsupported',smaps_rollup_errno:null,
+    rss_minus_known_allocations_bytes:1564160,buffer_bytes_current:3072,buffer_bytes_peak:4096,
     buffer_bytes_limit:131072,memory_ceiling_bytes:33554432,active_connections:2,max_connections:256,
     active_wss_connections:1,max_wss_connections:16,client_queue_bytes:512,upstream_queue_bytes:256,
     client_queue_capacity_bytes:4096,upstream_queue_capacity_bytes:2048,ws_rx_capacity_bytes:8192,
+    fd_count:10,soft_nofile_limit:4096,tls_objects:2,worker_pool_tls_objects:1,worker_pool_entries:2,
+    worker_pool_capacity:4,proxy_struct_bytes:2048,connection_struct_bytes:2048,
+    retired_connection_struct_bytes:1024,worker_pool_struct_bytes:512,
     ws_tx_memory_bytes:1024,mtproto_packet_capacity_bytes:16384,route_health:[],
     allocation_failures:0,buffer_budget_rejections:1,buffer_size_rejections:2,accept_limit_rejections:3,accept_fd_exhaustion:4,
     wss_read_pauses:5,wss_read_resumes:4,wss_paused_timeouts:1,wss_reads_paused:1,wss_oldest_pause_ms:1200,
@@ -195,6 +215,9 @@ function diagnosticFixture(kind='full'){
     worker_pool_responses:3,client_response_latency_samples:5,client_response_latency_p50_us:42700,
     client_response_latency_p95_us:187000,failure_by_stage:{connect:2,handshake:1},
     dc_map_status:'fresh',dc_map_endpoint_count:4,dc_map_last_known_good:true,
+    dc_map_refresh_attempts:3,dc_map_refresh_successes:2,dc_map_refresh_failures:1,
+    dc_map_last_refresh_result:'http_error',dc_map_last_refresh_errno:104,dc_map_last_manifest_errno:null,
+    dc_map_last_success_at:now-100,dc_map_last_failure_at:now-50,
     active_sessions:[{id:71,dc:2,is_media:true,direct_state:'selected',direct_transport:'cloudflare_proxy',
      fallback_state:'idle',fallback_transport:null,selected_transport:'cloudflare_proxy',first_response_latency_ms:420,
      client_queue_bytes:512,upstream_queue_bytes:256,client_queue_capacity_bytes:4096,upstream_queue_capacity_bytes:2048,
@@ -893,21 +916,33 @@ async function main(){
   await evaluate('document.querySelector("#diagnostic-telegram-tab").click()');
   await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','Telegram memory history renders in its tab');
   assert.equal(await evaluate('document.querySelector("#telegram-diagnostic-traffic-chart").dataset.points'),'3','Telegram throughput history uses the same time range');
+  assert.equal(await evaluate('document.querySelector("#telegram-diagnostic-resource-chart").dataset.points'),'3','Telegram connection and resource history uses the same time range');
   assert.equal(await evaluate('document.querySelector("#telegram-diagnostic-data").hidden'),false,'Telegram diagnostics are independently visible');
   assert.equal(await evaluate('document.querySelector("#tg-diag-rss").textContent'),'1.5 МиБ / 2.0 МиБ','Telegram RSS and high-water mark are shown');
   assert.equal(await evaluate('document.querySelector("#tg-diag-smaps-status").textContent'),'нет в procfs','missing optional smaps data is shown as unavailable');
   assert.equal(await evaluate('document.querySelector("#tg-diag-wss").textContent'),'12 / 3 / 8','WSS totals are visible');
-  assert.equal(await evaluate('document.querySelector("#tg-diag-error-delta").textContent'),'3 / 2','period error deltas stay within one process generation');
+  assert.equal(await evaluate('document.querySelector("#tg-diag-error-delta").textContent'),'1 / 1 / 1 / 2','HTTP status and WSS error deltas remain distinguishable');
   assert.equal(await evaluate('document.querySelector("#tg-diag-latency").textContent'),'42.7 мс / 187.0 мс','application response latency percentiles are shown');
   assert.match(await evaluate('document.querySelector("#tg-diag-queues").textContent'),/клиент 512 Б \/ 4\.0 КиБ.*upstream 256 Б \/ 2\.0 КиБ/,'current queue fill is shown next to capacity');
   assert.match(await evaluate('document.querySelector("#tg-diag-stage-failures").textContent'),/connect 2.*handshake 1/,'failure counts are grouped by stage');
   assert.match(await evaluate('document.querySelector("#tg-diag-throughput").textContent'),/50 Б\/с \/ 25 Б\/с/,'last-interval throughput is shown');
   assert.match(await evaluate('document.querySelector("#tg-diag-map-status").textContent'),/last-known-good да/,'last-known-good DC map state is visible');
+  assert.match(await evaluate('document.querySelector("#tg-diag-map-refresh").textContent'),/http_error.*errno 104/,'failed DC map refresh reason and errno are visible');
+  assert.match(await evaluate('document.querySelector("#tg-diag-allocation-breakdown").textContent'),/прокси 2\.0 КиБ.*соединения 2\.0 КиБ.*worker pool 512 Б/,'accounted proxy and connection memory is broken down');
   assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/media.*420 мс \/ 3 с/,'media sessions show activity, first response and time since progress');
   assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/5\.0 КиБ\/с \/ 2\.5 КиБ\/с/,'per-session lifetime throughput is displayed');
   assert.equal(await evaluate('document.querySelector("#tg-diag-sessions tr").children.length'),6,'session details match all six diagnostic columns');
   assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/420 мс \/ 3 с.*direct selected.*fallback idle/,'first response, no-progress age, and both route states are shown');
   assert.match(await evaluate('document.querySelector("#tg-diag-limit-history").textContent'),/Буферы: 64\.0 КиБ → 128\.0 КиБ/,'Telegram limit changes are shown from minute samples');
+  diagnosticsReply=diagnosticFixture('telegram_generation_change');await call('Page.reload');
+  await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','Telegram process generation fixture renders');
+  assert.equal(await evaluate('document.querySelectorAll("#telegram-diagnostic-memory-chart path.diag-line-rss").length'),2,'memory lines break when a PID is reused by a new process generation');
+  diagnosticsReply=diagnosticFixture('telegram_unavailable');await call('Page.reload');
+  await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','Telegram unavailable metric fixture renders');
+  assert.match(await evaluate('document.querySelector("#tg-diag-rss").textContent'),/^unavailable \/ 2\.0 МиБ$/,'unknown memory values are labelled unavailable');
+  diagnosticsReply=diagnosticFixture('telegram_socket_unavailable');await call('Page.reload');
+  await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','stale Telegram snapshot renders');
+  assert.match(await evaluate('document.querySelector("#telegram-diagnostic-status").textContent'),/Текущий срез unavailable; ниже последний успешный/,'failed socket reads do not present the previous sample as current');
   diagnosticsReply=diagnosticFixture('units');await call('Page.reload');
   await until('document.querySelector("#diagnostic-memory-chart").dataset.points==="2"','controlled metric fixture renders');
   await evaluate('document.querySelectorAll("[data-memory-series]").forEach(input=>{input.checked=true;input.dispatchEvent(new Event("change",{bubbles:true}))})');

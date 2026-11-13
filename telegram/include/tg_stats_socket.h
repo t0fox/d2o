@@ -11,6 +11,7 @@ typedef struct {
     char path[108];
     dev_t device;
     ino_t inode;
+    uint64_t process_generation;
 } tg_stats_socket;
 
 typedef struct {

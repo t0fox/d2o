@@ -54,6 +54,16 @@ static const char *failure_stage_name(uint8_t stage) {
     return stage < TG_EPOLL_FAILURE_STAGE_COUNT ? names[stage] : "unknown";
 }
 
+static uint64_t monotonic_generation(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0)
+        return (uint64_t)now.tv_sec * UINT64_C(1000000) +
+            (uint64_t)now.tv_nsec / 1000u;
+    uint64_t fallback = (uint64_t)time(NULL) * UINT64_C(1000000) +
+        (uint64_t)(unsigned)getpid();
+    return fallback ? fallback : 1;
+}
+
 static int stats_append(char *buffer, size_t capacity, size_t *used,
                         const char *format, ...) {
     if (*used >= capacity) return -1;
@@ -67,11 +77,13 @@ static int stats_append(char *buffer, size_t capacity, size_t *used,
 }
 
 static int append_active_sessions(char *buffer, size_t capacity, size_t *used,
-                                  const tg_epoll_proxy_stats *stats) {
+                                  const tg_epoll_proxy_stats *stats,
+                                  uint64_t process_generation) {
     if (stats_append(buffer, capacity, used,
-        "\"process_started_at\":%" PRIu64 ",\"accepted_connections\":%" PRIu64
+        "\"process_started_at\":%" PRIu64 ",\"process_generation\":%" PRIu64
+        ",\"accepted_connections\":%" PRIu64
         ",\"active_sessions\":[", stats->process_started_at,
-        stats->accepted_connections) != 0)
+        process_generation, stats->accepted_connections) != 0)
         return -1;
     for (size_t i = 0; i < stats->active_sessions_count; ++i) {
         const tg_active_route_session *session = &stats->active_sessions[i];
@@ -596,6 +608,7 @@ int tg_stats_socket_open(tg_stats_socket *server, const char *path) {
         return -1;
     }
     server->fd = fd;
+    server->process_generation = monotonic_generation();
     memcpy(server->path, path, path_len + 1);
     server->device = secured.st_dev;
     server->inode = secured.st_ino;
@@ -631,7 +644,7 @@ int tg_stats_socket_serve(tg_stats_socket *server,
         if (length > 0 && (size_t)length < sizeof(response)) {
             used = (size_t)length;
             if (append_active_sessions(response, sizeof(response), &used,
-                                       &stats) == 0 &&
+                                       &stats, server->process_generation) == 0 &&
                 stats_append(response, sizeof(response), &used,
                     "\"max_connections\":%zu,\"active_wss_connections\":%zu"
                     ",\"max_wss_connections\":%zu"

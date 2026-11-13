@@ -101,6 +101,7 @@ int main(void) {
             "\"rss_minus_known_allocations_bytes\":786432,\"active_connections\":2,"
             "\"buffer_bytes_current\":4096,\"bytes_from_clients\":8192,"
             "\"process_id\":1234,\"process_started_at\":1700000000,"
+            "\"process_generation\":987654321,\"worker_pool_struct_bytes\":1024,\"smaps_pss_kib\":null,"
             "\"wss_attempts\":7,\"wss_failures\":2,\"client_response_latency_p95_us\":90000,"
             "\"route_health\":[{\"rss_kib\":999}],\"problem_sessions\":[]}"};
         d=d2k_diag_new();d2k_diag_telegram *tg=d2k_diag_telegram_new();assert(d&&tg);
@@ -117,6 +118,9 @@ int main(void) {
         assert(strstr(all,"\"samples\":[[0,0,1024"));assert(strstr(all,"[0,60,1024"));
         assert(strstr(all,"\"process_id\":1234"));
         assert(strstr(all,"\"process_started_at\":1700000000"));
+        assert(strstr(all,"\"process_generation\":987654321"));
+        assert(strstr(all,"\"unavailable_fields\":["));
+        assert(strstr(all,"\"worker_pool_struct_bytes\":1024"));
         assert(strstr(all,"\"wss_attempts\":7"));
         assert(strstr(all,"\"latest\":{\"rss_kib\":1024"));
         const char *tg_export_path=getenv("D2K_TEST_TG_DIAG_JSON");

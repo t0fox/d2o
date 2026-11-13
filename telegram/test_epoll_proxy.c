@@ -1205,6 +1205,7 @@ static void test_read_only_stats_socket(void) {
 
     tg_stats_socket stats_socket = {.fd = -1};
     assert(tg_stats_socket_open(&stats_socket, path) == 0);
+    assert(stats_socket.process_generation != 0);
     tg_stats_socket duplicate = {.fd = -1};
     assert(tg_stats_socket_open(&duplicate, path) != 0);
     assert(stat(path, &socket_stat) == 0 && S_ISSOCK(socket_stat.st_mode));
@@ -1221,6 +1222,10 @@ static void test_read_only_stats_socket(void) {
     assert(strstr(response, "\"active_connections\":0") != NULL);
     assert(strstr(response, "\"connections_started\":0") != NULL);
     assert(strstr(response, "\"process_started_at\":") != NULL);
+    char expected_generation[64];
+    assert(snprintf(expected_generation, sizeof(expected_generation),
+        "\"process_generation\":%" PRIu64, stats_socket.process_generation) > 0);
+    assert(strstr(response, expected_generation) != NULL);
     assert(strstr(response, "\"accepted_connections\":0") != NULL);
     assert(strstr(response, "\"active_sessions\":[]") != NULL);
     assert(strstr(response, "\"route_sessions_truncated\":false") != NULL);

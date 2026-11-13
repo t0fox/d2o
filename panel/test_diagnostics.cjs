@@ -74,4 +74,14 @@ assert.equal(trafficRows[1].client_rate,50,'rates use the same process generatio
 assert.equal(trafficRows[1].upstream_rate,25);
 assert.equal(trafficRows[2].client_rate,null,'reused PID with a new start time does not create a negative rate');
 assert.equal(trafficRows[3].client_rate,1000/60,'rates resume within the new generation');
+const generationFields=['at_delta_s','mono_delta_s','process_id','process_started_at','process_generation',
+ 'bytes_from_clients','bytes_from_upstreams','active_connections','fd_count','tls_objects','worker_pool_entries',
+ 'proxy_struct_bytes','connection_struct_bytes','retired_connection_struct_bytes','worker_pool_struct_bytes'];
+const generationRows=telegramRows({memory_history:{fields:generationFields,time_base:[1700000000,1000],samples:[
+ [0,0,42,1700000000,111,1000,500,2,8,3,1,2048,1024,0,512],
+ [60,60,42,1700000000,222,10,10,0,4,0,0,2048,0,0,512]]}});
+assert.equal(generationRows[1].client_rate,null,'a new process generation breaks rates even if PID and wall start time were reused');
+assert.equal(generationRows[1].process_generation,222);
+assert.equal(generationRows[1].worker_pool_bytes,512,'worker pool allocations are retained in compact history');
+assert.equal(generationRows[1].active_connections,0);
 console.log('сводка диагностики панели прошла');
