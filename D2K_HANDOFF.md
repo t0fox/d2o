@@ -39,7 +39,7 @@ socket; сбор выключен по умолчанию.
 Private_Dirty и MemAvailable в выбор рядов, `fb23db1` уточняет браузерное
 ожидание форматирования smaps, а `fadd957` проверяет ротацию 1440 Telegram
 снимков и освобождение буферов/структур после закрытия соединений. CI для
-`fadd957` (`43406840780`) прошёл 30/30, включая Chrome-интеграцию, Telegram,
+`fadd957` (`43406840780`) прошёл 33/33, включая Chrome-интеграцию, Telegram,
 санитайзеры и кросс-сборки. Локально прошли `make -C core test-diagnostics`,
 `make -C core test-diagnostics-runtime`, `make -C telegram test-limits` с
 `/usr/bin/gcc`, проверки JavaScript и `node panel/test_diagnostics.cjs`. Локальный
