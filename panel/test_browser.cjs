@@ -452,7 +452,7 @@ async function main(){
    if(width===390){
     await evaluate('document.querySelector("#telegram").scrollIntoView({block:"center"})');
     await wait(100);
-    await evaluate(`(()=>{const p=CanvasRenderingContext2D.prototype,draw=p.fillText;window.__tgMobileRouteLabels=[];window.__tgMobileOriginalFillText=draw;p.fillText=function(value,...args){if(this.canvas?.classList.contains("tg-flow-canvas")&&/^(Прокси Cloudflare|активен · 2)$/.test(String(value))){const t=this.getTransform();window.__tgMobileRouteLabels.push({text:String(value),y:t.f})}return draw.call(this,value,...args)}})()`);
+    await evaluate(`(()=>{const p=CanvasRenderingContext2D.prototype,draw=p.fillText;window.__tgMobileRouteLabels=[];window.__tgMobileOriginalFillText=draw;p.fillText=function(value,...args){if(this.canvas?.classList.contains("tg-flow-canvas")&&/^(Прокси Cloudflare|ответ \\d+\\/\\d+)$/.test(String(value))){const t=this.getTransform();window.__tgMobileRouteLabels.push({text:String(value),y:t.f})}return draw.call(this,value,...args)}})()`);
     await wait(100);
     const labels=await evaluate('(()=>{const a=window.__tgMobileRouteLabels||[],i=a.findLastIndex(x=>x.text==="Прокси Cloudflare");return {title:a[i],state:a[i+1]}})()');
     await evaluate('CanvasRenderingContext2D.prototype.fillText=window.__tgMobileOriginalFillText;delete window.__tgMobileOriginalFillText');
