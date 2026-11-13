@@ -1105,6 +1105,9 @@ static void test_epoll_many_concurrent_tcp_clients(void) {
     assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
     assert(stats.connections_started == CLIENT_COUNT &&
            stats.active_connections == 0);
+    assert(stats.buffer_bytes_current == 0 &&
+           stats.connection_struct_bytes == 0 &&
+           stats.retired_connection_struct_bytes == 0);
     assert(stats.bytes_from_clients ==
            CLIENT_COUNT * (sizeof(test_handshake) + sizeof(payload)));
     tg_epoll_proxy_destroy(proxy);

@@ -130,6 +130,22 @@ int main(void) {
             assert(fwrite(all,1,strlen(all),out)==strlen(all));assert(!fclose(out));}
         free(all);d2k_diag_telegram_free(tg);d2k_diag_free(d);d=NULL;
     }
+    {
+        char sample[64];
+        d=d2k_diag_new();d2k_diag_telegram *tg=d2k_diag_telegram_new();assert(d&&tg);
+        d2k_diag_set_enabled(d,0);
+        for(uint64_t i=0;i<=D2K_DIAG_TG_HISTORY;i++) {
+            int n=snprintf(sample,sizeof sample,"{\"rss_kib\":%llu}",
+                (unsigned long long)i);
+            assert(n>0&&(size_t)n<sizeof sample);
+            assert(d2k_diag_telegram_record(tg,(int64_t)i*60000,sample,(size_t)n)==1);
+        }
+        all=combined_report(d,tg);
+        assert(strstr(all,"\"samples_overwritten\":1"));
+        assert(strstr(all,"\"samples\":[[0,0,1,"));
+        assert(strstr(all,"[0,86340,1440,"));
+        free(all);d2k_diag_telegram_free(tg);d2k_diag_free(d);d=NULL;
+    }
     char dir[]="/tmp/d2k-diag-proc-XXXXXX",path[512];assert(mkdtemp(dir));
     snprintf(path,sizeof path,"%s/123",dir);assert(!mkdir(path,0700));
     put(dir,"d2k.pid","123\n");put(dir,"123/comm","d2kc\n");
