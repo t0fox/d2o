@@ -31,6 +31,7 @@ for arch in $ARCHES; do
                 timeout 20 "qemu-$cpu" "$bin" >/dev/null 2>&1 || rc=$?
                 [ "$rc" = 2 ] || { echo "$bin: expected usage exit 2, got $rc" >&2; exit 1; }
                 ;;
+            d2kdiag) timeout 20 "qemu-$cpu" "$bin" --self-check ;;
             *) timeout 20 "qemu-$cpu" "$bin" --version ;;
         esac
     done
