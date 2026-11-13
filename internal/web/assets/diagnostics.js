@@ -604,8 +604,28 @@
       var at=wall===null||atDelta===null?null:wall+atDelta;
       var time=mono!==null&&monoDelta!==null?mono+monoDelta:at;
       return {at:at,time:time,rss:kibBytes(field(row,"rss_kib")),
-        rss_anon:kibBytes(field(row,"rss_anon_kib")),vm_data:kibBytes(field(row,"vm_data_kib"))};
+        rss_anon:kibBytes(field(row,"rss_anon_kib")),vm_data:kibBytes(field(row,"vm_data_kib")),
+        buffer_bytes_limit:field(row,"buffer_bytes_limit"),memory_ceiling_bytes:field(row,"memory_ceiling_bytes"),
+        max_connections:field(row,"max_connections"),soft_nofile_limit:field(row,"soft_nofile_limit"),
+        bytes_from_clients:field(row,"bytes_from_clients"),bytes_from_upstreams:field(row,"bytes_from_upstreams")};
     }).filter(Boolean);
+  }
+  function telegramLimitChanges(tg) {
+    var fields=[{key:"buffer_bytes_limit",label:"Буферы",bytes:true},
+      {key:"memory_ceiling_bytes",label:"Потолок памяти",bytes:true},
+      {key:"max_connections",label:"Максимум соединений"},
+      {key:"soft_nofile_limit",label:"Предел FD"}],previous={},changes=[];
+    telegramRows(tg).forEach(function(row){fields.forEach(function(item){
+      var value=number(row[item.key]);if(value===null)return;
+      if(Object.prototype.hasOwnProperty.call(previous,item.key)&&previous[item.key]!==value)
+        changes.push({at:row.at,label:item.label,from:previous[item.key],to:value,bytes:item.bytes});
+      previous[item.key]=value;
+    });});
+    return changes;
+  }
+  function telegramSessionRate(session,key) {
+    var bytes=number(session[key]),age=number(session.age_ms);
+    return bytes===null||age===null||age<=0?null:bytes*1000/age;
   }
   function drawTelegramMemory(doc,tg,hours) {
     var chart=doc.getElementById("telegram-diagnostic-memory-chart"),empty=doc.getElementById("telegram-diagnostic-memory-empty");
@@ -681,8 +701,11 @@
     });routeEmpty.hidden=list(latest&&latest.route_health).length>0;
     var sessions=doc.getElementById("tg-diag-sessions"),sessionEmpty=doc.getElementById("tg-diag-sessions-empty");sessions.replaceChildren();
     list(latest&&latest.active_sessions).forEach(function(session){var tr=doc.createElement("tr");
-      ["#"+pretty(session.id)+" / DC "+pretty(session.dc),pretty(session.selected_transport||session.direct_transport)+" / "+formatAge(session.age_ms),
-       formatBytes(session.bytes_from_clients)+" / "+formatBytes(session.bytes_from_upstreams),session.read_paused?"чтение приостановлено":pretty(session.stage)].forEach(function(value){var td=doc.createElement("td");td.textContent=value;tr.appendChild(td);});sessions.appendChild(tr);
+      var kind=session.is_media===true?"media":session.is_media===false?"основная":"тип неизвестен";
+      var rates=["bytes_from_clients","bytes_from_upstreams"].map(function(key){var rate=telegramSessionRate(session,key);return rate===null?"—":formatBytes(rate)+"/с";});
+      ["#"+pretty(session.id)+" / DC "+pretty(session.dc)+" / "+kind,
+       pretty(session.selected_transport||session.direct_transport)+" / "+formatAge(session.age_ms)+" / простой "+formatAge(session.no_progress_ms),
+       formatBytes(session.bytes_from_clients)+" / "+formatBytes(session.bytes_from_upstreams),rates.join(" / ")].forEach(function(value){var td=doc.createElement("td");td.textContent=value;tr.appendChild(td);});sessions.appendChild(tr);
     });sessionEmpty.hidden=list(latest&&latest.active_sessions).length>0;
     var problems=doc.getElementById("tg-diag-problems");problems.replaceChildren();
     list(latest&&latest.problem_sessions).slice().reverse().slice(0,8).forEach(function(problem){var li=doc.createElement("li");
@@ -691,6 +714,17 @@
         " · клиент/сервер "+formatBytes(problem.bytes_from_clients)+" / "+formatBytes(problem.bytes_from_upstreams);problems.appendChild(li);
     });
     if(!problems.children.length){var empty=doc.createElement("li");empty.className="diag-transition-empty";empty.textContent="Зафиксированных ошибок нет.";problems.appendChild(empty);}
+    var limitHistory=doc.getElementById("tg-diag-limit-history"),changes=telegramLimitChanges(tg).slice(-20).reverse();
+    limitHistory.replaceChildren();
+    if(!changes.length){var emptyLimit=doc.createElement("li"),limitValues=["buffer_bytes_limit","memory_ceiling_bytes","max_connections","soft_nofile_limit"];
+      emptyLimit.className="diag-transition-empty";
+      emptyLimit.textContent=history.some(function(row){return limitValues.some(function(key){return number(row[key])!==null;});})
+        ?"Изменений за сохранённые снимки нет.":"История лимитов недоступна.";limitHistory.appendChild(emptyLimit);}
+    changes.forEach(function(change){var row=doc.createElement("li"),strong=doc.createElement("strong"),label=doc.createElement("span"),time=doc.createElement("small");
+      var format=change.bytes?formatBytes:pretty;strong.textContent=change.label+": "+format(change.from)+" → "+format(change.to);
+      label.textContent="Изменение между снимками";time.textContent=number(change.at)===null?"":new Date(change.at*1000).toLocaleString();
+      row.appendChild(strong);row.appendChild(label);row.appendChild(time);limitHistory.appendChild(row);
+    });
   }
   if (typeof module === "object" && module.exports) module.exports = {
     summary: summary, memoryRows: memoryRows, rowsInRange: rowsInRange,

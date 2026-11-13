@@ -2296,7 +2296,6 @@ static int hedge_promote_candidate(proxy_connection *candidate) {
     watch_remove(server, &candidate->upstream_watch);
 
     parent->upstream_fd = candidate->upstream_fd;
-    parent->upstream_target = candidate->upstream_target;
     parent->upstream_ssl = candidate->upstream_ssl;
     parent->ws_pump = candidate->ws_pump;
     parent->wss_read_paused_at_ms = candidate->wss_read_paused_at_ms;
@@ -3915,6 +3914,12 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
         tg_active_route_session *session = &out->active_sessions[at];
         session->client_port = connection->original.port;
         session->upstream_port = connection->upstream_target.port;
+        if (connection->route_health_index >= 0 &&
+            (size_t)connection->route_health_index < TG_ROUTE_HEALTH_MAX) {
+            const route_health *health = &server->route_health[
+                (size_t)connection->route_health_index];
+            if (health->used) session->upstream_port = health->upstream_port;
+        }
         session->age_ms = now >= session->started_ms
             ? now - session->started_ms : 0;
         session->no_progress_ms = now >= session->no_progress_ms

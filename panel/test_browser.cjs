@@ -162,12 +162,16 @@ function diagnosticFixture(kind='full'){
    {kind:'diagnostic-json-write-error',at:now,stage:'open-temp',error_code:13}],
   memory_details:[{name:'d2kc',latest:{smaps_rollup_status:'unsupported',smaps_rollup_source:'smaps-fallback',smaps_rollup_errno:2,smaps_status:'ok',smaps_errno:null,smaps_rollup:{rss_kib:42399,anonymous_kib:23439,private_dirty_kib:13439}}}],
   telegram_diagnostics:{enabled:true,last_sample_at:now,collection_failures:0,
-   memory_history:{capacity:1440,sample_interval_ms:60000,fields:['at_delta_s','mono_delta_s','rss_kib','rss_anon_kib','vm_data_kib'],
-    time_base:[now-60,1000],samples:[[0,0,1024,768,2048],[60,60,1536,1024,3072]]},
+   memory_history:{capacity:1440,sample_interval_ms:60000,fields:['at_delta_s','mono_delta_s','rss_kib','rss_anon_kib','vm_data_kib',
+    'buffer_bytes_limit','memory_ceiling_bytes','max_connections','soft_nofile_limit','bytes_from_clients','bytes_from_upstreams'],
+    time_base:[now-60,1000],samples:[[0,0,1024,768,2048,65536,16777216,128,1024,1000,500],
+     [60,60,1536,1024,3072,131072,33554432,256,4096,2000,1000]]},
    latest:{rss_kib:1536,rss_hwm_kib:2048,rss_anon_kib:1024,vm_data_kib:3072,vm_swap_kib:0,
     smaps_pss_kib:1200,mem_available_kib:8192,memory_accounted_allocations_bytes:4096,
     rss_minus_known_allocations_bytes:1572864,buffer_bytes_current:2048,buffer_bytes_peak:4096,
-    buffer_bytes_limit:65536,active_connections:2,max_connections:256,route_health:[],active_sessions:[],problem_sessions:[]}}};
+    buffer_bytes_limit:131072,memory_ceiling_bytes:33554432,active_connections:2,max_connections:256,route_health:[],
+    active_sessions:[{id:71,dc:2,is_media:true,selected_transport:'cloudflare_proxy',age_ms:60000,no_progress_ms:3000,
+     bytes_from_clients:307200,bytes_from_upstreams:153600,stage:'first_wss_binary_response'}],problem_sessions:[]}}};
 }
 let ws,diagnosticsReply=null;
 async function main(){
@@ -862,6 +866,9 @@ async function main(){
   await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="2"','Telegram memory history renders in its tab');
   assert.equal(await evaluate('document.querySelector("#telegram-diagnostic-data").hidden'),false,'Telegram diagnostics are independently visible');
   assert.equal(await evaluate('document.querySelector("#tg-diag-rss").textContent'),'1.5 МиБ / 2.0 МиБ','Telegram RSS and high-water mark are shown');
+  assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/media.*простой 3 с/,'media sessions show activity and time since progress');
+  assert.match(await evaluate('document.querySelector("#tg-diag-sessions").textContent'),/5\.0 КиБ\/с \/ 2\.5 КиБ\/с/,'per-session lifetime throughput is displayed');
+  assert.match(await evaluate('document.querySelector("#tg-diag-limit-history").textContent'),/Буферы: 64\.0 КиБ → 128\.0 КиБ/,'Telegram limit changes are shown from minute samples');
   diagnosticsReply=diagnosticFixture('units');await call('Page.reload');
   await until('document.querySelector("#diagnostic-memory-chart").dataset.points==="2"','controlled metric fixture renders');
   await evaluate('document.querySelectorAll("[data-memory-series]").forEach(input=>{input.checked=true;input.dispatchEvent(new Event("change",{bubbles:true}))})');
