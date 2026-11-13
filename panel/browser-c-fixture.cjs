@@ -6,16 +6,19 @@ module.exports=async function(visualFixture){
  const temp=fs.mkdtempSync(path.join(os.tmpdir(),'d2k-c-browser-'));
  const config=path.join(temp,'config'),live=path.join(temp,'live.json'),log=path.join(temp,'actions');
  const engine=path.join(temp,'engine.pid'),controller=path.join(temp,'controller.pid'),telegram=path.join(temp,'telegram.pid');
- const tgStatus=path.join(temp,'tg-status'),tgStats=path.join(temp,'telegram-stats.sock'),service=path.join(temp,'service');
+ const tgStatus=path.join(temp,'tg-status'),tgStats=path.join(temp,'telegram-stats.json'),service=path.join(temp,'service');
  const connectedTelegramStats=visualFixture.telegramStats||null;
  let telegramStats=connectedTelegramStats;
  const pid=String(process.pid)+'\n';
  const writeLive=()=>fs.writeFileSync(live,JSON.stringify({...visualFixture.knowledge,linked:true,catalog_at:'local-browser-fixture'}));
+ const writeTelegramStats=()=>{
+  const next=tgStats+'.new';
+  fs.writeFileSync(next,telegramStats?JSON.stringify(telegramStats)+'\n':'');
+  fs.renameSync(next,tgStats);
+ };
  fs.writeFileSync(config,'MODE=apply\nTG_ENABLED=1\nTG_MODE=local\nTG_RELAY_URL=https://relay.example.invalid\nTG_RELAY_SECRET=public-test-fixture\n');
  for(const file of [engine,controller,telegram])fs.writeFileSync(file,pid);
- fs.writeFileSync(tgStatus,'connected\n');writeLive();
- const statsServer=net.createServer(socket=>socket.end(telegramStats?JSON.stringify(telegramStats)+'\n':''));
- await new Promise((resolve,reject)=>{statsServer.once('error',reject);statsServer.listen(tgStats,resolve)});
+ fs.writeFileSync(tgStatus,'connected\n');writeLive();writeTelegramStats();
  fs.writeFileSync(service,'#!/usr/bin/env node\n'+
   'const fs=require("node:fs");const action=process.argv[2];\n'+
   'const paths='+JSON.stringify({config,log,engine})+';\n'+
@@ -29,9 +32,9 @@ module.exports=async function(visualFixture){
   '--live',live,'--assets',path.resolve(__dirname,'../internal/web/assets'),'--service',service,
   '--engine-pid',engine,'--controller-pid',controller,'--telegram-pid',telegram,'--telegram-status',tgStatus,
   '--telegram-stats',tgStats],{stdio:'ignore'});
- const timer=setInterval(writeLive,2000),url='http://127.0.0.1:'+port+'/';
+ const timer=setInterval(()=>{writeLive();writeTelegramStats()},2000),url='http://127.0.0.1:'+port+'/';
  const close=async()=>{
-  clearInterval(timer);child.kill('SIGTERM');statsServer.close();
+  clearInterval(timer);child.kill('SIGTERM');
   if(child.exitCode===null)await new Promise(r=>child.once('exit',r));
   fs.rmSync(temp,{recursive:true,force:true});
  };
@@ -49,7 +52,8 @@ module.exports=async function(visualFixture){
   return {url,close,telegram:status=>{
     fs.writeFileSync(tgStatus,status+'\n');
     telegramStats=status==='connected'?connectedTelegramStats:null;
-   },telegramStats:stats=>{telegramStats=stats},
+    writeTelegramStats();
+   },telegramStats:stats=>{telegramStats=stats;writeTelegramStats()},
    seen:(command)=>fs.existsSync(log)&&fs.readFileSync(log,'utf8').split('\n').includes(command),
    waitFor:async(command)=>{
    for(let i=0;i<60;i++){
