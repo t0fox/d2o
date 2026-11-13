@@ -490,61 +490,25 @@ static void telegram_stats_value(const d2k_panel_config *cfg,
                                  char out[TELEGRAM_STATS_MAX]) {
     snprintf(out, TELEGRAM_STATS_MAX, "null");
     if (!cfg || !cfg->telegram_stats_path) return;
-    struct sockaddr_un address;
-    memset(&address, 0, sizeof(address));
-    size_t path_length = strlen(cfg->telegram_stats_path);
-    if (!path_length || path_length >= sizeof(address.sun_path)) return;
-    address.sun_family = AF_UNIX;
-    memcpy(address.sun_path, cfg->telegram_stats_path, path_length + 1);
-
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd = open(cfg->telegram_stats_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) return;
-    int flags = fcntl(fd, F_GETFL);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+        st.st_size <= 0 || st.st_size >= TELEGRAM_STATS_MAX ||
+        time(NULL) - st.st_mtime > 5 || st.st_mtime > time(NULL) + 1) {
         close(fd);
         return;
     }
-    int connected = connect(fd, (struct sockaddr *)&address, sizeof(address));
-    if (connected != 0 && errno != EINPROGRESS && errno != EAGAIN &&
-        errno != EWOULDBLOCK) {
-        close(fd);
-        return;
-    }
-    long long deadline = monotonic_ms() + 1250;
-    if (connected != 0) {
-        struct pollfd ready = {.fd = fd, .events = POLLOUT};
-        int remaining = (int)(deadline - monotonic_ms());
-        int rc = remaining > 0 ? poll(&ready, 1, remaining) : 0;
-        int error = 0;
-        socklen_t error_length = sizeof(error);
-        if (rc <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &error,
-                                  &error_length) != 0 || error) {
-            close(fd);
-            return;
-        }
-    }
-
     char raw[TELEGRAM_STATS_MAX];
     size_t used = 0;
-    int complete = 0;
-    while (monotonic_ms() < deadline) {
-        struct pollfd ready = {.fd = fd, .events = POLLIN};
-        int remaining = (int)(deadline - monotonic_ms());
-        int rc = poll(&ready, 1, remaining);
-        if (rc < 0 && errno == EINTR) continue;
-        if (rc <= 0 || (ready.revents & (POLLERR | POLLNVAL))) break;
-        if (used >= sizeof(raw) - 1) break;
-        ssize_t n = read(fd, raw + used, sizeof(raw) - 1 - used);
-        if (n > 0) {
-            used += (size_t)n;
-            continue;
-        }
-        if (n == 0) { complete = 1; break; }
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
-        break;
+    while (used < (size_t)st.st_size) {
+        ssize_t n = read(fd, raw + used, (size_t)st.st_size - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        used += (size_t)n;
     }
     close(fd);
-    if (!complete || !used) return;
+    if (used != (size_t)st.st_size) return;
     raw[used] = '\0';
     if (!json_valid_object(raw, raw + used)) return;
     char active[21], maximum[21], started[21], accepted[21];

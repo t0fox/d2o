@@ -32,7 +32,6 @@
 #define TG_EPOLL_IO_CHUNK 16384u
 #define TG_EPOLL_MAX_LISTEN_PORTS 16u
 #define TG_ROUTE_HEALTH_MAX 256u
-#define TG_CLIENT_LATENCY_SAMPLE_COUNT 128u
 #define TG_HEDGE_DELAY_DEFAULT_MS 125u
 #define TG_HEDGE_CANDIDATES 4u
 #define TG_ROUTE_DNS_WAIT_TIMEOUT_MS 20000u
@@ -4010,15 +4009,17 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
         worker_pool *pool = server->worker_pool;
         out->worker_pool_capacity = pool->capacity;
         out->worker_pool_struct_bytes = sizeof(*pool);
-        pthread_mutex_lock(&pool->lock);
-        out->worker_pool_started = pool->started;
-        out->worker_pool_entries = pool->count;
-        for (size_t i = 0; i < pool->capacity; ++i)
-            if (pool->entries[i].ssl) {
-                ++out->tls_objects;
-                ++out->worker_pool_tls_objects;
-            }
-        pthread_mutex_unlock(&pool->lock);
+        if (pthread_mutex_trylock(&pool->lock) == 0) {
+            out->worker_pool_started = pool->started;
+            out->worker_pool_entries = pool->count;
+            for (size_t i = 0; i < pool->capacity; ++i)
+                if (pool->entries[i].ssl) {
+                    ++out->tls_objects;
+                    ++out->worker_pool_tls_objects;
+                }
+            pthread_mutex_unlock(&pool->lock);
+        }
+
     }
     out->client_response_latency_total =
         server->client_response_latency_total;
@@ -4033,6 +4034,8 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
         for (size_t i = 0; i < count; ++i)
             samples[i] = server->client_response_latency[
                 (oldest + i) % TG_CLIENT_LATENCY_SAMPLE_COUNT];
+        memcpy(out->latency_samples, samples, count * sizeof(samples[0]));
+#ifdef TG_EPOLL_TESTING
         for (size_t i = 1; i < count; ++i) {
             uint64_t value = samples[i];
             size_t j = i;
@@ -4046,6 +4049,7 @@ int tg_epoll_proxy_get_stats(const tg_epoll_proxy *server,
         size_t p95 = (count * 95u + 99u) / 100u - 1u;
         out->client_response_latency_p50_us = samples[p50];
         out->client_response_latency_p95_us = samples[p95];
+#endif
         out->client_response_latency_last_us = server->client_response_latency[
             (server->client_response_latency_next +
              TG_CLIENT_LATENCY_SAMPLE_COUNT - 1u) %

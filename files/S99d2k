@@ -47,6 +47,7 @@ RELEASE=$DIR
 # ограничено локальной loopback-привязкой и командами из фиксированного списка.
 BIN=/opt/sbin/d2kc
 PANELBIN=/opt/sbin/d2kpanel
+DIAGBIN=/opt/sbin/d2kdiag
 PANEL_ASSETS=$RELEASE/panel
 DPBIN=/opt/sbin/d2kd
 CONF=$DIR/config
@@ -56,6 +57,7 @@ LOG=$DIR/log
 DP_PID=$RUN/d2kd.pid
 CT_PID=$RUN/d2k.pid
 PN_PID=$RUN/d2k-panel.pid
+DIAG_PID=$RUN/d2kdiag.pid
 # Прежний прокси открытого HTTP (d2khttp, до задачи 51): его pid-файл и
 # правила снимаются при остановке и запуске — миграция со старой версии.
 HU_PID=$RUN/d2k-http.pid
@@ -189,7 +191,6 @@ export TG_DC_MAP_ENDPOINTS_PATH
 TGBIN=/opt/sbin/d2ktg
 TG_PID=$RUN/d2ktg.pid
 TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
-TG_STATS_SOCKET=${TG_STATS_SOCKET:-$STATE_DIR/telegram.stats.sock}
 TG_FIREWALL=$RELEASE/d2k-tg-firewall.sh
 TG_WATCHDOG=$RELEASE/d2k-tg-watchdog.sh
 TG_WD_PID=$RUN/d2k-tg-watchdog.pid
@@ -1465,7 +1466,7 @@ start_engine() {
     set -- --health-file "$RUNTIME_DIR/d2kc.health"
     spawn_daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
         --control "$SOCK" --catalog "$DIR/state/catalog.json" --live "$LIVE" --mark "$PROBE_MARK" \
-        --measure-mark "$MEASURE_MARK" --telegram-stats "$TG_STATS_SOCKET" \
+        --measure-mark "$MEASURE_MARK" \
         "$@" --log "$LOG/d2kc.log" || { engine_stop; die_with_log "контроллер не запустился" "$LOG/d2kc.log"; }
     if ! wait_running "$CT_PID" d2kc; then
         engine_stop
@@ -1501,15 +1502,23 @@ start_panel() {
             --listen "$PANEL_LISTEN" --state-dir "$STATE_DIR" --mode "$MODE" \
             --queue "$QUEUE_NUM" --service /opt/etc/init.d/S99d2k \
             --engine-pid "$DP_PID" --controller-pid "$CT_PID" \
-            --telegram-stats "$TG_STATS_SOCKET" \
             "$@" --log "$LOG/panel.log" \
             || { say "панель не запустилась — обход это не затрагивает"; return 1; }
+    fi
+}
+
+start_diag() {
+    prepare_runtime
+    if [ -x "$DIAGBIN" ] && ! running "$DIAG_PID" d2kdiag; then
+        spawn_daemon -S -b -m -p "$DIAG_PID" -x "$DIAGBIN" -- \
+            || say "d2kdiag не запустился"
     fi
 }
 
 start() {
     start_engine || return $?
     telegram_start || say "Telegram tunnel не поднят; D2K продолжает работу независимо"
+    start_diag
     start_panel
     if [ -x "$DNS_SCHEDULER" ] && ! running "$DNS_SCHED_PID"; then
         spawn_daemon -S -b -m -p "$DNS_SCHED_PID" -x "$DNS_SCHEDULER" -- run \
@@ -1584,7 +1593,7 @@ telegram_launch() {
     rm -f "$RUNTIME_DIR/d2ktg.health"
     set -- --health-file "$RUNTIME_DIR/d2ktg.health"
     spawn_daemon -S -b -m -p "$TG_PID" -x "$TGBIN" -- \
-        --config "$CONF" --stats-socket "$TG_STATS_SOCKET" "$@" --log "$LOG/telegram.log" || { write_telegram_status error; return 1; }
+        --config "$CONF" "$@" --log "$LOG/telegram.log" || { write_telegram_status error; return 1; }
     tg_wait=0
     tg_ready=0
     while [ "$tg_wait" -lt 50 ]; do
@@ -1682,6 +1691,7 @@ stop() {
     stop_pidfile "$UPD_PID" || return 1
     telegram_stop || return 1
     engine_stop || return 1
+    stop_pidfile "$DIAG_PID" || say "не удалось остановить d2kdiag"
     stop_pidfile "$PN_PID" || return 1
     stop_pidfile "$LM_PID" || return 1
     rst_rules_down all
@@ -1796,6 +1806,9 @@ case "$1" in
     telegram-enable) telegram_enable ;;
     telegram-disable) telegram_disable ;;
     telegram-restart) telegram_restart ;;
+    diag-start) start_diag ;;
+    diag-stop) stop_pidfile "$DIAG_PID" ;;
+    diag-restart) stop_pidfile "$DIAG_PID" && start_diag ;;
     telegram-reapply) telegram_reapply ;;
     status)  status ;;
     reapply) reapply ;;

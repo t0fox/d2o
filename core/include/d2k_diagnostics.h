@@ -83,6 +83,7 @@ void d2k_diag_memory_release(unsigned site,size_t bytes,int tracked);
 void d2k_diag_memory_alloc_failure(unsigned site);
 void d2k_diag_memory_snapshot(d2k_diag_mem_site out[D2K_DIAG_MEMORY_SITE_COUNT]);
 void d2k_diag_memory_counts(d2k_diag_counts *counts);
+void d2k_diag_set_controller(d2k_diag *d, long pid, const d2k_diag_mem_site *memory);
 void d2k_diag_set_madvise(d2k_diag *d,const d2k_diag_madvise *stats);
 void d2k_diag_record_write_error(d2k_diag *d,const char *stage,int error);
 int d2k_diag_write(const d2k_diag *d,FILE *f);

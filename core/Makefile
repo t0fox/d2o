@@ -217,7 +217,7 @@ check: test-ech
 
 .PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kfetch-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-rst-trigger test-voice-sched test-verify FORCE
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o d2kask d2kc d2kfetch d2kvoice
+all: d2kdiag meas.o verdict.o crypto.o quic.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o d2kask d2kc d2kfetch d2kvoice
 
 
 meas.o: meas.c $(HDR)
@@ -964,7 +964,7 @@ ARCH ?= arm64
 .PHONY: release check-release
 d2kc-linux-arm64: release
 d2kfetch-linux-arm64: release
-release: hello_profiles.inc tcp1620_whitelist.inc ../runtime/d2k_dns_config.c ../runtime/d2k_dns_config.h
+release: d2kdiag-release hello_profiles.inc tcp1620_whitelist.inc ../runtime/d2k_dns_config.c ../runtime/d2k_dns_config.h
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -static -Wl,-S \
 		-o $(BUILDDIR)/d2kc-linux-$(ARCH) d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c \
@@ -1176,7 +1176,7 @@ d2kfetch: d2kfetch.c $(D2KFETCH_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(D2KFETCH_OBJ) $(TEST_LDFLAGS)
 
 clean:
-	rm -f *.o $(TESTS) d2kask d2kc d2kfetch hello_profiles.inc libd2k_udp.a
+	rm -f *.o $(TESTS) d2kdiag d2kask d2kc d2kfetch hello_profiles.inc libd2k_udp.a
 	rm -f ../runtime/d2k_dns_config.o
 	rm -rf .udp-engine
 
@@ -1435,3 +1435,14 @@ test_diagnostics_runtime: test_diagnostics_runtime.c d2kc.c diagnostics.o $(SCHE
 clean-diagnostics-runtime:
 	$(RM) test_diagnostics_runtime
 clean: clean-diagnostics-runtime
+
+DIAG_SOURCES = d2kdiag.c diagnostics.c ../telegram/src/stats_socket.c
+DIAG_HEADERS = diag_transport.h include/d2k_diagnostics.h ../runtime/d2k_diag_ipc.h ../telegram/include/tg_stats.h ../telegram/include/tg_stats_socket.h
+
+d2kdiag: $(DIAG_SOURCES) $(DIAG_HEADERS)
+	$(CC) $(CFLAGS) -std=c11 -I../telegram/include -o $@ $(DIAG_SOURCES)
+
+.PHONY: d2kdiag-release
+d2kdiag-release: $(DIAG_SOURCES) $(DIAG_HEADERS)
+	@mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -std=c11 -I../telegram/include -static -Wl,-S -o $(BUILDDIR)/d2kdiag-linux-$(ARCH) $(DIAG_SOURCES)

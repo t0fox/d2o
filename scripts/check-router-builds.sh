@@ -17,7 +17,7 @@ for arch in $ARCHES; do
         riscv64) cpu=riscv64 ;;
         *) echo "Unknown architecture: $arch" >&2; exit 1 ;;
     esac
-    for component in d2kd d2kc d2kfetch d2kpanel d2ktg; do
+    for component in d2kd d2kc d2kfetch d2kpanel d2ktg d2kdiag; do
         bin="$ROOT/builds/$component-linux-$arch"
         test -s "$bin"
         readelf -h "$bin" >/dev/null

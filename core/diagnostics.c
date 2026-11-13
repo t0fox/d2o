@@ -98,6 +98,8 @@ struct d2k_diag {
     int32_t growth_pid;long memory_pid;int64_t memory_start_ticks,last_unattributed_ms,last_ms;
     /* One generation change per retained row fits in this 16-bit value. */
     uint16_t d2kc_epoch;int memory_pid_seen,sampled,general_enabled;
+    long controller_pid;
+    d2k_diag_mem_site external_memory[D2K_DIAG_MEMORY_SITE_COUNT];
 };
 typedef char bounded_ring[(sizeof(struct d2k_diag)<=256*1024)?1:-1];
 struct d2k_diag_telegram {
@@ -523,9 +525,15 @@ static void write_limit_reason_state(FILE *f,unsigned flags,unsigned mask) {
     }
     fputc(']',f);
 }
-static void write_memory_tracking(FILE *f){
-    d2k_diag_mem_site sites[D2K_DIAG_MEMORY_SITE_COUNT];d2k_diag_memory_snapshot(sites);
-    fputs(",\"memory_tracking\":{\"enabled\":",f);fputs(d2k_diag_memory_active()?"true":"false",f);
+void d2k_diag_set_controller(d2k_diag *d, long pid, const d2k_diag_mem_site *memory) {
+    d->controller_pid = pid;
+    memcpy(d->external_memory, memory, sizeof(d->external_memory));
+}
+static void write_memory_tracking(FILE *f, const d2k_diag *d){
+    d2k_diag_mem_site sites[D2K_DIAG_MEMORY_SITE_COUNT];
+    if (d->controller_pid) memcpy(sites, d->external_memory, sizeof(sites));
+    else d2k_diag_memory_snapshot(sites);
+    fputs(",\"memory_tracking\":{\"enabled\":",f);fputs((d->controller_pid ? d->general_enabled : d2k_diag_memory_active())?"true":"false",f);
     fputs(",\"coverage\":\"учитываются объекты, выделенные при включённом сборе; уже существующие объекты задним числом не учитываются\",\"sites\":[",f);
     for(unsigned i=0;i<D2K_DIAG_MEMORY_SITE_COUNT;i++){
         if(i)fputc(',',f);
@@ -681,7 +689,7 @@ static void write_telegram(FILE *f,const d2k_diag_telegram *tg) {
 static int diag_write(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f) {
     if(!d||!f)return -1;
     fprintf(f,"{\"schema\":1,\"enabled\":%s,\"general_enabled\":%s,\"telegram_enabled\":%s,\"controller_pid\":%ld,\"release\":",
-        (d->general_enabled||tg)?"true":"false",d->general_enabled?"true":"false",tg?"true":"false",(long)getpid());js(f,D2K_RELEASE_ID);
+        (d->general_enabled||tg)?"true":"false",d->general_enabled?"true":"false",tg?"true":"false",d->controller_pid ? d->controller_pid : (long)getpid());js(f,D2K_RELEASE_ID);
     fprintf(f,",\"ring_bytes\":%zu,\"event_capacity\":64,\"limit_transition_capacity\":32,\"sample_capacity\":120,\"sample_interval_ms\":60000,\"memory_history_capacity\":1440,\"memory_history_interval_ms\":60000,\"events_overwritten\":%llu,\"limit_transitions_overwritten\":%llu,\"samples_overwritten\":%llu,\"memory_history_overwritten\":%llu",sizeof *d,
         (unsigned long long)(d->event_total-d->ne),(unsigned long long)(d->limit_total-d->nl),
         (unsigned long long)(d->sample_total-d->ns),
@@ -692,7 +700,7 @@ static int diag_write(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f) {
             (unsigned long long)c->http_records_limit_bytes,(unsigned long long)c->http_queue_limit_bytes,
             (unsigned long long)c->http_failure_limit_bytes,(unsigned long long)c->http_failure_record_limit_bytes);
     }
-    write_memory_tracking(f);write_madvise(f,&d->madvise);write_anomalies(f,d);
+    write_memory_tracking(f,d);write_madvise(f,&d->madvise);write_anomalies(f,d);
     fputs(",\"events\":[",f);
     for(size_t i=0;i<d->ne;i++) {
         const event *e=&d->events[(d->event_total-d->ne+i)%EVENTS];if(i)fputc(',',f);

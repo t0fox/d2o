@@ -496,6 +496,7 @@ fetch "builds/d2kc-linux-$ARCH" "$TMP/d2kc"
 fetch "builds/d2kfetch-linux-$ARCH" "$TMP/d2kfetch"
 fetch "builds/d2kd-linux-$ARCH" "$TMP/d2kd"
 fetch "builds/d2ktg-linux-$ARCH" "$TMP/d2ktg"
+fetch "builds/d2kdiag-linux-$ARCH" "$TMP/d2kdiag"
 fetch "files/S99d2k"            "$TMP/S99d2k"
 fetch "files/config"            "$TMP/config"
 fetch "files/d2k-fw-heal.sh"    "$TMP/d2k-fw-heal.sh"
@@ -525,12 +526,13 @@ for face in onest jbmono; do
     fetch "internal/web/assets/fonts/OFL-$face.txt" "$TMP/panel/OFL-$face.txt"
 done
 
-chmod +x "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kfetch" "$TMP/d2kd" "$TMP/d2ktg" \
+chmod +x "$TMP/d2kdiag" "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kfetch" "$TMP/d2kd" "$TMP/d2ktg" \
          "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/d2k-ppe-deoffload.sh" "$TMP/d2k-log-maintenance.sh" "$TMP/d2k-update.sh" "$TMP/001-d2k.sh" \
          "$TMP/d2k-tg-firewall.sh" "$TMP/d2k-tg-watchdog.sh" \
          "$TMP/d2k-instagram-dns.sh" "$TMP/d2k-instagram-dns-scheduler.sh"
 
 # Проверка ДО замены: запускается ли то, что скачалось, и та ли это арка.
+"$TMP/d2kdiag" --self-check >/dev/null 2>&1 || die "скачанный d2kdiag не запускается на этой системе"
 PANEL_VERSION=$("$TMP/d2kpanel" --version 2>/dev/null) || die "скачанный d2kpanel не запускается на этой системе"
 case "$PANEL_VERSION" in
     *features=telegram-control*) ;;
@@ -581,7 +583,7 @@ if [ "$FW" = nft ]; then
     opt_fs=/opt; [ -d "$opt_fs" ] || opt_fs=/
     avail_kb=$(df -kP "$opt_fs" 2>/dev/null | awk 'NR == 2 { print $4 }')
     new_kb=$(du -sk "$TMP" | awk '{ print $1 }')
-    old_kb=$(du -sk "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$DIR/panel" 2>/dev/null |
+    old_kb=$(du -sk "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$SBIN/d2kdiag" "$DIR/panel" 2>/dev/null |
         awk '{ s += $1 } END { print s + 0 }')
     big_kb=$(du -sk "$TMP/d2ktg" | awk '{ print $1 }')
     need_kb=$((new_kb - old_kb + big_kb))
@@ -634,6 +636,7 @@ install_data_atomic() {
     chmod 0644 "$2.new"
     mv -f "$2.new" "$2" || die "не подменить $2"
 }
+install_atomic "$TMP/d2kdiag" "$SBIN/d2kdiag"
 install_atomic "$TMP/d2kpanel" "$SBIN/d2kpanel"
 install_atomic "$TMP/d2kc"   "$SBIN/d2kc"
 install_atomic "$TMP/d2kfetch" "$SBIN/d2kfetch"

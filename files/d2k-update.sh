@@ -127,7 +127,7 @@ do_check() {
 
 # Файлы, которые меняет установщик. Состояние, журнал и каталог знаний — нет.
 installed_paths() {
-    for p in "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$INIT" "$NDM_HOOK" \
+    for p in "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$SBIN/d2kdiag" "$INIT" "$NDM_HOOK" \
              "$DIR/config" "$DIR/release-id" "$DIR/release-arch" "$DIR/panel" "$DIR/files"; do
         [ ! -e "$ROOT$p" ] || printf '%s\n' "${p#/}"
     done
@@ -200,6 +200,8 @@ install_release() {
     # shellcheck disable=SC2046  # список путей без пробелов, нарочно словами
     tar -cf "$WORK/previous.tar" -C "${ROOT:-/}" $(installed_paths) ||
         { finish false "$rid" "не удалось сохранить текущую версию — установка не начата"; return 1; }
+    diag_existed=0
+    [ ! -e "$ROOT$SBIN/d2kdiag" ] || diag_existed=1
     prev=$(current_id)
     log "ставлю выпуск $rid (был ${prev:-неизвестен})"
     if D2K_LOCAL="$WORK/release" D2K_RELEASE_ID="$rid" D2K_UPDATING=1 \
@@ -210,6 +212,7 @@ install_release() {
     fi
     log "выпуск $rid не прошёл проверку — возвращаю ${prev:-прежнюю версию}"
     "$INIT" stop >> "$LOG" 2>&1 || true
+    [ "$diag_existed" = 1 ] || rm -f "$ROOT$SBIN/d2kdiag"
     if tar -xf "$WORK/previous.tar" -C "${ROOT:-/}" && "$INIT" start >> "$LOG" 2>&1; then
         rm -f "$WORK/previous.tar"
         finish false "$rid" "выпуск $rid не прошёл проверку; возвращена прежняя версия" "$rid"

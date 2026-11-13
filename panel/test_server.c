@@ -323,13 +323,8 @@ static void test_telegram_status_is_dynamic_and_never_exposes_secret(void) {
     unlink(live);unlink(config);unlink(status);unlink(pid);
 }
 
-typedef struct { int listener; } stats_fixture;
-
-static void *serve_telegram_stats(void *opaque) {
-    stats_fixture *fixture = opaque;
-    int client = accept(fixture->listener, NULL, NULL);
-    assert(client >= 0);
-    write_all(client,
+static void write_telegram_stats_fixture(char *path) {
+    write_temp_file(path,
               "{\"active_connections\":2,\"max_connections\":64,"
               "\"connections_started\":9,\"bytes_from_clients\":1234,"
               "\"bytes_from_upstreams\":5678,\"wss_attempts\":8,"
@@ -352,12 +347,9 @@ static void *serve_telegram_stats(void *opaque) {
               "\"route_cooldowns\":[{\"dc\":4,\"is_media\":true,"
               "\"transport\":\"cloudflare_proxy\",\"remaining_ms\":28750,"
               "\"failure_stage\":3}],\"route_cooldowns_truncated\":false}\n");
-    close(client);
-    close(fixture->listener);
-    return NULL;
 }
 
-static void test_telegram_stats_socket_is_normalized_for_status_api(void) {
+static void test_telegram_cache_is_normalized_for_status_api(void) {
     char live[] = "/tmp/d2k-panel-tg-stats-live.XXXXXX";
     char status[] = "/tmp/d2k-panel-tg-stats-status.XXXXXX";
     char pid[] = "/tmp/d2k-panel-tg-stats-pid.XXXXXX";
@@ -365,21 +357,7 @@ static void test_telegram_stats_socket_is_normalized_for_status_api(void) {
     write_temp_file(live, "{\"linked\":false,\"boxes\":[],\"searches\":[],\"targets\":0,\"confirms\":0,\"probes_used\":0,\"client_unfit\":0}");
     write_temp_file(status, "connected\n");
     write_temp_file(pid, "1\n");
-    int temporary = mkstemp(socket_path);
-    assert(temporary >= 0);
-    close(temporary);
-    assert(unlink(socket_path) == 0);
-
-    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
-    assert(listener >= 0);
-    struct sockaddr_un address = {.sun_family = AF_UNIX};
-    assert(strlen(socket_path) < sizeof(address.sun_path));
-    memcpy(address.sun_path, socket_path, strlen(socket_path) + 1);
-    assert(bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
-    assert(listen(listener, 2) == 0);
-    stats_fixture fixture = {.listener = listener};
-    pthread_t server;
-    assert(pthread_create(&server, NULL, serve_telegram_stats, &fixture) == 0);
+    write_telegram_stats_fixture(socket_path);
 
     d2k_panel_config cfg = {
         .live_path = live,
@@ -394,7 +372,6 @@ static void test_telegram_stats_socket_is_normalized_for_status_api(void) {
     char response[32768];
     (void)request(&cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
                   response, sizeof response);
-    assert(pthread_join(server, NULL) == 0);
     assert(strstr(response,
                   "\"telegram_stats\":{\"active_connections\":2,"
                   "\"max_connections\":64,\"connections_started\":9,") != NULL);
@@ -415,10 +392,11 @@ static void test_telegram_stats_socket_is_normalized_for_status_api(void) {
                   "\"last_success_latency_ms\":126,\"last_success_age_ms\":500,"
                   "\"last_failure_dc\":3,\"last_failure_route\":2,"
                   "\"last_failure_stage\":4,\"last_failure_age_ms\":9000,") != NULL);
+    unlink(socket_path);
     (void)request(&cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
                   response, sizeof response);
     assert(strstr(response, "\"telegram_stats\":null") != NULL &&
-           "недоступный stats socket не выдаёт нулевые метрики");
+           "недоступный снимок Telegram не выдаёт нулевые метрики");
     unlink(socket_path);
     unlink(live);
     unlink(status);
@@ -975,7 +953,7 @@ int main(void) {
     test_api_exposes_live_knowledge();
     test_invalid_live_json_is_not_reported_as_empty_knowledge();
     test_telegram_status_is_dynamic_and_never_exposes_secret();
-    test_telegram_stats_socket_is_normalized_for_status_api();
+    test_telegram_cache_is_normalized_for_status_api();
     test_telegram_worker_domains_are_validated_and_restart_only_c11();
     test_telegram_route_only_is_validated_and_restarts_c11();
     test_update_state_is_served_from_file();

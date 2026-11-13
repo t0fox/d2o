@@ -132,6 +132,8 @@ cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
 make -s -C telegram BUILD_DIR=build-lab d2ktg
 cp telegram/build-lab/d2ktg "$REL/builds/d2ktg-linux-$ARCH"
 make -s -C panel clean >/dev/null
+make -s -C core d2kdiag
+cp core/d2kdiag "$REL/builds/d2kdiag-linux-$ARCH"
 make -s -C panel d2kpanel
 cp panel/d2kpanel "$REL/builds/d2kpanel-linux-$ARCH"
 cp internal/web/assets/index.html internal/web/assets/panel.css internal/web/assets/panel.js internal/web/assets/telegram-flow.js internal/web/assets/telegram-flow-prototype.js internal/web/assets/diagnostics.js internal/web/assets/gsap.js "$REL/internal/web/assets/"

@@ -59,6 +59,9 @@ fi
 
 # Defense in depth when init has already been removed: stop only the owned
 # Telegram PID and remove only the two D2K-owned redirect rule sets.
+if [ -f "$DIR/run/d2kdiag.pid" ]; then
+    start-stop-daemon -K -q -p "$DIR/run/d2kdiag.pid" 2>/dev/null || true
+fi
 if [ -f "$DIR/run/d2ktg.pid" ]; then
     start-stop-daemon -K -q -p "$DIR/run/d2ktg.pid" 2>/dev/null || true
 fi
@@ -183,7 +186,7 @@ say "правила сняты"
 # Хук NDM снимается ПЕРВЫМ: оставленный, он будет звать сторожа, которого уже
 # нет, на каждое изменение netfilter — мусор в журнале на ровном месте.
 rm -f "$PREFIX/etc/ndm/netfilter.d/001-d2k.sh"
-rm -f "$PREFIX/etc/init.d/S99d2k" "$PREFIX/etc/init.d/S98d2k-update" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kd" "$SBIN/d2ktg" "$SBIN/d2khttp"
+rm -f "$PREFIX/etc/init.d/S99d2k" "$PREFIX/etc/init.d/S98d2k-update" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kd" "$SBIN/d2ktg" "$SBIN/d2kdiag" "$SBIN/d2khttp"
 # Remove only d2kc snapshots explicitly named as D2K pre-install/work backups.
 # These were created during router development and are not user configuration.
 rm -f "$SBIN"/d2kc.before-d2k-* "$SBIN"/d2kc.pre-goal-* "$SBIN"/d2kc.pre-sched-*
@@ -227,7 +230,8 @@ cleanup_runtime() (
     rm -f "$runtime/live.json" "$runtime/d2kd.health" "$runtime/d2kc.health" \
         "$runtime/d2kpanel.health" "$runtime/d2ktg.health"
     if [ "$runtime" = /tmp/d2k-diagnostics ]; then
-        rm -f "$runtime/enabled" "$runtime/report.json" "$runtime/report.new"
+        rm -f "$runtime/enabled" "$runtime/telegram-enabled" "$runtime/report.json" "$runtime/report.new" \
+            "$runtime/input.sock" "$runtime/collector.lock" "$runtime/telegram.json" "$runtime/telegram.json.new"
     fi
     # SIGKILL/power loss can leave an abandoned retained tail.
     for stage in "$runtime"/log-tail.??????; do

@@ -38,6 +38,7 @@ exit 1
   for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, '#!/bin/sh\nexit 0\n');
   fixture('builds/d2kpanel-linux-amd64', '#!/bin/sh\necho features=telegram-control\n');
   fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=telegram-local-tcp-epoll,instagram-ip-probe,meta-hosts-v3\n');
+  fixture('builds/d2kdiag-linux-amd64', '#!/bin/sh\necho d2kdiag\n');
   fixture('builds/d2kd-linux-amd64', '#!/bin/sh\nexit 0\n');
   for (const name of ['d2kc','d2kfetch']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
   fixture('files/S99d2k', '#!/bin/sh\nprintf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');

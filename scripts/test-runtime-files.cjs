@@ -92,9 +92,9 @@ telegram_restart || exit 49
   const controller = calls.find(x => x.includes('--catalog'));
   const panel = calls.find(x => x.includes('--assets'));
   const telegram = calls.find(x => x.includes('--config') && x.includes('/run/tg.pid'));
-  assert(controller.includes(`--telegram-stats ${tmp}/stats.sock`));
-  assert(panel.includes(`--telegram-stats ${tmp}/stats.sock`));
-  assert(telegram.includes(`--stats-socket ${tmp}/stats.sock`));
+  assert(!controller.includes("--telegram-stats"));
+  assert(!panel.includes("--telegram-stats"));
+  assert(!telegram.includes("--stats-socket"));
   assert(controller.includes(`--live ${tmp}/runtime/live.json`), 'controller must explicitly write runtime live snapshot');
   assert(controller.includes(`--health-file ${tmp}/runtime/d2kc.health`), 'controller heartbeat must use configured private runtime');
   assert(panel.includes(`--health-file ${tmp}/runtime/d2kpanel.health`), 'panel heartbeat must use configured private runtime');
