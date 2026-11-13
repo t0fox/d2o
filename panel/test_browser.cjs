@@ -953,7 +953,7 @@ async function main(){
   assert.equal(await tgField('dc_map_last_known_good'),'Да');
   assert.equal(await tgField('dc_map_last_refresh_errno'),'104');
   assert.equal(await tgField('dc_map_last_refresh_result'),'Ошибка HTTP');
-  assert.match(await evaluate('document.querySelector("#tg-diag-allocations").textContent'),/Структура прокси2\.0 КиБ.*Пул Worker512 Б/);
+  assert.match(await evaluate('document.querySelector("#tg-diag-allocations").textContent'),/Структура прокси2\.0 КиБ[\s\S]*Пул Worker512 Б/);
   assert.match(await evaluate('document.querySelector("#tg-diag-sessions details").textContent'),/Медиа.*Первый ответ420 мс.*Без прогресса3 с/);
   assert.match(await evaluate('document.querySelector("#tg-diag-sessions details").textContent'),/5\.0 КиБ\/с.*2\.5 КиБ\/с/);
   assert.match(await evaluate('document.querySelector("#tg-diag-sessions details").textContent'),/Основной маршрутselected.*Запасной маршрутidle/);
