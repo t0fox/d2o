@@ -1534,6 +1534,26 @@ static void test_disabled_wss_does_not_enable_automatic_tcp(void) {
            stats.wss_attempts == 0 && stats.wss_failures == 0 &&
            stats.last_failure_route == TG_ROUTE_NONE &&
            stats.last_failure_stage == TG_EPOLL_FAILURE_ROUTE_UNAVAILABLE);
+
+    char directory[] = "/tmp/d2k-tg-no-route-XXXXXX";
+    assert(mkdtemp(directory) != NULL);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    assert(snprintf(address.sun_path, sizeof(address.sun_path), "%s/stats.sock",
+                    directory) > 0);
+    tg_stats_socket stats_socket = {.fd = -1};
+    assert(tg_stats_socket_open(&stats_socket, address.sun_path) == 0);
+    int stats_client = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(stats_client >= 0);
+    assert(connect(stats_client, (struct sockaddr *)&address, sizeof(address)) == 0);
+    assert(tg_stats_socket_serve(&stats_socket, proxy, NULL) == 0);
+    char response[8192];
+    ssize_t length = recv(stats_client, response, sizeof(response) - 1, 0);
+    assert(length > 0);
+    response[length] = '\0';
+    assert(strstr(response, "\"transport\":null,\"failure_stage\":\"route_unavailable\"") != NULL);
+    close(stats_client);
+    tg_stats_socket_close(&stats_socket);
+    assert(rmdir(directory) == 0);
     tg_epoll_proxy_destroy(proxy);
     close(listener);
 }
@@ -1975,6 +1995,7 @@ static void test_epoll_hedged_wss_commits_one_route_before_payload(
         ",\"bytes_from_upstreams\":%" PRIu64,
         session->bytes_from_clients, session->bytes_from_upstreams) > 0);
     assert(strstr(stats_json, expected_session_bytes) != NULL);
+    assert(strstr(stats_json, "\"events\":[{\"sequence\":") != NULL);
     assert(strstr(stats_json, "\"client_queue_capacity_bytes\":") != NULL);
     assert(strstr(stats_json, "\"route_health\":[") != NULL);
     assert(strstr(stats_json, "\"failure_by_stage\":{") != NULL);

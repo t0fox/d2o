@@ -102,7 +102,7 @@ static int append_active_sessions(char *buffer, size_t capacity, size_t *used,
             "\"direct_transport\":%s%s%s,\"fallback_state\":\"%s\","
             "\"fallback_transport\":%s%s%s,\"selected_transport\":%s%s%s,"
             "\"telegram_response_seen\":%s,\"bytes_from_clients\":%" PRIu64
-            ",\"bytes_from_upstreams\":%" PRIu64 ",\"events\":[",
+            ",\"bytes_from_upstreams\":%" PRIu64,
             session->has_media ? (session->is_media ? "true" : "false") : "null",
             route_stage_name(session->stage), route_state_name(session->direct_state),
             direct ? "\"" : "null", direct ? direct : "", direct ? "\"" : "",
@@ -139,6 +139,8 @@ static int append_active_sessions(char *buffer, size_t capacity, size_t *used,
             session->upstream_queue_capacity_bytes,
             session->ws_rx_capacity_bytes, session->ws_tx_memory_bytes,
             session->mtproto_packet_capacity_bytes) != 0)
+            return -1;
+        if (stats_append(buffer, capacity, used, ",\"events\":[") != 0)
             return -1;
         for (size_t j = 0; j < session->event_count; ++j) {
             const tg_route_session_event *event = &session->events[j];
@@ -221,15 +223,16 @@ static int append_route_stats(char *buffer, size_t capacity, size_t *used,
     for (size_t i = 0; i < stats->problem_sessions_count; ++i) {
         const tg_problem_session *problem = &stats->problem_sessions[i];
         const char *transport = route_transport_name(problem->transport);
-        if (!transport || stats_append(buffer, capacity, used,
+        if (stats_append(buffer, capacity, used,
             "%s{\"sequence\":%" PRIu64 ",\"session_id\":%" PRIu64
-            ",\"dc\":%u,\"is_media\":%s,\"transport\":\"%s\","
+            ",\"dc\":%u,\"is_media\":%s,\"transport\":%s%s%s,"
             "\"failure_stage\":\"%s\",\"http_status\":%u,"
             "\"client_port\":%u,\"upstream_port\":%u,\"age_ms\":%" PRIu64
             ",\"bytes_from_clients\":%" PRIu64
             ",\"bytes_from_upstreams\":%" PRIu64 "}",
             i ? "," : "", problem->sequence, problem->session_id,
-            problem->dc, problem->is_media ? "true" : "false", transport,
+            problem->dc, problem->is_media ? "true" : "false",
+            transport ? "\"" : "null", transport ? transport : "", transport ? "\"" : "",
             failure_stage_name(problem->failure_stage),
             (unsigned)problem->http_status, (unsigned)problem->client_port,
             (unsigned)problem->upstream_port, problem->age_ms,
