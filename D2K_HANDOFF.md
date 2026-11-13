@@ -57,15 +57,17 @@ Chrome/Edge локально недоступны, поэтому browser integr
 буфер чтения stats socket 256 KiB + 1 байт; это верхняя граница аллокаций, не полевой
 замер RSS с учётом allocator/runtime.
 
-Read-only срез default gateway от `2026-11-13T07:02:05Z`: OpenWrt `25.12.6`,
+Read-only срез default gateway от `2026-11-13T10:29:03Z`: OpenWrt `25.12.6`,
 `mediatek/filogic`, `aarch64_cortex-a53`, Linux `6.12.112`; процесс `d2ktg`,
-3 потока. `/proc/PID/status`: RSS `7628 kB` (7.45 MiB), пик RSS `7920 kB`
-(7.73 MiB), VmData `22188 kB` (21.67 MiB), swap `0`. В системе
-`MemTotal=496716 kB`, `MemAvailable=345376 kB`; это устройство не является
-128 MiB конфигурацией. `/proc/PID/smaps_rollup` отсутствует, поэтому PSS и
+3 потока. `/proc/PID/status`: RSS `7652 kB` (7.47 MiB), пик RSS `7944 kB`
+(7.76 MiB), `RssAnon=4884 kB` (4.77 MiB), `RssFile=2768 kB` (2.70 MiB),
+`VmData=22152 kB` (21.63 MiB), `VmSize=24788 kB`, `VmPeak=32736 kB`, swap
+`0`. В системе `MemTotal=496716 kB` (485.07 MiB),
+`MemAvailable=339092 kB` (331.14 MiB); это устройство не является 128 MiB
+конфигурацией. `/proc/PID/smaps_rollup` отсутствует, поэтому PSS и
 Private_Dirty недоступны. Службы не перезапускались, настройки и правила не
 менялись, Telegram-сбор не включался, новую версию не ставили. По просьбе не
-изменять роутер полевой прогон новой вкладки и проверка 128 MiB железа не
+изменять роутер полевая проверка новой вкладки и замер на 128 MiB железе не
 выполнялись. История в коде не меняет маршруты, epoll или передачу данных.
 
 ### DoH: самостоятельное подтверждение DNS-ответа, 12.11.2026
