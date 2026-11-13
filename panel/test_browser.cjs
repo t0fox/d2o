@@ -958,7 +958,7 @@ async function main(){
   assert.equal(await evaluate('document.querySelector("[data-tg-memory-series=smaps_pss]").parentNode.hidden'),false,'PSS is charted when smaps_rollup is available');
   assert.equal(await evaluate('document.querySelector("[data-tg-memory-series=smaps_private_dirty]").parentNode.hidden'),false,'Private_Dirty is charted when smaps_rollup is available');
   assert.ok(await evaluate('document.querySelectorAll("#telegram-diagnostic-memory-chart path.diag-line-private_dirty").length>0'),'Private_Dirty history is drawn');
-  assert.match(await evaluate('document.querySelector("#tg-diag-smaps-details").textContent'),/900 КиБ.*640 КиБ.*2.0 КиБ/,'smaps Anonymous, Private_Dirty and Swap values are shown');
+  assert.equal(await evaluate('document.querySelector("#tg-diag-smaps-details").textContent'),'900.0 КиБ / 640.0 КиБ / 2.0 КиБ','smaps Anonymous, Private_Dirty and Swap values are shown');
   diagnosticsReply=diagnosticFixture('telegram_unavailable');await call('Page.reload');
   await until('document.querySelector("#telegram-diagnostic-memory-chart")?.dataset.points==="3"','Telegram unavailable metric fixture renders');
   assert.match(await evaluate('document.querySelector("#tg-diag-rss").textContent'),/^unavailable \/ 2\.0 МиБ$/,'unknown memory values are labelled unavailable');
