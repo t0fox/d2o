@@ -4,6 +4,8 @@
 #include "server.h"
 #include "../runtime/d2k_dns_config.h"
 #include "../runtime/d2k_diagnostics_files.h"
+#include "../core/network_diag.h"
+#include <sys/file.h>
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -2089,6 +2091,77 @@ static int static_file(int fd, const d2k_panel_config *cfg, const char *req,
 static int diagnostic_response(int fd,int code,const char *reason,const char *type,const char *body,size_t len) {
     return response_ex(fd,code,reason,type,"Cache-Control: no-store\r\n",body,len);
 }
+#ifdef __linux__
+typedef struct {
+    int fd;
+    long long deadline;
+} network_export;
+
+static ssize_t write_network_json(void *cookie, const char *data, size_t len) {
+    network_export *sink = cookie;
+    return write_all(sink->fd, data, len, sink->deadline) ? -1 : (ssize_t)len;
+}
+
+static int stream_network_report(int fd, const d2k_network_history *history, int download) {
+    int flags = fcntl(fd, F_GETFL);
+    int send_buffer = 16384;
+    if (flags < 0 || setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) ||
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK)) return -1;
+    network_export sink = {fd, monotonic_ms() + D2K_PANEL_RESPONSE_TIMEOUT_MS};
+    FILE *out = fopencookie(&sink, "w", (cookie_io_functions_t){.write = write_network_json});
+    int rc = -1;
+    if (out) {
+        char buffer[4096];
+        if (setvbuf(out, buffer, _IOFBF, sizeof(buffer)) == 0) {
+            fputs("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+                  "Cache-Control: no-store\r\nConnection: close\r\n"
+                  "X-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'\r\n", out);
+            if (download)
+                fputs("Content-Disposition: attachment; filename=\"d2k-network-diagnostics.json\"\r\n", out);
+            fputs("\r\n", out);
+            d2k_network_history_write(out, history);
+            rc = ferror(out) ? -1 : 0;
+            if (fclose(out)) rc = -1;
+        } else fclose(out);
+    }
+    if (fcntl(fd, F_SETFL, flags)) rc = -1;
+    return rc;
+}
+#endif
+
+static int network_report(int fd, const char *dir, int download) {
+    if (!d2k_diag_network_enabled(dir))
+        return diagnostic_response(fd, 200, "OK", "application/json", "null", 4);
+#ifdef __linux__
+    if (d2k_network_memory_ready("/proc")) {
+        int export_lock = d2k_network_open(dir, D2K_NETWORK_EXPORT_LOCK, 1);
+        if (export_lock >= 0) {
+            d2k_network_history *snapshot = NULL;
+            if (flock(export_lock, LOCK_EX | LOCK_NB) == 0) {
+                int state = d2k_network_open(dir, D2K_NETWORK_STATE, 0);
+                if (state >= 0) {
+                    if (flock(state, LOCK_SH | LOCK_NB) == 0) {
+                        uint64_t session = d2k_network_session(dir);
+                        if (session) snapshot = d2k_network_history_copy(state, session);
+                    }
+                    close(state);
+                }
+            }
+            if (snapshot) {
+                int rc = stream_network_report(fd, snapshot, download);
+                free(snapshot);
+                close(export_lock);
+                return rc;
+            }
+            close(export_lock);
+        }
+    }
+#else
+    (void)download;
+#endif
+    return diagnostic_response(fd, 503, "Service Unavailable", "application/json", "null", 4);
+}
+
 static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
                            const char *method,const char *action) {
     const char *dir=cfg&&cfg->diagnostics_dir?cfg->diagnostics_dir:D2K_DIAG_DIR;
@@ -2096,23 +2169,28 @@ static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
         if(!cfg||!cfg->control_enabled||!d2k_panel_same_origin(req))
             return diagnostic_response(fd,403,"Forbidden","application/json","{\"error\":\"требуется запрос с того же источника\"}",sizeof "{\"error\":\"требуется запрос с того же источника\"}"-1);
         int telegram_action=!strcmp(action,"telegram-enable")||!strcmp(action,"telegram-disable");
-        if(strcmp(action,"enable")&&strcmp(action,"disable")&&!telegram_action)
+        int network_action=!strcmp(action,"network-enable")||!strcmp(action,"network-disable");
+        if(strcmp(action,"enable")&&strcmp(action,"disable")&&!telegram_action&&!network_action)
             return diagnostic_response(fd,400,"Bad Request","application/json","{}",2);
-        int enable=!strcmp(action,"enable")||!strcmp(action,"telegram-enable");
-        int toggle_result=telegram_action?d2k_diag_telegram_toggle(dir,enable):d2k_diag_toggle(dir,enable);
+        int enable=!strcmp(action,"enable")||!strcmp(action,"telegram-enable")||!strcmp(action,"network-enable");
+        int toggle_result=network_action?d2k_diag_network_toggle(dir,enable):
+            telegram_action?d2k_diag_telegram_toggle(dir,enable):d2k_diag_toggle(dir,enable);
         if(toggle_result)
             return diagnostic_response(fd,500,"Internal Server Error","application/json","{\"error\":\"не удалось изменить состояние диагностики\"}",sizeof "{\"error\":\"не удалось изменить состояние диагностики\"}"-1);
-        char body[96];int n=snprintf(body,sizeof body,"{\"enabled\":%s,\"telegram_enabled\":%s}",
-            d2k_diag_enabled(dir)?"true":"false",d2k_diag_telegram_enabled(dir)?"true":"false");
+        char body[96];int n=snprintf(body,sizeof body,"{\"enabled\":%s,\"telegram_enabled\":%s,\"network_enabled\":%s}",
+            d2k_diag_enabled(dir)?"true":"false",d2k_diag_telegram_enabled(dir)?"true":"false",
+            d2k_diag_network_enabled(dir)?"true":"false");
         return n>0&&(size_t)n<sizeof body?diagnostic_response(fd,200,"OK","application/json",body,(size_t)n):
             diagnostic_response(fd,500,"Internal Server Error","application/json","{}",2);
     }
     if(strcmp(method,"GET"))return diagnostic_response(fd,405,"Method Not Allowed","text/plain","",0);
     int general_enabled=d2k_diag_enabled(dir),telegram_enabled=d2k_diag_telegram_enabled(dir);
-    if(!general_enabled&&!telegram_enabled)return diagnostic_response(fd,200,"OK","application/json","{\"enabled\":false,\"telegram_enabled\":false}",sizeof "{\"enabled\":false,\"telegram_enabled\":false}"-1);
-    if(!strcmp(action,"status")) {
-        char body[96];int n=snprintf(body,sizeof body,"{\"enabled\":%s,\"telegram_enabled\":%s}",
-            general_enabled?"true":"false",telegram_enabled?"true":"false");
+    if(!strcmp(action,"network-report")||!strcmp(action,"network-download"))
+        return network_report(fd,dir,!strcmp(action,"network-download"));
+    if(!strcmp(action,"status")||(!general_enabled&&!telegram_enabled)) {
+        char body[96];int n=snprintf(body,sizeof body,"{\"enabled\":%s,\"telegram_enabled\":%s,\"network_enabled\":%s}",
+            general_enabled?"true":"false",telegram_enabled?"true":"false",
+            d2k_diag_network_enabled(dir)?"true":"false");
         return n>0&&(size_t)n<sizeof body?diagnostic_response(fd,200,"OK","application/json",body,(size_t)n):
             diagnostic_response(fd,500,"Internal Server Error","application/json","{}",2);
     }

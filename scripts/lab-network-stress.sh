@@ -9,19 +9,20 @@ if [ "${1:-}" != --inside ]; then
     WORK=$(mktemp -d /tmp/d2o-network-stress.XXXXXX)
     echo "Network stress evidence: $WORK/evidence"
     mkdir "$WORK/evidence"
-    tar -C "$ROOT" -cf - --exclude='*.o' --exclude='.udp-engine' core datapath detect runtime files/S99d2k \
+    tar -C "$ROOT" -cf - --exclude='*.o' --exclude='.udp-engine' core datapath detect runtime panel files/S99d2k \
         scripts/lab-network-stress.sh tests/network-stress.py | tar -C "$WORK" -xf -
     exec docker run --rm --cap-add=NET_ADMIN --cap-add=NET_RAW --cap-add=SYS_ADMIN \
-        --sysctl net.ipv4.ip_forward=1 --sysctl net.netfilter.nf_conntrack_acct=1 \
+        --tmpfs /tmp:rw,nosuid,nodev --sysctl net.ipv4.ip_forward=1 --sysctl net.netfilter.nf_conntrack_acct=1 \
         -e D2O_STRESS_SECONDS="${D2O_STRESS_SECONDS:-60}" \
         -v "$WORK:/w" -w /w gcc:14 sh scripts/lab-network-stress.sh --inside
 fi
 
 # Prepare tools before disconnecting the container's external interface.
 apt-get update -qq
-apt-get install -y -qq iproute2 nftables openssl python3-aioquic >/dev/null
+apt-get install -y -qq iproute2 nftables openssl curl python3-aioquic >/dev/null
 make -s -C datapath d2kd
 make -s -C core d2kc d2kdiag
+make -s -C panel d2kpanel
 seconds=${D2O_STRESS_SECONDS:-60}
 case "$seconds" in ''|*[!0-9]*) exit 2 ;; esac
 if [ "$seconds" -lt 20 ] || [ "$seconds" -gt 600 ]; then exit 2; fi
@@ -32,10 +33,10 @@ unshare -n sleep 1800 &
 client=$!
 unshare -n sleep 1800 &
 server=$!
-dp='' ctl='' diag='' media=''
+dp='' ctl='' diag='' media='' panel=''
 # shellcheck disable=SC2329  # EXIT trap
 cleanup() {
-    for pid in "$ctl" "$dp" "$diag" "$media" "$client" "$server"; do
+    for pid in "$ctl" "$dp" "$diag" "$media" "$panel" "$client" "$server"; do
         [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
     done
 }
@@ -87,8 +88,8 @@ table ip lab {
 NFT
 mkdir -p /tmp/d2k-diagnostics /w/evidence/run
 chmod 700 /tmp/d2k-diagnostics
-touch /tmp/d2k-diagnostics/enabled
-chmod 600 /tmp/d2k-diagnostics/enabled
+touch /tmp/d2k-diagnostics/network-enabled
+chmod 600 /tmp/d2k-diagnostics/network-enabled
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
     -subj /CN=media.example -addext subjectAltName=DNS:media.example,DNS:stalled.example \
     -keyout /tmp/lab-key -out /tmp/lab-cert >/dev/null 2>&1
@@ -138,20 +139,17 @@ rc=0
 cl python3 tests/network-stress.py client 10.74.0.2 /tmp/lab-cert --seconds "$seconds" \
     --stall-host 10.74.0.3 > /w/evidence/with-d2o.json || rc=$?
 kill -0 "$dp" "$ctl" "$diag"
-touch /tmp/d2o-load-finished
-i=0
-until [ /tmp/d2k-diagnostics/report.json -nt /tmp/d2o-load-finished ]; do
-    kill -0 "$diag"
-    i=$((i+1)); [ "$i" -le 65 ]; sleep 1
-done
-cp /tmp/d2k-diagnostics/report.json /w/evidence/diagnostics.json
+./panel/d2kpanel serve --listen 127.0.0.1:18080 >/w/evidence/panel.log 2>&1 &
+panel=$!
+curl --fail --silent --show-error --retry 5 --retry-connrefused --max-time 10 \
+    http://127.0.0.1:18080/api/diagnostics?network-download > /w/evidence/diagnostics.json
 cat /w/evidence/baseline.json /w/evidence/with-d2o.json
 python3 - /w/evidence/diagnostics.json <<'PY'
 import json
 import sys
 
 with open(sys.argv[1]) as handle:
-    history = json.load(handle)["network_history"]
+    history = json.load(handle)
 rows = [dict(zip(history["fields"], row)) for row in history["samples"]]
 queues = [dict(zip(history["nfqueue_fields"], row["nfqueue"])) for row in rows if row["nfqueue"]]
 controllers = [dict(zip(history["controller_fields"], row["controller"])) for row in rows if row["controller"]]

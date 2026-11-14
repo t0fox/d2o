@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/resource.h>
+#include <sys/file.h>
 #include <time.h>
 
 static volatile sig_atomic_t stopping;
@@ -83,11 +84,6 @@ static void record_event(d2k_diag *diag, d2k_diag_event_message *m) {
     d2k_diag_record(diag, &event);
 }
 
-static void report_network(FILE *file, const void *history) {
-    fputs(",\"network_history\":", file);
-    d2k_network_history_write(file, history);
-}
-
 static FILE *begin_write(const char *path) {
     if (unlink(path) && errno != ENOENT) return NULL;
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -133,6 +129,10 @@ int main(int argc, char **argv) {
     d2k_diag_telegram *telegram = NULL;
     d2k_diag_counts_message controller = {0};
     d2k_network_history *network = NULL;
+    int network_fd = d2k_network_open(D2K_DIAG_DIR, D2K_NETWORK_STATE, 1);
+    int64_t network_retry = 0;
+    uint64_t network_session = 0, requested_session = 0;
+    int network_clean = 0;
     d2k_network_controller_message net_controller = {0};
     d2k_network_datapath_message net_datapath = {0};
     static char json[D2K_DIAG_TG_JSON_MAX + 1];
@@ -153,10 +153,6 @@ int main(int argc, char **argv) {
                 if (!general) break;
                 d2k_diag_set_enabled(general, g);
                 general_on = g;
-                free(network);
-                network = g ? d2k_network_history_new() : NULL;
-                net_controller = (d2k_network_controller_message){0};
-                net_datapath = (d2k_network_datapath_message){0};
                 report_due = 0;
             }
             if (t != telegram_on) {
@@ -179,8 +175,35 @@ int main(int argc, char **argv) {
                 if (telegram) report_due = 0;
             }
             live = length != 0;
-            if (g) d2k_network_history_sample(network, (uint64_t)now, &net_controller,
+            uint64_t session = d2k_network_session(D2K_DIAG_DIR);
+            if (session != requested_session) {
+                requested_session = session;
+                network_retry = 0;
+            }
+            if (!network_clean || session != network_session || (session && (network || now >= network_retry))) {
+                if (network_fd < 0 && session && now >= network_retry) {
+                    network_fd = d2k_network_open(D2K_DIAG_DIR, D2K_NETWORK_STATE, 1);
+                    if (network_fd < 0) network_retry = now + 10000;
+                }
+                if (network_fd >= 0 && flock(network_fd, LOCK_EX | LOCK_NB) == 0) {
+                    if (!network_clean || session != network_session) {
+                        d2k_network_history_unmap(network, network_fd);
+                        network = NULL;
+                        network_clean = 1;
+                        network_session = session;
+                        net_controller = (d2k_network_controller_message){0};
+                        net_datapath = (d2k_network_datapath_message){0};
+                    }
+                    if (session && !network && now >= network_retry) {
+                        if (d2k_network_memory_ready("/proc"))
+                            network = d2k_network_history_map(network_fd, session);
+                        if (!network) network_retry = now + 10000;
+                    }
+                    d2k_network_history_sample(network, (uint64_t)now, &net_controller,
                                                &net_datapath, "/proc", "/sys", run_path);
+                    flock(network_fd, LOCK_UN);
+                }
+            }
             if ((g || t) && now >= report_due) {
                 report_due = now + 60000;
                 if (g && now - controller_at <= 3500) {
@@ -195,8 +218,7 @@ int main(int argc, char **argv) {
                 }
                 FILE *file = begin_write(D2K_DIAG_DIR "/report.new");
                 if (file) {
-                    int ok = d2k_diag_write_extended(general, telegram, file,
-                        g ? report_network : NULL, network) == 0;
+                    int ok = d2k_diag_write_extended(general, telegram, file, NULL, NULL) == 0;
                     ok = ok && g == d2k_diag_enabled(D2K_DIAG_DIR) &&
                          t == d2k_diag_telegram_enabled(D2K_DIAG_DIR);
                     finish_write(file, D2K_DIAG_DIR "/report.new", D2K_DIAG_DIR "/report.json", ok);
@@ -225,11 +247,11 @@ int main(int argc, char **argv) {
                     d2k_diag_record_limit(general, message.counts.monotonic_ms, &message.counts.counts);
                 break;
             case D2K_DIAG_IPC_NETWORK_CONTROLLER:
-                if (general_on && n == (ssize_t)sizeof(message.net_controller))
+                if (network && n == (ssize_t)sizeof(message.net_controller))
                     net_controller = message.net_controller;
                 break;
             case D2K_DIAG_IPC_NETWORK_DATAPATH:
-                if (general_on && n == (ssize_t)sizeof(message.net_datapath))
+                if (network && n == (ssize_t)sizeof(message.net_datapath))
                     net_datapath = message.net_datapath;
                 break;
             case D2K_DIAG_IPC_EVENT:
@@ -238,7 +260,11 @@ int main(int argc, char **argv) {
             }
         }
     }
-    free(network);
+    if (network_fd >= 0) {
+        if (flock(network_fd, LOCK_EX | LOCK_NB) == 0)
+            d2k_network_history_unmap(network, network_fd);
+        close(network_fd);
+    }
     d2k_diag_free(general);
     d2k_diag_telegram_free(telegram);
     unlink(D2K_DIAG_INPUT);

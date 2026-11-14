@@ -455,19 +455,23 @@ static void diagnostic_tick(d2k_sched *s, int64_t now) {
         d2k_sched_limit_diagnostics(s, enabled ? diagnostic_limit : NULL, NULL);
         d2k_httpsearch_diagnostics(g_hs, enabled ? diagnostic_event : NULL, NULL);
     }
-    if (!enabled) return;
+    int network_enabled = diagnostic_sender >= 0 && d2k_diag_network_enabled(D2K_DIAG_DIR);
+    static uint64_t next_network;
+    int network_due = network_enabled && (uint64_t)now >= next_network;
+    if (!enabled && !network_due) return;
     d2k_diag_counts_message message = {
         .header = {D2K_DIAG_IPC_VERSION, D2K_DIAG_IPC_COUNTS, diagnostic_pid},
         .monotonic_ms = now
     };
     d2k_sched_diagnostic_counts(s, &message.counts);
-    d2k_httpsearch_diagnostic_counts(g_hs, &message.counts);
-    d2k_diag_memory_counts(&message.counts);
-    d2k_sched_diagnostic_madvise(s, &message.madvise);
-    d2k_diag_memory_snapshot(message.memory);
-    d2k_diag_send(diagnostic_sender, D2K_DIAG_INPUT, &message, sizeof(message));
-    static uint64_t next_network;
-    if ((uint64_t)now >= next_network) {
+    if (enabled) {
+        d2k_httpsearch_diagnostic_counts(g_hs, &message.counts);
+        d2k_diag_memory_counts(&message.counts);
+        d2k_sched_diagnostic_madvise(s, &message.madvise);
+        d2k_diag_memory_snapshot(message.memory);
+        d2k_diag_send(diagnostic_sender, D2K_DIAG_INPUT, &message, sizeof(message));
+    }
+    if (network_due) {
         next_network = (uint64_t)now + D2K_NET_DIAG_INTERVAL_MS;
         const d2k_diag_counts *c = &message.counts;
         d2k_network_controller_message network = {

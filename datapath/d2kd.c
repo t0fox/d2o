@@ -1514,7 +1514,7 @@ int main(int argc, char **argv) {
         previous_loop = t;
         if (t >= next_network) {
             next_network = t + D2K_NET_DIAG_INTERVAL_MS * NS_PER_MS;
-            int enabled = network_sender >= 0 && d2k_diag_enabled(D2K_DIAG_DIR);
+            int enabled = network_sender >= 0 && d2k_diag_network_enabled(D2K_DIAG_DIR);
             if (network_diag_on != enabled) {
                 network_diag_on = enabled;
                 d2k_nfq_timing(q, enabled);

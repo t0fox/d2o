@@ -916,17 +916,92 @@
     telegramLimitReasons: telegramLimitReasons
   };
   if (!root.document || !root.fetch) return;
+  function renderNetwork(doc, report) {
+    var list=doc.getElementById("network-diagnostic-incidents");
+    if (!list) return;
+    var expanded=Array.prototype.map.call(list.querySelectorAll("details[open]"),function(card){return card.dataset.trigger;});
+    list.replaceChildren();
+    var incidents=report.incidents||[];
+    var labels=["Потеря маршрута IPv4","Потеря маршрута IPv6","Потеря линка IPv4",
+      "Потеря линка IPv6","Потери в NFQUEUE","Потери в conntrack"];
+    if (!incidents.length) list.textContent="Инцидентов пока нет.";
+    incidents.slice().reverse().forEach(function(event) {
+      var card=doc.createElement("details"), title=doc.createElement("summary");
+      card.dataset.trigger=String(event.trigger_ms);
+      var reasons=labels.filter(function(label,index){return event.signals&(1<<index);});
+      title.textContent=new Date(event.at*1000).toLocaleString()+" · "+reasons.join(", ")+
+        (event.complete?"":" · сбор продолжается");
+      card.appendChild(title);
+      var rows=event.samples||[], coverage=doc.createElement("p");
+      var before=rows.length?Math.max(0,(event.trigger_ms-rows[0][1])/1000):0;
+      var after=rows.length?Math.max(0,(rows[rows.length-1][1]-event.trigger_ms)/1000):0;
+      coverage.textContent="Охват: "+Math.floor(before)+" с до сигнала, "+Math.floor(after)+
+        " с после. Замеров: "+rows.length+".";
+      card.appendChild(coverage);
+      card.addEventListener("toggle",function(){
+        if (!card.open||card.querySelector("table")) return;
+        var table=doc.createElement("table"), head=table.createTHead().insertRow();
+        ["Смещение, с","WAN IPv4 / IPv6, маршруты","NFQUEUE, очередь","Conntrack, записей","Замеры в очереди"]
+          .forEach(function(label){var th=doc.createElement("th");th.textContent=label;head.appendChild(th);});
+        function num(value){return value==null?"—":value;}
+        var body=table.createTBody();
+        rows.forEach(function(row){
+          var tr=body.insertRow();
+          [(row[1]-event.trigger_ms)/1000,num(row[4][0])+" / "+num(row[5][0]),
+           num(row[6]&&row[6][6]),num(row[3][0]),num(row[7]&&row[7][4])]
+            .forEach(function(value){tr.insertCell().textContent=value;});
+        });
+        var scroller=doc.createElement("div");
+        scroller.className="diag-table-scroll";
+        scroller.appendChild(table);
+        card.appendChild(scroller);
+      });
+      list.appendChild(card);
+      card.open=expanded.indexOf(card.dataset.trigger)>=0;
+    });
+  }
+
   function boot() {
     var doc = root.document, toggle = doc.getElementById("diagnostic-toggle"), tgToggle = doc.getElementById("telegram-diagnostic-toggle"), status = doc.getElementById("diagnostic-status"), download = doc.getElementById("diagnostic-download");
     if (!toggle || !tgToggle || !status || !download) return;
+    var netToggle=doc.getElementById("network-diagnostic-toggle");
+    var netDownload=doc.getElementById("network-diagnostic-download");
+    var networkEnabled=false, networkBusy=false, networkEpoch=0, networkToggleEpoch=0;
     var enabled = false, telegramEnabled = false, busy = false, range = 2, telegramRange = 2, currentReport = {};
     function redraw() { render(currentReport, enabled, range);renderTelegram(doc,currentReport.telegram_diagnostics,telegramEnabled,telegramRange); }
     var tabs=Array.prototype.slice.call(doc.querySelectorAll("[data-diagnostic-tab]"));
     var selectedTab;
+    function refreshNetwork() {
+      if (!netToggle || !netDownload) return;
+      var epoch=++networkEpoch;
+      netToggle.setAttribute("aria-checked",String(networkEnabled));
+      netToggle.textContent=networkEnabled?"Выключить и удалить историю":"Включить сбор";
+      if (!networkEnabled) {
+        netDownload.hidden=true;
+        setText(doc,"network-diagnostic-status","Сбор выключен.");
+        renderNetwork(doc,{});
+        return;
+      }
+      if (selectedTab!=="network") return;
+      root.fetch("/api/diagnostics?network-report",{cache:"no-store"}).then(function(r){
+        if (!r.ok) return null;
+        return r.json();
+      }).then(function(report){
+        if (epoch!==networkEpoch) return;
+        netDownload.hidden=!report;
+        setText(doc,"network-diagnostic-status",report?
+          "Минутных сводок: "+report.minutes.length+". Подробных замеров: "+report.samples.length+".":
+          "Сбор включён. Данные пока недоступны или недостаточно свободной памяти.");
+        renderNetwork(doc,report||{});
+      }).catch(function(){
+        if (epoch===networkEpoch) setText(doc,"network-diagnostic-status","Не удалось прочитать сетевой отчёт.");
+      });
+    }
     function selectTab(name,focus) {
       selectedTab=name;
       tabs.forEach(function(tab){var selected=tab.dataset.diagnosticTab===name;tab.setAttribute("aria-selected",String(selected));tab.tabIndex=selected?0:-1;
         var panel=doc.querySelector('[data-diagnostic-panel="'+tab.dataset.diagnosticTab+'"]');if(panel)panel.hidden=!selected;if(selected&&focus)tab.focus();});
+      if (name==="network") refreshNetwork();
     }
     tabs.forEach(function(tab,index){
       tab.addEventListener("click",function(){selectTab(tab.dataset.diagnosticTab,false);});
@@ -951,17 +1026,22 @@
     doc.querySelectorAll("[data-tg-memory-series]").forEach(function(input){input.addEventListener("change",redraw);});
     doc.querySelectorAll("[data-tg-resource-series]").forEach(function(input){input.addEventListener("change",redraw);});
     function refresh() {
+      var toggleEpoch=networkToggleEpoch;
       return root.fetch("/api/diagnostics?status",{cache:"no-store"}).then(function(statusResponse){
         if(!statusResponse.ok)throw new Error("Ошибка HTTP "+statusResponse.status);return statusResponse.json();
       }).then(function(flags){return root.fetch("/api/diagnostics?report",{cache:"no-store"}).then(function(reportResponse){
         if(!reportResponse.ok&&reportResponse.status!==503)throw new Error("Ошибка HTTP "+reportResponse.status);
         return reportResponse.json().then(function(report){report=report||{};report.general_enabled=flags.enabled===true;
-          report.telegram_enabled=flags.telegram_enabled===true;return report;});
+          report.telegram_enabled=flags.telegram_enabled===true;report.network_enabled=flags.network_enabled===true;return report;});
       });}).then(function (r) {
         currentReport = r || {};
         enabled = typeof currentReport.general_enabled==="boolean"?currentReport.general_enabled:
           currentReport.enabled===true&&currentReport.telegram_enabled!==true;
         telegramEnabled = currentReport.telegram_enabled===true;
+        if (toggleEpoch===networkToggleEpoch && !networkBusy) {
+          networkEnabled = currentReport.network_enabled===true;
+          refreshNetwork();
+        }
         toggle.textContent = enabled ? "Выключить и удалить историю" : "Включить сбор";
         tgToggle.textContent = telegramEnabled ? "Выключить и удалить историю Telegram" : "Включить сбор Telegram";
         download.hidden = !(enabled||telegramEnabled) || !!currentReport.pending;
@@ -980,13 +1060,29 @@
     }
     toggle.addEventListener("click",function(){switchCollector(false);});
     tgToggle.addEventListener("click",function(){switchCollector(true);});
+    if (netToggle) netToggle.addEventListener("click",function(){
+      if (networkBusy) return;
+      networkBusy=true;netToggle.disabled=true;
+      ++networkToggleEpoch;++networkEpoch;
+      root.fetch("/api/diagnostics?network-"+(networkEnabled?"disable":"enable"),{method:"POST",cache:"no-store"})
+        .then(function(r){
+          if (!r.ok) throw new Error("Ошибка HTTP "+r.status);
+          return r.json();
+        }).then(function(flags){
+          networkEnabled=flags.network_enabled===true;
+          refreshNetwork();
+        }).catch(function(){
+          setText(doc,"network-diagnostic-status","Не удалось переключить сетевой сбор.");
+        }).finally(function(){networkBusy=false;netToggle.disabled=false;});
+    });
     selectTab("general",false);
     refresh();
     var lastRefresh=Date.now();
     root.setInterval(function () {
       var waiting=selectedTab==="telegram"&&telegramEnabled&&
         !(currentReport.telegram_diagnostics||{}).latest;
-      if(!busy&&!doc.hidden&&(waiting||Date.now()-lastRefresh>=60000)){
+      if (!busy&&!networkBusy&&!doc.hidden&&selectedTab==="network"&&networkEnabled&&netDownload&&netDownload.hidden&&Date.now()-lastRefresh<60000) refreshNetwork();
+      if(!busy&&!networkBusy&&!doc.hidden&&(waiting||Date.now()-lastRefresh>=60000)){
         lastRefresh=Date.now();
         refresh();
       }

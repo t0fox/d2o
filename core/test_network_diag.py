@@ -6,7 +6,7 @@ import tempfile
 
 
 def main():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory(dir="/dev/shm") as ram:
         root = Path(tmp)
         fixture = {
             "proc/net/netfilter/nfnetlink_queue": (
@@ -40,13 +40,15 @@ def main():
             dest = root / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(value)
-        argv = [str(Path(__file__).with_name("test_network_diag")), *(str(root / k) for k in ("proc", "sys", "run"))]
+        argv = [str(Path(__file__).with_name("test_network_diag")), *(str(root / k) for k in ("proc", "sys", "run")), ram]
         # Resolve the binary path when Make invokes this from core/.
         argv[0] = str(Path(argv[0]).resolve())
         report = json.loads(subprocess.check_output(argv))
         rows = report["samples"]
         assert len(rows) == report["capacity"] == 240 and report["overwritten"] == 3
-        assert report["ring_bytes"] <= 176 * 1024
+        assert report["ram_budget_bytes"] == 2 * 1024 * 1024
+        assert 2 * report["ring_bytes"] < report["ram_reserved_bytes"] <= report["ram_budget_bytes"]
+        assert report["incidents"] == []
         assert rows[-1][1] - rows[0][1] >= 300000
         assert "wan0" not in json.dumps(report)
         parsed = [dict(zip(report["fields"], row, strict=True)) for row in rows]
@@ -73,6 +75,23 @@ def main():
         q = dict(zip(queue_fields, gaps["samples"][1][-2], strict=True))
         assert q["backlog"] is None and q["netlink_socket_drops"] is None
         assert gaps["samples"][1][4] == [None] * 8
+        long_report = json.loads(subprocess.check_output([*argv, "long"]))
+        minutes = long_report["minutes"]
+        assert len(minutes) == 1440
+        assert minutes[-1][1] - minutes[0][1] == 1439
+        assert all(row[2] == 30 for row in minutes)
+        assert all(row[8] == 10 for row in minutes)
+        assert len(long_report["samples"]) == 240
+        assert long_report["samples"][-1][1] - long_report["samples"][0][1] == 478000
+        incidents = long_report["incidents"]
+        assert len(incidents) == 3
+        assert long_report["incidents_overwritten"] == 1
+        for e, sample_index in zip(incidents, (420, 660, 900), strict=True):
+            assert e["trigger_ms"] == 1000 + sample_index * 2000
+            assert e["signals"] == 16 and e["complete"]
+            assert len(e["samples"]) == 241
+            assert e["trigger_ms"] - e["samples"][0][1] == 300000
+            assert e["samples"][-1][1] - e["trigger_ms"] == 180000
     print("network diagnostics: history, procfs, missing sources and stale IPC OK")
 
 
