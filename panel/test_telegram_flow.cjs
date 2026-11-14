@@ -412,3 +412,60 @@ console.log("telegram flow: active sessions and route states match C11 snapshots
   assert.equal(paintedPackets, 0, "новое поколение процесса сбрасывает анимацию старого");
   scene.destroy();
 }
+
+{
+  // Poll order, missing sessions, and stale API must never restart orbiting dots.
+  let timestamp = 1000, nextFrame, orbitDots = [];
+  const fakeMath = Object.create(Math);
+  fakeMath.random = () => 0;
+  const ctx = new Proxy({
+    arc(x, y, radius) {
+      if (radius === 2.8 && x > 240 && x < 360 && y > 140 && y < 280)
+        orbitDots.push([x, y]);
+    },
+  }, { get(target, key) { return target[key] ?? (() => {}); } });
+  const canvas = {
+    style: {}, dataset: {}, getContext: () => ctx, closest: () => null,
+    getBoundingClientRect: () => ({ width: 900 }), setAttribute() {},
+  };
+  const { runInNewContext } = require("node:vm");
+  const { readFileSync } = require("node:fs");
+  const scope = {
+    D2kTelegramFlow: flow, Math: fakeMath, performance: { now: () => timestamp },
+    document: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    requestAnimationFrame(callback) { nextFrame = callback; return 1; },
+    cancelAnimationFrame() { nextFrame = null; },
+    addEventListener() {}, removeEventListener() {},
+  };
+  runInNewContext(readFileSync(require.resolve("../internal/web/assets/telegram-flow-prototype.js"), "utf8"), scope);
+  const scene = scope.D2kTelegramPrototype.mountTelegramFlow(canvas);
+  const confirmed = session({ id: 1, dc: 2, stage: "first_wss_binary_response",
+    selected_transport: "cloudflare_worker", telegram_response_seen: true });
+  const pending = session({ id: 2, dc: 2, stage: "routing" });
+  const poll = active_sessions => snapshot({
+    process_generation: 100, active_connections: active_sessions.length, active_sessions,
+  });
+  scene.update(poll([confirmed, pending]));
+  timestamp += 1000;
+  nextFrame(timestamp);
+  assert.equal(orbitDots.length, 1, "confirmed session has one orbit dot");
+  const first = orbitDots[0];
+  orbitDots = [];
+  scene.update(poll([pending, confirmed]));
+  nextFrame(timestamp);
+  assert.equal(orbitDots.length, 1, "order change retains confirmed dot");
+  assert.deepEqual(orbitDots[0], first, "poll reordering cannot teleport an orbit");
+  orbitDots = [];
+  scene.update(poll([confirmed]));
+  nextFrame(timestamp);
+  assert.deepEqual(orbitDots[0], first, "removing another session preserves the same orbit");
+
+  // Stale telemetry must not cancel requestAnimationFrame or rewind its clock.
+  scene.update(poll([confirmed]), true);
+  assert.equal(typeof nextFrame, "function", "stale polling keeps the visual orbit running");
+  timestamp += 50;
+  orbitDots = [];
+  nextFrame(timestamp);
+  assert.equal(orbitDots.length, 0, "stale data doesn't claim confirmed green traffic");
+  scene.destroy();
+}

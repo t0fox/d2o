@@ -6,6 +6,7 @@ const PORTRAIT_WIDTH = 420, COMPACT_WIDTH = 600;
 const CLI = [70, 210], HUB = [300, 210], COL = [720, 210];
 const GX = [465, 500, 535, 570, 605], GN = ["DNS", "TCP", "TLS", "WS", "MTP"];
 const COOL = 30000;
+const ORBIT_FADE_MS = 600;
 const COLORS = {
   sig: [232, 71, 15], ok: [143, 220, 178], bad: [255, 150, 123],
   mute: [193, 189, 175], ink: [246, 243, 235], rule: [101, 100, 87], warn: [224, 176, 80],
@@ -76,7 +77,7 @@ function mountTelegramFlow(canvas) {
   const hub = { pulse: 0, angle: 0 }, client = { pulse: 0 };
   let view = api.summarizeTelegramFlow(null);
   let processId = 0, processStartedAt = 0, processGeneration = 0, acceptedConnections = null;
-  let now = performance.now(), lastFrame = now, canvasWidth = 900;
+  let now = performance.now(), lastFrame = now, orbitClock = 0, canvasWidth = 900;
   let pixelRatio = 1, inView = true, destroyed = false, frameId = 0;
 
   function fullPath(lane, dc) {
@@ -89,8 +90,16 @@ function mountTelegramFlow(canvas) {
     const id = Number(session.id);
     let item = sessions.get(id);
     if (!item) {
-      item = { id, seed: Math.random() * Math.PI * 2, tries: Object.create(null) };
+      item = { id, seed: Math.random() * Math.PI * 2, orbit: id % 2,
+        appearedAt: now, disappearedAt: null, fadeStartAlpha: 1,
+        tries: Object.create(null) };
       sessions.set(id, item);
+    } else if (item.disappearedAt !== null) {
+      // A session briefly absent from a poll retains its phase and fades back in.
+      const opacity = item.fadeStartAlpha
+        * Math.max(0, 1 - (now - item.disappearedAt) / ORBIT_FADE_MS);
+      item.appearedAt = now - opacity * ORBIT_FADE_MS;
+      item.disappearedAt = null;
     }
     Object.assign(item, {
       dc: Number(session.dc) || null, media: session.is_media === true,
@@ -151,6 +160,19 @@ function mountTelegramFlow(canvas) {
     lanes.forEach(lane => { lane.coolUntil = 0; lane.failT = -1e9; lane.winT = -1e9; });
   }
 
+  function retireMissingOrbits(live) {
+    for (const [id, item] of sessions) {
+      if (live.has(id)) continue;
+      if (item.disappearedAt === null) {
+        item.fadeStartAlpha = Math.min(1,
+          Math.max(0, (now - item.appearedAt) / ORBIT_FADE_MS));
+        item.disappearedAt = now;
+        item.tries = Object.create(null);
+      }
+      if (now - item.disappearedAt >= ORBIT_FADE_MS) sessions.delete(id);
+    }
+  }
+
   function readEvents(snapshot) {
     if (!snapshot) return;
     const pid = Number(snapshot.process_id) || 0;
@@ -196,7 +218,7 @@ function mountTelegramFlow(canvas) {
         if (attempt.state === "run" && !connecting) delete item.tries[transport];
       });
     });
-    for (const id of sessions.keys()) if (!live.has(id)) sessions.delete(id);
+    retireMissingOrbits(live);
     for (const id of cursors.keys()) if (!live.has(id)) cursors.delete(id);
   }
 
@@ -279,7 +301,7 @@ function mountTelegramFlow(canvas) {
     now = performance.now();
     view = api.summarizeTelegramFlow(snapshot || null, stale ? "stale" : undefined);
     if (!snapshot) {
-      sessions.clear(); cursors.clear(); previousTraffic.clear(); parts.length = 0;
+      retireMissingOrbits(new Set()); cursors.clear(); previousTraffic.clear(); parts.length = 0;
       sparks.length = 0; ripples.length = 0; spikes.length = 0;
       dcs.forEach(dc => { dc.count = 0; dc.media = 0; dc.confirmed = 0; });
     } else if (stale) {
@@ -299,8 +321,7 @@ function mountTelegramFlow(canvas) {
     }
     setRouteState(snapshot);
     updateAccessibility();
-    if (stale) { stopLoop(); draw(); }
-    else if (!inView || document.hidden) draw();
+    if (!inView || document.hidden) draw();
     else startLoop();
     return view;
   }
@@ -338,7 +359,7 @@ function mountTelegramFlow(canvas) {
   }
 
   function draw() {
-    const t = now / 1000;
+    const t = orbitClock;
     setSceneTransform();
     context.globalCompositeOperation = "source-over";
     context.fillStyle = "#171813"; context.fillRect(0, 0, W, H);
@@ -543,21 +564,30 @@ function mountTelegramFlow(canvas) {
     context.shadowBlur = 6 + 10 * hub.pulse; context.stroke(); context.shadowBlur = 0;
     context.beginPath(); context.arc(0, 0, 5 + 2 * hub.pulse, 0, Math.PI * 2);
     context.fillStyle = rgba(COLORS.ink, 0.95); context.fill(); context.restore();
-    Array.from(sessions.values()).forEach((item, index) => {
-      const orbit = index % 2, angle = item.seed + t * (orbit ? -0.68 : 0.5)
-        + index * 2.399, radius = 45 + orbit * 8;
+    for (const item of sessions.values()) {
+      const opacity = item.disappearedAt === null
+        ? Math.min(1, Math.max(0, (now - item.appearedAt) / ORBIT_FADE_MS))
+        : item.fadeStartAlpha * Math.max(0, 1 - (now - item.disappearedAt) / ORBIT_FADE_MS);
+      if (opacity <= 0) continue;
+      // Position and direction belong to the session, never its poll-order index.
+      const orbit = item.orbit, angle = item.seed + t * (orbit ? -0.68 : 0.5);
+      const radius = 45 + orbit * 8;
       const x = hubX + radius * Math.cos(angle), y = hubY + radius * Math.sin(angle);
       let tint = COLORS.mute, alpha = 0.4, dotRadius = 2.4;
-      if (view.state === "stale") { tint = COLORS.rule; alpha = 0.3; }
+      if (view.state === "stale" || view.state === "unavailable" ||
+          item.disappearedAt !== null) { tint = COLORS.rule; alpha = 0.3; }
       else if (item.responseSeen) { tint = COLORS.ok; alpha = 0.95; dotRadius = 2.8; }
       else if (item.selectedTransport) { tint = COLORS.sig; alpha = 0.9; }
-      else if (item.stage === "routing") { tint = COLORS.sig; alpha = 0.35 + 0.5 * Math.abs(Math.sin(now / 130 + index)); }
-      else if (item.stage === "upstream_ready") { tint = COLORS.sig; alpha = 0.9; }
+      else if (item.stage === "routing") {
+        tint = COLORS.sig; alpha = 0.35 + 0.5 * Math.abs(Math.sin(now / 130 + item.seed));
+      } else if (item.stage === "upstream_ready") { tint = COLORS.sig; alpha = 0.9; }
       context.beginPath(); context.arc(x, y, dotRadius, 0, Math.PI * 2);
-      context.fillStyle = rgba(tint, alpha);
-      if (item.responseSeen) { context.shadowColor = rgba(tint, 1); context.shadowBlur = 6; }
+      context.fillStyle = rgba(tint, alpha * opacity);
+      if (item.responseSeen && item.disappearedAt === null && view.state !== "stale") {
+        context.shadowColor = rgba(tint, 1); context.shadowBlur = 6 * opacity;
+      }
       context.fill(); context.shadowBlur = 0;
-    });
+    }
     text("d2o", hubX, hubY + 86, 12, COLORS.ink, 0.75);
     setSceneTransform();
   }
@@ -616,14 +646,15 @@ function mountTelegramFlow(canvas) {
 
   function frame(timestamp) {
     frameId = 0;
-    if (destroyed || view.state === "stale" || !inView || document.hidden) return;
+    if (destroyed || !inView || document.hidden) return;
     const delta = Math.min(0.05, Math.max(0, (timestamp - lastFrame) / 1000));
-    lastFrame = timestamp; now = Math.max(now, timestamp); animate(delta); draw(); startLoop();
+    lastFrame = timestamp; now = Math.max(now, timestamp);
+    orbitClock += delta; animate(delta); draw(); startLoop();
   }
   function startLoop() {
     // This canvas is live proxy telemetry; keep it animated independently of
     // the browser's reduced-motion preference.
-    if (!destroyed && view.state !== "stale" && !frameId && inView && !document.hidden)
+    if (!destroyed && !frameId && inView && !document.hidden)
       frameId = global.requestAnimationFrame(frame);
   }
   function stopLoop() { if (frameId) global.cancelAnimationFrame(frameId); frameId = 0; }
