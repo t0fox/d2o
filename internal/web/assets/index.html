@@ -530,13 +530,20 @@ function configuredTargets(value = "") {
   return value.split(",").map(entry => ipAddress(entry.trim())).filter(Boolean);
 }
 
+const TCP_OPEN_TIMEOUT_MS = 5000;
+const TCP_CLOSE_TIMEOUT_MS = 2000;
+const TCP_QUEUE_BYTES = 4 * 1024 * 1024; // Also fits the largest C11 WebSocket frame.
+const TCP_QUEUE_MESSAGES = 512;
+const WS_CHUNK_BYTES = 64 * 1024;
+
 async function waitForTcp(socket) {
   let timer;
   try {
-    await Promise.race([
-      socket.opened,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error("TCP open timed out")), 5000);
+    return await Promise.race([
+      socket.opened.then(() => null, () => "tcp_open_error"),
+      socket.closed.then(() => "tcp_early_eof", () => "tcp_open_error"),
+      new Promise(resolve => {
+        timer = setTimeout(() => resolve("tcp_open_timeout"), TCP_OPEN_TIMEOUT_MS);
       }),
     ]);
   } finally {
@@ -544,53 +551,173 @@ async function waitForTcp(socket) {
   }
 }
 
-function bridge(socket, websocket) {
-  const reader = socket.readable.getReader();
+async function initialRead(firstRead) {
+  let timer;
+  try {
+    return await Promise.race([
+      firstRead,
+      new Promise(resolve => { timer = setTimeout(resolve, 0); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sessionLogger(request, env, port) {
+  if (env.D2O_TG_LOG_SESSIONS !== "1") return () => {};
+  const started = Date.now();
+  const header = request.headers.get("CF-Ray") ?? "";
+  const ray = /^[a-f0-9]{16}(?:-[a-z]{3})?$/i.test(header) ? header : undefined;
+  return fields => console.log({
+    event: "d2o_tg_session_end", ray, port, duration_ms: Date.now() - started,
+    ...fields,
+  });
+}
+
+function bridge(socket, reader, firstRead, ws, report) {
+  ws.binaryType = "arraybuffer";
   const writer = socket.writable.getWriter();
-  let closing = false;
-  function close(code, reason) {
-    if (closing) return;
-    closing = true;
-    try {
-      websocket.close(code, reason);
-    } catch {
-      // Newer compatibility dates can close the WebSocket automatically.
-    }
-    void socket.close().catch(() => {});
+  try {
+    ws.accept({ allowHalfOpen: true });
+  } catch (error) {
+    writer.releaseLock();
+    throw error;
   }
 
-  websocket.binaryType = "arraybuffer";
-  websocket.accept();
-  websocket.addEventListener("message", event => {
-    if (closing) return;
-    const bytes = typeof event.data === "string"
-      ? new TextEncoder().encode(event.data) : new Uint8Array(event.data);
-    // WritableStream preserves call order, including back-to-back messages.
-    void writer.write(bytes).catch(() => close(1011, "TCP write failed"));
-  });
-  websocket.addEventListener("close", () => {
-    void writer.close().then(
-      () => close(1000, "WebSocket closed"),
-      () => close(1011, "TCP close failed"),
-    );
-  });
-  websocket.addEventListener("error", () => close(1011, "WebSocket error"));
-  void socket.opened.catch(() => close(1011, "TCP open failed"));
+  const queue = [];
+  let pendingBytes = 0;
+  let peakBytes = 0;
+  let tcpBytes = 0;
+  let wsBytes = 0;
+  let writing = false;
+  let stopped = false;
+  let peerCode;
+  let closeTimer;
 
-  void (async () => {
+  // All terminal paths share this teardown. Initiate cancellation before
+  // releasing the locks so an outstanding read/write can settle safely.
+  function finish(reason, code) {
+    if (stopped) return;
+    stopped = true;
+    clearTimeout(closeTimer);
+    queue.length = 0;
+    ws.removeEventListener("message", onMessage);
+    ws.removeEventListener("close", onClose);
+    ws.removeEventListener("error", onError);
     try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (value?.byteLength && !closing) websocket.send(value);
-      }
-      close(1000, "TCP closed");
+      ws.close(code, reason);
     } catch {
-      close(1011, "TCP read failed");
-    } finally {
-      reader.releaseLock();
+      // The peer or runtime may already have closed the WebSocket.
     }
-  })();
+    void reader.cancel().catch(() => {});
+    void writer.abort().catch(() => {});
+    reader.releaseLock();
+    writer.releaseLock();
+    void socket.close().catch(() => {});
+    report({
+      http: 101, reason, ws_code: code, peer_ws_code: peerCode,
+      bytes_to_tcp: tcpBytes, bytes_to_ws: wsBytes, tcp_queue_peak: peakBytes,
+      tcp_pending_bytes: pendingBytes,
+    });
+  }
+
+  async function writeTcp() {
+    writing = true;
+    try {
+      while (!stopped && queue.length) {
+        // Keep the in-flight message in the byte and message budgets.
+        const bytes = queue[0];
+        await writer.write(bytes);
+        if (stopped) return;
+        queue.shift();
+        pendingBytes -= bytes.byteLength;
+        tcpBytes += bytes.byteLength;
+      }
+      if (!stopped && peerCode !== undefined) {
+        await writer.close();
+        finish("ws_peer_close", 1000);
+      }
+    } catch {
+      finish("tcp_write_error", 1011);
+    } finally {
+      writing = false;
+    }
+  }
+
+  function onMessage(event) {
+    if (stopped || peerCode !== undefined) return;
+    const data = event.data;
+    if (typeof data === "string" && data.length > TCP_QUEUE_BYTES - pendingBytes) {
+      finish("tcp_queue_full", 1013);
+      return;
+    }
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data);
+    if (!bytes.byteLength) return;
+    if (queue.length >= TCP_QUEUE_MESSAGES || bytes.byteLength > TCP_QUEUE_BYTES - pendingBytes) {
+      finish("tcp_queue_full", 1013);
+      return;
+    }
+    pendingBytes += bytes.byteLength;
+    peakBytes = Math.max(peakBytes, pendingBytes);
+    queue.push(bytes);
+    if (!writing) void writeTcp();
+  }
+
+  function onClose(event) {
+    if (stopped || peerCode !== undefined) return;
+    peerCode = event.code;
+    if (!event.wasClean || peerCode === 1006) {
+      finish("ws_peer_disconnected", 1011);
+      return;
+    }
+    closeTimer = setTimeout(() => finish("tcp_close_timeout", 1011), TCP_CLOSE_TIMEOUT_MS);
+    if (!writing) void writeTcp();
+  }
+
+  function onError() {
+    finish("ws_error", 1011);
+  }
+
+  async function readTcp() {
+    try {
+      let next = firstRead;
+      while (!stopped && peerCode === undefined) {
+        const { value, done } = await next;
+        if (stopped || peerCode !== undefined) return;
+        if (done) {
+          if (pendingBytes) finish("tcp_eof_with_pending_writes", 1011);
+          else finish("tcp_eof", 1000);
+          return;
+        }
+        try {
+          if (ws.readyState !== 1) {
+            finish("ws_not_open", 1011);
+            return;
+          }
+          for (let offset = 0; offset < value.byteLength; offset += WS_CHUNK_BYTES) {
+            const part = value.subarray(offset, offset + WS_CHUNK_BYTES);
+            // send() enqueues bytes in the runtime and has no drain signal.
+            ws.send(part);
+            wsBytes += part.byteLength;
+          }
+        } catch {
+          finish("ws_send_error", 1011);
+          return;
+        }
+        next = reader.read();
+      }
+    } catch {
+      finish("tcp_read_error", 1011);
+    }
+  }
+
+  ws.addEventListener("message", onMessage);
+  ws.addEventListener("close", onClose);
+  ws.addEventListener("error", onError);
+  // A fulfilled closed promise can race the final readable chunk. Let the
+  // reader handle normal EOF after forwarding those bytes.
+  void socket.closed.catch(() => finish("tcp_socket_error", 1011));
+  void readTcp();
 }
 
 export default {
@@ -617,22 +744,44 @@ export default {
       return new Response("Telegram destination is outside the allowlist", { status: 403 });
     }
 
-    let socket;
+    const port = exactPort ? 5222 : 443;
+    const report = sessionLogger(request, env, port);
+    let socket, reader;
+    let failure = "tcp_open_error";
     try {
-      socket = connect({ hostname, port: exactPort ? 5222 : 443 });
-      void socket.closed.catch(() => {});
-      await waitForTcp(socket);
+      socket = connect({ hostname, port });
+      failure = await waitForTcp(socket);
+      if (failure) throw new Error(failure);
+
+      failure = "tcp_early_read_error";
+      reader = socket.readable.getReader();
+      const firstRead = reader.read();
+      // Observe already settled EOF/errors without waiting for application
+      // data: Telegram normally waits for the client to send its handshake.
+      const first = await initialRead(firstRead);
+      if (first?.done) {
+        failure = "tcp_early_eof";
+        throw new Error(failure);
+      }
+      failure = "ws_setup_error";
       const pair = new WebSocketPair();
-      bridge(socket, pair[1]);
-      return new Response(null, {
+      const response = new Response(null, {
         status: 101,
         webSocket: pair[0],
         headers: exactPort ? { "Sec-WebSocket-Protocol": PORT_5222_PROTOCOL } : undefined,
       });
+      bridge(socket, reader, firstRead, pair[1], report);
+      return response;
     } catch {
+      if (reader) {
+        void reader.cancel().catch(() => {});
+        reader.releaseLock();
+      }
       if (socket) void socket.close().catch(() => {});
-      return new Response(exactPort ? "Telegram 5222 connection failed" : "Telegram 443 connection failed",
-        { status: 502 });
+      const status = failure === "tcp_open_timeout" ? 504 : 502;
+      report({ http: status, reason: failure });
+      return new Response(`Telegram ${port} ${status === 504 ? "connection timed out" : "connection failed"}`,
+        { status });
     }
   },
 };
