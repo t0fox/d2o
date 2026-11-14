@@ -1778,6 +1778,41 @@ static void hedge_cancel_candidates(proxy_connection *connection) {
     connection->route_racing = 0;
 }
 
+static int can_reclaim_wss_slot(const tg_epoll_proxy *server) {
+    const tg_config *routing = server->config.routing_config;
+    return server->config.cloudflare_only && routing &&
+           routing->route_only == TG_ROUTE_ONLY_AUTO &&
+           server->active_wss_connections == server->max_wss_connections;
+}
+
+static int reclaim_wss_slot(proxy_connection *connection) {
+    /* An admitted client needs a slot more than a parallel handshake.
+     * Candidates have not sent client payload before promotion. */
+    for (proxy_connection *parent = connection->server->connections;
+         parent; parent = parent->next) {
+        if (parent == connection || !parent->route_index) continue;
+        proxy_connection *first = NULL;
+        for (size_t i = 0; i < TG_HEDGE_CANDIDATES; ++i) {
+            proxy_connection *candidate = parent->hedges[i];
+            if (!candidate) continue;
+            if (!first) {
+                first = candidate;
+                continue;
+            }
+            if (candidate->wss_phase == WSS_READY && first->wss_phase != WSS_READY)
+                candidate = first;
+            parent->route_plan.steps[--parent->route_index] = (tg_route_step){
+                .kind = candidate->route_kind, .index = candidate->hedge_step_index
+            };
+            /* Keep this route available if the surviving candidate fails. */
+            parent->hedge_due_ms = 0;
+            hedge_retire_candidate(candidate, 0);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int setup_route_attempt(proxy_connection *connection,
                                const tg_route_step *step,
                                tg_listener_destination *target,
@@ -1897,8 +1932,9 @@ static int start_next_route(proxy_connection *connection) {
                                 TG_ROUTE_SESSION_FAILED);
             continue;
         }
+        int wss_full = server->active_wss_connections >= server->max_wss_connections;
         if (!server->config.enable_direct_wss ||
-            server->active_wss_connections >= server->max_wss_connections) {
+            (wss_full && !can_reclaim_wss_slot(server))) {
             route_session_event(connection, step.kind,
                                 TG_ROUTE_SESSION_SKIPPED);
             continue;
@@ -1952,6 +1988,10 @@ static int start_next_route(proxy_connection *connection) {
             }
             route_session_event(connection, step.kind,
                                 TG_ROUTE_SESSION_FAILED);
+            continue;
+        }
+        if (wss_full && !reclaim_wss_slot(connection)) {
+            route_session_event(connection, step.kind, TG_ROUTE_SESSION_SKIPPED);
             continue;
         }
         connection->route_data_seen = 0;

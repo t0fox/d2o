@@ -3374,6 +3374,81 @@ static void test_adaptive_races_alternates_in_both_wss_branches(void) {
     atomic_store(&test_monotonic_offset_ms, 0);
 }
 
+static void test_auto_preserves_primary_route_at_wss_capacity(void) {
+    uint16_t client_port, target_port, spare_port;
+    int listener = create_listener(&client_port);
+    int target = create_listener(&target_port);
+    int spare = create_listener(&spare_port);
+    proxy_fixture fixture = {0};
+    set_ipv4(&fixture.original, "149.154.167.51", 443);
+    set_ipv4(&fixture.upstream, "127.0.0.1", target_port);
+    set_ipv4(&fixture.cf_proxy_b_upstream, "127.0.0.1", spare_port);
+    SSL_CTX *tls_context = SSL_CTX_new(TLS_client_method());
+    assert(tls_context);
+    tg_config routing = {
+        .ws_routing = TG_WS_ROUTING_ADAPTIVE,
+        .ws_hedge_delay_ms = 125, .ws_hedge_limit = 2,
+        .cf_proxy_domain_count = 2,
+        .cf_proxy_domains = {"cfproxy-a.test", "cfproxy-b.test"}
+    };
+    tg_epoll_proxy_config config = {
+        .listener_fd = listener, .queue_bytes = 4096,
+        .memory_budget_bytes = 16u * 1024u * 1024u, .configured_max_connections = 3,
+        .handshake_timeout_ms = 5000, .idle_timeout_ms = 6000,
+        .enable_direct_wss = 1, .cloudflare_only = 1,
+        .tls_context = tls_context, .routing_config = &routing,
+        .original_destination = original_destination, .select_route = select_pending_test_route,
+        .resolve_domain = resolve_test_route_domain, .route_context = &fixture,
+        .context = &fixture
+    };
+    tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
+    assert(proxy && tg_epoll_proxy_max_connections(proxy) == 3);
+    int clients[3], upstreams[2];
+    for (size_t i = 0; i < 2; ++i) {
+        clients[i] = connect_to_listener(client_port);
+        assert(send(clients[i], test_handshake, sizeof(test_handshake), 0) ==
+               (ssize_t)sizeof(test_handshake));
+        step_many(proxy, 5);
+        struct pollfd pending = {.fd = target, .events = POLLIN};
+        assert(poll(&pending, 1, 1000) == 1);
+        upstreams[i] = accept(target, NULL, NULL);
+        assert(upstreams[i] >= 0);
+    }
+    atomic_fetch_add(&test_monotonic_offset_ms, 126u);
+    step_many(proxy, 5);
+    tg_epoll_proxy_stats stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.active_connections == 2 && stats.active_wss_connections == 3);
+    assert(stats.wss_attempts == 3);
+    assert(fixture.cf_proxy_a_resolve_calls == 2 && fixture.cf_proxy_b_resolve_calls == 1);
+
+    clients[2] = connect_to_listener(client_port);
+    assert(send(clients[2], test_handshake, sizeof(test_handshake), 0) ==
+           (ssize_t)sizeof(test_handshake));
+    step_many(proxy, 5);
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.active_connections == 3 && stats.active_wss_connections == 3);
+    assert(stats.wss_attempts == 4 && stats.wss_failures == 0);
+    assert(stats.accept_limit_rejections == 0);
+    assert(fixture.cf_proxy_a_resolve_calls == 3 && fixture.cf_proxy_b_resolve_calls == 1);
+
+    /* The surviving primary can still fall back to its requeued route. */
+    close(upstreams[1]);
+    step_many(proxy, 5);
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.active_connections == 3 && stats.active_wss_connections == 3);
+    assert(fixture.cf_proxy_b_resolve_calls == 2);
+
+    for (size_t i = 0; i < 3; ++i) close(clients[i]);
+    close(upstreams[0]);
+    tg_epoll_proxy_destroy(proxy);
+    close(spare);
+    close(target);
+    close(listener);
+    SSL_CTX_free(tls_context);
+    atomic_store(&test_monotonic_offset_ms, 0);
+}
+
 static void test_listener_recovery_preserves_runtime(void) {
     uint16_t port, replacement_port;
     int listener = create_listener(&port);
@@ -3685,6 +3760,10 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
 
 int main(int argc, char **argv) {
     (void)signal(SIGPIPE, SIG_IGN);
+    if (argc == 2 && strcmp(argv[1], "auto-capacity") == 0) {
+        test_auto_preserves_primary_route_at_wss_capacity();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "worker-only") == 0) {
         test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 4, "149.154.167.43", 1, 1024);
         return 0;
@@ -3697,6 +3776,7 @@ int main(int argc, char **argv) {
     test_small_fd_limit_keeps_a_client_slot();
     test_listener_recovery_preserves_runtime();
     test_adaptive_races_alternates_in_both_wss_branches();
+    test_auto_preserves_primary_route_at_wss_capacity();
     test_epoll_bridge_preserves_handshake_and_half_close();
     test_epoll_many_concurrent_tcp_clients();
     test_pending_tcp_connect_expires_before_idle_timeout();
