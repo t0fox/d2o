@@ -403,6 +403,47 @@ static void test_telegram_cache_is_normalized_for_status_api(void) {
     unlink(pid);
 }
 
+
+static void test_telegram_worker_targets_allow_nonexclusive_ports(void) {
+    char dir[128], map_path[256], reply[8192], json[2048];
+    snprintf(dir, sizeof dir, "/tmp/d2k-panel-worker-targets-%ld", (long)getpid());
+    assert(mkdir(dir, 0700) == 0);
+    snprintf(map_path, sizeof map_path, "%s/telegram-dc-map.json", dir);
+    long long now = (long long)time(NULL);
+    int n = snprintf(json, sizeof json,
+        "{\"schema_version\":1,\"fetched_at\":%lld,\"config_date\":%lld,"
+        "\"config_expires\":%lld,\"this_dc\":2,\"endpoints\":["
+        "{\"id\":3,\"address\":\"149.154.175.100\",\"port\":443,\"this_port_only\":false},"
+        "{\"id\":3,\"address\":\"149.154.175.101\",\"port\":443,\"this_port_only\":true},"
+        "{\"id\":2,\"address\":\"149.154.167.51\",\"port\":443,\"this_port_only\":false},"
+        "{\"id\":2,\"address\":\"149.154.167.51\",\"port\":5222,\"this_port_only\":true}"
+        "]}", now, now - 300, now + 3600);
+    assert(n > 0 && (size_t)n < sizeof json);
+    FILE *f = fopen(map_path, "w");
+    assert(f && fwrite(json, 1, (size_t)n, f) == (size_t)n && fclose(f) == 0);
+    d2k_panel_config cfg = {.state_dir = dir};
+    request(&cfg, "GET /api/telegram/worker-targets HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            reply, sizeof reply);
+    assert(strstr(reply, "HTTP/1.1 200 OK"));
+    assert(strstr(reply, "\"count\":2,\"explicit_count\":1"));
+    assert(strstr(reply, "\"149.154.175.100\""));
+    assert(strstr(reply, "\"149.154.167.51\""));
+    assert(!strstr(reply, "\"149.154.175.101\""));
+
+    /* Missing this_port_only cannot silently broaden Worker permissions. */
+    char *flag = strstr(json, "\"this_port_only\":false");
+    assert(flag);
+    memcpy(flag, "\"this_port_only\":null ", strlen("\"this_port_only\":null "));
+    f = fopen(map_path, "w");
+    assert(f && fwrite(json, 1, (size_t)n, f) == (size_t)n && fclose(f) == 0);
+    request(&cfg, "GET /api/telegram/worker-targets HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            reply, sizeof reply);
+    assert(strstr(reply, "\"status\":\"unavailable\""));
+
+    assert(unlink(map_path) == 0);
+    assert(rmdir(dir) == 0);
+}
+
 static void test_telegram_worker_domains_are_validated_and_restart_only_c11(void) {
     char config[] = "/tmp/d2k-panel-workers-config.XXXXXX";
     char service[] = "/tmp/d2k-panel-workers-service.XXXXXX";
@@ -954,6 +995,7 @@ int main(void) {
     test_invalid_live_json_is_not_reported_as_empty_knowledge();
     test_telegram_status_is_dynamic_and_never_exposes_secret();
     test_telegram_cache_is_normalized_for_status_api();
+    test_telegram_worker_targets_allow_nonexclusive_ports();
     test_telegram_worker_domains_are_validated_and_restart_only_c11();
     test_telegram_route_only_is_validated_and_restarts_c11();
     test_update_state_is_served_from_file();

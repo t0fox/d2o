@@ -1271,6 +1271,7 @@ static void buf_json_string(panel_buf *b, const char *s) {
 typedef struct {
     char addresses[WORKER_DC_MAX_ENDPOINTS][INET6_ADDRSTRLEN];
     size_t count;
+    uint8_t exact_port[WORKER_DC_MAX_ENDPOINTS];
     long long fetched_at, expires;
 } worker_dc_targets;
 
@@ -1317,10 +1318,25 @@ static int read_dc_timestamp(const char *json, const char *field, long long *out
 }
 
 static int append_dc_target(const char *endpoint, const char *end, worker_dc_targets *targets) {
-    const char *port, *value;
-    size_t port_len, value_len;
-    if (!json_object_value(endpoint, end, "port", &port, &port_len)) return -1;
-    if (port_len != 4 || memcmp(port, "5222", 4) != 0) return 0;
+    const char *port, *port_only, *value;
+    size_t port_len, port_only_len, value_len;
+    if (!json_object_value(endpoint, end, "port", &port, &port_len) ||
+        !port_len || port_len > 5) return -1;
+    unsigned port_number = 0;
+    for (size_t i = 0; i < port_len; ++i) {
+        if (port[i] < '0' || port[i] > '9') return -1;
+        port_number = port_number * 10u + (unsigned)(port[i] - '0');
+    }
+    if (!port_number || port_number > 65535) return -1;
+    if (!json_object_value(endpoint, end, "this_port_only",
+                           &port_only, &port_only_len)) return -1;
+    int port_restricted = port_only_len == 4 &&
+                          memcmp(port_only, "true", 4) == 0;
+    if (!port_restricted && !(port_only_len == 5 &&
+                              memcmp(port_only, "false", 5) == 0)) return -1;
+    /* Mirror tg_dc_write_endpoint_manifest(): a Telegram dcOption may
+     * permit 5222 without literally listing port 5222. */
+    if (port_restricted && port_number != 5222u) return 0;
     if (!json_object_value(endpoint, end, "address", &value, &value_len) ||
         value_len < 3 || value_len - 2 >= INET6_ADDRSTRLEN || *value != '"') return -1;
 
@@ -1337,9 +1353,15 @@ static int append_dc_target(const char *endpoint, const char *end, worker_dc_tar
         ip += sizeof mapped_prefix;
     }
     if (!inet_ntop(family, ip, address, sizeof address)) return -1;
-    for (size_t i = 0; i < targets->count; ++i)
-        if (strcmp(address, targets->addresses[i]) == 0) return 0;
-    snprintf(targets->addresses[targets->count++], sizeof address, "%s", address);
+    for (size_t i = 0; i < targets->count; ++i) {
+        if (strcmp(address, targets->addresses[i]) != 0) continue;
+        if (port_number == 5222u) targets->exact_port[i] = 1;
+        return 0;
+    }
+    if (targets->count >= WORKER_DC_MAX_ENDPOINTS) return -1;
+    size_t index = targets->count++;
+    snprintf(targets->addresses[index], sizeof address, "%s", address);
+    targets->exact_port[index] = port_number == 5222u;
     return 0;
 }
 
@@ -1348,6 +1370,7 @@ static int parse_dc_targets(const char *json, long long now, worker_dc_targets *
     size_t len;
     long long schema, config_date, dc;
     targets->count = 0;
+    memset(targets->exact_port, 0, sizeof targets->exact_port);
     if (read_dc_timestamp(json, "schema_version", &schema) != 0 || schema != 1 ||
         read_dc_timestamp(json, "fetched_at", &targets->fetched_at) != 0 ||
         read_dc_timestamp(json, "config_date", &config_date) != 0 ||
@@ -1406,7 +1429,10 @@ static int api_telegram_worker_targets(int fd, const d2k_panel_config *cfg) {
         }
     }
 
-    size_t cap = targets->count * (INET6_ADDRSTRLEN + 3u) + 192u;
+    size_t exact_count = 0;
+    for (size_t i = 0; i < targets->count; ++i)
+        exact_count += targets->exact_port[i] != 0;
+    size_t cap = targets->count * (INET6_ADDRSTRLEN + 3u) + 256u;
     char *body = malloc(cap);
     if (!body) {
         free(targets);
@@ -1421,7 +1447,8 @@ static int api_telegram_worker_targets(int fd, const d2k_panel_config *cfg) {
         if (i) buf_puts(&out, ",");
         buf_json_string(&out, targets->addresses[i]);
     }
-    buf_printf(&out, "],\"count\":%zu}", targets->count);
+    buf_printf(&out, "],\"count\":%zu,\"explicit_count\":%zu}",
+               targets->count, exact_count);
     int rc = out.failed ? -1 : response_ex(fd, 200, "OK", type, no_store, body, out.len);
     free(body);
     free(targets);

@@ -950,18 +950,18 @@
   function createWorkerSetup(doc, win) {
     var section = el(doc, "section", "tg-worker-setup");
     var title = el(doc, "h3", "", "Настройка Cloudflare Worker");
-    var intro = el(doc, "p", "", "Стандартный Worker Flowseal подходит для TCP 443. Для TCP 5222 нужен Worker D2O.");
+    var intro = el(doc, "p", "", "TCP 443 работает без дополнительных переменных. TCP 5222 — необязательная функция Worker D2O.");
     var steps = el(doc, "ol");
     [
       "В Cloudflare откройте Workers & Pages, создайте Worker и перейдите в Edit code. Вставьте код ниже и нажмите Deploy.",
-      "Для TCP 5222 добавьте в Settings → Variables and Secrets переменную D2O_TG_5222_TARGETS типа Text. Вставьте скопированные IP и нажмите Deploy.",
+      "Для TCP 5222 (необязательно) добавьте в Settings → Variables and Secrets переменную D2O_TG_5222_TARGETS типа Text. Вставьте разрешённые картой IP и нажмите Deploy.",
       "Скопируйте hostname workers.dev из Cloudflare и добавьте его в поле «Домен Worker» в этом окне."
     ].forEach(function (text) { steps.appendChild(el(doc, "li", "", text)); });
 
     var actions = el(doc, "div", "tg-worker-setup-actions");
     var copyCode = el(doc, "button", "btn", "Скопировать код Worker");
     var download = el(doc, "a", "btn", "Скачать .js");
-    var copyIPs = el(doc, "button", "btn", "Скопировать IP для TCP 5222");
+    var copyIPs = el(doc, "button", "btn", "Скопировать разрешённые IP для TCP 5222");
     copyCode.type = copyIPs.type = "button";
     download.download = "worker.js";
     actions.append(copyCode, download, copyIPs);
@@ -1046,13 +1046,17 @@
       }).then(function (map) {
         if (current !== request) return;
         if (!map || (map.status !== "current" && map.status !== "expired") ||
-            !Array.isArray(map.addresses) || map.count !== map.addresses.length) throw new Error("DC map");
+            !Array.isArray(map.addresses) || map.count !== map.addresses.length ||
+            !Number.isSafeInteger(map.explicit_count) || map.explicit_count < 0 ||
+            map.explicit_count > map.count) throw new Error("DC map");
         var date = new Date(map.fetched_at * 1000);
         var fetched = Number.isFinite(date.getTime()) ? date.toLocaleString("ru-RU") : "неизвестно";
         var state = map.last_good ? "Резервная подтверждённая карта DC" : "Подтверждённая карта DC";
-        mapStatus.textContent = state + " от " + fetched + " · IP для TCP 5222 — " + map.count + ".";
+        mapStatus.textContent = state + " от " + fetched + " · IP, допускающих 5222: " + map.count +
+          " (прямо указали 5222: " + map.explicit_count + ").";
         if (map.status === "expired") mapStatus.textContent += " Срок действия карты истёк.";
-        if (!map.count) mapStatus.textContent += " Telegram не указал порт 5222 в карте. Здесь отображаются только явно объявленные адреса.";
+        if (map.count) mapStatus.textContent += " Адреса разрешены картой, но доступность TCP 5222 не проверялась.";
+        else mapStatus.textContent += " В карте нет адресов, допускающих использование порта 5222.";
         if (map.status === "expired") mapStatus.setAttribute("data-tone", "warn");
         targets = map.addresses.join(",");
         copyIPs.disabled = !targets;
