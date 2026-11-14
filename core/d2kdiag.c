@@ -187,14 +187,13 @@ int main(int argc, char **argv) {
                 }
                 if (network_fd >= 0 && flock(network_fd, LOCK_EX | LOCK_NB) == 0) {
                     if (!network_clean || session != network_session) {
-                        d2k_network_history_unmap(network, network_fd);
+                        network_clean = d2k_network_history_unmap(network, network_fd) == 0;
                         network = NULL;
-                        network_clean = 1;
                         network_session = session;
                         net_controller = (d2k_network_controller_message){0};
                         net_datapath = (d2k_network_datapath_message){0};
                     }
-                    if (session && !network && now >= network_retry) {
+                    if (session && network_clean && !network && now >= network_retry) {
                         if (d2k_network_memory_ready("/proc"))
                             network = d2k_network_history_map(network_fd, session);
                         if (!network) network_retry = now + 10000;
@@ -262,7 +261,7 @@ int main(int argc, char **argv) {
     }
     if (network_fd >= 0) {
         if (flock(network_fd, LOCK_EX | LOCK_NB) == 0)
-            d2k_network_history_unmap(network, network_fd);
+            (void)d2k_network_history_unmap(network, network_fd);
         close(network_fd);
     }
     d2k_diag_free(general);

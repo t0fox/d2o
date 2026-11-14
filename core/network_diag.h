@@ -16,7 +16,7 @@ uint64_t d2k_network_session(const char *dir);
 int d2k_network_open(const char *dir, const char *name, int create);
 int d2k_network_memory_ready(const char *proc);
 d2k_network_history *d2k_network_history_map(int fd, uint64_t session);
-void d2k_network_history_unmap(d2k_network_history *history, int fd);
+int d2k_network_history_unmap(d2k_network_history *history, int fd);
 d2k_network_history *d2k_network_history_copy(int fd, uint64_t session);
 
 void d2k_network_history_sample(d2k_network_history *history, uint64_t now,

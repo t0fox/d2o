@@ -49,7 +49,7 @@ static void test_network_export(void) {
  n=read(sv[1],response,sizeof(response)-1); assert(n>0); response[n]=0;
  assert(strstr(response,"\r\n\r\nnull"));
  close(sv[0]); close(sv[1]);
- d2k_network_history_unmap(history,state); close(state);
+ assert(!d2k_network_history_unmap(history,state)); close(state);
  assert(!d2k_diag_toggle(dir,0));
  char path[512];
  assert(!d2k_diag_path(path,sizeof(path),dir,D2K_NETWORK_STATE) && !unlink(path));

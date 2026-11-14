@@ -632,16 +632,17 @@ d2k_network_history *d2k_network_history_map(int fd, uint64_t session) {
             return h;
         }
     }
-    (void)ftruncate(fd, 0);
+    int saved_errno = errno;
+    if (ftruncate(fd, 0) == 0) errno = saved_errno;
 #else
     (void)fd; (void)session;
 #endif
     return NULL;
 }
 
-void d2k_network_history_unmap(d2k_network_history *h, int fd) {
+int d2k_network_history_unmap(d2k_network_history *h, int fd) {
     if (h) munmap(h, sizeof(*h));
-    (void)ftruncate(fd, 0);
+    return ftruncate(fd, 0);
 }
 
 d2k_network_history *d2k_network_history_copy(int fd, uint64_t session) {

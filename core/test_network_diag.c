@@ -40,7 +40,7 @@ int main(int argc, char **argv) {
     }
     d2k_network_history *copy = d2k_network_history_copy(fd, 123);
     assert(copy && !d2k_network_history_copy(fd, 124));
-    d2k_network_history_unmap(history, fd);
+    assert(!d2k_network_history_unmap(history, fd));
     assert(!d2k_network_history_copy(fd, 123));
     close(fd);
     d2k_network_history_write(stdout, copy);
