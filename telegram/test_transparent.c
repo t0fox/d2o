@@ -154,6 +154,48 @@ static void test_dc4_media_alias_uses_dc4_wss_route(void) {
     assert(selected.dc_id == 4 && selected.is_media && !selected.tcp_only);
 }
 
+static void test_ios_reserved_abridged_prefix_on_known_media_dc(void) {
+    uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN];
+    tg_mtproto_ctr tx = {0}, rx = {0};
+    assert(tg_mtproto_make_obfuscated2_init(TG_MTPROTO_ABRIDGED, 4, 1,
+                                          handshake, &tx, &rx) == 0);
+    tg_mtproto_ctr_destroy(&tx);
+    tg_mtproto_ctr_destroy(&rx);
+    handshake[0] = 0xef;
+    tg_mtproto_init parsed;
+    assert(tg_mtproto_parse_obfuscated2(handshake, &parsed) != 0);
+
+    const uint16_t ports[] = {443, 5222};
+    const char *cidrs[] = {"149.154.160.0/20"};
+    tg_transparent_policy policy = {
+        .allowed_ports = ports, .allowed_port_count = 2,
+        .allowed_cidrs = cidrs, .allowed_cidr_count = 1,
+    };
+    tg_listener_destination original;
+    destination(&original, "149.154.167.43", 443);
+    tg_epoll_route_selection route = {0};
+    assert(tg_transparent_select_route(&policy, &original, handshake, &route) == 0);
+    assert(route.dc_id == 4 && route.is_media && !route.tcp_only);
+    assert(route.proto == TG_MTPROTO_ABRIDGED &&
+           route.repaired_init_first_byte && route.repaired_init_first_byte != 0xef);
+    assert(!memcmp(route.upstream.address, original.address, 4) &&
+           route.upstream.port == original.port);
+    assert(handshake[0] == 0xef);
+
+    original.port = 5222;
+    assert(tg_transparent_select_route(&policy, &original, handshake, &route) == 0);
+    assert(route.upstream.port == 5222 && route.repaired_init_first_byte == 1);
+    destination(&original, "149.154.167.250", 443);
+    assert(tg_transparent_select_route(&policy, &original, handshake, &route) != 0);
+    destination(&original, "149.154.175.100", 443);
+    assert(tg_transparent_select_route(&policy, &original, handshake, &route) != 0);
+    destination(&original, "149.154.167.43", 80);
+    assert(tg_transparent_select_route(&policy, &original, handshake, &route) != 0);
+    destination(&original, "149.154.167.43", 443);
+    uint8_t plain[TG_MTPROTO_HANDSHAKE_LEN] = {0xef, 1};
+    assert(tg_transparent_select_route(&policy, &original, plain, &route) != 0);
+}
+
 static void test_exact_tcpo_secret_is_used_for_original_destination_only(void) {
     uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN], secret[16];
     assert(unhex("0001020304050607000102030405060708090a0b0c0d0e0f"
@@ -234,6 +276,7 @@ int main(void) {
     test_policy_rejects_wrong_port_cidr_and_unlisted_dc();
     test_unmapped_direct_route_preserves_exact_original_target();
     test_dc4_media_alias_uses_dc4_wss_route();
+    test_ios_reserved_abridged_prefix_on_known_media_dc();
     test_exact_tcpo_secret_is_used_for_original_destination_only();
     puts("Тесты политики прозрачного Telegram-прокси: ок");
     return 0;

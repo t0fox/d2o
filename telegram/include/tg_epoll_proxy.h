@@ -164,6 +164,7 @@ typedef struct {
     tg_mtproto_proto proto;
     int tcp_only;
     int is_cdn;
+    uint8_t repaired_init_first_byte; /* Zero leaves the client init unchanged. */
 } tg_epoll_route_selection;
 
 typedef int (*tg_epoll_select_route_fn)(

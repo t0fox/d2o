@@ -2473,6 +2473,8 @@ static int route_after_handshake(proxy_connection *connection) {
          tg_listener_is_self_dial_addr(upstream, server->listen_ports,
                                        server->config.listen_port_count)))
         return -1;
+    if (selection.repaired_init_first_byte)
+        connection->handshake[0] = selection.repaired_init_first_byte;
     connection->upstream_target = *upstream;
     connection->direct_wss = 0;
     size_t worker_count = 0, cf_count = 0;

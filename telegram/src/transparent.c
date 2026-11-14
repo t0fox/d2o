@@ -113,15 +113,30 @@ int tg_transparent_select_route(
         return -1;
     tg_mtproto_init parsed;
     int used_official_secret = 0;
-    if (parse_client_handshake(policy, original, handshake, &parsed,
-                               &used_official_secret) != 0)
+    uint8_t repaired_init_first_byte = 0;
+    if (handshake[0] == 0xef) {
+        /* Some iOS clients send an obfuscated abridged init with the reserved
+         * plain abridged marker as its first random byte. Bytes 0..7 are
+         * outside the obfuscation key and IV in both directions. */
+        uint8_t repaired[TG_MTPROTO_HANDSHAKE_LEN];
+        memcpy(repaired, handshake, sizeof(repaired));
+        repaired[0] = 1;
+        if (tg_mtproto_parse_obfuscated2(repaired, &parsed) != 0 ||
+            parsed.proto != TG_MTPROTO_ABRIDGED || !parsed.dc_id)
+            return -1;
+        repaired_init_first_byte = repaired[0];
+    } else if (parse_client_handshake(policy, original, handshake, &parsed,
+                                      &used_official_secret) != 0) {
         return -1;
+    }
     int64_t now = (int64_t)time(NULL);
     tg_dc_endpoint endpoint = {0};
     tg_dc_map_source source;
     int result = tg_dc_map_store_resolve(policy->map_store, now, original,
                                          parsed.is_media, parsed.dc_id, 1,
                                          &endpoint, &source);
+    if (repaired_init_first_byte &&
+        (result != TG_DC_LOOKUP_OK || endpoint.secret_len)) return -1;
     /* Unknown destinations may only pass through unchanged when no DC hint
      * was supplied. Never grant an arbitrary address a WSS/CF route. */
     if (result != TG_DC_LOOKUP_OK &&
@@ -136,6 +151,7 @@ int tg_transparent_select_route(
     selection->is_media = parsed.is_media ||
         (result == TG_DC_LOOKUP_OK && endpoint.media_only);
     selection->proto = parsed.proto;
+    selection->repaired_init_first_byte = repaired_init_first_byte;
     selection->is_cdn = result == TG_DC_LOOKUP_OK && endpoint.cdn;
     selection->tcp_only = used_official_secret ||
         result != TG_DC_LOOKUP_OK || endpoint.cdn || endpoint.tcpo_only ||

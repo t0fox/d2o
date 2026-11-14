@@ -8,6 +8,7 @@ void tg_epoll_proxy_test_set_ping_interval_ms(uint64_t interval_ms);
 #include "tg_tls.h"
 #include "tg_ws.h"
 #include "tg_route_plan.h"
+#include "tg_transparent.h"
 
 #include <assert.h>
 #include <arpa/inet.h>
@@ -109,6 +110,7 @@ typedef struct {
     size_t cf_proxy_b_resolve_calls;
     atomic_int fail_cf_proxy_a_dns;
     atomic_int dns_ready;
+    tg_transparent_policy transparent;
 } proxy_fixture;
 
 typedef struct {
@@ -257,6 +259,15 @@ static int select_target(void *opaque,
     return 0;
 }
 
+static int select_transparent_route(void *opaque,
+                                     const tg_listener_destination *original,
+                                     const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
+                                     tg_epoll_route_selection *out) {
+    proxy_fixture *fixture = opaque;
+    ++fixture->routes;
+    return tg_transparent_select_route(&fixture->transparent, original, handshake, out);
+}
+
 static int select_tcp_passthrough(void *opaque,
                                   const tg_listener_destination *original,
                                   const uint8_t handshake[TG_MTPROTO_HANDSHAKE_LEN],
@@ -284,6 +295,7 @@ static int resolve_test_route_domain(void *opaque, const char *domain,
     }
     if (strcmp(domain, "worker.test") != 0 &&
         strcmp(domain, "kws4.cfproxy.test") != 0 &&
+        strcmp(domain, "kws2-1.cfproxy.test") != 0 &&
         strcmp(domain, "kws4-1.cfproxy.test") != 0 &&
         strcmp(domain, "kws203-1.cfproxy.test") != 0) return -1;
     *out = fixture->upstream;
@@ -2486,7 +2498,7 @@ static void test_async_route_dns_waits_before_worker(void) {
     assert(rmdir(directory) == 0);
 }
 
-static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(void) {
+static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(int ios_prefix) {
     char directory[] = "/tmp/d2k-tg-cf-proxy-XXXXXX";
     char cert_path[256], key_path[256];
     assert(mkdtemp(directory) != NULL);
@@ -2508,24 +2520,33 @@ static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(void) {
         .listener = create_listener(&ws_port),
         .cert_path = cert_path,
         .key_path = key_path,
-        .expected_sni = "kws203-1.cfproxy.test",
+        .expected_sni = ios_prefix ? "kws2-1.cfproxy.test" : "kws203-1.cfproxy.test",
         .expected_path = "/apiws",
         .expect_binary_subprotocol = 1
     };
     atomic_init(&cf_proxy.complete, 0);
     uint8_t handshake[64];
-    make_wss_test_handshake(TG_MTPROTO_INTERMEDIATE, 203, 1, handshake);
+    tg_mtproto_proto proto = ios_prefix ? TG_MTPROTO_ABRIDGED : TG_MTPROTO_INTERMEDIATE;
+    make_wss_test_handshake(proto, ios_prefix ? 2 : 203, 1, handshake);
+    if (ios_prefix) handshake[0] = 1;
     memcpy(cf_proxy.handshake, handshake, sizeof(handshake));
     cf_proxy.handshake_len = sizeof(handshake);
-    prepare_wss_response(&cf_proxy, handshake, TG_MTPROTO_INTERMEDIATE);
+    prepare_wss_response(&cf_proxy, handshake, proto);
     const uint8_t clear_packet[12] = {8,0,0,0,0x11,0x22,0x33,0x44,
                                       0x55,0x66,0x77,0x88};
     tg_mtproto_ctr decrypt = {0}, encrypt = {0};
-    memcpy(cf_proxy.expected_packet, clear_packet, sizeof(clear_packet));
+    cf_proxy.expected_packet_len = sizeof(clear_packet);
+    if (ios_prefix) {
+        cf_proxy.expected_packet[0] = 2;
+        memcpy(cf_proxy.expected_packet + 1, clear_packet + 4, sizeof(clear_packet) - 4);
+        cf_proxy.expected_packet_len = 9;
+    } else {
+        memcpy(cf_proxy.expected_packet, clear_packet, sizeof(clear_packet));
+    }
     assert(tg_mtproto_direct_stream_ciphers(handshake, &decrypt,
                                              &encrypt) == 0);
     assert(tg_mtproto_ctr_xor(&encrypt, cf_proxy.expected_packet,
-                              sizeof(cf_proxy.expected_packet)) == 0);
+                              cf_proxy.expected_packet_len) == 0);
     tg_mtproto_ctr_destroy(&decrypt);
     tg_mtproto_ctr_destroy(&encrypt);
     pthread_t cf_thread;
@@ -2533,7 +2554,7 @@ static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(void) {
 
     int listener = create_listener(&proxy_port);
     proxy_fixture fixture = {0};
-    set_ipv4(&fixture.original, "149.154.167.51", 443);
+    set_ipv4(&fixture.original, ios_prefix ? "149.154.167.151" : "149.154.167.51", 443);
     set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
     SSL_CTX *tls_context = tg_tls_client_context(cert_path);
     assert(tls_context);
@@ -2541,6 +2562,12 @@ static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(void) {
     routing.ws_routing = TG_WS_ROUTING_CF_FIRST;
     routing.cf_proxy_domain_count = 1;
     memcpy(routing.cf_proxy_domains[0], "cfproxy.test", sizeof("cfproxy.test"));
+    const uint16_t ports[] = {443};
+    const char *cidrs[] = {"149.154.160.0/20"};
+    fixture.transparent = (tg_transparent_policy){
+        .allowed_ports = ports, .allowed_port_count = 1,
+        .allowed_cidrs = cidrs, .allowed_cidr_count = 1,
+    };
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
@@ -2554,7 +2581,8 @@ static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(void) {
         .resolve_domain = resolve_test_route_domain,
         .route_context = &fixture,
         .original_destination = original_destination,
-        .select_target = select_target,
+        .select_target = ios_prefix ? NULL : select_target,
+        .select_route = ios_prefix ? select_transparent_route : NULL,
         .context = &fixture,
     };
     tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
@@ -2568,11 +2596,12 @@ static void test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(void) {
     struct timeval timeout = {.tv_sec = 5};
     assert(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                       sizeof(timeout)) == 0);
+    if (ios_prefix) handshake[0] = 0xef;
     assert(send(client, handshake, sizeof(handshake), 0) ==
            (ssize_t)sizeof(handshake));
     assert(send(client, cf_proxy.expected_packet,
-                sizeof(cf_proxy.expected_packet), 0) ==
-           (ssize_t)sizeof(cf_proxy.expected_packet));
+                cf_proxy.expected_packet_len, 0) ==
+           (ssize_t)cf_proxy.expected_packet_len);
     assert(shutdown(client, SHUT_WR) == 0);
     uint8_t echoed[sizeof(cf_proxy.response_packet)];
     size_t received = 0;
@@ -3760,6 +3789,10 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
 
 int main(int argc, char **argv) {
     (void)signal(SIGPIPE, SIG_IGN);
+    if (argc == 2 && strcmp(argv[1], "ios-media") == 0) {
+        test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(1);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "auto-capacity") == 0) {
         test_auto_preserves_primary_route_at_wss_capacity();
         return 0;
@@ -3817,7 +3850,8 @@ int main(int argc, char **argv) {
     test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 4, "149.154.167.43", 1, 1024);
     test_epoll_wss_sends_ping();
     test_async_route_dns_waits_before_worker();
-    test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing();
+    test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(0);
+    test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing(1);
     test_epoll_reuses_confirmed_media_route_across_ips();
     test_epoll_cools_down_cf_proxy_after_dns_failure();
     test_wss_partial_frame_before_response_advances_route();
