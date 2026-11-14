@@ -353,6 +353,14 @@
                   <div><dt>Файловые дескрипторы</dt><dd data-tg-field="fd_count" data-format="n" data-limit="soft_nofile_limit">—</dd></div>
                   <div><dt>Доступно для роста</dt><dd data-tg-field="memory_headroom_bytes" data-format="b">—</dd></div>
                   <div><dt>Потолок памяти</dt><dd data-tg-field="memory_ceiling_bytes" data-format="b">—</dd></div>
+                  <div><dt>Доступная RAM при пересчёте</dt><dd data-tg-field="limit_mem_available_kib" data-format="k">—</dd></div>
+                  <div><dt>RSS при пересчёте</dt><dd data-tg-field="limit_rss_kib" data-format="k">—</dd></div>
+                  <div><dt>Предел соединений по RAM</dt><dd data-tg-field="connection_ram_limit" data-format="n">—</dd></div>
+                  <div><dt>Предел соединений по FD</dt><dd data-tg-field="connection_fd_limit" data-format="n">—</dd></div>
+                  <div><dt>Настроенный максимум</dt><dd data-tg-field="configured_connection_limit" data-format="n">—</dd></div>
+                  <div><dt>Причины текущего лимита</dt><dd data-tg-field="connection_limit_reasons" data-format="limitReasons">—</dd></div>
+                  <div><dt>Последнее изменение</dt><dd data-tg-field="connection_limit_changed_at" data-format="time">—</dd></div>
+                  <div><dt>Лимит до изменения</dt><dd data-tg-field="previous_connection_limit" data-format="n">—</dd></div>
                 </dl><details class="tg-diag-chart-help"><summary>Изменения лимитов</summary><ol id="tg-diag-limit-history" class="diag-transition-list"></ol></details>
               </section>
               <section class="diag-card tg-diag-detail"><h4>Соединения и ошибки</h4>
@@ -384,6 +392,7 @@
                   <div><dt>Отказы по лимиту буферов</dt><dd data-tg-field="buffer_budget_rejections" data-format="n">—</dd></div>
                   <div><dt>Отказы по размеру буфера</dt><dd data-tg-field="buffer_size_rejections" data-format="n">—</dd></div>
                   <div><dt>Отказы по лимиту соединений</dt><dd data-tg-field="accept_limit_rejections" data-format="n">—</dd></div>
+                  <div><dt>Причины последнего ресурсного отказа</dt><dd data-tg-field="last_accept_rejection_reasons" data-format="limitReasons">—</dd></div>
                   <div><dt>Отказы из-за нехватки FD</dt><dd data-tg-field="accept_fd_exhaustion" data-format="n">—</dd></div>
                 </dl><dl class="tg-diag-metrics" id="tg-diag-period-errors"></dl><dl class="tg-diag-metrics" id="tg-diag-stage-failures"></dl></details>
               </section>

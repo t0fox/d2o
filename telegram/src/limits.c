@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "tg_limits.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/resource.h>
@@ -10,6 +12,21 @@
 #define TG_LIMITS_RESERVED_FDS 33u
 #define TG_LIMITS_FDS_PER_CONNECTION 2u
 #define TG_LIMITS_MEMORY_BUDGET_MAX (192u * 1024u * 1024u)
+#define MIB (1024u * 1024u)
+
+static size_t usable_fds(size_t fd_limit) {
+    return fd_limit - (fd_limit / 5u + (fd_limit % 5u != 0));
+}
+
+static size_t memory_headroom(size_t total, size_t available) {
+    size_t reserve = total / 5u;
+    if (available / 2u > reserve) reserve = available / 2u;
+    /* Older small routers can boot below the nominal reserve. Leave at
+     * least 3/4 of the available memory to the OS in that case. */
+    size_t cold_reserve = available - available / 4u;
+    if (reserve > cold_reserve) reserve = cold_reserve;
+    return available - reserve;
+}
 
 void tg_limits_read_meminfo(FILE *file, size_t *total, size_t *available) {
     *total = *available = 0;
@@ -77,16 +94,9 @@ size_t tg_limits_policy_admission(size_t fd_limit, size_t total_bytes,
                                   size_t available_bytes, size_t cap,
                                   size_t active) {
     if (!total_bytes || available_bytes > total_bytes) return 0;
-    size_t usable_fds = fd_limit - (fd_limit / 5u + (fd_limit % 5u != 0));
-    size_t fd_slots = usable_fds > 32u ? (usable_fds - 32u) / 5u : 0;
-    size_t reserved = total_bytes / 5u;
-    if (available_bytes / 2u > reserved) reserved = available_bytes / 2u;
-    /* Cold boot may have less RAM free than the nominal reserve alone.
-     * Leave at least 3/4 of available memory for the system under pressure
-     * and admit only whole slots from the remaining quarter. */
-    size_t max_reserve = available_bytes - available_bytes / 4u;
-    if (reserved > max_reserve) reserved = max_reserve;
-    size_t memory_slots = (available_bytes - reserved) / (1024u * 1024u);
+    size_t usable = usable_fds(fd_limit);
+    size_t fd_slots = usable > 32u ? (usable - 32u) / 5u : 0;
+    size_t memory_slots = memory_headroom(total_bytes, available_bytes) / MIB;
     if (cap > fd_slots) cap = fd_slots;
     /* MemAvailable budgets additional clients. Counting live clients
      * against that allowance would starve new media behind idle text. */
@@ -109,4 +119,100 @@ size_t tg_limits_runtime_memory_budget(size_t total_bytes,
     return budget < TG_LIMITS_MEMORY_BUDGET_MAX
         ? budget
         : TG_LIMITS_MEMORY_BUDGET_MAX;
+}
+
+tg_limit_resources tg_limits_read_resources(void) {
+    tg_limit_resources resources = {.fd_limit = tg_limits_soft_nofile()};
+    FILE *mem = fopen("/proc/meminfo", "r");
+    tg_limits_read_meminfo(mem, &resources.total, &resources.available);
+    if (mem) fclose(mem);
+    int have_rss = 0;
+    FILE *status = fopen("/proc/self/status", "r");
+    if (status) {
+        char line[160];
+        unsigned long long kib;
+        while (fgets(line, sizeof(line), status)) {
+            if (sscanf(line, "VmRSS: %llu kB", &kib) != 1) continue;
+            if (kib <= SIZE_MAX / 1024u) {
+                resources.rss = (size_t)kib * 1024u;
+                have_rss = 1;
+            }
+            break;
+        }
+        fclose(status);
+    }
+    DIR *fds = opendir("/proc/self/fd");
+    if (fds) {
+        errno = 0;
+        for (struct dirent *entry; (entry = readdir(fds));)
+            if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9')
+                ++resources.fd_count;
+        if (errno) resources.fd_count = 0;
+        closedir(fds);
+        if (resources.fd_count) --resources.fd_count; /* Directory FD. */
+    }
+    resources.valid = resources.total && resources.available <= resources.total &&
+        have_rss && resources.fd_count;
+    return resources;
+}
+
+tg_limit_plan tg_limits_plan(const tg_limit_resources *r, size_t configured,
+                            size_t active, size_t pending_upstreams,
+                            size_t buffer_used, size_t slot_bytes) {
+    tg_limit_plan plan = {.configured = configured};
+    if (!r->valid || !slot_bytes) return plan;
+
+    plan.headroom = memory_headroom(r->total, r->available);
+    plan.ceiling = tg_limits_runtime_memory_budget(r->total, r->total);
+
+    /* MemAvailable already excludes resident pages. Charge RSS and buffer
+     * allocations against the separate process ceiling without counting the
+     * same bytes twice, while preserving room for growth of live sessions. */
+    size_t resident = r->rss > buffer_used ? r->rss : buffer_used;
+    size_t ceiling_room = plan.ceiling > resident ? plan.ceiling - resident : 0;
+    if (plan.headroom > ceiling_room) plan.headroom = ceiling_room;
+    size_t new_slots = plan.headroom / (slot_bytes > MIB ? slot_bytes : MIB);
+    /* A ceiling with no room for even one new client must also stop new
+     * admissions when an existing session closes between samples. */
+    plan.ram = new_slots ? active + new_slots : 0;
+
+    /* Retain the original FD guard and additionally budget from live FD
+     * usage. Each new client needs its downstream and primary upstream FD. */
+    size_t usable = usable_fds(r->fd_limit);
+    plan.fd = usable > 32u ? (usable - 32u) / 5u : 0;
+    size_t remaining = usable > r->fd_count ? usable - r->fd_count : 0;
+    remaining = remaining > pending_upstreams ? remaining - pending_upstreams : 0;
+    if (remaining < 2u)
+        plan.fd = 0;
+    else if (remaining / 2u < plan.fd && active < plan.fd - remaining / 2u)
+        plan.fd = active + remaining / 2u;
+    return plan;
+}
+
+size_t tg_limits_adapt(const tg_limit_plan *plan, size_t current, size_t *recovery_limit,
+                       unsigned *reasons) {
+    size_t target = plan->ram < plan->fd ? plan->ram : plan->fd;
+    if (target > plan->configured) target = plan->configured;
+    *reasons = (target == plan->ram ? TG_LIMIT_RAM : 0u) |
+               (target == plan->fd ? TG_LIMIT_FD : 0u) |
+               (target == plan->configured ? TG_LIMIT_CONFIGURED : 0u);
+    if (target <= current) {
+        *recovery_limit = 0;
+        return target;
+    }
+    size_t growth_target = target;
+    size_t margin_slots = TG_LIMITS_OS_MARGIN_BYTES / MIB;
+    if (plan->ram == target && target > current && target - current > margin_slots)
+        growth_target = target - margin_slots;
+    else if (plan->ram == target && current)
+        growth_target = current;
+    /* Two consecutive samples must support the increase. A lost sample
+     * clears this state through the immediate reduction path above. */
+    size_t confirmed = *recovery_limit < growth_target ? *recovery_limit : growth_target;
+    *recovery_limit = growth_target;
+    if (confirmed <= current) confirmed = current;
+    if (confirmed - current > TG_LIMITS_GROWTH_STEP)
+        confirmed = current + TG_LIMITS_GROWTH_STEP;
+    if (confirmed < target) *reasons |= TG_LIMIT_RECOVERY;
+    return confirmed;
 }

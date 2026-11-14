@@ -661,7 +661,8 @@
     telegramRows(tg).forEach(function(row){fields.forEach(function(item){
       var value=number(row[item.key]);if(value===null)return;
       if(Object.prototype.hasOwnProperty.call(previous,item.key)&&previous[item.key]!==value)
-        changes.push({at:row.at,label:item.label,from:previous[item.key],to:value,bytes:item.bytes});
+        changes.push({at:row.at,label:item.label,from:previous[item.key],to:value,
+          bytes:item.bytes,memAvailable:row.mem_available});
       previous[item.key]=value;
     });});
     return changes;
@@ -772,9 +773,14 @@
       install_failed:"Не удалось сохранить карту",thread_start_failed:"Не удалось начать обновление"};
     return labels[value] || telegramPretty(value);
   }
+  function telegramLimitReasons(value) {
+    var labels=["RAM","FD","Настроенный максимум","Плавное восстановление",
+      "Замер ресурсов недоступен","Слоты заняты"];
+    return labels.filter(function(label,index){return (value & (1 << index))!==0;}).join(", ") || "—";
+  }
   function renderTelegramMetrics(doc, data, latest, history) {
     var formats = {k:telegramKib,b:telegramBytes,n:telegramCountText,age:telegramAgeText,time:telegramTime,
-      status:telegramStatusLabel,yes:function(v){return v?"Да":"Нет";},
+      status:telegramStatusLabel,limitReasons:telegramLimitReasons,yes:function(v){return v?"Да":"Нет";},
       us:function(v){return (v/1000).toFixed(1)+" мс";},delta:formatDeltaBytes};
     Array.from(data.querySelectorAll("[data-tg-field]")).forEach(function(element){
       var key=element.dataset.tgField, value=latest[key], limit=latest[element.dataset.limit];
@@ -897,14 +903,17 @@
         ?"Изменений за сохранённые снимки нет.":"Лимиты в снимке отсутствуют.";limitHistory.appendChild(emptyLimit);}
     changes.forEach(function(change){var row=doc.createElement("li"),strong=doc.createElement("strong"),label=doc.createElement("span"),time=doc.createElement("small");
       var format=change.bytes?formatBytes:pretty;strong.textContent=change.label+": "+format(change.from)+" → "+format(change.to);
-      label.textContent="Изменение между снимками";time.textContent=number(change.at)===null?"":new Date(change.at*1000).toLocaleString();
+      label.textContent=change.memAvailable===null?"Изменение между снимками":
+        "Доступная RAM в снимке · "+telegramBytes(change.memAvailable);
+      time.textContent=number(change.at)===null?"":new Date(change.at*1000).toLocaleString();
       row.appendChild(strong);row.appendChild(label);row.appendChild(time);limitHistory.appendChild(row);
     });
   }
   if (typeof module === "object" && module.exports) module.exports = {
     summary: summary, memoryRows: memoryRows, rowsInRange: rowsInRange,
     seriesEndpoints: seriesEndpoints, formatBytes: formatBytes, coverageText: coverageText,
-    telegramRows: telegramRows
+    telegramRows: telegramRows, telegramLimitChanges: telegramLimitChanges,
+    telegramLimitReasons: telegramLimitReasons
   };
   if (!root.document || !root.fetch) return;
   function boot() {

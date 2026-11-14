@@ -1046,11 +1046,12 @@ static void test_epoll_bridge_preserves_handshake_and_half_close(void) {
 }
 
 static void test_epoll_many_concurrent_tcp_clients(void) {
-    enum { CLIENT_COUNT = 16 };
+    enum { CLIENT_COUNT = 36, COLD_CLIENT_COUNT = 12 };
     const uint8_t payload[] = {0xa1,0xb2,0xc3,0xd4,0xe5};
     size_t open_fds_before = count_open_fds();
     uint16_t upstream_port, listen_port;
     int upstream_listener = create_listener(&upstream_port);
+    assert(listen(upstream_listener, CLIENT_COUNT) == 0);
     int listener = create_listener(&listen_port);
     echo_load_fixture echo = {.listener = upstream_listener,
                               .connections = CLIENT_COUNT};
@@ -1063,8 +1064,9 @@ static void test_epoll_many_concurrent_tcp_clients(void) {
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
-        .memory_budget_bytes = 32u * 1024u * 1024u,
-        .configured_max_connections = CLIENT_COUNT,
+        .memory_budget_bytes = 28u * 1024u * 1024u,
+        .configured_max_connections = TG_LIMITS_MAX_CONFIGURED,
+        .initial_connection_limit = COLD_CLIENT_COUNT,
         .handshake_timeout_ms = 5000,
         .idle_timeout_ms = 5000,
         .routing_config = &routing,
@@ -1073,13 +1075,23 @@ static void test_epoll_many_concurrent_tcp_clients(void) {
         .context = &fixture,
     };
     tg_epoll_proxy *proxy = tg_epoll_proxy_create(&config);
-    assert(proxy && tg_epoll_proxy_max_connections(proxy) >= CLIENT_COUNT);
-    proxy_runner runner = {.server = proxy};
-    atomic_init(&runner.stop, 0);
-    pthread_t proxy_thread;
-    assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
+    assert(proxy && tg_epoll_proxy_max_connections(proxy) == COLD_CLIENT_COUNT);
+    const size_t mib = 1024u * 1024u;
+    tg_limit_resources r = {.total = 256u * mib, .available = 48u * mib, .rss = 8u * mib,
+        .fd_limit = 1024, .fd_count = 8, .valid = 1};
     int clients[CLIENT_COUNT];
     for (unsigned i = 0; i < CLIENT_COUNT; ++i) {
+        if (i == COLD_CLIENT_COUNT) {
+            step_many(proxy, 8);
+            assert(tg_epoll_proxy_active_connections(proxy) == COLD_CLIENT_COUNT);
+            r.available = 80u * mib;
+            r.fd_count = count_open_fds() - 1u;
+            tg_epoll_proxy_refresh_limits(proxy, &r);
+            assert(tg_epoll_proxy_max_connections(proxy) == COLD_CLIENT_COUNT);
+            for (unsigned sample = 0; sample < 6; ++sample)
+                tg_epoll_proxy_refresh_limits(proxy, &r);
+            assert(tg_epoll_proxy_max_connections(proxy) >= CLIENT_COUNT);
+        }
         clients[i] = connect_to_listener(listen_port);
         struct timeval timeout = {.tv_sec = 5};
         assert(setsockopt(clients[i], SOL_SOCKET, SO_RCVTIMEO, &timeout,
@@ -1088,8 +1100,30 @@ static void test_epoll_many_concurrent_tcp_clients(void) {
                (ssize_t)sizeof(test_handshake));
         assert(send(clients[i], payload, sizeof(payload), 0) ==
                (ssize_t)sizeof(payload));
-        assert(shutdown(clients[i], SHUT_WR) == 0);
+        assert(tg_epoll_proxy_step(proxy, 0) >= 0);
     }
+    step_many(proxy, CLIENT_COUNT);
+    tg_epoll_proxy_stats stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.active_connections == CLIENT_COUNT && stats.limit_changes == 6);
+    r.available = 2u * mib;
+    tg_epoll_proxy_refresh_limits(proxy, &r);
+    assert(tg_epoll_proxy_max_connections(proxy) == 0);
+    int rejected = connect_to_listener(listen_port);
+    step_many(proxy, 3);
+    uint8_t byte;
+    assert(recv(rejected, &byte, sizeof(byte), MSG_DONTWAIT) == 0);
+    close(rejected);
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.last_rejection_reasons == (TG_LIMIT_RAM | TG_LIMIT_SLOTS));
+    assert(stats.active_connections == CLIENT_COUNT && stats.accept_limit_rejections == 1);
+    /* The admitted sessions finish normally as their clients signal EOF. */
+    proxy_runner runner = {.server = proxy};
+    atomic_init(&runner.stop, 0);
+    pthread_t proxy_thread;
+    assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
+    for (unsigned i = 0; i < CLIENT_COUNT; ++i)
+        assert(shutdown(clients[i], SHUT_WR) == 0);
     uint8_t expected[sizeof(test_handshake) + sizeof(payload)];
     memcpy(expected, test_handshake, sizeof(test_handshake));
     memcpy(expected + sizeof(test_handshake), payload, sizeof(payload));
@@ -1113,12 +1147,19 @@ static void test_epoll_many_concurrent_tcp_clients(void) {
     atomic_store(&runner.stop, 1);
     assert(pthread_join(proxy_thread, NULL) == 0);
     assert(fixture.routes == CLIENT_COUNT);
-    tg_epoll_proxy_stats stats;
     assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
     assert(stats.connections_started == CLIENT_COUNT &&
            stats.active_connections == 0);
     assert(stats.bytes_from_clients ==
            CLIENT_COUNT * (sizeof(test_handshake) + sizeof(payload)));
+    assert(!stats.allocation_failures && !stats.buffer_budget_rejections &&
+           !stats.buffer_bytes_current);
+    rejected = connect_to_listener(listen_port);
+    step_many(proxy, 3);
+    assert(recv(rejected, &byte, sizeof(byte), MSG_DONTWAIT) == 0);
+    close(rejected);
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.accept_limit_rejections == 2 && !stats.active_connections);
     tg_epoll_proxy_destroy(proxy);
     close(listener);
     close(upstream_listener);
@@ -1207,6 +1248,12 @@ static void test_read_only_stats_socket(void) {
     assert(initial_stats.buffer_bytes_limit > 0);
     assert(initial_stats.buffer_bytes_limit >=
            initial_stats.max_wss_connections * TG_WS_PUMP_RX_INITIAL);
+    const size_t mib = 1024u * 1024u;
+    tg_limit_resources sample = {.total = 234u * mib, .available = 80u * mib,
+        .rss = 8u * mib, .fd_limit = 1024, .fd_count = 12, .valid = 1};
+    tg_epoll_proxy_refresh_limits(proxy, &sample);
+    tg_epoll_proxy_refresh_limits(proxy, &sample);
+    assert(initial_stats.max_connections < tg_epoll_proxy_max_connections(proxy));
     struct stat socket_stat;
     struct sockaddr_un address = {.sun_family = AF_UNIX};
     memcpy(address.sun_path, path, (size_t)path_length + 1);
@@ -1241,6 +1288,12 @@ static void test_read_only_stats_socket(void) {
     assert(strstr(response, "\"route_cooldowns_truncated\":false") != NULL);
     assert(strstr(response, "\"active_wss_connections\":0") != NULL);
     assert(strstr(response, "\"max_wss_connections\":") != NULL);
+    assert(strstr(response, "\"limit_mem_available_kib\":81920") != NULL);
+    assert(strstr(response, "\"limit_rss_kib\":8192") != NULL);
+    assert(strstr(response, "\"soft_nofile_limit\":1024") != NULL);
+    assert(strstr(response, "\"configured_connection_limit\":8") != NULL);
+    assert(strstr(response, "\"connection_limit_changes\":1") != NULL);
+    assert(strstr(response, "\"last_accept_rejection_reasons\":0") != NULL);
     assert(strstr(response, "\"buffer_bytes_current\":0") != NULL);
     assert(strstr(response, "\"buffer_bytes_peak\":0") != NULL);
     assert(strstr(response, "\"buffer_bytes_limit\":") != NULL);
@@ -3461,7 +3514,18 @@ static void test_auto_preserves_primary_route_at_wss_capacity(void) {
     assert(stats.accept_limit_rejections == 0);
     assert(fixture.cf_proxy_a_resolve_calls == 3 && fixture.cf_proxy_b_resolve_calls == 1);
 
-    /* The surviving primary can still fall back to its requeued route. */
+    /* The surviving primary can still fall back to its requeued route.
+     * Even at zero new admissions, the other primary slots stay available. */
+    const size_t mib = 1024u * 1024u;
+    tg_limit_resources resources = {.total = 128u * mib, .rss = 8u * mib,
+        .fd_limit = 1024, .fd_count = 16, .valid = 1};
+    tg_epoll_proxy_refresh_limits(proxy, &resources);
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.max_connections == 0 && stats.active_wss_connections == 3);
+    assert(stats.max_wss_connections == 3 && stats.active_connections == 3);
+    resources.available = 32u * mib;
+    tg_epoll_proxy_refresh_limits(proxy, &resources);
+    tg_epoll_proxy_refresh_limits(proxy, &resources);
     close(upstreams[1]);
     step_many(proxy, 5);
     assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
@@ -3499,6 +3563,9 @@ static void test_listener_recovery_preserves_runtime(void) {
         atomic_fetch_add(&test_monotonic_offset_ms, 501u);
         assert(tg_epoll_proxy_step(proxy, 0) >= 0);
     }
+    tg_epoll_proxy_stats stats;
+    assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
+    assert(stats.accept_fd_exhaustion > 0 && stats.last_rejection_reasons == TG_LIMIT_FD);
     accept_error = EIO;
     for (unsigned i = 0; i < 4; ++i) {
         assert(tg_epoll_proxy_step(proxy, 0) >= 0);
@@ -3607,6 +3674,7 @@ static void *read_media_test_client(void *opaque) {
 }
 
 static void test_media_after_low_memory_start(size_t media_chunks) {
+    size_t open_fds_before = count_open_fds();
     char directory[] = "/tmp/d2k-tg-memory-XXXXXX", cert_path[256], key_path[256];
     assert(mkdtemp(directory));
     assert(snprintf(cert_path, sizeof(cert_path), "%s/cert.pem", directory) > 0);
@@ -3671,6 +3739,8 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
     assert(tls);
     const size_t mib = 1024u * 1024u, total = 128u * mib, configured = 32;
     const size_t cold = 8u * mib, recovered = 48u * mib;
+    tg_limit_resources resources = {.total = total, .available = cold, .rss = 8u * mib,
+        .fd_limit = tg_limits_soft_nofile(), .fd_count = 16, .valid = 1};
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 64u * 1024u,
@@ -3704,15 +3774,13 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
             assert(tg_epoll_proxy_active_connections(proxy) == 2);
             /* Under pressure there is no room for another session, but the
              * already allocated buffers must remain usable. */
-            size_t ceiling = tg_limits_runtime_memory_budget(total, total);
-            size_t admission = tg_limits_policy_admission(tg_limits_soft_nofile(),
-                total, 0, configured, tg_epoll_proxy_active_connections(proxy));
-            tg_epoll_proxy_update_limits(proxy, admission, 0, ceiling);
+            resources.available = 0;
+            tg_epoll_proxy_refresh_limits(proxy, &resources);
             tg_epoll_proxy_stats pressure;
             assert(tg_epoll_proxy_get_stats(proxy, &pressure) == 0);
             assert(pressure.buffer_bytes_current > 0);
             assert(pressure.buffer_bytes_limit == pressure.buffer_bytes_current);
-            assert(pressure.max_connections == 2 && pressure.active_connections == 2);
+            assert(pressure.max_connections == 0 && pressure.active_connections == 2);
             int rejected = connect_to_listener(proxy_port);
             assert(tg_epoll_proxy_step(proxy, 0) >= 0);
             uint8_t byte;
@@ -3721,11 +3789,10 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
             assert(tg_epoll_proxy_get_stats(proxy, &pressure) == 0);
             assert(pressure.accept_limit_rejections == 1);
             fixture.fail_dc4_proxy = 1;
-            tg_epoll_proxy_update_limits(proxy,
-                tg_limits_policy_connections(tg_limits_soft_nofile(),
-                                             total, recovered, configured),
-                tg_limits_runtime_memory_budget(total, recovered),
-                tg_limits_runtime_memory_budget(total, total));
+            resources.available = recovered;
+            tg_epoll_proxy_refresh_limits(proxy, &resources);
+            tg_epoll_proxy_refresh_limits(proxy, &resources);
+            assert(tg_epoll_proxy_max_connections(proxy) == 4);
             atomic_store(&runner.stop, 0);
             assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
             media_started_us = test_monotonic_us();
@@ -3739,6 +3806,15 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
         if (i < 2) read_media_test_client(&clients[i]);
         else assert(pthread_create(&readers[i - 2], NULL, read_media_test_client, &clients[i]) == 0);
     }
+    atomic_store(&runner.stop, 1);
+    assert(pthread_join(proxy_thread, NULL) == 0);
+    step_many(proxy, 5);
+    resources.available = 2u * mib;
+    tg_epoll_proxy_refresh_limits(proxy, &resources);
+    assert(tg_epoll_proxy_max_connections(proxy) == 0);
+    assert(tg_epoll_proxy_active_connections(proxy) == 4);
+    atomic_store(&runner.stop, 0);
+    assert(pthread_create(&proxy_thread, NULL, run_proxy, &runner) == 0);
     uint64_t text_latency_us = 0;
     /* Send a second valid transport packet on each established text stream
      * while the media readers and writers are running. */
@@ -3769,11 +3845,13 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
     }
     atomic_store(&runner.stop, 1);
     assert(pthread_join(proxy_thread, NULL) == 0);
+    step_many(proxy, 10);
     tg_epoll_proxy_stats stats;
     assert(tg_epoll_proxy_get_stats(proxy, &stats) == 0);
     assert(stats.wss_responses == 4 && stats.cf_wss_responses == 4);
     assert(stats.buffer_bytes_peak < mib);
     assert(stats.buffer_budget_rejections == 0 && stats.allocation_failures == 0);
+    assert(!stats.active_connections && !stats.active_wss_connections && !stats.buffer_bytes_current);
     assert(stats.wss_read_pauses == stats.wss_read_resumes && stats.wss_reads_paused == 0);
     printf("mixed traffic: 4/4, media 2/2, WSS buffer peak %zu bytes, "
            "media %zu bytes in %" PRIu64 " us, text max RTT %" PRIu64 " us\n",
@@ -3785,6 +3863,7 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
     unlink(key_path);
     unlink(cert_path);
     assert(rmdir(directory) == 0);
+    assert(count_open_fds() == open_fds_before);
 }
 
 int main(int argc, char **argv) {
@@ -3795,6 +3874,10 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && strcmp(argv[1], "auto-capacity") == 0) {
         test_auto_preserves_primary_route_at_wss_capacity();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "runtime-capacity") == 0) {
+        test_epoll_many_concurrent_tcp_clients();
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "worker-only") == 0) {

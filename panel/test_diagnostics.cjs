@@ -1,6 +1,7 @@
 'use strict';
 const assert=require('node:assert/strict');
 const {summary,memoryRows,rowsInRange,seriesEndpoints,formatBytes,coverageText,telegramRows}=require('../internal/web/assets/diagnostics.js');
+const {telegramLimitChanges,telegramLimitReasons}=require('../internal/web/assets/diagnostics.js');
 assert.match(summary({}),/первый снимок/);
 const samples=[{at:1,bindings:2,plans:1,processes:[{name:'d2kc',pid:1,rss_kib:1024}]},
  {at:2,bindings:3,plans:1,processes:[{name:'d2kc',pid:2,rss_kib:512}]}];
@@ -95,4 +96,13 @@ assert.equal(generationRows[1].client_rate,null,'a new process generation breaks
 assert.equal(generationRows[1].process_generation,222);
 assert.equal(generationRows[1].worker_pool_bytes,512,'worker pool allocations are retained in compact history');
 assert.equal(generationRows[1].active_connections,0);
+const limitHistory=telegramLimitChanges({memory_history:{
+ fields:['at_delta_s','mono_delta_s','max_connections','mem_available_kib'],
+ time_base:[1700000000,1000],samples:[[0,0,12,49152],[60,60,36,81920],[120,120,0,null]]
+}});
+assert.deepEqual(limitHistory.map(change=>[change.from,change.to,change.memAvailable]),
+ [[12,36,80*1024*1024],[36,0,null]]);
+assert.equal(telegramLimitReasons(33),'RAM, Слоты заняты');
+assert.equal(telegramLimitReasons(34),'FD, Слоты заняты');
+assert.equal(telegramLimitReasons(4),'Настроенный максимум');
 console.log('сводка диагностики панели прошла');

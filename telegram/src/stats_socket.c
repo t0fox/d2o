@@ -230,6 +230,36 @@ int tg_stats_socket_open(tg_stats_socket *server, const char *path) {
     return 0;
 }
 
+static int append_limits(char *response, size_t size, size_t *used,
+                         const tg_epoll_proxy_stats *stats) {
+    const tg_limit_resources *r = &stats->limit_resources;
+    const tg_limit_plan *plan = &stats->limit_plan;
+    if (!plan->configured) return 0;
+    if (r->fd_limit != SIZE_MAX &&
+        stats_append(response, size, used, "\"soft_nofile_limit\":%zu,", r->fd_limit) != 0)
+        return -1;
+    if (r->valid &&
+        stats_append(response, size, used,
+                     "\"limit_mem_available_kib\":%zu,\"limit_rss_kib\":%zu,"
+                     "\"limit_fd_count\":%zu,",
+                     r->available / 1024u, r->rss / 1024u, r->fd_count) != 0)
+        return -1;
+    if (stats->limit_changes &&
+        stats_append(response, size, used,
+                     "\"previous_connection_limit\":%zu,"
+                     "\"connection_limit_changed_at\":%" PRIu64 ",",
+                     stats->previous_connection_limit, stats->limit_changed_at) != 0)
+        return -1;
+    return stats_append(response, size, used,
+                        "\"configured_connection_limit\":%zu,"
+                        "\"connection_ram_limit\":%zu,\"connection_fd_limit\":%zu,"
+                        "\"memory_headroom_bytes\":%zu,\"memory_ceiling_bytes\":%zu,"
+                        "\"connection_limit_reasons\":%u,"
+                        "\"connection_limit_changes\":%" PRIu64 ",",
+                        plan->configured, plan->ram, plan->fd, plan->headroom, plan->ceiling,
+                        stats->limit_reasons, stats->limit_changes);
+}
+
 int tg_stats_socket_serve(tg_stats_socket *server,
                           const tg_epoll_proxy *proxy) {
     if (!server || server->fd < 0 || !proxy) {
@@ -257,6 +287,7 @@ int tg_stats_socket_serve(tg_stats_socket *server,
             used = (size_t)length;
             if (append_active_sessions(response, sizeof(response), &used,
                                        &stats) == 0 &&
+                append_limits(response, sizeof(response), &used, &stats) == 0 &&
                 stats_append(response, sizeof(response), &used,
                     "\"max_connections\":%zu,\"active_wss_connections\":%zu"
                     ",\"max_wss_connections\":%zu"
@@ -264,6 +295,7 @@ int tg_stats_socket_serve(tg_stats_socket *server,
                     ",\"buffer_bytes_peak\":%zu"
                     ",\"buffer_bytes_limit\":%zu"
                     ",\"accept_limit_rejections\":%" PRIu64
+                    ",\"last_accept_rejection_reasons\":%u"
                     ",\"accept_fd_exhaustion\":%" PRIu64
                     ",\"allocation_failures\":%" PRIu64
                     ",\"buffer_budget_rejections\":%" PRIu64
@@ -297,6 +329,7 @@ int tg_stats_socket_serve(tg_stats_socket *server,
                     stats.max_wss_connections, stats.buffer_bytes_current,
                     stats.buffer_bytes_peak, stats.buffer_bytes_limit,
                     stats.accept_limit_rejections,
+                    stats.last_rejection_reasons,
                     stats.accept_fd_exhaustion,
                     stats.allocation_failures,
                     stats.buffer_budget_rejections,

@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <openssl/ssl.h>
+#include "tg_limits.h"
 
 typedef struct tg_epoll_proxy tg_epoll_proxy;
 
@@ -106,6 +107,13 @@ typedef struct {
     uint64_t monotonic_time_ms;
     uint32_t route_cooldown_ms;
     size_t max_connections;
+    tg_limit_resources limit_resources;
+    tg_limit_plan limit_plan;
+    unsigned limit_reasons;
+    unsigned last_rejection_reasons;
+    uint64_t limit_changes;
+    size_t previous_connection_limit;
+    uint64_t limit_changed_at;
     size_t active_wss_connections;
     size_t max_wss_connections;
     size_t buffer_bytes_current;
@@ -210,6 +218,8 @@ int tg_epoll_proxy_set_listener(tg_epoll_proxy *server, int listener_fd);
  * the ceiling comes from total memory. Existing connections are not evicted. */
 void tg_epoll_proxy_update_limits(tg_epoll_proxy *server, size_t connection_limit,
                                   size_t memory_headroom_bytes, size_t memory_ceiling_bytes);
+void tg_epoll_proxy_refresh_limits(tg_epoll_proxy *server,
+                                   const tg_limit_resources *resources);
 int tg_epoll_proxy_step(tg_epoll_proxy *server, int timeout_ms);
 void tg_epoll_proxy_destroy(tg_epoll_proxy *server);
 size_t tg_epoll_proxy_active_connections(const tg_epoll_proxy *server);

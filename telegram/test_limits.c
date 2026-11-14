@@ -62,12 +62,67 @@ static void test_old_meminfo_and_real_memory_pressure(void) {
     assert_meminfo("MemTotal: 131072 kB\nMemFree: 16384 kB\nMemAvailable: 0 kB\n", 0);
 }
 
+static void test_runtime_admission_tracks_ram_on_both_router_sizes(void) {
+    const size_t mib = 1024u * 1024u;
+    const size_t sizes[] = {128, 234, 256};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        tg_limit_resources r = {.total = sizes[i] * mib, .available = (i ? 48u : 38u) * mib,
+            .rss = 8 * mib, .fd_limit = 1024, .fd_count = 28, .valid = 1};
+        size_t cap = i ? TG_LIMITS_MAX_CONFIGURED : TG_LIMITS_SMALL_ROUTER_CAP;
+        size_t limit = tg_limits_policy_connections(r.fd_limit, r.total, r.available, cap);
+        assert(limit == 12);
+        size_t recovery = 0;
+        unsigned reasons;
+        r.available = (i ? 80u : 68u) * mib;
+        tg_limit_plan plan = tg_limits_plan(&r, cap, 12, 0, 0, 256u * 1024u);
+        assert(tg_limits_adapt(&plan, limit, &recovery, &reasons) == limit);
+        assert(reasons & TG_LIMIT_RECOVERY);
+        for (unsigned j = 0; j < 12; ++j) {
+            size_t next = tg_limits_adapt(&plan, limit, &recovery, &reasons);
+            assert(next >= limit && next <= limit + TG_LIMITS_GROWTH_STEP);
+            limit = next;
+        }
+        assert(i ? limit > 32 : limit == cap);
+
+        r.available = 0;
+        plan = tg_limits_plan(&r, cap, limit, 0, 2u * mib, 256u * 1024u);
+        assert(tg_limits_adapt(&plan, limit, &recovery, &reasons) == 0);
+        assert(reasons == TG_LIMIT_RAM && !recovery && !plan.headroom);
+    }
+}
+
+static void test_runtime_caps_and_hysteresis(void) {
+    const size_t mib = 1024u * 1024u;
+    tg_limit_resources r = {.total = 256 * mib, .available = 80 * mib,
+        .rss = 8 * mib, .fd_limit = 256, .fd_count = 185, .valid = 1};
+    size_t recovery = 0;
+    unsigned reasons;
+    tg_limit_plan plan = tg_limits_plan(&r, 128, 12, 0, 6 * mib, mib);
+    assert(plan.fd == 21 && plan.ram == 40);
+    plan = tg_limits_plan(&r, 128, 12, 18, 6 * mib, mib);
+    assert(plan.fd == 0);
+    r.fd_count = 60;
+    plan = tg_limits_plan(&r, 15, 12, 0, 6 * mib, mib);
+    assert(tg_limits_adapt(&plan, 16, &recovery, &reasons) == 15);
+    assert(reasons == TG_LIMIT_CONFIGURED);
+    r.rss = 100 * mib;
+    plan = tg_limits_plan(&r, 128, 12, 0, 6 * mib, mib);
+    assert(plan.ram == 14);
+    assert(tg_limits_adapt(&plan, 13, &recovery, &reasons) == 13);
+    assert(tg_limits_adapt(&plan, 13, &recovery, &reasons) == 13);
+    assert(reasons == (TG_LIMIT_RAM | TG_LIMIT_RECOVERY));
+    plan = tg_limits_plan(&r, 128, 12, 0, 104 * mib, mib);
+    assert(!plan.headroom && !plan.ram);
+}
+
 int main(void) {
     test_connection_budget_respects_file_descriptors();
     test_connection_budget_respects_memory_and_configured_cap();
     test_reserved_resources_and_invalid_inputs_fail_closed();
     test_runtime_memory_budget_tracks_router_ram();
     test_old_meminfo_and_real_memory_pressure();
+    test_runtime_admission_tracks_ram_on_both_router_sizes();
+    test_runtime_caps_and_hysteresis();
     const size_t mib = 1024u * 1024u;
     assert(tg_limits_policy_connections(1024, 128*mib, 64*mib, 32) == 32);
     assert(tg_limits_policy_connections(1024, 128*mib, 64*mib, 16) == 16);
