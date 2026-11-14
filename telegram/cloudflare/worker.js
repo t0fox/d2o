@@ -176,9 +176,7 @@ export default {
     try {
       socket = connect({ hostname, port: exactPort ? 5222 : 443 });
       void socket.closed.catch(() => {});
-      // The legacy upgrade keeps its timing. The exact-port upgrade is proof
-      // that the TCP connect has already succeeded on the requested port.
-      if (exactPort) await waitForTcp(socket);
+      await waitForTcp(socket);
       const pair = new WebSocketPair();
       bridge(socket, pair[1]);
       return new Response(null, {

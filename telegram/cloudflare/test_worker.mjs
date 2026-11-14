@@ -77,10 +77,15 @@ test("Flowseal /apiws opens the requested media DC on 443 and forwards bytes in 
     assert.equal(address.port, 443);
     return socket;
   });
-  const response = await worker.fetch(upgrade("/apiws", "dst=::ffff:149.154.167.43&dc=4&media=1&port=5222"));
+  let completed = false;
+  const pending = worker.fetch(upgrade("/apiws", "dst=::ffff:149.154.167.43&dc=4&media=1&port=5222"))
+    .then(result => { completed = true; return result; });
+  await tick();
+  assert.equal(completed, false);
+  opened();
+  const response = await pending;
   assert.equal(response.status, 101);
   assert.equal(response.headers.get("Sec-WebSocket-Protocol"), null);
-  opened();
   const ws = response.webSocket.server;
   ws.dispatchEvent(new MessageEvent("message", { data: Uint8Array.of(1, 2).buffer }));
   ws.dispatchEvent(new MessageEvent("message", { data: Uint8Array.of(3, 4).buffer }));
@@ -130,17 +135,24 @@ test("5222 refuses missing negotiation and invalid destinations before connectin
   assert.equal((await worker.fetch(upgrade("/apiws/5222", "dst=149.154.167.91"))).status, 404);
 });
 
-test("a failed TCP 5222 open returns HTTP 502 without upgrade or retry on 443", async () => {
-  let attempts = 0;
-  const worker = await loadWorker(address => {
-    assert.equal(address.port, 5222);
-    ++attempts;
-    return socket;
+for (const port of [443, 5222]) {
+  test(`a failed TCP ${port} open returns HTTP 502 without upgrade or port fallback`, async () => {
+    let attempts = 0;
+    const worker = await loadWorker(address => {
+      assert.equal(address.hostname, "149.154.167.91");
+      assert.equal(address.port, port);
+      ++attempts;
+      return socket;
+    });
+    const socket = tcp(Promise.reject(new Error("connection refused")));
+    const request = port === 5222
+      ? upgrade(exact, "dst=149.154.167.91", protocol)
+      : upgrade("/apiws", "dst=149.154.167.91");
+    const response = await worker.fetch(request, allowed);
+    assert.equal(attempts, 1);
+    assert.equal(socket.isClosed, true);
+    assert.equal(response.status, 502);
+    assert.equal(response.webSocket, undefined);
+    assert.equal(response.headers.get("Sec-WebSocket-Protocol"), null);
   });
-  const socket = tcp(Promise.reject(new Error("connection refused")));
-  const response = await worker.fetch(upgrade(exact, "dst=149.154.167.91", protocol), allowed);
-  assert.equal(attempts, 1);
-  assert.equal(socket.isClosed, true);
-  assert.equal(response.status, 502);
-  assert.equal(response.headers.get("Sec-WebSocket-Protocol"), null);
-});
+}

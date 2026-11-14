@@ -163,6 +163,7 @@ typedef struct {
     int is_media;
     tg_mtproto_proto proto;
     int tcp_only;
+    int is_cdn;
 } tg_epoll_route_selection;
 
 typedef int (*tg_epoll_select_route_fn)(

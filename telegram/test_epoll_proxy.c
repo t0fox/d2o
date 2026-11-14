@@ -2185,10 +2185,18 @@ static void test_worker_pool_requires_exact_target(void) {
     close(listener);
 }
 
+typedef struct {
+    int fd;
+    wss_server_fixture *upstream;
+} media_test_client;
+
+static void *read_media_test_client(void *opaque);
+
 static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
                                                         int legacy_worker,
                                                         int slow_proxy, uint32_t dc,
-                                                        const char *dc_address, int media) {
+                                                        const char *dc_address, int media,
+                                                        size_t media_chunks) {
     char directory[] = "/tmp/d2k-tg-worker-XXXXXX";
     char cert_path[256], key_path[256];
     assert(mkdtemp(directory) != NULL);
@@ -2222,7 +2230,8 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
         .required_subprotocol = raw_port == 5222 ? "d2o-tcp-5222-v1" : NULL,
         .omit_subprotocol = legacy_worker,
         .expect_binary_subprotocol = 0,
-        .expect_no_browser_headers = 1
+        .expect_no_browser_headers = 1,
+        .media_chunks = media_chunks,
     };
     atomic_init(&worker.complete, 0);
     memcpy(worker.handshake, handshake, sizeof(handshake));
@@ -2249,7 +2258,7 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
     set_ipv4(&fixture.upstream, "127.0.0.1", ws_port);
     SSL_CTX *tls_context = tg_tls_client_context(cert_path);
     assert(tls_context);
-    tg_config routing = {0};
+    tg_config routing = {.route_only = media_chunks ? TG_ROUTE_ONLY_WORKER : TG_ROUTE_ONLY_AUTO};
     uint16_t slow_port;
     int slow_listener = slow_proxy ? create_listener(&slow_port) : -1;
     routing.ws_routing = slow_proxy ? TG_WS_ROUTING_ADAPTIVE : TG_WS_ROUTING_CF_FIRST;
@@ -2257,13 +2266,15 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
     routing.ws_hedge_limit = 1;
     routing.cf_worker_domain_count = 1;
     memcpy(routing.cf_worker_domains[0], "worker.test", sizeof("worker.test"));
-    routing.cf_proxy_domain_count = slow_proxy ? 1 : 0;
+    routing.cf_proxy_domain_count = slow_proxy || media_chunks ? 1 : 0;
     memcpy(routing.cf_proxy_domains[0], "cfproxy-b.test", sizeof("cfproxy-b.test"));
     if (slow_proxy) set_ipv4(&fixture.cf_proxy_b_upstream, "127.0.0.1", slow_port);
+    const size_t mib = 1024u * 1024u;
     tg_epoll_proxy_config config = {
         .listener_fd = listener,
         .queue_bytes = 4096,
-        .memory_budget_bytes = 32u * 1024u * 1024u,
+        .memory_budget_bytes = media_chunks
+            ? tg_limits_runtime_memory_budget(128u * mib, 8u * mib) : 32u * mib,
         .configured_max_connections = 8,
         .handshake_timeout_ms = 3000,
         .idle_timeout_ms = 5000,
@@ -2294,11 +2305,15 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
     assert(send(client, worker.expected_packet,
                 sizeof(worker.expected_packet), 0) ==
            (ssize_t)sizeof(worker.expected_packet));
-    assert(shutdown(client, SHUT_WR) == 0);
+    if (!media_chunks) assert(shutdown(client, SHUT_WR) == 0);
     if (legacy_worker) {
         uint8_t unexpected;
         ssize_t n = recv(client, &unexpected, 1, 0);
         assert(n == 0 || (n < 0 && errno == ECONNRESET));
+    } else if (media_chunks) {
+        media_test_client receiver = {.fd = client, .upstream = &worker};
+        read_media_test_client(&receiver);
+        assert(shutdown(client, SHUT_WR) == 0);
     } else {
         uint8_t echoed[sizeof(worker.response_packet)];
         size_t received = 0;
@@ -2321,6 +2336,14 @@ static void test_epoll_cf_worker_uses_raw_stream_framing(uint16_t raw_port,
     tg_epoll_proxy_stats route_stats;
     assert(tg_epoll_proxy_get_stats(proxy, &route_stats) == 0);
     assert(route_stats.wss_attempts == (slow_proxy ? 2u : 1u));
+    if (media_chunks) {
+        assert(fixture.cf_proxy_b_resolve_calls == 0);
+        assert(route_stats.bytes_from_upstreams ==
+               worker.response_packet_len + media_chunks * TEST_MEDIA_CHUNK);
+        assert(route_stats.buffer_bytes_peak < mib && route_stats.wss_read_pauses > 0);
+        assert(route_stats.wss_read_pauses == route_stats.wss_read_resumes);
+        assert(route_stats.wss_reads_paused == 0 && route_stats.buffer_budget_rejections == 0);
+    }
     if (legacy_worker) {
         assert(route_stats.last_failure_route == TG_ROUTE_CF_WORKER);
         assert(route_stats.last_failure_stage == TG_EPOLL_FAILURE_WORKER_PORT);
@@ -3459,11 +3482,6 @@ static void receive_exact_client(int fd, uint8_t *data, size_t len) {
     }
 }
 
-typedef struct {
-    int fd;
-    wss_server_fixture *upstream;
-} media_test_client;
-
 static void *read_media_test_client(void *opaque) {
     const media_test_client *client = opaque;
     wss_server_fixture *upstream = client->upstream;
@@ -3667,6 +3685,10 @@ static void test_media_after_low_memory_start(size_t media_chunks) {
 
 int main(int argc, char **argv) {
     (void)signal(SIGPIPE, SIG_IGN);
+    if (argc == 2 && strcmp(argv[1], "worker-only") == 0) {
+        test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 4, "149.154.167.43", 1, 1024);
+        return 0;
+    }
     if (argc == 2) {
         test_media_after_low_memory_start((size_t)strtoul(argv[1], NULL, 10));
         return 0;
@@ -3702,16 +3724,17 @@ int main(int argc, char **argv) {
     test_worker_pool_requires_exact_target();
     for (size_t i = 0; i < sizeof(worker_dcs) / sizeof(worker_dcs[0]); ++i)
         test_epoll_cf_worker_uses_raw_stream_framing(
-            0, 0, 0, worker_dcs[i].dc, worker_dcs[i].address, 0);
+            0, 0, 0, worker_dcs[i].dc, worker_dcs[i].address, 0, 0);
     /* Ordinary, dedicated media, and IPv6 destinations must survive the
      * Worker upgrade unchanged, including when Proxy is attempted first. */
-    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 2, "149.154.167.50", 0);
-    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 2, "149.154.167.151", 1);
-    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 1, 4, "149.154.167.43", 1);
-    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 4, "2001:67c:4e8:f004::a", 0);
-    test_epoll_cf_worker_uses_raw_stream_framing(443, 0, 0, 4, "149.154.167.51", 1);
-    test_epoll_cf_worker_uses_raw_stream_framing(5222, 0, 0, 4, "149.154.167.51", 1);
-    test_epoll_cf_worker_uses_raw_stream_framing(5222, 1, 0, 4, "149.154.167.51", 1);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 2, "149.154.167.50", 0, 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 2, "149.154.167.151", 1, 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 1, 4, "149.154.167.43", 1, 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 4, "2001:67c:4e8:f004::a", 0, 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(443, 0, 0, 4, "149.154.167.51", 1, 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(5222, 0, 0, 4, "149.154.167.51", 1, 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(5222, 1, 0, 4, "149.154.167.51", 1, 0);
+    test_epoll_cf_worker_uses_raw_stream_framing(0, 0, 0, 4, "149.154.167.43", 1, 1024);
     test_epoll_wss_sends_ping();
     test_async_route_dns_waits_before_worker();
     test_epoll_cf_proxy_preserves_media_dc_hostname_and_framing();

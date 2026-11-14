@@ -1052,8 +1052,8 @@
         var state = map.last_good ? "Резервная подтверждённая карта DC" : "Подтверждённая карта DC";
         mapStatus.textContent = state + " от " + fetched + " · IP для TCP 5222 — " + map.count + ".";
         if (map.status === "expired") mapStatus.textContent += " Срок действия карты истёк.";
-        if (!map.count) mapStatus.textContent += " В карте нет адресов для TCP 5222.";
-        if (map.status === "expired" || !map.count) mapStatus.setAttribute("data-tone", "warn");
+        if (!map.count) mapStatus.textContent += " Telegram не указал порт 5222 в карте. Здесь отображаются только явно объявленные адреса.";
+        if (map.status === "expired") mapStatus.setAttribute("data-tone", "warn");
         targets = map.addresses.join(",");
         copyIPs.disabled = !targets;
       }).catch(function () {

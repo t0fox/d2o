@@ -208,6 +208,14 @@ static void test_exact_tcpo_secret_is_used_for_original_destination_only(void) {
     assert(tg_transparent_select_route(&policy, &original, handshake,
                                        &selected) == 0);
     assert(selected.dc_id == 4 && selected.tcp_only);
+    assert(!selected.is_cdn);
+    endpoints[3].cdn = 1;
+    endpoints[5].cdn = 1;
+    assert(tg_transparent_select_route(&policy, &original, handshake,
+                                       &selected) == 0);
+    assert(selected.dc_id == 4 && selected.tcp_only && selected.is_cdn);
+    endpoints[3].cdn = 0;
+    endpoints[5].cdn = 0;
     endpoints[5].port = 5222;
     endpoints[5].this_port_only = 1;
     assert(tg_transparent_select_route(&policy, &original, handshake,

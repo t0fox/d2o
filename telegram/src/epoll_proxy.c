@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -122,7 +123,8 @@ struct proxy_connection {
     int wss_close_queued;
     uint32_t route_dc_id;
     int route_is_media;
-    int route_tcp_only;
+    unsigned route_tcp_only : 1;
+    unsigned route_is_cdn : 1;
     int direct_recovery_probe;
     int route_session_tracked;
     int route_failure_recorded;
@@ -338,10 +340,44 @@ static proxy_connection *route_session_owner(proxy_connection *connection) {
         ? connection->hedge_parent : connection;
 }
 
+static int worker_only(const proxy_connection *connection) {
+    const tg_config *config = connection->server->config.routing_config;
+    return config && config->route_only == TG_ROUTE_ONLY_WORKER;
+}
+
+static void trace_worker(const proxy_connection *connection, const char *event,
+                         uint32_t failure, uint64_t pause_ms) {
+    if (!worker_only(connection)) return;
+    const proxy_connection *owner = connection->hedge_parent
+        ? connection->hedge_parent : connection;
+    char address[INET6_ADDRSTRLEN] = "?";
+    (void)inet_ntop(connection->original.family, connection->original.address,
+                   address, sizeof(address));
+    uint64_t now = monotonic_us();
+    uint64_t elapsed_ms = now >= owner->accepted_at_us
+        ? (now - owner->accepted_at_us) / 1000u : 0;
+    fprintf(stderr, "worker-only ts=%jd session=%" PRIu64
+            " elapsed_ms=%" PRIu64 " event=%s dst=[%s]:%u dc=%u media=%d cdn=%u"
+            " worker=%s path=%s http=%u mtproto=%s tx=%" PRIu64 " rx=%" PRIu64
+            " paused_ms=%" PRIu64 " failure=%u pooled=%d\n",
+            (intmax_t)time(NULL), owner->route_session.id,
+            elapsed_ms, event, address,
+            (unsigned)connection->original.port, connection->route_dc_id,
+            connection->route_is_media, (unsigned)connection->route_is_cdn,
+            connection->tls_hostname[0] ? connection->tls_hostname : "-",
+            connection->tls_hostname[0] ? connection->wss_path : "-",
+            connection->ws_upgrade.http_status,
+            connection->route_response_seen ? "confirmed" :
+                connection->response_observer_disabled ? "unverified" : "pending",
+            owner->route_session.bytes_from_clients,
+            owner->route_session.bytes_from_upstreams, pause_ms, failure,
+            connection->from_worker_pool);
+}
+
 static void route_session_add_bytes(proxy_connection *connection,
                                     int from_client, size_t amount) {
     proxy_connection *owner = route_session_owner(connection);
-    if (!owner || !owner->route_session_tracked) return;
+    if (!owner || (!owner->route_session_tracked && !worker_only(owner))) return;
     uint64_t *total = from_client
         ? &owner->route_session.bytes_from_clients
         : &owner->route_session.bytes_from_upstreams;
@@ -678,6 +714,11 @@ static void wss_close_best_effort(proxy_connection *connection) {
 static void connection_close(proxy_connection *connection) {
     if (!connection || connection->closed) return;
     tg_epoll_proxy *server = connection->server;
+    if (worker_only(connection)) {
+        uint64_t paused = connection->wss_read_paused_at_ms;
+        trace_worker(connection, "closed", connection->route_failure_stage,
+                     paused ? monotonic_ms() - paused : 0);
+    }
     connection->closed = 1;
     hedge_cancel_candidates(connection);
     if (connection->direct_wss && server->active_wss_connections)
@@ -852,6 +893,7 @@ static uint64_t route_cooldown_ms(const proxy_connection *connection,
 static void route_failure_record(proxy_connection *connection,
                                  tg_route_kind kind, uint32_t stage) {
     if (!connection) return;
+    trace_worker(connection, "failed", stage, 0);
     connection->route_failure_stage = (uint8_t)stage;
     uint64_t now = monotonic_ms();
     tg_epoll_proxy *server = connection->server;
@@ -1536,6 +1578,7 @@ static int attach_pooled_worker(proxy_connection *connection,
     entry->ssl = NULL;
     connection->direct_wss = 1;
     connection->from_worker_pool = 1;
+    connection->ws_upgrade.http_status = 101;
     connection->packet_framing = 0;
     connection->wss_subprotocol = 0;
     connection->connecting = 0;
@@ -1620,6 +1663,7 @@ static int begin_upstream(proxy_connection *connection,
         connection->upstream_fd = -1;
         return -1;
     }
+    if (!connection->connecting) trace_worker(connection, "tcp", 0, 0);
     connection->upstream_watch = (socket_watch){
         .kind = 2, .connection = connection, .side = 1, .fd = fd
     };
@@ -1788,6 +1832,11 @@ static int setup_route_attempt(proxy_connection *connection,
         if (!domain) return -1;
         if (strlen(domain) >= sizeof(connection->tls_hostname)) return -1;
         memcpy(connection->tls_hostname, domain, strlen(domain) + 1u);
+        if (step->kind == TG_ROUTE_CF_WORKER) {
+            connection->packet_framing = 0;
+            connection->wss_subprotocol = 0;
+            if (set_worker_path(connection) != 0) return -1;
+        }
         int health_index = route_health_get(server, connection, 0);
         if (health_index >= 0 &&
             server->route_health[health_index].cooldown_until_ms >
@@ -1797,13 +1846,8 @@ static int setup_route_attempt(proxy_connection *connection,
         }
         int resolve_status = resolve_route_domain(server, domain, target);
         if (resolve_status < 0 && dns_failure) *dns_failure = 1;
-        if (resolve_status != 0) return resolve_status;
-        if (step->kind == TG_ROUTE_CF_WORKER) {
-            connection->packet_framing = 0;
-            connection->wss_subprotocol = 0;
-            return set_worker_path(connection);
-        }
-        return 0;
+        if (resolve_status == 0) trace_worker(connection, "dns", 0, 0);
+        return resolve_status;
     }
     return -1;
 }
@@ -1865,6 +1909,7 @@ static int start_next_route(proxy_connection *connection) {
         int setup_status = setup_route_attempt(connection, &step, &target,
                                                &dns_failure, &route_cooldown);
         if (route_cooldown) {
+            trace_worker(connection, "cooldown", 0, 0);
             route_session_event(connection, step.kind,
                                 TG_ROUTE_SESSION_COOLDOWN);
             continue;
@@ -2065,6 +2110,7 @@ static int hedge_launch_next(proxy_connection *parent) {
         candidate->route_dc_id = parent->route_dc_id;
         candidate->route_is_media = parent->route_is_media;
         candidate->route_tcp_only = parent->route_tcp_only;
+        candidate->route_is_cdn = parent->route_is_cdn;
         candidate->hedge_step_index = step.index;
         candidate->wss_proto = parent->wss_proto;
         memcpy(candidate->handshake, parent->handshake,
@@ -2094,6 +2140,7 @@ static int hedge_launch_next(proxy_connection *parent) {
             return 0;
         }
         if (route_cooldown) {
+            trace_worker(candidate, "cooldown", 0, 0);
             route_session_event(parent, step.kind,
                                 TG_ROUTE_SESSION_COOLDOWN);
             free(candidate);
@@ -2394,7 +2441,8 @@ static int route_after_handshake(proxy_connection *connection) {
     int have_preferred = 0;
     connection->route_dc_id = selection.dc_id;
     connection->route_is_media = selection.is_media;
-    connection->route_tcp_only = selection.tcp_only;
+    connection->route_tcp_only = selection.tcp_only != 0;
+    connection->route_is_cdn = selection.is_cdn != 0;
     connection->route_failure_recorded = 0;
     connection->wss_proto = selection.proto;
     if (connection->route_session_tracked) {
@@ -2866,7 +2914,8 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
         response = observe_mtproto_response(connection, payload, payload_len);
         if (response < 0) connection->response_observer_disabled = 1;
     }
-    if (response > 0 && !connection->route_response_seen) {
+    int first_response = response > 0 && !connection->route_response_seen;
+    if (first_response) {
         connection->route_response_seen = 1;
         if (connection->from_worker_pool &&
             connection->server->worker_pool_responses != UINT64_MAX)
@@ -2910,7 +2959,16 @@ static int queue_wss_response(void *opaque, const uint8_t *payload,
                           TG_MTPROTO_MAX_PACKET) != 0)
         return -1;
     add_bytes(&connection->server->bytes_from_upstreams, payload_len);
+    int trace = worker_only(connection);
+    const proxy_connection *owner = route_session_owner(connection);
+    uint64_t bytes_before = trace ? owner->route_session.bytes_from_upstreams : 0;
     route_session_add_bytes(connection, 0, payload_len);
+    if (first_response) trace_worker(connection, "mtproto", 0, 0);
+    if (trace) {
+        const uint64_t interval = 16u * 1024u * 1024u;
+        if (owner->route_session.bytes_from_upstreams / interval > bytes_before / interval)
+            trace_worker(connection, "transfer", 0, 0);
+    }
     connection->last_activity_ms = monotonic_ms();
     if (connection->to_client.len < connection->server->config.queue_bytes)
         return 0;
@@ -2952,6 +3010,7 @@ static int establish_wss_stream(proxy_connection *connection) {
                                 sizeof(connection->handshake)) != 0)
         return -1;
     connection->wss_phase = WSS_READY;
+    trace_worker(connection, "ws", 0, 0);
     route_session_event(connection, connection->route_kind,
                         TG_ROUTE_SESSION_CONNECTED);
     if (!connection->hedge_parent)
@@ -2986,6 +3045,7 @@ static int progress_wss(proxy_connection *connection, uint32_t events) {
             if (!(events & connection->tls_want)) return 0;
             int rc = SSL_do_handshake(connection->upstream_ssl);
             if (rc != 1) return set_tls_want(connection, rc);
+            trace_worker(connection, "tls", 0, 0);
             if (SSL_get_verify_result(connection->upstream_ssl) != X509_V_OK ||
                 tg_ws_upgrade_start_ex(&connection->ws_upgrade,
                     connection->tls_hostname, connection->wss_path,
@@ -3173,6 +3233,10 @@ static void client_event(proxy_connection *connection, uint32_t events) {
     if (!connection->upstream_eof && connection->ws_pump.read_paused &&
         !connection->to_client.len) {
         connection->ws_pump.read_paused = 0;
+        if (worker_only(connection) && connection->wss_read_paused_at_ms) {
+            uint64_t pause = monotonic_ms() - connection->wss_read_paused_at_ms;
+            if (pause >= 1000) trace_worker(connection, "resumed", 0, pause);
+        }
         connection->wss_read_paused_at_ms = 0;
         ++connection->server->wss_read_resumes;
         /* TLS or the WS parser may already hold the next complete frame. */
@@ -3212,6 +3276,7 @@ static void upstream_event(proxy_connection *connection, uint32_t events) {
         }
         connection->connecting = 0;
         connection->upstream_connect_deadline_ms = 0;
+        trace_worker(connection, "tcp", 0, 0);
         if (!connection->direct_wss) {
             route_health *ip = ip_health(connection, 0);
             if (ip) ip->cooldown_until_ms = ip->next_probe_ms = 0;
@@ -3405,9 +3470,9 @@ static int accept_clients(tg_epoll_proxy *server) {
         ++server->active_connections;
         if (server->connections_started != UINT64_MAX)
             ++server->connections_started;
+        connection->route_session.id = server->connections_started;
         if (server->tracked_sessions < TG_EPOLL_MAX_ACTIVE_ROUTE_SESSIONS) {
             connection->route_session_tracked = 1;
-            connection->route_session.id = server->connections_started;
             connection->route_session.stage = TG_ROUTE_SESSION_STAGE_ACCEPTED;
             connection->route_session.direct_state = TG_ROUTE_SESSION_IDLE;
             connection->route_session.fallback_state = TG_ROUTE_SESSION_IDLE;

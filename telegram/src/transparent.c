@@ -136,6 +136,7 @@ int tg_transparent_select_route(
     selection->is_media = parsed.is_media ||
         (result == TG_DC_LOOKUP_OK && endpoint.media_only);
     selection->proto = parsed.proto;
+    selection->is_cdn = result == TG_DC_LOOKUP_OK && endpoint.cdn;
     selection->tcp_only = used_official_secret ||
         result != TG_DC_LOOKUP_OK || endpoint.cdn || endpoint.tcpo_only ||
         endpoint.this_port_only;
