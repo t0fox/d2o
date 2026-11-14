@@ -5,9 +5,23 @@ const assert = require('node:assert/strict');
 const { App } = require('../internal/web/assets/panel.js');
 const ids = ['updates-body','nav-updates','update-current','update-state','update-reason','update-checked','update-release','update-version','update-notes','update-notes-text','update-progress','update-progress-text','update-check','update-install','update-warning','update-auto','update-schedule','update-result','update-action','update-lamp'];
 function fixture(reply) {
-  const nodes = Object.fromEntries(ids.map(id => [id, {textContent:'',hidden:false,disabled:false,checked:false,style:{},attrs:{},listeners:{},parentElement:{setAttribute(){}},setAttribute(k,v){this.attrs[k]=v;},getAttribute(k){return this.attrs[k];},addEventListener(k,v){this.listeners[k]=v;}}]));
+  function element(tagName) {
+    return {
+      tagName:tagName.toUpperCase(), children:[], _textContent:'', hidden:false,
+      disabled:false,checked:false,style:{},attrs:{},listeners:{},
+      parentElement:{setAttribute(){}},
+      get textContent() {return this._textContent+this.children.map(x=>x.textContent).join('');},
+      set textContent(v) {this._textContent=String(v);this.children=[];},
+      replaceChildren(...children) {this._textContent='';this.children=children;},
+      appendChild(child) {this.children.push(child);return child;},
+      setAttribute(k,v){this.attrs[k]=v;},getAttribute(k){return this.attrs[k];},
+      addEventListener(k,v){this.listeners[k]=v;}
+    };
+  }
+  const nodes = Object.fromEntries(ids.map(id => [id,element('div')]));
   const requests = [];
-  const document = {hidden:false,getElementById:id=>nodes[id]};
+  const document = {hidden:false,getElementById:id=>nodes[id],
+    createElement:element,createTextNode:v=>({tagName:'#text',textContent:String(v)})};
   const window = {setTimeout,clearTimeout,fetch:async (url,opts={})=>{requests.push({url,method:opts.method});return reply(url,opts);}};
   const app = new App(document, window);
   app.initUpdates();
@@ -83,6 +97,33 @@ const json = (data, status=200) => ({ok:status<300,status,json:async()=>data});
     assert.equal(nodes['update-current'].textContent, 'r1', 'подпись «Версия» уже в разметке');
     assert.equal(nodes['update-auto'].checked, true);
     assert.equal(nodes['nav-updates'].textContent, 'новая');
+  }
+
+  // Markdown release notes must be structured even when GitHub stored the whole
+  // description on one line. No HTML is ever interpreted or injected.
+  {
+    const flattened = '### D2O — обновление от 14.11.2026  - 🔧 **Telegram C11:** стабильная база. - ☁️ **Cloudflare Worker:** проверка TCP.  **Важно:** обновить скрипт.';
+    const {app,nodes} = fixture(() => json(state({
+      latest:{release_id:'r2',version:'14.11.2026',notes:flattened}
+    })));
+    await app.pollUpdates();
+    const note = nodes['update-notes-text'];
+    assert.deepEqual(note.children.map(x=>x.tagName), ['H4','UL','P']);
+    assert.equal(note.children[1].children.length, 2, 'flattened emoji bullets become a list');
+    assert.equal(note.children[1].children[0].children[0].tagName, '#text');
+    assert.equal(note.children[1].children[0].children[1].tagName, 'STRONG');
+    assert.match(note.children[2].textContent, /^Важно:/);
+    assert.doesNotMatch(note.textContent, /###|\*\*/);
+    const saved = note.children[0];
+    await app.pollUpdates();
+    assert.equal(note.children[0], saved, 'unchanged polling preserves release DOM and scroll');
+
+    const newer = '### Изменения\n\n- **Важное:** <img src=x onerror=alert(1)>\n- \u0060MTProto\u0060 работает.\n\nТекст без разметки.';
+    app.renderUpdates(state({latest:{release_id:'r3',version:'new',notes:newer}}));
+    assert.deepEqual(note.children.map(x=>x.tagName), ['H4','UL','P']);
+    assert.equal(note.children[1].children[1].children[0].tagName,'CODE');
+    assert.ok(note.textContent.includes('<img src=x onerror=alert(1)>'), 'HTML stays text');
+    assert.equal(note.children[1].children[0].children.some(x=>x.tagName==='IMG'), false);
   }
   // Установлена последняя: зелёная лампа, кнопки установки нет.
   {

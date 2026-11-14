@@ -1,5 +1,5 @@
 /* D2K — локальная панель. Состояние движка, управление службами и обновления.
-   Данные из сети попадают в DOM исключительно через textContent. */
+   Сетевые данные выводятся через textContent/текстовые DOM-узлы, без innerHTML. */
 (function (global) {
   "use strict";
 
@@ -646,6 +646,71 @@
     }).finally(function () { self.updateInflight = false; });
   };
 
+
+  /* Release notes come from GitHub. Build a restricted Markdown view with
+     text nodes, never innerHTML: even malicious release text stays inert. */
+  function normalizeUpdateNotes(value) {
+    var notes = str(value).replace(/\r\n?/g, "\n").trim();
+    /* Older one-line releases lost line breaks during publication. Recover
+       emoji-prefixed bullets without modifying ordinary prose or dates. */
+    if (notes.indexOf("\n") < 0 && /(?:^|\s)-\s+[^\x00-\x7f]/.test(notes)) {
+      notes = notes.replace(/ +- +(?=[^\x00-\x7f])/g, "\n- ");
+      notes = notes.replace(/ {2,}(?=\*\*[^*\n]{1,50}:\*\*)/g, "\n\n");
+    }
+    return notes;
+  }
+
+  function updateNotesInline(doc, parent, source) {
+    var rx = /\*\*([^*\n]+)\*\*|`([^`\n]+)`/g;
+    var start = 0, match;
+    while ((match = rx.exec(source)) !== null) {
+      if (match.index > start)
+        parent.appendChild(doc.createTextNode(source.slice(start, match.index)));
+      var node = doc.createElement(match[1] === undefined ? "code" : "strong");
+      node.textContent = match[1] === undefined ? match[2] : match[1];
+      parent.appendChild(node);
+      start = rx.lastIndex;
+    }
+    if (start < source.length) parent.appendChild(doc.createTextNode(source.slice(start)));
+  }
+
+  function renderUpdateNotes(doc, node, raw) {
+    var source = str(raw) || "Описание изменений не опубликовано.";
+    if (node.__notesSource === source) return;
+    node.__notesSource = source;
+    if (!doc.createElement || !doc.createTextNode || !node.replaceChildren) {
+      node.textContent = source;
+      return;
+    }
+    var lines = normalizeUpdateNotes(source).split("\n");
+    node.replaceChildren();
+    var paragraph = null, bullets = null;
+    lines.forEach(function (line) {
+      var content = line.trim(), heading = /^(#{1,4})\s+(.+)$/.exec(content);
+      if (!content) { paragraph = null; bullets = null; return; }
+      if (heading) {
+        paragraph = null; bullets = null;
+        var title = doc.createElement("h4");
+        updateNotesInline(doc, title, heading[2]);
+        node.appendChild(title);
+        return;
+      }
+      var bullet = /^[-*]\s+(.+)$/.exec(content);
+      if (bullet) {
+        paragraph = null;
+        if (!bullets) { bullets = doc.createElement("ul"); node.appendChild(bullets); }
+        var item = doc.createElement("li");
+        updateNotesInline(doc, item, bullet[1]);
+        bullets.appendChild(item);
+        return;
+      }
+      bullets = null;
+      if (!paragraph) { paragraph = doc.createElement("p"); node.appendChild(paragraph); }
+      else paragraph.appendChild(doc.createTextNode(" "));
+      updateNotesInline(doc, paragraph, content);
+    });
+  }
+
   App.prototype.renderUpdates = function (status) {
     if (!this.$("updates-body")) return;
     if (status) this.updateStatus = status;
@@ -680,7 +745,7 @@
     write("update-checked", num(s.checked_utc) > 0 ? "проверено " + localTime(num(s.checked_utc) * 1000) : "проверки ещё не было");
     this.$("update-release").hidden = !newer;
     write("update-version", newer ? "Что изменилось в " + (str(latest.version) || latest.release_id) : "");
-    write("update-notes-text", str(latest && latest.notes) || "Описание изменений не опубликовано.");
+    renderUpdateNotes(this.doc, this.$("update-notes-text"), latest && latest.notes);
     var install = this.$("update-install");
     install.hidden = !newer;
     install.disabled = !!action || absent;
