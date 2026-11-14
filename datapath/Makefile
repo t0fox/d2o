@@ -50,6 +50,7 @@ HDR     = include/d2k_icmpguard.h include/d2k_hold.h include/d2k_udp_hold.h incl
 
 HDR += include/d2k_http_response.h include/d2k_http_request_stream.h
 HDR += ../runtime/d2k_runtime.h ../runtime/d2k_protocol.h include/d2k_http_trace.h
+HDR += ../runtime/d2k_network_diag.h ../runtime/d2k_diag_ipc.h ../runtime/d2k_diagnostics_files.h
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
@@ -59,12 +60,18 @@ TESTS   = test_icmpguard test_addr test_hold test_udp_hold test_udp_release test
 
 # Linux integration regression: the NFQUEUE receive buffer must honor a large
 # request even when net.core.rmem_max is lower (the target router setting).
-.PHONY: test-nfq-rcvbuf-linux
+.PHONY: test-nfq-rcvbuf-linux test-nfq-poll-event
 test_nfq_rcvbuf: test_nfq_rcvbuf.c nfq.c nl.c include/d2k_nfq.h include/d2k_nl.h
 	$(CC) $(CFLAGS) -o $@ test_nfq_rcvbuf.c nfq.c nl.c $(LDFLAGS)
 
 test_nfq_rcvbuf_unit: test_nfq_rcvbuf_unit.c nfq.c nl.c include/d2k_nfq.h include/d2k_nl.h
 	$(CC) $(CFLAGS) -o $@ test_nfq_rcvbuf_unit.c nl.c $(LDFLAGS)
+
+ifeq ($(shell uname -s),Linux)
+check: test-nfq-poll-event
+endif
+test-nfq-poll-event: test_nfq_rcvbuf_unit
+	./test_nfq_rcvbuf_unit
 
 test-nfq-rcvbuf-linux: test_nfq_rcvbuf test_nfq_rcvbuf_unit
 	./test_nfq_rcvbuf_unit

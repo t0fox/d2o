@@ -94,4 +94,6 @@ int d2k_diag_telegram_record(d2k_diag_telegram *d,int64_t mono_ms,const char *js
 void d2k_diag_telegram_proc(FILE *f,const char *proc,long pid);
 void d2k_diag_telegram_error(d2k_diag_telegram *d,int error);
 int d2k_diag_write_combined(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f);
+int d2k_diag_write_extended(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f,
+                            void (*extension)(FILE *, const void *), const void *data);
 #endif

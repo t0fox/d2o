@@ -67,6 +67,8 @@
 typedef struct d2k_sched d2k_sched;
 void d2k_sched_diagnostics(d2k_sched *,d2k_diag_observer,void *);
 void d2k_sched_limit_diagnostics(d2k_sched *,d2k_diag_limit_observer,void *);
+struct d2k_network_controller;
+void d2k_sched_network_counts(const d2k_sched *, struct d2k_network_controller *);
 void d2k_sched_diagnostic_counts(d2k_sched *,d2k_diag_counts *);
 void d2k_sched_diagnostic_madvise(d2k_sched *,d2k_diag_madvise *);
 void d2k_sched_diagnostic_madvise_reset(d2k_sched *);

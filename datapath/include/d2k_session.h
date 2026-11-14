@@ -115,6 +115,9 @@ typedef struct {
 
 typedef struct d2k_session d2k_session;
 
+/* Diagnostic evidence of exchange before the current packet. No conntrack query. */
+unsigned d2k_session_prior_exchange(d2k_session *s, const uint8_t *packet, size_t len);
+
 uint64_t d2k_session_plan_revision(const d2k_session *s);
 /* НОМЕР КРЮЧКА NETFILTER ДЛЯ СЛЕДУЮЩЕГО ПАКЕТА.
  *

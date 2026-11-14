@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "diag_transport.h"
+#include "network_diag.h"
 #include "../runtime/d2k_runtime.h"
 #include <limits.h>
 #include <poll.h>
@@ -15,6 +16,8 @@ typedef union {
     d2k_diag_header header;
     d2k_diag_counts_message counts;
     d2k_diag_event_message event;
+    d2k_network_controller_message net_controller;
+    d2k_network_datapath_message net_datapath;
 } diag_message;
 
 static int64_t now_ms(void) {
@@ -80,6 +83,11 @@ static void record_event(d2k_diag *diag, d2k_diag_event_message *m) {
     d2k_diag_record(diag, &event);
 }
 
+static void report_network(FILE *file, const void *history) {
+    fputs(",\"network_history\":", file);
+    d2k_network_history_write(file, history);
+}
+
 static FILE *begin_write(const char *path) {
     if (unlink(path) && errno != ENOENT) return NULL;
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -101,8 +109,9 @@ static int self_check(void) { return sizeof(diag_message) <= 65536 ? 0 : -1; }
 int main(int argc, char **argv) {
     int offline = d2k_runtime_offline(argc, argv, "d2kdiag", self_check);
     if (offline >= 0) return offline;
-    if (argc > 2 || d2k_diag_dir(D2K_DIAG_DIR, 1) != 0) return 1;
-    const char *stats_path = argc == 2 ? argv[1] : "/opt/d2k/state/telegram.stats.sock";
+    if (argc > 3 || d2k_diag_dir(D2K_DIAG_DIR, 1) != 0) return 1;
+    const char *stats_path = argc >= 2 ? argv[1] : "/opt/d2k/state/telegram.stats.sock";
+    const char *run_path = argc >= 3 ? argv[2] : "/opt/d2k/run";
     const struct rlimit memory = {16u * 1024u * 1024u, 16u * 1024u * 1024u};
     if (setrlimit(RLIMIT_AS, &memory) != 0) return 1;
     if (setpriority(PRIO_PROCESS, 0, 15) != 0) return 1;
@@ -123,6 +132,9 @@ int main(int argc, char **argv) {
     d2k_diag *general = d2k_diag_new();
     d2k_diag_telegram *telegram = NULL;
     d2k_diag_counts_message controller = {0};
+    d2k_network_history *network = NULL;
+    d2k_network_controller_message net_controller = {0};
+    d2k_network_datapath_message net_datapath = {0};
     static char json[D2K_DIAG_TG_JSON_MAX + 1];
     int general_on = 0, telegram_on = 0, live = 0;
     int64_t controller_at = -10000, next = 0, report_due = 0;
@@ -132,7 +144,7 @@ int main(int argc, char **argv) {
     while (!stopping) {
         int64_t now = now_ms();
         if (now >= next) {
-            next = now + 2000;
+            next = now + D2K_NET_DIAG_INTERVAL_MS;
             int g = d2k_diag_enabled(D2K_DIAG_DIR);
             int t = d2k_diag_telegram_enabled(D2K_DIAG_DIR);
             if (g != general_on) {
@@ -141,6 +153,10 @@ int main(int argc, char **argv) {
                 if (!general) break;
                 d2k_diag_set_enabled(general, g);
                 general_on = g;
+                free(network);
+                network = g ? d2k_network_history_new() : NULL;
+                net_controller = (d2k_network_controller_message){0};
+                net_datapath = (d2k_network_datapath_message){0};
                 report_due = 0;
             }
             if (t != telegram_on) {
@@ -163,12 +179,14 @@ int main(int argc, char **argv) {
                 if (telegram) report_due = 0;
             }
             live = length != 0;
+            if (g) d2k_network_history_sample(network, (uint64_t)now, &net_controller,
+                                               &net_datapath, "/proc", "/sys", run_path);
             if ((g || t) && now >= report_due) {
                 report_due = now + 60000;
                 if (g && now - controller_at <= 3500) {
                     d2k_diag_set_controller(general, controller.header.pid, controller.memory);
                     d2k_diag_set_madvise(general, &controller.madvise);
-                    d2k_diag_sample(general, now, &controller.counts, "/proc", "/opt/d2k/run");
+                    d2k_diag_sample(general, now, &controller.counts, "/proc", run_path);
                 }
                 if (telegram) {
                     if (length) length = telegram_sample(json, length, sizeof(json), pid);
@@ -177,7 +195,8 @@ int main(int argc, char **argv) {
                 }
                 FILE *file = begin_write(D2K_DIAG_DIR "/report.new");
                 if (file) {
-                    int ok = d2k_diag_write_combined(general, telegram, file) == 0;
+                    int ok = d2k_diag_write_extended(general, telegram, file,
+                        g ? report_network : NULL, network) == 0;
                     ok = ok && g == d2k_diag_enabled(D2K_DIAG_DIR) &&
                          t == d2k_diag_telegram_enabled(D2K_DIAG_DIR);
                     finish_write(file, D2K_DIAG_DIR "/report.new", D2K_DIAG_DIR "/report.json", ok);
@@ -198,12 +217,20 @@ int main(int argc, char **argv) {
                 if (n == (ssize_t)sizeof(message.counts)) {
                     controller = message.counts;
                     controller.counts.worker_oldest_type[sizeof(controller.counts.worker_oldest_type)-1] = 0;
-                    controller_at = now;
+                    controller_at = now_ms();
                 }
                 break;
             case D2K_DIAG_IPC_LIMIT:
                 if (general_on && n == (ssize_t)sizeof(message.counts))
                     d2k_diag_record_limit(general, message.counts.monotonic_ms, &message.counts.counts);
+                break;
+            case D2K_DIAG_IPC_NETWORK_CONTROLLER:
+                if (general_on && n == (ssize_t)sizeof(message.net_controller))
+                    net_controller = message.net_controller;
+                break;
+            case D2K_DIAG_IPC_NETWORK_DATAPATH:
+                if (general_on && n == (ssize_t)sizeof(message.net_datapath))
+                    net_datapath = message.net_datapath;
                 break;
             case D2K_DIAG_IPC_EVENT:
                 if (general_on && n == (ssize_t)sizeof(message.event)) record_event(general, &message.event);
@@ -211,6 +238,7 @@ int main(int argc, char **argv) {
             }
         }
     }
+    free(network);
     d2k_diag_free(general);
     d2k_diag_telegram_free(telegram);
     unlink(D2K_DIAG_INPUT);

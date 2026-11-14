@@ -39,6 +39,10 @@ int main(void) {
     assert(recv(receiver, &message, sizeof(message), MSG_DONTWAIT) == sizeof(message));
     assert(message.header.kind == D2K_DIAG_IPC_COUNTS);
     assert(message.counts.tasks == 0);
+    d2k_network_controller_message network;
+    assert(recv(receiver, &network, sizeof(network), MSG_DONTWAIT) == sizeof(network));
+    assert(network.header.kind == D2K_DIAG_IPC_NETWORK_CONTROLLER);
+    assert(network.mono_ms == 2000 && network.counters.measurements == 0);
     /* Leave the receiver stalled until its bounded queue fills. */
     for (int i = 3; i <= 200; ++i) diagnostic_tick(s, 1000 * i);
     close(receiver);

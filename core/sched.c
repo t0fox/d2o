@@ -50,6 +50,7 @@
 #endif
 #include <sys/mman.h>
 #endif
+#include "../runtime/d2k_network_diag.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -656,6 +657,9 @@ typedef struct {
     char       dns_bootstrap[D2K_DNS_BOOTSTRAP_MAX];
     uint64_t   dns_service_generation;
     int        dns_health_probe;
+    int        dns_bootstrap_failed;
+    int        deadline_counted;
+    int        classifier_started;
 
     int64_t    started_ms; /* active search/lifecycle budget begins on launch */
     int64_t    began_ms;   /* when this search began, for the card and verdict line only (task 49) */
@@ -1376,6 +1380,7 @@ struct d2k_sched {
        вытесняется. */
     struct { char name[256]; uint8_t family; } quic_multi[16];
     size_t quic_multi_next;
+    d2k_network_controller network_diag;
     int64_t      last_measure_start_ms;
     int          measure_start_seen;
 
@@ -2904,6 +2909,7 @@ static void *worker_run_body(void *vp) {
             d2k_dns_resolve_bootstrap(t->dns_host, t->dns_bootstrap,
                                       s->measure_mark, resolved_ip, sizeof resolved_ip);
         if (resolved) snprintf(t->ip, sizeof t->ip, "%s", resolved_ip);
+        t->dns_bootstrap_failed = t->dns_bootstrap[0] && !resolved;
         if (!t->ip[0]) {
             memset(&vr, 0, sizeof vr); vr.fd = -1; vr.name_ok = -1;
             vr.local_refusal = 1;
@@ -3564,6 +3570,12 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     }
     t->th_live = 1;
     s->workers_started++;
+    if (job == JOB_DNS_HEALTH) s->network_diag.dns_checks++;
+    if (job == JOB_CLASSIFY) {
+        s->network_diag.measurements++;
+        if (t->classifier_started) s->network_diag.measurement_restarts++;
+        t->classifier_started = 1;
+    }
     if (job == JOB_CLASSIFY || job == JOB_VOICE) { t->search_started = 1; }
     return 0;
 }
@@ -6033,6 +6045,10 @@ static const char *worker_type(const task *t) {
     default:return "UNKNOWN";
     }
 }
+void d2k_sched_network_counts(const d2k_sched *s, d2k_network_controller *counts) {
+    *counts = s->network_diag;
+}
+
 void d2k_sched_diagnostic_counts(d2k_sched *s,d2k_diag_counts *c) {
     if(!s||!c)return;
     memset(c,0,sizeof *c);c->boxes=s->cat->n_boxes;
@@ -11124,6 +11140,9 @@ static void dns_health_finish(d2k_sched *s, task *t, int64_t now_ms) {
     ready = t->res_ready;
     pthread_mutex_unlock(&s->mu);
     if (!ready || join_worker(t) != 0) return;
+    if (!t->ver.dns_reply) s->network_diag.dns_failures++;
+    if (t->ver.local_refusal) s->network_diag.dns_local_failures++;
+    if (t->dns_bootstrap_failed) s->network_diag.dns_bootstrap_failures++;
     dns_service_live *live = dns_live_generation(s, t->dns_service_generation);
     int bootstrap = t->dns_bootstrap[0] != '\0';
     if (live && ((bootstrap && t->ip[0]) ||
@@ -11174,6 +11193,7 @@ static void dns_health_start_due(d2k_sched *s, int64_t now_ms) {
         int fd = -1;
         uint16_t sport = 0;
         if (!bootstrap && (d2k_sched_bind_hook(transport, family, &fd, &sport) != 0 || fd < 0)) {
+            s->network_diag.dns_local_failures++;
             live->state = DNS_SERVICE_FAILED;
             live->checked_ms = now_ms;
             live->next_check_ms = now_ms + DNS_HEALTH_RETRY_MS;
@@ -11182,6 +11202,7 @@ static void dns_health_start_due(d2k_sched *s, int64_t now_ms) {
         }
         if (fd >= 0 && s->measure_mark && d2k_sched_mark_hook(fd, s->measure_mark) != 0) {
             close(fd);
+            s->network_diag.dns_local_failures++;
             live->state = DNS_SERVICE_FAILED;
             live->checked_ms = now_ms;
             live->next_check_ms = now_ms + DNS_HEALTH_RETRY_MS;
@@ -11203,6 +11224,7 @@ static void dns_health_start_due(d2k_sched *s, int64_t now_ms) {
         snprintf(t->dns_bootstrap, sizeof t->dns_bootstrap, "%s", dns->bootstrap_dns);
         t->started_ms = t->began_ms = now_ms;
         if (start_worker(s, t, JOB_DNS_HEALTH) != 0) {
+            s->network_diag.dns_local_failures++;
             live->state = DNS_SERVICE_FAILED;
             live->checked_ms = now_ms;
             live->next_check_ms = now_ms + DNS_HEALTH_RETRY_MS;
@@ -11299,6 +11321,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                чужому подозрению. Прежде устаревшее ждало, пока восстановление
                получит слот, и висело в очереди сверх SCHED_TASK_LIFE_MS. */
             if (now_ms - t->queued_ms > SCHED_TASK_LIFE_MS) {
+                s->network_diag.queue_expired++;
                 say(s, "по %s подозрение устарело в очереди — сетевой замер не запускал",
                     t->name);
                 task_done(s, t);
@@ -11338,6 +11361,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                    пустым own_seen и проиграет те же свои планы снова, а
                    полный замер не начнётся никогда. */
                 if(join_worker(t)!=0)continue;
+                s->network_diag.phase_deadlines++;
                 for (size_t k = 0; k < t->n_plans && k < 32; k++) {
                     if (!(t->own_probed & (1u << k))) continue;
                     tried_add(t, (uint32_t)fnv1a(t->plans[k]));
@@ -11369,6 +11393,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                    выглядит это как зависание службы, а не как упёршийся в
                    потолок поиск. Сам замер бросается просьбой (join_worker),
                    и его вердикт никуда не идёт: дерево пройдено не до конца. */
+                if (!t->deadline_counted) {
+                    t->deadline_counted = 1;
+                    s->network_diag.phase_deadlines++;
+                }
                 if (t->state == T_ASKING) {
                     say(s, "по %s замер не уложился в %d мин и брошен — "
                            "в каталог не идёт ничего",
@@ -11446,6 +11474,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             if(join_worker(t)!=0)continue;
+            if (r.dial_deadline) s->network_diag.tcp_dial_deadlines++;
+            if (r.probes > 0) s->network_diag.probe_units += (unsigned)r.probes;
             int vol_cut = t->transport == 6 &&
                 (t->vol.rx_cut || t->vol.verdict == D2K_VOL_CUT);
             int direct_clear = (r.verdict == D2K_V_CLEAR && !vol_cut && !t->ech_trial &&

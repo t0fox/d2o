@@ -16,15 +16,25 @@
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <poll.h>
+#include <time.h>
 
 #include "d2k_nfq.h"
 #include "d2k_nl.h"
+
+enum { TIMING_SLOTS = 128 };
+typedef struct {
+    uint32_t id;
+    uint64_t kernel_ns, read_ns;
+} packet_time;
 
 struct d2k_nfq {
     int      fd;
     uint16_t queue;
     uint32_t seq;
     uint64_t lost;
+    d2k_nfq_window window;
+    int timing;
+    packet_time packet_times[TIMING_SLOTS];
 };
 
 static void say(char *err, size_t cap, const char *fmt, ...)
@@ -251,12 +261,69 @@ int d2k_nfq_fd(const d2k_nfq *q) {
     return q ? q->fd : -1;
 }
 
+uint32_t d2k_nfq_port(const d2k_nfq *q) {
+    struct sockaddr_nl addr;
+    socklen_t len = sizeof(addr);
+    return getsockname(q->fd, (struct sockaddr *)&addr, &len) == 0 &&
+           len == sizeof(addr) && addr.nl_family == AF_NETLINK ? addr.nl_pid : 0;
+}
+
+void d2k_nfq_timing(d2k_nfq *q, int enabled) {
+    if (q->timing == enabled) return;
+    q->timing = enabled;
+    memset(q->packet_times, 0, sizeof(q->packet_times));
+    q->window = (d2k_nfq_window){0};
+}
+
+void d2k_nfq_note_packet(d2k_nfq *q, uint32_t id, uint64_t kernel_ns, uint64_t read_ns) {
+    if (!q->timing) return;
+    q->packet_times[id % TIMING_SLOTS] = (packet_time){id, kernel_ns, read_ns};
+}
+
+d2k_nfq_window d2k_nfq_take_window(d2k_nfq *q) {
+    d2k_nfq_window window = q->window;
+    q->window = (d2k_nfq_window){0};
+    return window;
+}
+
+static void note_verdict(d2k_nfq *q, uint32_t id, uint32_t verdict, int replaced) {
+    if (!q->timing) return;
+    if (verdict == D2K_NF_DROP) q->window.drops++;
+    if (replaced) q->window.replacements++;
+    packet_time *slot = &q->packet_times[id % TIMING_SLOTS];
+    if (slot->id == id && slot->read_ns) {
+        struct timespec ts;
+        uint64_t kernel_ns = slot->kernel_ns, read_ns = slot->read_ns;
+        slot->read_ns = 0;
+        const uint64_t second = UINT64_C(1000000000);
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+            uint64_t now = (uint64_t)ts.tv_sec * second + (uint64_t)ts.tv_nsec;
+            if (now >= read_ns) {
+                uint64_t us = (now - read_ns) / 1000;
+                q->window.userspace_samples++;
+                if (us > q->window.userspace_max_us) q->window.userspace_max_us = us;
+            }
+        }
+        if (kernel_ns && clock_gettime(CLOCK_REALTIME, &ts) == 0 && ts.tv_sec >= 0) {
+            uint64_t now = (uint64_t)ts.tv_sec * second + (uint64_t)ts.tv_nsec;
+            /* Reject missing, future and clock-step outliers. */
+            if (now >= kernel_ns && now - kernel_ns <= 60 * second) {
+                uint64_t us = (now - kernel_ns) / 1000;
+                q->window.samples++;
+                if (us > q->window.max_us) q->window.max_us = us;
+                return;
+            }
+        }
+    }
+    q->window.no_timestamp++;
+}
+
 ssize_t d2k_nfq_recv(d2k_nfq *q, uint8_t *buf, size_t cap, char *err, size_t errcap) {
     if (!q || !buf || cap == 0) {
         say(err, errcap, "нет буфера для чтения");
         return -1;
     }
-    ssize_t n = recv(q->fd, buf, cap, 0);
+    ssize_t n = recv(q->fd, buf, cap, MSG_DONTWAIT);
     if (n >= 0) {
         return n;
     }
@@ -288,6 +355,7 @@ int d2k_nfq_verdict(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
         say(err, errcap, "отправка вердикта: %s", strerror(errno));
         return -1;
     }
+    note_verdict(q, pkt_id, verdict, 0);
     return 0;
 }
 
@@ -307,6 +375,7 @@ int d2k_nfq_verdict_payload(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
         say(err, errcap, "отправка вердикта с заменой: %s", strerror(errno));
         return -1;
     }
+    note_verdict(q, pkt_id, verdict, 1);
     return 0;
 }
 

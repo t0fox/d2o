@@ -9,7 +9,14 @@ typedef struct {
     d2k_udp_hold_batch b;
 } udp_slot;
 
-struct d2k_udp_hold { udp_slot slots[D2K_UDP_HOLD_SLOTS]; };
+struct d2k_udp_hold {
+    udp_slot slots[D2K_UDP_HOLD_SLOTS];
+    uint64_t timeout_packets;
+};
+
+uint64_t d2k_udp_hold_timeout_packets(const d2k_udp_hold *h) {
+    return h ? h->timeout_packets : 0;
+}
 
 static int same_key(const d2k_key *a, const d2k_key *b) {
     return d2k_key_equal(a, b);
@@ -45,6 +52,7 @@ size_t d2k_udp_hold_flush(d2k_udp_hold *h, uint64_t now_ns,
     for (size_t i = 0; i < D2K_UDP_HOLD_SLOTS; i++) {
         udp_slot *s = &h->slots[i];
         if (s->used && now_ns >= s->deadline) {
+            h->timeout_packets += s->b.count;
             n += release_slot(s, release, ctx);
         }
     }

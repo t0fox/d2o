@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <poll.h>
 
 typedef struct d2k_nfq d2k_nfq;
 
@@ -36,6 +37,12 @@ typedef struct {
 d2k_nfq *d2k_nfq_open(const d2k_nfq_cfg *cfg, char *err, size_t errcap);
 void     d2k_nfq_close(d2k_nfq *q);
 int      d2k_nfq_fd(const d2k_nfq *q);
+uint32_t d2k_nfq_port(const d2k_nfq *q);
+
+/* Netlink can signal ENOBUFS without unread packets (POLLERR only). */
+static inline int d2k_nfq_read_event(short events) {
+    return events & (POLLIN | POLLERR);
+}
 
 /* Читает один буфер сообщений.
  *  >0 — прочитано байт;
@@ -53,6 +60,17 @@ int d2k_nfq_verdict(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
 /* Вердикт, выпускающий вместо пакета payload (до 2048 байт). */
 int d2k_nfq_verdict_payload(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
                             const uint8_t *payload, size_t len, char *err, size_t errcap);
+
+typedef struct {
+    uint64_t drops, replacements, samples, max_us, no_timestamp;
+    uint64_t userspace_samples, userspace_max_us;
+} d2k_nfq_window;
+
+/* Packet ID is retained only until verdict, in a fixed-size timing table.
+ * NFQA_TIMESTAMP is kernel packet time, which can precede NFQUEUE enqueue. */
+void d2k_nfq_timing(d2k_nfq *q, int enabled);
+void d2k_nfq_note_packet(d2k_nfq *q, uint32_t id, uint64_t kernel_ns, uint64_t read_ns);
+d2k_nfq_window d2k_nfq_take_window(d2k_nfq *q);
 
 /* Сколько раз ядро сообщало о потерянных сообщениях. */
 uint64_t d2k_nfq_lost(const d2k_nfq *q);

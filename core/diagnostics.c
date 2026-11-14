@@ -716,7 +716,8 @@ static void write_telegram(FILE *f,const d2k_diag_telegram *tg) {
     if(tg&&tg->latest_len)fwrite(tg->latest_json,1,tg->latest_len,f);else fputs("null",f);
     fputc('}',f);
 }
-static int diag_write(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f) {
+int d2k_diag_write_extended(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f,
+                            void (*extension)(FILE *, const void *), const void *data) {
     if(!d||!f)return -1;
     fprintf(f,"{\"schema\":1,\"enabled\":%s,\"general_enabled\":%s,\"telegram_enabled\":%s,\"controller_pid\":%ld,\"release\":",
         (d->general_enabled||tg)?"true":"false",d->general_enabled?"true":"false",tg?"true":"false",d->controller_pid ? d->controller_pid : (long)getpid());js(f,D2K_RELEASE_ID);
@@ -852,7 +853,9 @@ static int diag_write(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f) {
         if(i)fputc(',',f);
         fputs("{\"name\":",f);js(f,names[i]);fputs(",\"first\":",f);write_detail(f,&d->first[i]);
         fputs(",\"latest\":",f);write_detail(f,&d->latest[i]);fputc('}',f);
-    }fputc(']',f);write_telegram(f,tg);fputs("}\n",f);return ferror(f)?-1:0;
+    }fputc(']',f);write_telegram(f,tg);
+    if(extension)extension(f,data);
+    fputs("}\n",f);return ferror(f)?-1:0;
 }
-int d2k_diag_write(const d2k_diag *d,FILE *f){return diag_write(d,NULL,f);}
-int d2k_diag_write_combined(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f){return diag_write(d,tg,f);}
+int d2k_diag_write(const d2k_diag *d,FILE *f){return d2k_diag_write_extended(d,NULL,f,NULL,NULL);}
+int d2k_diag_write_combined(const d2k_diag *d,const d2k_diag_telegram *tg,FILE *f){return d2k_diag_write_extended(d,tg,f,NULL,NULL);}

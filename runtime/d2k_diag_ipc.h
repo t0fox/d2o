@@ -3,6 +3,7 @@
 
 #include "d2k_diagnostics_files.h"
 #include <sys/socket.h>
+#include <stdint.h>
 #include <sys/un.h>
 #include <stddef.h>
 
@@ -12,7 +13,8 @@
 #define D2K_DIAG_LIVE D2K_DIAG_DIR "/telegram.json"
 
 enum { D2K_DIAG_IPC_VERSION = 1, D2K_DIAG_IPC_TELEGRAM = 1,
-       D2K_DIAG_IPC_COUNTS, D2K_DIAG_IPC_EVENT, D2K_DIAG_IPC_LIMIT };
+       D2K_DIAG_IPC_COUNTS, D2K_DIAG_IPC_EVENT, D2K_DIAG_IPC_LIMIT,
+       D2K_DIAG_IPC_NETWORK_DATAPATH, D2K_DIAG_IPC_NETWORK_CONTROLLER };
 
 typedef struct {
     unsigned version, kind;

@@ -1511,7 +1511,7 @@ start_panel() {
 start_diag() {
     prepare_runtime
     if [ -x "$DIAGBIN" ] && ! running "$DIAG_PID" d2kdiag; then
-        spawn_daemon -S -b -m -p "$DIAG_PID" -x "$DIAGBIN" -- "$TG_STATS_SOCKET" \
+        spawn_daemon -S -b -m -p "$DIAG_PID" -x "$DIAGBIN" -- "$TG_STATS_SOCKET" "$RUN" \
             || say "d2kdiag не запустился"
     fi
 }

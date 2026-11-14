@@ -83,7 +83,7 @@ HDR += include/d2k_resource.h
 HDR += include/d2k_http_reply.h
 HDR += include/d2k_domain.h include/d2k_groups.h
 HDR += include/d2k_diagnostics.h ../runtime/d2k_diagnostics_files.h
-HDR += ../runtime/d2k_dns_config.h
+HDR += ../runtime/d2k_dns_config.h ../runtime/d2k_network_diag.h ../runtime/d2k_diag_ipc.h
 diagnostics.o: diagnostics.c include/d2k_diagnostics.h
 SRC += domain.c groups.c udpplan.c udpruntime.c
 DIAG_SRC = diagnostics.c
@@ -1436,8 +1436,8 @@ clean-diagnostics-runtime:
 	$(RM) test_diagnostics_runtime
 clean: clean-diagnostics-runtime
 
-DIAG_SOURCES = d2kdiag.c diagnostics.c
-DIAG_HEADERS = diag_transport.h include/d2k_diagnostics.h ../runtime/d2k_diag_ipc.h
+DIAG_SOURCES = d2kdiag.c diagnostics.c network_diag.c
+DIAG_HEADERS = diag_transport.h network_diag.h include/d2k_diagnostics.h ../runtime/d2k_network_diag.h ../runtime/d2k_diag_ipc.h ../runtime/d2k_diagnostics_files.h
 
 d2kdiag: $(DIAG_SOURCES) $(DIAG_HEADERS)
 	$(CC) $(CFLAGS) -std=c11 -o $@ $(DIAG_SOURCES)
@@ -1446,3 +1446,15 @@ d2kdiag: $(DIAG_SOURCES) $(DIAG_HEADERS)
 d2kdiag-release: $(DIAG_SOURCES) $(DIAG_HEADERS)
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -std=c11 -static -Wl,-S -o $(BUILDDIR)/d2kdiag-linux-$(ARCH) $(DIAG_SOURCES)
+
+.PHONY: test-network-diag clean-network-diag
+check: test-network-diag
+test-network-diag: test_network_diag
+	python3 test_network_diag.py
+
+test_network_diag: test_network_diag.c network_diag.c $(DIAG_HEADERS)
+	$(CC) $(CFLAGS) -std=c11 -o $@ test_network_diag.c network_diag.c
+
+clean: clean-network-diag
+clean-network-diag:
+	$(RM) test_network_diag

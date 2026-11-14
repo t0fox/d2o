@@ -17,6 +17,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "../runtime/d2k_runtime.h"
+#include "../runtime/d2k_network_diag.h"
 #include "d2k_crypto.h"
 #include <errno.h>
 #include <arpa/inet.h>
@@ -208,6 +209,20 @@ static struct {
     uint64_t hold_resent;      /* оригиналов возвращено на провод своей посылкой */
     uint64_t hold_resend_fail; /* оригиналов, которые вернуть не удалось */
 } st;
+
+static d2k_network_datapath network_diag;
+static int network_diag_on;
+
+static void note_exchange(unsigned transport, uint64_t *reason) {
+    if (reason) {
+        (*reason)++;
+        if (transport == 6) network_diag.tcp_prior_exchange_actions++;
+        if (transport == 17) network_diag.udp_prior_exchange_actions++;
+    } else {
+        if (transport == 6) network_diag.tcp_prior_exchange_packets++;
+        if (transport == 17) network_diag.udp_prior_exchange_packets++;
+    }
+}
 
 /* ICMP time-exceeded на собственные фальшивки с пониженным TTL (поле
    04.10.2026, d2k_icmpguard.h): клиент не должен получать ошибку на пакет,
@@ -562,6 +577,10 @@ static int ct_query(void *ctx, const d2k_ct_tuple *t, d2k_ct_info *out) {
     ct_link *c = ctx;
     if (++c->seq == 0) { c->seq = 1; }
     int rc = d2k_ct_query_info_fd(c->fd, c->seq, t, out);
+    if (network_diag_on) {
+        network_diag.conntrack_queries++;
+        if (rc < 0) network_diag.conntrack_query_errors++;
+    }
     if (rc == 2 && !c->told_acct) {
         c->told_acct = 1;
         fprintf(stderr, "d2kd: в записях conntrack нет счётчиков (nf_conntrack_acct выключен) — "
@@ -1472,6 +1491,14 @@ int main(int argc, char **argv) {
     /* Счётчики связи уезжают контроллеру раз в секунду: реже — и он узнавал бы
        о своей слепоте позже, чем успел бы выбросить рабочий план. */
     uint64_t next_ctl_stats = start + NS_PER_S;
+    uint64_t next_network = 0, previous_loop = 0;
+    int network_sender = d2k_diag_sender();
+    d2k_network_datapath_message network_message = {
+        .header = {D2K_DIAG_IPC_VERSION, D2K_DIAG_IPC_NETWORK_DATAPATH, (long)getpid()},
+        .generation = d2k_runtime_start_ticks("/proc/self/stat"),
+        .queue = queue, .queue_limit = qlen, .fail_open = (unsigned)fail_open,
+        .netlink_port = d2k_nfq_port(q)
+    };
 
     while (!stop_flag) {
         (void)d2k_runtime_heartbeat(health_path, NULL, ctl && d2k_ctl_peer_fd(ctl) >= 0, 1, 1);
@@ -1480,6 +1507,46 @@ int main(int argc, char **argv) {
            см. d2k_plans.h) — точность в сотни миллисекунд достаточна: там
            считают минуты простоя записи, а не наносекунды. */
         cx.now_ns = t;
+        if (network_diag_on && previous_loop) {
+            uint64_t us = (t - previous_loop) / NS_PER_US;
+            if (us > network_diag.loop_max_us) network_diag.loop_max_us = us;
+        }
+        previous_loop = t;
+        if (t >= next_network) {
+            next_network = t + D2K_NET_DIAG_INTERVAL_MS * NS_PER_MS;
+            int enabled = network_sender >= 0 && d2k_diag_enabled(D2K_DIAG_DIR);
+            if (network_diag_on != enabled) {
+                network_diag_on = enabled;
+                d2k_nfq_timing(q, enabled);
+            }
+            if (enabled) {
+                d2k_nfq_window window = d2k_nfq_take_window(q);
+                d2k_hold_stats hold_stats;
+                d2k_hold_get_stats(holding, &hold_stats);
+                network_diag.packets = st.seen;
+                network_diag.enobufs = d2k_nfq_lost(q);
+                network_diag.recv_errors = st.recv_err;
+                network_diag.verdict_errors = st.verdict_fail;
+                network_diag.raw_send_errors = st.send_fail;
+                network_diag.drop_verdicts += window.drops;
+                network_diag.replacements += window.replacements;
+                network_diag.verdict_samples += window.samples;
+                network_diag.verdict_max_us = window.samples ? window.max_us : UINT64_MAX;
+                network_diag.userspace_verdict_samples += window.userspace_samples;
+                network_diag.userspace_verdict_max_us = window.userspace_samples
+                    ? window.userspace_max_us : UINT64_MAX;
+                network_diag.verdict_no_timestamp += window.no_timestamp;
+                network_diag.tcp_hold_timeouts = hold_stats.timed_out_pkts;
+                network_diag.udp_hold_timeouts = d2k_udp_hold_timeout_packets(udp_holding);
+                network_diag.routed_flows = d2k_session_routed_flows(sess);
+                network_diag.flow_table_refusals = d2k_session_refusals(sess);
+                network_message.mono_ms = t / NS_PER_MS;
+                network_message.counters = network_diag;
+                network_diag.loop_max_us = 0;
+                network_diag.sweep_max_us = 0;
+                d2k_diag_send(network_sender, D2K_DIAG_INPUT, &network_message, sizeof(network_message));
+            }
+        }
         if (duration_s && t - start >= (uint64_t)duration_s * NS_PER_S) {
             break;
         }
@@ -1577,7 +1644,7 @@ int main(int argc, char **argv) {
            чтения через сколько угодно времени (ревью N2). */
         int read_follows = pr > 0 && (pfd[iq].revents & POLLIN);
         (void)d2k_udp_path_expire(&udp_path, now_ns(), read_follows);
-        if (read_follows) {
+        if (pr > 0 && d2k_nfq_read_event(pfd[iq].revents)) {
             ssize_t n = d2k_nfq_recv(q, rbuf, sizeof rbuf, err, sizeof err);
             if (n == -1) {
                 st.recv_err++;
@@ -1603,6 +1670,7 @@ int main(int argc, char **argv) {
                         if (kerr != 0) {
                             /* Молчаливо копить пакеты, получая EINVAL, уже
                                случалось на этапе 0. Больше не молча. */
+                            network_diag.kernel_errors++;
                             fprintf(stderr, "d2kd: ядро отвергло сообщение: %s\n",
                                     strerror(-kerr));
                         }
@@ -1618,6 +1686,8 @@ int main(int argc, char **argv) {
                         continue;   /* вердикт слать некому: нет номера пакета */
                     }
 
+                    if (network_diag_on)
+                        d2k_nfq_note_packet(q, np.id, np.have_tstamp ? np.tstamp_ns : 0, t);
                     st.seen++;
                     st.bytes += np.payload_len;
                     /* ICMP идёт в очередь только как time-exceeded (S99d2k,
@@ -1673,6 +1743,11 @@ int main(int argc, char **argv) {
                        first tail cannot escape while the ClientHello is still
                        incomplete.  The session only classifies; it never
                        concatenates these datagrams. */
+                    int user_diagnostic = network_diag_on && np.have_payload && !np.truncated &&
+                        !(probe_mark && np.have_mark && np.mark == probe_mark);
+                    unsigned prior_exchange = user_diagnostic
+                        ? d2k_session_prior_exchange(sess, np.payload, np.payload_len) : 0;
+                    if (prior_exchange) note_exchange(prior_exchange, NULL);
                     int udp_fed = udp_holding && np.have_payload && !np.truncated &&
                         d2k_udp_path_pre(&udp_path, np.id, np.payload, np.payload_len,
                                          umark, t, &udp_key);
@@ -1693,6 +1768,8 @@ int main(int argc, char **argv) {
                             d2k_session_hold_candidate(sess, np.payload, np.payload_len),
                             anchor, have_anchor,
                             release_original, &hc, &batch);
+                        if (user_diagnostic && (hr == 1 || hr == 2))
+                            note_exchange(prior_exchange, &network_diag.hold_actions);
                         if (hr == 1) {
                             /* Взят в слот (или уже возвращён на провод из него):
                                у ядра копия больше не нужна — иначе хвост
@@ -1722,6 +1799,7 @@ int main(int argc, char **argv) {
                         http80_step(q, mode == MODE_APPLY ? raw : NULL, ctl, np.id,
                                     np.payload, np.payload_len, t,
                                     np.have_tstamp ? np.tstamp_ns : 0, &http_observation)) {
+                        if (user_diagnostic) note_exchange(prior_exchange, &network_diag.http_actions);
                         continue;
                     }
 
@@ -1825,6 +1903,8 @@ int main(int argc, char **argv) {
                             }
                         }
                     }
+                    if (user_diagnostic && udp_fed)
+                        note_exchange(prior_exchange, &network_diag.hold_actions);
                     if (udp_how == D2K_UDP_PATH_HELD || udp_how == D2K_UDP_PATH_RECLAIMED) {
                         continue;
                     }
@@ -2147,6 +2227,7 @@ int main(int argc, char **argv) {
                            спланированного Initial снимался всякий раз. Только
                            в окне столкновения (та же пачка приёма или ≤5 мс);
                            позже — обычный ACCEPT. Вердикт выдан там. */
+                        if (user_diagnostic) note_exchange(prior_exchange, &network_diag.udp_follow_actions);
                     } else if (!delayed_originals && batch_owned) {
                         /* ОРИГИНАЛЫ СОБРАННОГО ПРИВЕТСТВИЯ УЖЕ У НАС (hold_owns).
                            План лёг (fate drop) — они ушли его посылкой. Не лёг
@@ -2181,6 +2262,12 @@ int main(int argc, char **argv) {
                             (void)d2k_udp_path_planned(&udp_path, np.payload,
                                                        np.payload_len, umark, at, t);
                         }
+                    }
+                    if (user_diagnostic && mode == MODE_APPLY &&
+                        ((!original_failed && verdict == D2K_NF_DROP) ||
+                         (res.applied && (delayed_originals || st.emitted_now != http_sent_before ||
+                                          st.deferred != http_queued_before)))) {
+                        note_exchange(prior_exchange, &network_diag.plan_actions);
                     }
                     if (original_failed) {
                         if (res.applied && mode == MODE_APPLY) {
@@ -2315,12 +2402,17 @@ int main(int argc, char **argv) {
             /* Сперва заметить молчание, потом забывать. Обратный порядок
                означал бы, что о молчании узнаём только при забвении потока —
                через две минуты, когда человек уже ушёл со страницы. */
+            uint64_t sweep_start = network_diag_on ? now_ns() : 0;
             d2k_session_sweep(sess, t);
             if (http80) { (void)d2k_http80_sweep(http80, t, http80_cut, ctl); }
             d2k_session_expire(sess, t, idle_ns);
             /* Окно следования — миллисекунды: всё старше и из прежних пачек
                приёма убирается (финальное ревью M-5). */
             d2k_udp_follow_age(udp_follow, t, udp_path.rseq + 1);
+            if (sweep_start) {
+                uint64_t us = (now_ns() - sweep_start) / NS_PER_US;
+                if (us > network_diag.sweep_max_us) network_diag.sweep_max_us = us;
+            }
             next_expire = t + NS_PER_S;
         }
         if (ctl) {
@@ -2390,6 +2482,7 @@ int main(int argc, char **argv) {
     print_stats(sess, sched, q, raw, now_ns() - start);
     print_journal(sess, start);
 
+    if (network_sender >= 0) close(network_sender);
     d2k_ctl_close(ctl);
     /* The hold first, while the scheduler still exists (ревью M3); its
        release sends now (at == now). */

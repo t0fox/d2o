@@ -2710,6 +2710,23 @@ int d2k_session_udp_hold_begin(d2k_session *s, const uint8_t *p, size_t n,
     return 1;
 }
 
+unsigned d2k_session_prior_exchange(d2k_session *s, const uint8_t *p, size_t n) {
+    d2k_packet_view ip;
+    if (!s || !d2k_packet_parse(p, n, &ip) || (ip.fragment & 0x3fff)) return 0;
+    const uint8_t *transport = p + ip.l4;
+    d2k_key key;
+    (void)d2k_key_make_addr(&key, ip.protocol, &ip.src, &ip.dst, transport, transport + 2);
+    d2k_flow *flow = d2k_track_find(ip.protocol == 6 ? s->flows : s->uflows, &key);
+    if (!flow) return 0;
+    /* Called before accounting the current packet. UDP fwd/rev counters
+       also cover opaque datagrams whose direction comes from the hook. */
+    if (ip.protocol == 6) {
+        if ((transport[13] & 0x02) || !flow->dir_known) return 0;
+        return flow->fwd_data_pkts && flow->rev_data_pkts ? 6u : 0;
+    }
+    return flow->fwd_pkts && flow->rev_pkts ? 17u : 0;
+}
+
 int d2k_session_udp_opening(d2k_session *s, const uint8_t *p, size_t n) {
     d2k_packet_view ip;
     if (!s || !d2k_packet_parse(p, n, &ip) || ip.protocol != 17 || (ip.fragment & 0x3fff)) {

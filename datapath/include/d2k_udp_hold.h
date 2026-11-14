@@ -62,6 +62,7 @@ int d2k_udp_hold_take(d2k_udp_hold *h, const d2k_key *key, uint64_t now_ns,
                       d2k_udp_hold_batch *out);
 
 /* Releases expired slots and reports how many original IDs were released. */
+uint64_t d2k_udp_hold_timeout_packets(const d2k_udp_hold *h);
 size_t d2k_udp_hold_flush(d2k_udp_hold *h, uint64_t now_ns,
                           d2k_udp_hold_release release, void *ctx);
 

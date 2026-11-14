@@ -36,6 +36,7 @@
 #include "d2k_arm.h"
 #include "d2k_diagnostics.h"
 #include "diag_transport.h"
+#include "../runtime/d2k_network_diag.h"
 #include "d2k_httpsprobe.h"
 #include "d2k_httpsearch.h"
 #include "d2k_plantlv.h"
@@ -415,6 +416,7 @@ static int offline_self_check(void) {
 static int diagnostic_sender = -1;
 static long diagnostic_pid;
 static int diagnostic_enabled;
+static uint64_t diagnostic_generation, dns_config_failures, dns_config_max_ms;
 
 static void diagnostic_event(void *ctx, const d2k_diag_event *e) {
     (void)ctx;
@@ -464,6 +466,25 @@ static void diagnostic_tick(d2k_sched *s, int64_t now) {
     d2k_sched_diagnostic_madvise(s, &message.madvise);
     d2k_diag_memory_snapshot(message.memory);
     d2k_diag_send(diagnostic_sender, D2K_DIAG_INPUT, &message, sizeof(message));
+    static uint64_t next_network;
+    if ((uint64_t)now >= next_network) {
+        next_network = (uint64_t)now + D2K_NET_DIAG_INTERVAL_MS;
+        const d2k_diag_counts *c = &message.counts;
+        d2k_network_controller_message network = {
+            .header = {D2K_DIAG_IPC_VERSION, D2K_DIAG_IPC_NETWORK_CONTROLLER, diagnostic_pid},
+            .generation = diagnostic_generation, .mono_ms = (uint64_t)now,
+            .active = c->active, .queued = c->queued, .workers = c->workers_running,
+            .limit = c->measurement_limit,
+            .cpu_free_pct = c->cpu_valid ? (uint32_t)c->cpu_free_pct : UINT32_MAX,
+            .mem_available_kib = c->mem_valid && c->mem_avail_kb < UINT32_MAX
+                ? (uint32_t)c->mem_avail_kb : UINT32_MAX
+        };
+        d2k_sched_network_counts(s, &network.counters);
+        network.counters.dns_config_failures = dns_config_failures;
+        network.counters.dns_config_max_ms = dns_config_max_ms;
+        dns_config_max_ms = 0;
+        d2k_diag_send(diagnostic_sender, D2K_DIAG_INPUT, &network, sizeof(network));
+    }
 }
 
 static void dns_services_refresh(d2k_sched *s, int64_t now) {
@@ -471,13 +492,16 @@ static void dns_services_refresh(d2k_sched *s, int64_t now) {
     d2k_dns_service items[D2K_DNS_SERVICE_MAX];
     size_t count = 0;
     if (!s || now < retry_at) return;
+    int64_t started = now_ms();
     if (d2k_dns_services_read_system(items, D2K_DNS_SERVICE_MAX, &count) == 0) {
         d2k_sched_set_dns_services(s, items, count);
-        retry_at = now + 30000;
     } else {
         /* Keep the last good endpoint set if ndmc is temporarily unavailable. */
-        retry_at = now + 30000;
+        dns_config_failures++;
     }
+    uint64_t elapsed = (uint64_t)(now_ms() - started);
+    if (elapsed > dns_config_max_ms) dns_config_max_ms = elapsed;
+    retry_at = now + 30000;
 }
 
 int main(int argc, char **argv) {
@@ -728,6 +752,7 @@ int main(int argc, char **argv) {
 
     diagnostic_sender = d2k_diag_sender();
     diagnostic_pid = (long)getpid();
+    diagnostic_generation = d2k_runtime_start_ticks("/proc/self/stat");
     while (!stop_asked) {
         (void)d2k_runtime_heartbeat(health_path, greeting.release_id, 1, 1, 1);
         struct pollfd pfd[4];
